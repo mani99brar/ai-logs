@@ -1,0 +1,600 @@
+# PRD: Parallel reviewers (slice B)
+
+Status: Proposed 2026-09-22. Umbrella: [PRD_CONFIGURABLE_WORKFLOW.md](PRD_CONFIGURABLE_WORKFLOW.md). Depends on slice A ([PRD_WORKER_LANES.md](PRD_WORKER_LANES.md)) for the lane vocabulary and the plan-driven pane layout. Ships as an ordinary commit with offline tests and a controlled live smoke test (section 8); no feature run.
+
+## 1. Goal
+
+A feature declares one or more reviewers, each with its own brief. The review node launches all of them over the same bundle, waits for all of them, and the run continues only when every reviewer approves and no reviewer leaves an unresolved P0 or P1. The viewer shows each reviewer's verdict and findings and the combined result.
+
+Success: a feature with a general reviewer and a test-coverage reviewer runs both as native sessions with their own panes, both completion files are accepted, `review.json` carries the union of findings tagged by reviewer, and the review node in the viewer lists both reviewers with their verdicts.
+
+## 2. Confirmed decisions
+
+- Unanimous verdict. Every declared reviewer must write an accepted `approved` file. Any `blocked`, any unresolved P0/P1 from any reviewer, any rejected file, or any reviewer reaching `review_timeout_seconds` blocks the run. No advisory reviewers, no quorum.
+- Findings are unioned. Each finding gains `reviewer` (the reviewer id). Duplicate findings from different reviewers are kept, not merged.
+- Reviewers run in parallel, all launched by the one `review` graph node, all over the same shared `review-worktree` at the candidate commit. Their tools stay Read, Glob, Grep plus exactly one allowed write, their own completion file.
+- One review per bundle per reviewer. Nothing is relaunched. A blocked run means a new run.
+- Run-wide `--reviewer-transport` applies to every reviewer. No per-reviewer transport, tools or model.
+- A feature file without `reviewers` declares one reviewer with id `review` and the built-in prompt. `features/project-workflows` needs no change.
+
+## 3. Configuration
+
+feature.json 2.1.0 adds:
+
+```json
+{
+  "reviewers": [
+    {"reviewer_id": "general", "prompt": "reviewers/general.md"},
+    {"reviewer_id": "coverage", "prompt": "reviewers/coverage.md"}
+  ]
+}
+```
+
+Rules: at least one entry; ids match `^[a-z][a-z0-9-]{0,31}$`, are unique, and are not a lane id or a reserved id; prompt files exist and are non-empty. The built-in prompt moves to `workflow/prompts/review.md` and is what a custom prompt replaces; the controller appends the same blocks it appends today (bundle paths, task locations, lane vocabulary, completion protocol) to every prompt, so a custom brief only states what to look for. `prepare` pins each reviewer's id and prompt text into `plan.reviewers`, and `plan.json` without `reviewers` means the single default reviewer.
+
+## 4. Design
+
+| Item | Single reviewer today | Per reviewer `<id>` |
+| --- | --- | --- |
+| Node id in the completion file | `review` | `review-<id>`; the default reviewer keeps `review` |
+| Session name | `workflow-<run>-reviewer` | `workflow-<run>-reviewer-<id>` |
+| Files | `review.interactive.json`, `review.prompt.txt`, `review.launch.log`, `review.completion.json`, `review.stop.json`, `review.stdout.json`, `review.stderr.log` | `review-<id>.*` with the same suffixes; the default reviewer keeps the unprefixed names |
+| Status file | `automatic-review.json` | `automatic-review-<id>.json` per reviewer, plus `automatic-review.json` holding the combined status |
+| Verdict file | `review.json` | `review.json` stays the single accepted record for `approve` and the viewer: combined `verdict`, `reviewers: [{reviewer_id, session_id, verdict, accepted_at}]`, unioned `findings` each with `reviewer` |
+| Bundle binding | run id, node, launch token, bundle hash, candidate | same, with a launch token per reviewer |
+| Independence | reviewer UUID differs from every worker | differs from every worker and every other reviewer |
+| Deadline | from the reviewer's launch | from each reviewer's own launch; the first expiry blocks the run |
+| Pane | `Claude: reviewer` right of the last worker | `Claude: reviewer <id>` panes in declared order, each split right of the previous |
+| Stop | identity re-checked stop after acceptance or block | every reviewer stopped after the combined decision; a stop that cannot be confirmed is retried by `automatic --live` as today |
+| Interruption | resume waits for the same session | resume rebinds every reviewer receipt; a reviewer whose launch was interrupted before the receipt exists goes to `needs_reconciliation` and no other reviewer is relaunched |
+| Manual mode | `review --review-file` imports one review | `review --reviewer <id> --review-file` imports one per reviewer; `approve` requires every declared reviewer imported and approved |
+
+Decision: after the last completion file is accepted or the first block or rejection is recorded, the controller writes `review.json` with the combined verdict, then stops every reviewer. A block does not wait for the other reviewers' files; their sessions are stopped and their status files record `superseded`.
+
+### Export 1.4.0 and projects contract 1.4.0
+
+Additive. The `review` section gains `reviewers` (one entry per reviewer: id, transport, session id, verdict, findings, launch and acceptance times, status) and each finding in the combined list gains `reviewer`. Old exports have one reviewer named `review` and the adapter fills `reviewers` from the existing single section, so the viewer has one code path. `ReviewDetail.tsx` shows a reviewer strip (id, verdict, finding counts) above the findings table, a Reviewer column, and a filter by reviewer alongside the existing group-by-worker toggle. The `reviews/<attempt>` route is unchanged; attempt stays 1.
+
+## 5. Work items
+
+1. `contracts/workflow/reviewCompletion.schema.json` 1.2.0: `node_id` pattern `^review(-[a-z0-9-]{1,32})?$`; `contracts/workflow/feature.schema.json` gains `reviewers`.
+2. `workflow/prompts/review.md`: the built-in brief extracted from `automatic.review_prompt`; `review_prompt(runtime, patch, reviewer)` appends the fixed blocks to any brief.
+3. `automatic.py`: `launch_reviewers`, a `wait_reviews` poll over all receipts, per-reviewer status files, `_decide` over the set, combined `review.json`, stop all, print-mode fallback per reviewer.
+4. `interactive.py`: reviewer launch and `attach-one --node review-<id>` per reviewer, panes in order.
+5. `pipeline.py`: the review node launches the set, `check_review` validates the `reviewers` list and the `reviewer` tag on findings, manual `review --reviewer`, `approve` requires all.
+6. `launch.py`: feature 2.1.0, `reviewers` validation.
+7. `export_state.py` 1.4.0, `contracts/projects` 1.4.0, `server/projects.ts`, `ReviewDetail.tsx`, fixtures with a two-reviewer run and a legacy one-reviewer run.
+8. Tests: every existing reviewer test runs with one and with two reviewers; interruption during the second reviewer's launch; one reviewer blocks while the other is still working; one reviewer times out; a completion file whose `node_id` names the other reviewer is rejected; two reviewers sharing a session UUID are rejected.
+9. Docs: RUNBOOK review section, CHEATSHEET, feature README, an example `reviewers/` brief.
+
+## 6. Acceptance scenarios
+
+| Scenario id | Asserts |
+| --- | --- |
+| two-approve | two fake reviewers approve; `review.json` has `verdict: approved`, both entries in `reviewers`, unioned findings tagged by reviewer; the run reaches a verified branch |
+| one-blocks | the second reviewer writes `blocked` while the first is still running; the run blocks, the first reviewer is stopped, its status is `superseded`, no relaunch |
+| p1-anywhere | reviewer A approves, reviewer B approves with an unresolved P1; the combined verdict is `blocked` with B's raw decision kept |
+| one-times-out | reviewer B never writes a file; at its deadline the run blocks with A's accepted verdict retained |
+| wrong-node | a file with `node_id: review-general` in `review-coverage.completion.json` is rejected and blocks the run |
+| shared-identity | two reviewer receipts with the same session UUID fail the independence check |
+| interrupted-launch | the controller is interrupted after the first reviewer's `claude --bg` and before the second's; resume reconciles the first and launches nothing |
+| default-reviewer | a feature without `reviewers` behaves exactly as slice A: same file names, same `review.json` shape plus a one-entry `reviewers` list |
+| manual-import | `review --reviewer general --review-file a.json` then `approve` is refused until `coverage` is imported too |
+| viewer-two-reviewers | a seeded two-reviewer run shows both verdicts in the reviewer strip, a Reviewer column, and filtering by reviewer; a legacy single-reviewer export shows one entry named `review` |
+| panes (live) | the smoke run's tab holds one pane per reviewer to the right of the worker panes; a question typed into one pane is answered without affecting the other |
+
+## 7. Open questions
+
+- Whether a reviewer may be scoped to a subset of lanes (review only the `ui` diff). Out of scope now; the `requirement` lookup already names a lane, so scoping could be added to the brief without a contract change.
+- Whether reviewers should see one another's findings. Default: no, independence is the point.
+- Whether a blocked reviewer should let the others finish so their findings are recorded. Default: no, stop them; the retained transcripts hold whatever they found.
+
+## 8. How to run
+
+Offline: the workflow unit suite, contract tests and the project-workflows Playwright suite on free ports.
+
+Live smoke, before merging: a scratch run directory holding a copy of project-workflows-001's `review-bundle.json`, `review.diff` and verification packets, as in the reviewer pane slice, with a scratch feature declaring `general` (the built-in brief) and `coverage` (a short brief asking only about test coverage). Drive the review node alone: two reviewer sessions appear in `claude agents --json` with distinct UUIDs, two panes appear, both completion files are accepted, `review.json` carries both entries, both sessions are stopped. Repeat once with `--reviewer-transport print`. The real run directory is untouched.
+====
+import { useCallback, useState } from 'react'
+import {
+  fetchReviewResult,
+  isBlockingFinding,
+  isNotRecorded,
+  NOT_RECORDED,
+  paths,
+  scopedReviewPath,
+  type ReviewFinding,
+  type ReviewResult,
+  type RunDetail,
+  type RunInputs,
+  type RunScope,
+} from './api.ts'
+import { runLanes, workerGroupOf, workerGroups, workerWording } from './findings.ts'
+import { AppLink, ErrorPanel, LoadingPanel } from './panels.tsx'
+import { runPathname } from './routes.ts'
+import { formatTime, reviewSummary, shortRevision } from './status.ts'
+import { useResource, type Resource } from './useResource.ts'
+
+type SnapshotNode = RunDetail['snapshot']['nodes'][number]
+type DefinitionNode = RunDetail['definition']['nodes'][number]
+type Lane = ReviewFinding['requirement_found_in'][number]
+type Disposition = ReviewFinding['disposition']
+type GroupBy = 'disposition' | 'worker'
+
+type Props = {
+  scope: RunScope
+  node: SnapshotNode
+  definitionNodes: DefinitionNode[]
+  /** The run's inputs, used only to name the graph node that launched a lane; the review itself never needs them. */
+  inputs: Resource<RunInputs | null>
+  refreshToken: number
+  onNavigate: (pathname: string) => void
+  /** Opens a worker's task with the quoted requirement highlighted (the run view navigates and hands the quote over). */
+  onOpenRequirement: (nodeId: string, quote: string) => void
+}
+
+const TRANSPORT_WORDING: Record<ReviewResult['reviewer']['transport'], string> = {
+  native: 'native session',
+  print: 'print-mode session',
+  manual: 'operator-supplied review',
+}
+const DISPOSITIONS: readonly Disposition[] = ['open', 'resolved', 'accepted']
+const DISPOSITION_LABEL: Record<Disposition, string> = { open: 'Open', resolved: 'Resolved', accepted: 'Accepted' }
+/** The graph node that launched a lane: from the inputs when loaded, else `launch_<lane>` when the pinned graph has it, else the lane itself. */
+function launchNodeFor(lane: Lane, definitionNodes: DefinitionNode[], inputs: Resource<RunInputs | null>): string {
+  if (inputs.status === 'ready' && inputs.data !== null) {
+    const worker = inputs.data.workers.find(candidate => candidate.node_id === lane)
+    if (worker) return worker.launch_node_id
+  }
+  return definitionNodes.some(candidate => candidate.node_id === `launch_${lane}`) ? `launch_${lane}` : lane
+}
+
+function FindingRow({ finding, scope, definitionNodes, inputs, onOpenRequirement }: { finding: ReviewFinding } & Omit<Props, 'node' | 'refreshToken' | 'onNavigate'>) {
+  const blocking = isBlockingFinding(finding)
+  return (
+    <tr
+      data-testid="finding"
+      data-severity={finding.severity}
+      data-disposition={finding.disposition}
+      data-worker={finding.worker ?? 'unrecorded'}
+      className={blocking ? 'finding-blocking' : undefined}
+    >
+      <td><span className="finding-severity">{finding.severity}</span>{blocking && <span className="visually-hidden"> (blocks integration)</span>}</td>
+      <td>{finding.message}</td>
+      <td>{finding.worker === null ? <span className="projects-muted">not recorded</span> : workerWording(finding.worker)}</td>
+      <td>
+        {finding.requirement === null ? '—' : (
+          <>
+            <q data-testid="finding-requirement">{finding.requirement}</q>
+            {finding.requirement_found_in.length === 0 ? (
+              <span className="projects-muted finding-task-note" data-testid="finding-task-unlinked">not found verbatim in the task</span>
+            ) : finding.requirement_found_in.map(lane => {
+              const nodeId = launchNodeFor(lane, definitionNodes, inputs)
+              const quote = finding.requirement!
+              return (
+                <AppLink
+                  key={lane}
+                  href={runPathname(scope.projectId, scope.workflowId, scope.runId, nodeId)}
+                  onNavigate={() => onOpenRequirement(nodeId, quote)}
+                  className="finding-task-link"
+                  data-testid="finding-task-link"
+                  data-lane={lane}
+                >
+                  Open in the {lane} task
+                </AppLink>
+              )
+            })}
+          </>
+        )}
+      </td>
+    </tr>
+  )
+}
+
+function ReviewResultView({ review, scope, definitionNodes, inputs, onNavigate, onOpenRequirement }: { review: ReviewResult } & Omit<Props, 'node' | 'refreshToken'>) {
+  const approved = review.verdict === 'approved'
+  const candidateNode = definitionNodes.some(candidate => candidate.node_id === 'candidate') ? 'candidate' : null
+  const bundle = <code title={review.bundle_sha256}>{shortRevision(review.bundle_sha256)}</code>
+  // Like every other artifact link, the diff is only ever fetched through this run's own artifact route by its ID.
+  const diffHref = review.diff === null ? null : paths.artifact(scope, review.diff.artifact_id)
+  const diffScoped = review.diff !== null && review.diff.uri === diffHref
+  const [groupBy, setGroupBy] = useState<GroupBy>('disposition')
+  const lanes = runLanes(definitionNodes, inputs)
+  const groups = groupBy === 'disposition'
+    ? DISPOSITIONS.map(disposition => ({ key: disposition, label: DISPOSITION_LABEL[disposition], attributes: { 'data-disposition': disposition }, findings: review.findings.filter(finding => finding.disposition === disposition) }))
+    : workerGroups(lanes, review.findings).map(group => ({ ...group, attributes: { 'data-worker-group': group.key }, findings: review.findings.filter(finding => workerGroupOf(finding) === group.key) }))
+  const populated = groups.filter(group => group.findings.length > 0)
+  return (
+    <div className="review-result" data-testid="review-result" data-verdict={review.verdict}>
+      <p className="review-verdict-line">
+        <span className={`status-badge ${approved ? 'status-succeeded' : 'status-failed'}`} data-testid="review-verdict" data-status={review.verdict}>
+          <span>{approved ? 'Approved' : 'Blocked'}</span>
+        </span>
+        <span className="projects-muted">Recorded verdict of review attempt {review.attempt}; approval and integration are separate nodes.</span>
+      </p>
+      <p className="review-summary" data-testid="review-summary">{reviewSummary(review)}</p>
+      <dl className="projects-facts">
+        <div>
+          <dt>Reviewer</dt>
+          <dd data-testid="review-reviewer"><code>{review.reviewer.session_id}</code> · {TRANSPORT_WORDING[review.reviewer.transport]}, independent of every worker lane</dd>
+        </div>
+        <div><dt>Reviewed at</dt><dd>{formatTime(review.reviewed_at)}</dd></div>
+        <div>
+          <dt>Bundle reviewed</dt>
+          <dd data-testid="review-bundle">
+            {candidateNode === null ? bundle : (
+              <AppLink href={runPathname(scope.projectId, scope.workflowId, scope.runId, candidateNode)} onNavigate={onNavigate} title="Open the candidate node this bundle was built from">{bundle}</AppLink>
+            )}
+            {' '}· candidate commit <code title={review.candidate_commit}>{shortRevision(review.candidate_commit)}</code>
+          </dd>
+        </div>
+        <div>
+          <dt>Diff the reviewer saw</dt>
+          <dd data-testid="review-diff">
+            {review.diff === null ? 'No diff artifact was recorded.' : diffScoped && diffHref !== null ? (
+              <>
+                <a href={diffHref} target="_blank" rel="noopener noreferrer">Open {review.diff.artifact_id}</a>
+                {' '}<span className="projects-muted">(plain text, new tab) · sha256 {review.diff.sha256.slice(0, 12)}…</span>
+              </>
+            ) : (
+              <span className="projects-error-inline" role="alert">The diff link <code>{review.diff.uri}</code> is outside this run's artifact route and was not linked.</span>
+            )}
+          </dd>
+        </div>
+      </dl>
+
+      <section className="evidence-section" aria-labelledby="review-findings-title" data-testid="review-findings" data-group-by={groupBy}>
+        <div className="review-findings-head">
+          <h4 id="review-findings-title">Findings</h4>
+          {review.findings.length > 0 && (
+            <div className="review-group-toggle" role="group" aria-label="Group findings by">
+              <span className="projects-muted">Group by</span>
+              <button type="button" className="button button-small" aria-pressed={groupBy === 'disposition'} data-testid="group-by-disposition" onClick={() => setGroupBy('disposition')}>Disposition</button>
+              <button type="button" className="button button-small" aria-pressed={groupBy === 'worker'} data-testid="group-by-worker" onClick={() => setGroupBy('worker')}>Worker</button>
+            </div>
+          )}
+        </div>
+        {populated.length === 0 ? (
+          <p className="projects-muted" data-testid="findings-empty">The reviewer recorded no findings.</p>
+        ) : populated.map(group => (
+          <section key={group.key} className="finding-group" {...group.attributes} aria-labelledby={`findings-${group.key}`}>
+            <h5 id={`findings-${group.key}`}>{group.label} ({group.findings.length})</h5>
+            <div className="table-wrap">
+              <table className="findings-table">
+                <thead>
+                  <tr><th scope="col">Severity</th><th scope="col">Message</th><th scope="col">Worker</th><th scope="col">Requirement</th></tr>
+                </thead>
+                <tbody>
+                  {group.findings.map((finding, index) => (
+                    <FindingRow key={`${group.key}-${index}`} finding={finding} scope={scope} definitionNodes={definitionNodes} inputs={inputs} onOpenRequirement={onOpenRequirement} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        ))}
+        <p className="projects-muted">Blocking means an unresolved P0 or P1 finding; a quote links only where the task text contains it verbatim. Workers are the lanes this run had{lanes.length > 0 ? ` (${lanes.join(', ')})` : ''}; “multiple workers” covers findings that concern more than one lane.</p>
+      </section>
+    </div>
+  )
+}
+
+/**
+ * The Result section of a review node: the persisted verdict, reviewer identity, bundle, findings and diff.
+ * A run whose export predates review results (404 REVIEW_NOT_FOUND) is a "not recorded" state, not an error.
+ */
+export function ReviewPanel({ scope, node, definitionNodes, inputs, refreshToken, onNavigate, onOpenRequirement }: Props) {
+  // The snapshot links the recorded review; an older export has no link, so the first attempt is asked for once the node ran.
+  const reviewPath = node.result_uri !== null
+    ? scopedReviewPath(scope, node.result_uri)
+    : node.status === 'pending' ? null : paths.review(scope, Math.max(node.attempt, 1))
+  const unscoped = node.result_uri !== null && reviewPath === null
+  const load = useCallback((signal: AbortSignal) => fetchReviewResult(scope, reviewPath!, signal), [scope, reviewPath])
+  const { state, reload } = useResource(reviewPath, load, refreshToken)
+  const none = (
+    <p className="projects-muted" data-testid="review-none">
+      No review recorded for this run: either the review has not happened or the run's export predates review results (re-export it with the workflow CLI).
+    </p>
+  )
+  if (unscoped) {
+    return (
+      <p className="projects-error-inline" role="alert" data-testid="result-unscoped">
+        The review link <code>{node.result_uri}</code> is outside this run's reviews route and was not fetched.
+      </p>
+    )
+  }
+  if (reviewPath === null) return none
+  if (state.status === 'loading' || state.status === 'idle') return <LoadingPanel>Loading the recorded review…</LoadingPanel>
+  if (state.status === 'error') {
+    if (isNotRecorded(state.error, NOT_RECORDED.review)) return none
+    return <ErrorPanel error={state.error} what="The recorded review" onRetry={reload} />
+  }
+  return <ReviewResultView review={state.data} scope={scope} definitionNodes={definitionNodes} inputs={inputs} onNavigate={onNavigate} onOpenRequirement={onOpenRequirement} />
+}
+====
+/**
+ * How review findings are attributed to the lanes a run actually had. A finding's `worker` is a lane id, `multiple`
+ * or `none`; exports of two-lane runs recorded `both`, which reads as `multiple`; null predates the vocabulary.
+ * Pure helpers, kept out of the component file so it only exports components.
+ */
+import type { ReviewFinding, RunDetail, RunInputs } from './api.ts'
+import type { Resource } from './useResource.ts'
+
+type DefinitionNode = RunDetail['definition']['nodes'][number]
+
+const MULTIPLE = 'multiple'
+const LEGACY_MULTIPLE = 'both'
+const NONE = 'none'
+const UNRECORDED = 'unrecorded'
+const SPECIAL_GROUPS: readonly string[] = [MULTIPLE, NONE, UNRECORDED]
+const SPECIAL_LABEL: Record<string, string> = { [MULTIPLE]: 'Multiple workers', [NONE]: 'No worker (cross-cutting)', [UNRECORDED]: 'Worker not recorded' }
+
+/** The group a finding belongs to when grouped by worker: a lane id, `multiple` (also for legacy `both`), `none` or `unrecorded`. */
+export function workerGroupOf(finding: Pick<ReviewFinding, 'worker'>): string {
+  if (finding.worker === null) return UNRECORDED
+  if (finding.worker === LEGACY_MULTIPLE) return MULTIPLE
+  return finding.worker
+}
+
+/** The Worker column wording: lane ids verbatim, the multi-lane values as words. */
+export function workerWording(worker: string): string {
+  if (worker === MULTIPLE || worker === LEGACY_MULTIPLE) return 'multiple workers'
+  if (worker === NONE) return 'none'
+  return worker
+}
+
+/**
+ * The run's lanes in policy order: from the recorded inputs when loaded, else from the pinned graph's `launch_<id>`
+ * nodes (the naming the exporter guarantees), so findings group by lane even for a run whose inputs are not recorded.
+ */
+export function runLanes(definitionNodes: DefinitionNode[], inputs: Resource<RunInputs | null>): string[] {
+  if (inputs.status === 'ready' && inputs.data !== null) return inputs.data.workers.map(worker => worker.node_id)
+  return definitionNodes.filter(node => node.kind === 'worker' && node.node_id.startsWith('launch_')).map(node => node.node_id.slice('launch_'.length))
+}
+
+/**
+ * Worker groups in display order: the run's lanes, then any lane id a finding names that the run does not list
+ * (never dropped), then `multiple`, `none` and `unrecorded`. Only populated groups are rendered.
+ */
+export function workerGroups(lanes: readonly string[], findings: readonly Pick<ReviewFinding, 'worker'>[]): { key: string; label: string }[] {
+  const keys = [...lanes]
+  for (const finding of findings) {
+    const group = workerGroupOf(finding)
+    if (!keys.includes(group) && !SPECIAL_GROUPS.includes(group)) keys.push(group)
+  }
+  return [...keys.map(lane => ({ key: lane, label: `Worker ${lane}` })), ...SPECIAL_GROUPS.map(key => ({ key, label: SPECIAL_LABEL[key] }))]
+}
+====
+/**
+ * Read-only client for the project workflow viewer API (`contracts/projects/README.md`).
+ *
+ * Every payload is validated against the committed contract schemas before it reaches a component. A
+ * response that fails validation is a malformed-payload error: nothing is patched up or substituted.
+ * Artifacts and results are only ever requested through the scoped routes of the run being viewed.
+ */
+import { z } from 'zod'
+import {
+  isBlockingFinding,
+  schemas,
+  validateReviewResult,
+  validateRunDetail,
+  validateRunInputs,
+  type Project,
+  type ReviewFinding,
+  type ReviewResult,
+  type RunDetail,
+  type RunInputs,
+  type RunInputWorker,
+  type RunSummary,
+  type WorkflowDefinition,
+} from '../../contracts/projects/v1.ts'
+import { eventSchema, validateWorkerResult, type WorkerResult, type WorkflowEvent } from '../../contracts/workflow/v1.ts'
+
+export type { Project, ReviewFinding, ReviewResult, RunDetail, RunInputs, RunInputWorker, RunSummary, WorkflowDefinition, WorkerResult, WorkflowEvent }
+export { isBlockingFinding }
+
+/** The contract's "not recorded" 404 codes: a run whose export predates a section, never an error state. */
+export const NOT_RECORDED = { review: 'REVIEW_NOT_FOUND', inputs: 'INPUTS_NOT_FOUND' } as const
+
+export type ApiErrorKind = 'network' | 'http' | 'malformed'
+
+/** A failed request. `status` is set for HTTP failures; `code` comes from the contract error body when present. */
+export class ProjectsApiError extends Error {
+  readonly kind: ApiErrorKind
+  readonly status: number | null
+  readonly code: string | null
+  readonly path: string
+
+  constructor(kind: ApiErrorKind, message: string, path: string, options: { status?: number | null; code?: string | null } = {}) {
+    super(message)
+    this.name = 'ProjectsApiError'
+    this.kind = kind
+    this.status = options.status ?? null
+    this.code = options.code ?? null
+    this.path = path
+  }
+
+  get notFound(): boolean {
+    return this.kind === 'http' && this.status === 404
+  }
+}
+
+export function describeApiError(error: unknown): string {
+  if (error instanceof ProjectsApiError) {
+    switch (error.kind) {
+      case 'network': return 'The API could not be reached. Check that the server is running, then retry.'
+      case 'malformed': return `The API returned data that does not match the projects contract: ${error.message}`
+      case 'http': return error.code ? `${error.message} (${error.code}, HTTP ${error.status})` : `${error.message} (HTTP ${error.status})`
+    }
+  }
+  return error instanceof Error && error.message ? error.message : 'An unexpected error occurred.'
+}
+
+const errorBodySchema = z.object({ error: z.object({ code: z.string(), message: z.string() }) })
+
+function encodeSegments(...segments: string[]): string {
+  return segments.map(encodeURIComponent).join('/')
+}
+
+export type RunScope = { projectId: string; workflowId: string; runId: string }
+
+export const paths = {
+  projects: () => '/api/projects',
+  workflows: (projectId: string) => `/api/projects/${encodeSegments(projectId)}/workflows`,
+  runs: (projectId: string, workflowId: string, options: { limit?: number; cursor?: string | null } = {}) => {
+    const query = new URLSearchParams()
+    if (options.limit !== undefined) query.set('limit', String(options.limit))
+    if (options.cursor) query.set('cursor', options.cursor)
+    const suffix = query.size ? `?${query}` : ''
+    return `/api/projects/${encodeSegments(projectId)}/workflows/${encodeSegments(workflowId)}/runs${suffix}`
+  },
+  run: (scope: RunScope) => `/api/projects/${encodeSegments(scope.projectId)}/workflows/${encodeSegments(scope.workflowId)}/runs/${encodeSegments(scope.runId)}`,
+  events: (scope: RunScope, after = 0) => `${paths.run(scope)}/events?after=${after}`,
+  result: (scope: RunScope, nodeId: string, attempt: number) => `${paths.run(scope)}/results/${encodeSegments(nodeId)}/${attempt}`,
+  artifact: (scope: RunScope, artifactId: string) => `${paths.run(scope)}/artifacts/${encodeSegments(artifactId)}`,
+  review: (scope: RunScope, attempt: number) => `${paths.run(scope)}/reviews/${attempt}`,
+  inputs: (scope: RunScope) => `${paths.run(scope)}/inputs`,
+}
+
+async function request(path: string, signal: AbortSignal | undefined, accept: string): Promise<Response> {
+  let response: Response
+  try {
+    response = await fetch(path, { signal, headers: { Accept: accept } })
+  } catch (error) {
+    if (signal?.aborted) throw error
+    throw new ProjectsApiError('network', error instanceof Error ? error.message : 'Network failure', path)
+  }
+  if (!response.ok) {
+    let body: unknown = null
+    try { body = await response.json() } catch { /* not JSON */ }
+    const parsed = errorBodySchema.safeParse(body)
+    const message = parsed.success ? parsed.data.error.message : `The API responded with status ${response.status}.`
+    throw new ProjectsApiError('http', message, path, { status: response.status, code: parsed.success ? parsed.data.error.code : null })
+  }
+  return response
+}
+
+async function requestJson<T>(path: string, validate: (input: unknown) => T, signal?: AbortSignal): Promise<T> {
+  const response = await request(path, signal, 'application/json')
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    throw new ProjectsApiError('malformed', 'the response body is not JSON.', path)
+  }
+  try {
+    return validate(body)
+  } catch (error) {
+    throw new ProjectsApiError('malformed', error instanceof z.ZodError ? z.prettifyError(error) : error instanceof Error ? error.message : 'invalid payload', path)
+  }
+}
+
+export function fetchProjects(signal?: AbortSignal): Promise<Project[]> {
+  return requestJson(paths.projects(), input => schemas.projectList.parse(input).projects, signal)
+}
+
+export function fetchWorkflows(projectId: string, signal?: AbortSignal): Promise<WorkflowDefinition[]> {
+  return requestJson(paths.workflows(projectId), input => schemas.workflowList.parse(input).workflows, signal)
+}
+
+export type RunPage = { runs: RunSummary[]; nextCursor: string | null }
+
+export function fetchRuns(projectId: string, workflowId: string, options: { cursor?: string | null } = {}, signal?: AbortSignal): Promise<RunPage> {
+  return requestJson(paths.runs(projectId, workflowId, options), input => {
+    const page = schemas.runList.parse(input)
+    for (const run of page.runs) {
+      if (run.project_id !== projectId || run.workflow_id !== workflowId) throw new Error(`run ${run.run_id} belongs to another scope.`)
+    }
+    return { runs: page.runs, nextCursor: page.next_cursor }
+  }, signal)
+}
+
+export function fetchRunDetail(scope: RunScope, signal?: AbortSignal): Promise<RunDetail> {
+  return requestJson(paths.run(scope), input => {
+    const detail = validateRunDetail(input)
+    if (detail.summary.project_id !== scope.projectId || detail.summary.workflow_id !== scope.workflowId || detail.summary.run_id !== scope.runId) {
+      throw new Error('the run detail belongs to a different project, workflow or run.')
+    }
+    return detail
+  }, signal)
+}
+
+const eventListSchema = z.strictObject({ events: z.array(eventSchema) })
+
+export function fetchEvents(scope: RunScope, signal?: AbortSignal): Promise<WorkflowEvent[]> {
+  return requestJson(paths.events(scope, 0), input => {
+    const events = eventListSchema.parse(input).events
+    // Deduplicate by sequence and keep the persisted order; the run ID must be this run's.
+    const seen = new Set<number>()
+    const unique: WorkflowEvent[] = []
+    for (const event of events) {
+      if (event.run_id !== scope.runId) throw new Error(`event ${event.event_id} belongs to run ${event.run_id}.`)
+      if (seen.has(event.sequence)) continue
+      seen.add(event.sequence)
+      unique.push(event)
+    }
+    return unique.sort((a, b) => a.sequence - b.sequence)
+  }, signal)
+}
+
+/** Only results published under this run's scoped `results/` route are fetched; anything else is refused. */
+export function scopedResultPath(scope: RunScope, resultUri: string): string | null {
+  const prefix = `${paths.run(scope)}/results/`
+  if (!resultUri.startsWith(prefix)) return null
+  const rest = resultUri.slice(prefix.length).split('/')
+  if (rest.length !== 2 || rest.some(segment => segment === '') || !/^[1-9][0-9]*$/.test(rest[1])) return null
+  return resultUri
+}
+
+export function fetchWorkerResult(scope: RunScope, resultPath: string, signal?: AbortSignal): Promise<WorkerResult> {
+  return requestJson(resultPath, input => {
+    const result = validateWorkerResult(input)
+    if (result.run_id !== scope.runId) throw new Error(`the result belongs to run ${result.run_id}.`)
+    return result
+  }, signal)
+}
+
+/** Text artifacts (logs, reports, patches) are read as plain text and rendered as text, never as HTML. */
+export async function fetchArtifactText(scope: RunScope, artifactId: string, signal?: AbortSignal): Promise<string> {
+  const response = await request(paths.artifact(scope, artifactId), signal, 'text/plain, */*')
+  return response.text()
+}
+
+/** Only reviews published under this run's scoped `reviews/` route are fetched; anything else is refused. */
+export function scopedReviewPath(scope: RunScope, resultUri: string): string | null {
+  const prefix = `${paths.run(scope)}/reviews/`
+  if (!resultUri.startsWith(prefix)) return null
+  if (!/^[1-9][0-9]*$/.test(resultUri.slice(prefix.length))) return null
+  return resultUri
+}
+
+export function fetchReviewResult(scope: RunScope, reviewPath: string, signal?: AbortSignal): Promise<ReviewResult> {
+  return requestJson(reviewPath, input => {
+    const review = validateReviewResult(input)
+    if (review.run_id !== scope.runId) throw new Error(`the review belongs to run ${review.run_id}.`)
+    return review
+  }, signal)
+}
+
+export function fetchRunInputs(scope: RunScope, signal?: AbortSignal): Promise<RunInputs> {
+  return requestJson(paths.inputs(scope), input => {
+    const inputs = validateRunInputs(input)
+    if (inputs.run_id !== scope.runId) throw new Error(`the inputs belong to run ${inputs.run_id}.`)
+    return inputs
+  }, signal)
+}
+
+/** Whether a failure is the contract's 404 for a section the run's export does not carry. */
+export function isNotRecorded(error: unknown, code: string): boolean {
+  return error instanceof ProjectsApiError && error.notFound && error.code === code
+}
+
+/** Resolves to null when the section is not recorded (the contract's 404 code); every other failure propagates. */
+export async function orNotRecorded<T>(request: Promise<T>, code: string): Promise<T | null> {
+  try {
+    return await request
+  } catch (error) {
+    if (isNotRecorded(error, code)) return null
+    throw error
+  }
+}

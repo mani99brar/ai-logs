@@ -1,0 +1,108 @@
+import { describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { parseTonicPurchaseMessage, parseTonicUsedMessage } from "@pirate-sea-race/protocol";
+import { addPlayer, objectiveRules, purchase, reserveDuel, useTonic, type LedgerState } from "@pirate-sea-race/simulation/objectives";
+import { createMatchLedger } from "./objectives.js";
+import {
+  KEPT_SHOP_REFUSALS,
+  ledgerRequestId,
+  MAX_PENDING_SHOP_REQUESTS,
+  ShopBook,
+  tonicPurchaseMessage,
+  tonicPurchaseOf,
+  tonicUsedMessage,
+  tonicUseOf,
+  type TonicPurchaseDecision,
+} from "./shop.js";
+
+const ledgerWith = (startingGold: number, players = ["a", "b"]): LedgerState =>
+  players.reduce((ledger, playerId) => addPlayer(ledger, { playerId, tick: 0 }).state, createMatchLedger({ map: seaMap, seed: 1, rules: { ...objectiveRules, startingGold } }));
+
+describe("the shop's book (ShopBook)", () => {
+  it("queues two requests per player, merges a pending id, refuses a third busy, gives them back oldest first, and drains", () => {
+    const book = new ShopBook<TonicPurchaseDecision>();
+    expect(book.arrive("a", "s1")).toBe("queued");
+    expect(book.arrive("a", "s1")).toBe("merged");
+    expect(book.arrive("a", "s2")).toBe("queued");
+    expect(book.arrive("a", "s3")).toBe("busy");
+    expect(book.arrive("b", "s1")).toBe("queued");
+    expect(MAX_PENDING_SHOP_REQUESTS).toBe(2);
+    expect(book.pendingCount("a")).toBe(2);
+    expect(book.waiting()).toEqual(["a", "b"]);
+    expect(book.take("a")).toEqual({ requestId: "s1" });
+    expect(book.drain()).toEqual([
+      { playerId: "a", request: { requestId: "s2" } },
+      { playerId: "b", request: { requestId: "s1" } },
+    ]);
+    expect(book.waiting()).toEqual([]);
+    expect(book.take("nobody")).toBeUndefined();
+    expect(book.pendingCount("nobody")).toBe(0);
+  });
+
+  it("keeps every applied id and the last 16 refusals per player; forgetting a player drops theirs", () => {
+    const book = new ShopBook<TonicPurchaseDecision>();
+    book.decide("a", "bought", { outcome: "bought", price: 30, tonics: 1 }, true);
+    for (let index = 0; index <= KEPT_SHOP_REFUSALS; index++) book.decide("a", `r${index}`, { outcome: "refused", reason: "not-at-dock" }, false);
+    expect(book.decided("a", "bought")).toEqual({ outcome: "bought", price: 30, tonics: 1 });
+    expect(book.decided("a", "r0")).toBeUndefined();
+    expect(book.decided("a", "r1")).toEqual({ outcome: "refused", reason: "not-at-dock" });
+    expect(book.decided("b", "bought")).toBeUndefined();
+    book.forget("a");
+    expect(book.decided("a", "bought")).toBeUndefined();
+  });
+});
+
+describe("the ledger's answers as the players get them", () => {
+  it("namespaces the ledger's request ids by item, so one client id is two purchases", () => {
+    expect(ledgerRequestId("tonic", "x")).toBe("tonic:x");
+    expect(ledgerRequestId("rumor", "x")).toBe("rumor:x");
+    const ledger = ledgerWith(100);
+    const tonic = purchase(ledger, { requestId: ledgerRequestId("tonic", "x"), playerId: "a", item: "tonic", tick: 1 });
+    const rumor = purchase(tonic.state, { requestId: ledgerRequestId("rumor", "x"), playerId: "a", item: "rumor", tick: 1 });
+    expect([tonic.result.ok, rumor.result.ok]).toEqual([true, true]);
+    // Without the namespace the ledger would call the second a duplicate.
+    expect(purchase(tonic.state, { requestId: "tonic:x", playerId: "a", item: "rumor", tick: 1 }).result.rejection).toBe("duplicate");
+  });
+
+  it("maps a purchase: bought with its price and tonics, the ledger's kept refusals, and throws on anything the room never asks", () => {
+    const ledger = ledgerWith(50);
+    const bought = purchase(ledger, { requestId: "tonic:1", playerId: "a", item: "tonic", tick: 1 });
+    expect(tonicPurchaseOf(bought.result)).toEqual({ outcome: "bought", price: 30, tonics: 1 });
+    expect(tonicPurchaseOf(purchase(bought.state, { requestId: "tonic:2", playerId: "a", item: "tonic", tick: 1 }).result)).toEqual({ outcome: "refused", reason: "insufficient-gold" });
+    const rich = ledgerWith(200);
+    let full = rich;
+    for (const id of ["tonic:1", "tonic:2"]) full = purchase(full, { requestId: id, playerId: "a", item: "tonic", tick: 1 }).state;
+    expect(tonicPurchaseOf(purchase(full, { requestId: "tonic:3", playerId: "a", item: "tonic", tick: 1 }).result)).toEqual({ outcome: "refused", reason: "tonic-limit" });
+    const reserved = reserveDuel(rich, { duelId: "d", players: ["a", "b"], tick: 1 }).state;
+    expect(tonicPurchaseOf(purchase(reserved, { requestId: "tonic:1", playerId: "a", item: "tonic", tick: 1 }).result)).toEqual({ outcome: "refused", reason: "player-in-duel" });
+    // A replayed refusal is still that refusal.
+    const refused = purchase(bought.state, { requestId: "tonic:2", playerId: "a", item: "tonic", tick: 1 }).state;
+    expect(tonicPurchaseOf(purchase(refused, { requestId: "tonic:2", playerId: "a", item: "tonic", tick: 5 }).result)).toEqual({ outcome: "refused", reason: "insufficient-gold" });
+    expect(() => tonicPurchaseOf(purchase(ledger, { requestId: "tonic:1", playerId: "nobody", item: "tonic", tick: 1 }).result)).toThrow(/did not decide a tonic purchase: unknown-player/);
+    expect(() => tonicPurchaseOf(purchase(bought.state, { requestId: "tonic:1", playerId: "a", item: "rumor", tick: 1 }).result)).toThrow(/duplicate/);
+  });
+
+  it("maps a drink: active until its last boosted tick, the ledger's refusals, and throws on anything the room never asks", () => {
+    // Two tonics: the ledger checks the count before the active effect.
+    const ledger = ["tonic:1", "tonic:2"].reduce((state, requestId) => purchase(state, { requestId, playerId: "a", item: "tonic", tick: 1 }).state, ledgerWith(100));
+    const drink = (overrides: Partial<Parameters<typeof useTonic>[1]> = {}, state = ledger) => useTonic(state, { playerId: "a", tick: 10, atSea: true, grappled: false, ...overrides });
+    expect(tonicUseOf(drink().result, 10, 240)).toEqual({ outcome: "active", endTick: 250 });
+    expect(tonicUseOf(drink({ atSea: false }).result, 10, 240)).toEqual({ outcome: "refused", reason: "not-at-sea" });
+    expect(tonicUseOf(drink({ grappled: true }).result, 10, 240)).toEqual({ outcome: "refused", reason: "grappled" });
+    expect(tonicUseOf(drink({ playerId: "b" }).result, 10, 240)).toEqual({ outcome: "refused", reason: "no-tonic" });
+    expect(tonicUseOf(drink({ tick: 11 }, drink().state).result, 11, 240)).toEqual({ outcome: "refused", reason: "tonic-active" });
+    expect(() => tonicUseOf(drink({ playerId: "nobody" }).result, 10, 240)).toThrow(/did not decide a drink: unknown-player/);
+    expect(() => tonicUseOf(drink({ tick: 0 }, drink().state).result, 0, 240)).toThrow(/stale/);
+  });
+
+  it("words the answers as the protocol's strict messages", () => {
+    const bought = tonicPurchaseMessage("a", { outcome: "bought", price: 30, tonics: 2 }, true);
+    expect(bought).toEqual({ requestId: "a", outcome: "bought", price: 30, tonics: 2, replayed: true });
+    expect(parseTonicPurchaseMessage(bought)).toEqual(bought);
+    const refused = tonicPurchaseMessage("b", { outcome: "refused", reason: "not-at-dock" }, false);
+    expect(parseTonicPurchaseMessage(refused)).toEqual({ requestId: "b", outcome: "refused", reason: "not-at-dock", replayed: false });
+    const active = tonicUsedMessage("c", { outcome: "active", endTick: 250 }, false);
+    expect(parseTonicUsedMessage(active)).toEqual({ requestId: "c", outcome: "active", endTick: 250, replayed: false });
+    expect(parseTonicUsedMessage(tonicUsedMessage("d", { outcome: "refused", reason: "grappled" }, true))).toEqual({ requestId: "d", outcome: "refused", reason: "grappled", replayed: true });
+  });
+});

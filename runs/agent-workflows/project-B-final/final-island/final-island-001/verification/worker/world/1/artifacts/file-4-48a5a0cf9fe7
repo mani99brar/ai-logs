@@ -1,0 +1,576 @@
+import { describe, expect, it } from "vitest";
+import tiledSource from "../../../assets/source/maps/slice-sea.tmj?raw";
+import { sliceSeaTmj } from "../../../assets/source/maps/sliceSeaSketch.js";
+import sketchSource from "../../../assets/source/maps/sliceSeaSketch.ts?raw";
+import generatedModule from "./maps/sliceSea.ts?raw";
+import { sliceSeaSource } from "./maps/sliceSea.js";
+import { privateMatch, rulesPresets } from "./rules.js";
+import { ENGAGEMENT_RANGE_TILES, shipTuning, SIGHT_RADIUS_TILES, travelTargets } from "./sailing.js";
+import { seaMap, spawnSlots } from "./sea.js";
+import { TREASURE_CIRCLE_RADIUS_TILES } from "./claim/rules.js";
+import { chooseFinalSocket, createSeaMap, dockLabel, insideIsland, sectorOf, Terrain, terrainAt, type SeaMapSource } from "./seaMap.js";
+import {
+  FINAL_SOCKET_KEEP_CLEAR_TILES,
+  inHubDisc,
+  keepClearZones,
+  MAX_SEA_SIDE_TILES,
+  MIN_TREASURE_CIRCLE_NAVIGABLE_TILES,
+  obstacleDistancesSquared,
+  octileStepCosts,
+  seaPathCosts,
+  sliceSeaRules,
+  validateFinalSockets,
+  validateSeaMap,
+  type SeaMapReport,
+} from "./seaValidation.js";
+import { convertTiledMap, formatSeaMapModule, type TiledMap } from "./tiledMap.js";
+
+const SOURCE_PATH = "assets/source/maps/slice-sea.tmj";
+
+describe("map pipeline", () => {
+  it("keeps the generated module in step with the Tiled source map (run `npm run map:build` after editing it)", () => {
+    const converted = convertTiledMap("slice-sea", JSON.parse(tiledSource));
+    if (!converted.ok) throw new Error(converted.issues.join("\n"));
+    expect(converted.value).toEqual(sliceSeaSource);
+    expect(formatSeaMapModule(converted.value, "sliceSeaSource", SOURCE_PATH)).toBe(generatedModule);
+  });
+
+  it("keeps the Tiled source map in step with the sketch it is drawn from (run `npm run map:build -- --from-sketch`)", () => {
+    expect(sliceSeaTmj()).toBe(tiledSource);
+  });
+
+  it("keeps the sketch pure: it imports no Node API (`scripts/build-map.ts` writes the file)", () => {
+    // Any `node:` specifier, in a static or dynamic import or a require.
+    expect(sketchSource).not.toMatch(/["'`]node:/);
+  });
+
+  const tiled = (): TiledMap => JSON.parse(tiledSource) as TiledMap;
+  const issuesOf = (candidate: unknown) => {
+    const result = convertTiledMap("broken", candidate);
+    return result.ok ? [] : result.issues;
+  };
+
+  it("refuses maps outside the documented Tiled subset", () => {
+    const infinite = { ...tiled(), infinite: true };
+    const extraLayer = { ...tiled(), layers: [...tiled().layers, { type: "imagelayer", name: "art" }] };
+    const bigTiles = { ...tiled(), tilewidth: 32 };
+    for (const broken of [infinite, extraLayer, bigTiles, "not a map"]) expect(issuesOf(broken).length).toBeGreaterThan(0);
+  });
+
+  it("refuses an empty cell, a tile without a terrain type, and flipped tiles", () => {
+    for (const gid of [0, 9, 0x80000002]) {
+      const map = tiled();
+      map.layers[0].data[5] = gid;
+      expect(issuesOf(map).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("refuses badly authored objects", () => {
+    const edit = (change: (objects: TiledMap["layers"][1]["objects"]) => void) => {
+      const map = tiled();
+      change(map.layers[1].objects);
+      return issuesOf(map);
+    };
+    const island = (objects: TiledMap["layers"][1]["objects"]) => objects.find((object) => object.type === "island")!;
+    const spawn = (objects: TiledMap["layers"][1]["objects"]) => objects.find((object) => object.type === "spawn")!;
+    expect(edit((objects) => void (island(objects).x += 3))).toEqual([expect.stringMatching(/tile boundaries/)]);
+    expect(edit((objects) => void (island(objects).properties = [{ name: "theme", type: "string", value: "candy" }]))).toEqual([
+      expect.stringMatching(/theme must be one of/),
+    ]);
+    expect(edit((objects) => void spawn(objects).properties!.push({ name: "loot", type: "int", value: 3 }))).toEqual([
+      expect.stringMatching(/unknown property "loot"/),
+    ]);
+    expect(edit((objects) => void (spawn(objects).properties = [{ name: "slot", type: "int", value: 0 }]))).toEqual([
+      expect.stringMatching(/facing must be one of/),
+    ]);
+    const repeated = edit((objects) => void spawn(objects).properties!.forEach((entry) => entry.name === "slot" && (entry.value = 5)));
+    expect(repeated).toEqual(["spawns: slots must run 0, 1, 2… without gaps or repeats (found 1, 2, 3, 4, 5, 5, 6, 7)"]);
+  });
+
+  it("reads final-socket rectangles with their claim tiles, and refuses badly authored ones", () => {
+    const converted = convertTiledMap("slice-sea", tiled());
+    if (!converted.ok) throw new Error(converted.issues.join("\n"));
+    expect(converted.value.finalSockets).toHaveLength(4);
+    const edit = (change: (socket: TiledMap["layers"][1]["objects"][number]) => void) => {
+      const map = tiled();
+      change(map.layers[1].objects.find((object) => object.type === "final-socket")!);
+      return issuesOf(map);
+    };
+    expect(edit((socket) => void (socket.y += 5))).toEqual([expect.stringMatching(/a final socket is a rectangle on tile boundaries/)]);
+    expect(edit((socket) => void (socket.properties = [{ name: "claimX", type: "int", value: 3 }]))).toEqual([expect.stringMatching(/claimX and claimY must be ints/)]);
+    expect(edit((socket) => void socket.properties!.push({ name: "chosen", type: "int", value: 1 }))).toEqual([
+      expect.stringMatching(/unknown property "chosen"/),
+    ]);
+  });
+
+  it("reads exactly one hub point", () => {
+    const edit = (change: (objects: TiledMap["layers"][1]["objects"]) => void) => {
+      const map = tiled();
+      change(map.layers[1].objects);
+      return issuesOf(map);
+    };
+    const hubIndex = (objects: TiledMap["layers"][1]["objects"]) => objects.findIndex((object) => object.type === "hub");
+    expect(edit((objects) => void objects.splice(hubIndex(objects), 1))).toEqual(["objects: 0 hub points, not one"]);
+    expect(edit((objects) => void objects.push({ ...objects[hubIndex(objects)]!, id: 99 }))).toEqual(["objects: 2 hub points, not one"]);
+    expect(edit((objects) => void (objects[hubIndex(objects)]!.point = false))).toEqual([expect.stringMatching(/a hub is a point/)]);
+    expect(edit((objects) => void (objects[hubIndex(objects)]!.properties = [{ name: "slot", type: "int", value: 0 }]))).toEqual([
+      expect.stringMatching(/unknown property "slot"/),
+    ]);
+  });
+});
+
+/** The slice map with some tiles changed: `edits` maps "x,y" to a terrain character. */
+function editedMap(edits: Record<string, string>, change: Partial<SeaMapSource> = {}): SeaMapSource {
+  const rows = sliceSeaSource.rows.map((row, tileY) =>
+    [...row].map((char, tileX) => edits[`${tileX},${tileY}`] ?? char).join(""),
+  );
+  return { ...sliceSeaSource, rows, ...change };
+}
+
+function issuesFor(source: SeaMapSource, tuning = shipTuning): string[] {
+  const result = validateSeaMap(createSeaMap(source), tuning);
+  return result.ok ? [] : result.issues;
+}
+
+function sliceReport(): SeaMapReport {
+  const result = validateSeaMap(seaMap, shipTuning);
+  if (!result.ok) throw new Error(result.issues.join("\n"));
+  return result.value;
+}
+
+/** Every tile of a rectangle, as edits. */
+function fill(tileX: number, tileY: number, width: number, height: number, char: string): Record<string, string> {
+  const edits: Record<string, string> = {};
+  for (let y = tileY; y < tileY + height; y++) for (let x = tileX; x < tileX + width; x++) edits[`${x},${y}`] = char;
+  return edits;
+}
+
+describe("the slice sea", () => {
+  it("passes every map validator", () => {
+    const result = validateSeaMap(seaMap, shipTuning);
+    if (!result.ok) throw new Error(result.issues.join("\n"));
+  });
+
+  it("has four small islands, each with a dock beside its land, shoals, and eight outer-sea spawn slots", () => {
+    expect(seaMap.islands).toHaveLength(rulesPresets.slice.islands);
+    expect(seaMap.islands).toHaveLength(4);
+    seaMap.islands.forEach((island, index) => {
+      expect(seaMap.docks.filter((dock) => dock.island === index).length).toBeGreaterThanOrEqual(1);
+      expect(island.widthTiles * island.heightTiles).toBeLessThanOrEqual(16 * 16);
+    });
+    expect(seaMap.terrain.filter((kind) => kind === Terrain.Shoal).length).toBeGreaterThan(0);
+    expect(spawnSlots).toHaveLength(privateMatch.maxPlayers);
+    expect(new Set(spawnSlots.map((slot) => `${slot.tileX},${slot.tileY}`)).size).toBe(8);
+    for (const slot of spawnSlots) {
+      expect(terrainAt(seaMap, slot.tileX, slot.tileY)).toBe(Terrain.Sea);
+      expect(seaMap.islands.some((island) => insideIsland(island, slot.tileX, slot.tileY))).toBe(false);
+    }
+    expect(dockLabel(seaMap, 0)).toMatch(/^[A-Z][a-z]+ [A-Z][a-z]+, [a-z-]+ dock$/);
+  });
+
+  it("meets the travel-time targets at full speed", () => {
+    const result = validateSeaMap(seaMap, shipTuning);
+    if (!result.ok) throw new Error(result.issues.join("\n"));
+    const { nearestIsland, longestCrossing, firstDock } = result.value;
+    expect(nearestIsland).toHaveLength(4);
+    for (const entry of nearestIsland) {
+      expect(entry.seconds).toBeGreaterThanOrEqual(20);
+      expect(entry.seconds).toBeLessThanOrEqual(40);
+    }
+    expect(longestCrossing.seconds).toBeLessThanOrEqual(90);
+    for (const entry of firstDock) expect(entry.seconds).toBeLessThanOrEqual(travelTargets.firstDockMaxSeconds);
+  });
+
+  it("starts adjacent spawn slots out of engagement range, and sees further than it engages", () => {
+    expect(SIGHT_RADIUS_TILES).toBeGreaterThan(ENGAGEMENT_RANGE_TILES);
+    spawnSlots.forEach((slot, index) => {
+      const next = spawnSlots[(index + 1) % spawnSlots.length]!;
+      const dx = next.tileX - slot.tileX;
+      const dy = next.tileY - slot.tileY;
+      expect(dx * dx + dy * dy).toBeGreaterThan(ENGAGEMENT_RANGE_TILES * ENGAGEMENT_RANGE_TILES);
+    });
+  });
+
+  it("leaves no empty stretch: every navigable tile is within sight of land, a shoal or a dock", () => {
+    const { largestObstacleDistanceSquared, openSeaShare } = sliceReport();
+    expect(largestObstacleDistanceSquared).toBeLessThanOrEqual(SIGHT_RADIUS_TILES * SIGHT_RADIUS_TILES);
+    const distances = obstacleDistancesSquared(seaMap);
+    seaMap.terrain.forEach((kind, index) => {
+      if (kind === Terrain.Sea || kind === Terrain.Dock) expect(distances[index]).toBeLessThanOrEqual(SIGHT_RADIUS_TILES * SIGHT_RADIUS_TILES);
+      else expect(distances[index]).toBe(0);
+    });
+    expect(openSeaShare).toBeLessThan(0.95);
+  });
+
+  it("funnels every route between islands through the hub's crossing, where ships in it see each other", () => {
+    const { hub } = seaMap;
+    expect(terrainAt(seaMap, hub.tileX, hub.tileY)).toBe(Terrain.Sea);
+    // Any two tile centres in the disc are within sight of each other.
+    const disc = seaMap.terrain.flatMap((_, index) => {
+      const tileX = index % seaMap.widthTiles;
+      const tileY = (index - tileX) / seaMap.widthTiles;
+      return inHubDisc(seaMap, tileX, tileY) ? [{ tileX, tileY }] : [];
+    });
+    expect(disc.length).toBeGreaterThan(50);
+    for (const a of disc) for (const b of disc) expect((a.tileX - b.tileX) ** 2 + (a.tileY - b.tileY) ** 2).toBeLessThanOrEqual(SIGHT_RADIUS_TILES ** 2);
+    // One route per pair of docks on different islands, each passing within the disc.
+    const { hubApproach } = sliceReport();
+    const pairs = seaMap.docks.flatMap((a, index) => seaMap.docks.slice(index + 1).filter((b) => b.island !== a.island));
+    expect(hubApproach).toHaveLength(pairs.length);
+    for (const route of hubApproach) expect(4 * route.squaredTiles).toBeLessThanOrEqual(SIGHT_RADIUS_TILES ** 2);
+  });
+
+  it("keeps the regular map as it was: every tile outside the socket footprints, the islands, docks, spawns and hub", () => {
+    // FNV-1a (32-bit) of the rows joined by newlines. 0x380609a9 is the whole map before the sockets were drawn, taken
+    // from sliceSea.ts before the change: with every socket footprint back to open sea, the map hashes to it again.
+    const fnv1a = (text: string) => {
+      let hash = 0x811c9dc5;
+      for (let index = 0; index < text.length; index++) hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+      return hash;
+    };
+    const restored = sliceSeaSource.rows.map((row, tileY) =>
+      [...row].map((char, tileX) => (seaMap.finalSockets.some((socket) => insideIsland(socket.rect, tileX, tileY)) ? "." : char)).join(""),
+    );
+    expect(fnv1a(restored.join("\n"))).toBe(0x380609a9);
+    expect(fnv1a(sliceSeaSource.rows.join("\n"))).not.toBe(0x380609a9);
+    expect(seaMap.docks.map((dock) => [dock.tileX, dock.tileY, dock.island, dock.side])).toEqual([
+      [17, 21, 0, "W"], [93, 21, 1, "E"], [23, 27, 0, "S"], [87, 27, 1, "S"], [23, 83, 2, "N"], [87, 83, 3, "N"], [17, 89, 2, "W"], [93, 89, 3, "E"],
+    ]);
+    expect(seaMap.islands.map((island) => [island.name, island.tileX, island.tileY, island.widthTiles, island.heightTiles])).toEqual([
+      ["Palm Key", 17, 17, 14, 12], ["Ember Rock", 80, 17, 14, 12], ["Old Stones", 17, 82, 14, 12], ["Mist Cay", 80, 82, 14, 12],
+    ]);
+    expect(spawnSlots.map((slot) => [slot.tileX, slot.tileY, slot.facing])).toEqual([
+      [31, 5, "SW"], [79, 5, "SE"], [105, 32, "NW"], [105, 78, "SW"], [79, 105, "NE"], [31, 105, "NW"], [5, 78, "SE"], [5, 32, "NE"],
+    ]);
+    expect(seaMap.hub).toEqual({ tileX: 55, tileY: 55 });
+  });
+
+  it("has four hidden final-island sockets: one dockless islet of at most 6 × 6, mirrored, each with a claim tile of sea beside it", () => {
+    const sockets = seaMap.finalSockets;
+    expect(sockets).toHaveLength(4);
+    const shape = (socket: (typeof sockets)[number], mirrorX: boolean, mirrorY: boolean) => {
+      const { rect } = socket;
+      const rows: string[] = [];
+      for (let y = 0; y < rect.heightTiles; y++) {
+        let row = "";
+        for (let x = 0; x < rect.widthTiles; x++) {
+          row += String(terrainAt(seaMap, rect.tileX + (mirrorX ? rect.widthTiles - 1 - x : x), rect.tileY + (mirrorY ? rect.heightTiles - 1 - y : y)));
+        }
+        rows.push(row);
+      }
+      return rows;
+    };
+    const [first] = sockets;
+    for (const [index, socket] of sockets.entries()) {
+      const { rect, claimTile } = socket;
+      expect(rect.widthTiles).toBeLessThanOrEqual(6);
+      expect(rect.heightTiles).toBeLessThanOrEqual(6);
+      const kinds = shape(socket, false, false).join("");
+      expect(kinds).toContain(String(Terrain.Land));
+      expect(kinds).not.toContain(String(Terrain.Dock));
+      expect(seaMap.docks.some((dock) => insideIsland(rect, dock.tileX, dock.tileY))).toBe(false);
+      expect(terrainAt(seaMap, claimTile.tileX, claimTile.tileY)).toBe(Terrain.Sea);
+      expect(insideIsland(rect, claimTile.tileX, claimTile.tileY)).toBe(false);
+      // The same islet, mirrored: socket 1 across x, 2 across y, 3 across both.
+      expect(shape(socket, index % 2 === 1, index >= 2)).toEqual(shape(first!, false, false));
+      expect(claimTile.tileX === first!.claimTile.tileX || claimTile.tileX === seaMap.widthTiles - 1 - first!.claimTile.tileX).toBe(true);
+    }
+    const result = validateFinalSockets(seaMap, shipTuning);
+    if (!result.ok) throw new Error(result.issues.join("\n"));
+    expect(result.value.map((entry) => entry.sector)).toEqual([
+      { column: 1, row: 0 },
+      { column: 1, row: 0 },
+      { column: 1, row: 2 },
+      { column: 1, row: 2 },
+    ]);
+    for (const entry of result.value) {
+      expect(entry.worstSpawn.seconds).toBeLessThanOrEqual(travelTargets.longestCrossingMaxSeconds);
+      expect(entry.circleNavigableTiles).toBeGreaterThanOrEqual(MIN_TREASURE_CIRCLE_NAVIGABLE_TILES);
+    }
+    expect(sliceReport().finalSockets).toEqual(result.value);
+  });
+
+  it("splits the sea into a 3 × 3 sector grid that the mirror maps onto itself", () => {
+    expect(sectorOf(seaMap, 0, 0)).toEqual({ column: 0, row: 0 });
+    expect(sectorOf(seaMap, 36, 37)).toEqual({ column: 0, row: 1 });
+    expect(sectorOf(seaMap, 73, 74)).toEqual({ column: 1, row: 2 });
+    expect(sectorOf(seaMap, 110, 110)).toEqual({ column: 2, row: 2 });
+    for (let tile = 0; tile < seaMap.widthTiles; tile++) {
+      expect(sectorOf(seaMap, seaMap.widthTiles - 1 - tile, 0).column).toBe(2 - sectorOf(seaMap, tile, 0).column);
+    }
+  });
+
+  it("reaches every dock and spawn slot by sea", () => {
+    const [first] = spawnSlots;
+    const costs = seaPathCosts(seaMap, first!.tileX, first!.tileY);
+    for (const point of [...seaMap.docks, ...spawnSlots]) {
+      expect(costs[point.tileY * seaMap.widthTiles + point.tileX]).toBeLessThan(Number.MAX_SAFE_INTEGER);
+    }
+  });
+
+  it("derives its path costs from the map's sub-units per tile", () => {
+    expect(octileStepCosts(256)).toEqual({ straight: 256, diagonal: 362 });
+    expect(octileStepCosts(128)).toEqual({ straight: 128, diagonal: 181 });
+    expect(octileStepCosts(100)).toEqual({ straight: 100, diagonal: 141 });
+    expect(octileStepCosts(16)).toEqual({ straight: 16, diagonal: 23 });
+    // The same sea at half the scale costs exactly half as much everywhere, so its costs follow the map, not a constant.
+    const [first] = spawnSlots;
+    const full = seaPathCosts(seaMap, first!.tileX, first!.tileY);
+    const half = seaPathCosts({ ...seaMap, subUnitsPerTile: seaMap.subUnitsPerTile / 2 }, first!.tileX, first!.tileY);
+    const reachable = full.filter((cost) => cost < Number.MAX_SAFE_INTEGER);
+    expect(reachable.length).toBeGreaterThan(1000);
+    expect(half.map((cost) => (cost < Number.MAX_SAFE_INTEGER ? cost * 2 : cost))).toEqual(full);
+  });
+});
+
+describe("map validators fail on a broken map", () => {
+  const palm = seaMap.islands[0]!;
+  const palmDocks = seaMap.docks.filter((dock) => dock.island === 0);
+
+  it("a sea larger than 112 × 112 tiles", () => {
+    expect(MAX_SEA_SIDE_TILES).toBe(112);
+    expect(Math.max(seaMap.widthTiles, seaMap.heightTiles)).toBeLessThanOrEqual(MAX_SEA_SIDE_TILES);
+    // Open sea added along the east edge: 112 tiles wide is still compact, 113 is not.
+    const widened = (widthTiles: number) => ({
+      ...sliceSeaSource,
+      widthTiles,
+      rows: sliceSeaSource.rows.map((row) => row.padEnd(widthTiles, ".")),
+    });
+    const tooLarge = `113 × ${seaMap.heightTiles} tiles is larger than 112 × 112`;
+    expect(issuesFor(widened(113))).toContain(tooLarge);
+    expect(issuesFor(widened(112)).some((issue) => /larger than 112 × 112/.test(issue))).toBe(false);
+    const tall = { ...sliceSeaSource, heightTiles: 113, rows: [...sliceSeaSource.rows, ".".repeat(seaMap.widthTiles), ".".repeat(seaMap.widthTiles)] };
+    expect(issuesFor(tall)).toContain(`${seaMap.widthTiles} × 113 tiles is larger than 112 × 112`);
+  });
+
+  it("an island without a dock", () => {
+    const edits = Object.fromEntries(palmDocks.map((dock) => [`${dock.tileX},${dock.tileY}`, "."]));
+    expect(issuesFor(editedMap(edits))).toContain(`${palm.name}: no dock`);
+  });
+
+  it("a dock away from its island's land", () => {
+    const dock = palmDocks[0]!;
+    const island = seaMap.islands[0]!;
+    // A dock tile in the island rectangle's corner, which touches only sea.
+    const corner = `${island.tileX + island.widthTiles - 1},${island.tileY + island.heightTiles - 1}`;
+    expect(issuesFor(editedMap({ [corner]: "D", [`${dock.tileX},${dock.tileY}`]: "D" }))).toEqual([
+      expect.stringMatching(/not beside Palm Key's land/),
+    ]);
+  });
+
+  it("a fifth island, or land outside every island", () => {
+    // In the open water of the hub's crossing.
+    const [tileX, tileY] = [seaMap.hub.tileX - 1, seaMap.hub.tileY - 1];
+    const extra = { name: "Extra Isle", theme: "mist" as const, tileX, tileY, widthTiles: 3, heightTiles: 3 };
+    const withFifth = editedMap({ ...fill(tileX, tileY, 2, 2, "#"), [`${tileX + 2},${tileY + 1}`]: "D" }, { islands: [...sliceSeaSource.islands, extra] });
+    expect(issuesFor(withFifth)).toContain("5 islands, not 4");
+    expect(issuesFor(editedMap(fill(tileX, tileY, 2, 2, "#")))).toEqual(
+      expect.arrayContaining([expect.stringMatching(new RegExp(`^land at ${tileX},${tileY} lies in 0 island or final-socket rectangles`))]),
+    );
+  });
+
+  it("a large island", () => {
+    const islands = sliceSeaSource.islands.map((island, index) => (index === 0 ? { ...island, widthTiles: 20 } : island));
+    expect(issuesFor({ ...sliceSeaSource, islands })).toEqual(expect.arrayContaining([expect.stringMatching(/not a small island/)]));
+  });
+
+  it("no shoals", () => {
+    const rows = sliceSeaSource.rows.map((row) => row.replaceAll("%", "."));
+    expect(issuesFor({ ...sliceSeaSource, rows })).toContain("no shoals");
+  });
+
+  it("a dock walled in by shoals", () => {
+    const dock = palmDocks.find((each) => each.side === "S")!;
+    // A shoal ring two tiles out, from land edge to land edge.
+    const ring = {
+      ...fill(dock.tileX - 3, dock.tileY + 2, 7, 1, "%"),
+      ...fill(dock.tileX - 3, dock.tileY - 1, 1, 3, "%"),
+      ...fill(dock.tileX + 3, dock.tileY - 1, 1, 3, "%"),
+    };
+    const otherDocks = Object.fromEntries(palmDocks.filter((each) => each !== dock).map((each) => [`${each.tileX},${each.tileY}`, "."]));
+    const issues = issuesFor(editedMap({ ...ring, ...otherDocks }));
+    expect(issues).toEqual([expect.stringMatching(/Palm Key S dock at \d+,\d+: not reachable by sea/)]);
+  });
+
+  it("a sea cut in two", () => {
+    // A shoal row just south of the hub, from edge to edge.
+    const issues = issuesFor(editedMap(fill(0, seaMap.hub.tileY + 1, sliceSeaSource.widthTiles, 1, "%")));
+    expect(issues.some((issue) => /not reachable by sea/.test(issue))).toBe(true);
+  });
+
+  it("an empty stretch of sea: open water farther than the sight radius from land, shoals and docks", () => {
+    // Clear the shoals near the north-west corner: the corner is then out of sight of every obstacle. The map edge does
+    // not count as one.
+    const near = 12;
+    const edits: Record<string, string> = {};
+    for (let tileY = 0; tileY <= near; tileY++) {
+      for (let tileX = 0; tileX <= near; tileX++) if (terrainAt(seaMap, tileX, tileY) === Terrain.Shoal) edits[`${tileX},${tileY}`] = ".";
+    }
+    expect(Object.keys(edits).length).toBeGreaterThan(0);
+    const cleared = createSeaMap(editedMap(edits));
+    expect(obstacleDistancesSquared(cleared)[0]).toBeGreaterThan(SIGHT_RADIUS_TILES * SIGHT_RADIUS_TILES);
+    expect(issuesFor(editedMap(edits))).toEqual([expect.stringMatching(/^\d+ sea tiles lie farther than 10 tiles from any land, shoal or dock, such as \d+,\d+$/)]);
+  });
+
+  it("a route between islands that avoids the hub", () => {
+    // A gap in the wall north of the hub, outside its disc: ships crossing between the northern islands no longer meet
+    // there.
+    const { hub } = seaMap;
+    const gap = [hub.tileY - 2 * SIGHT_RADIUS_TILES, hub.tileY - 2 * SIGHT_RADIUS_TILES + 1].map((tileY) => `${hub.tileX},${tileY}`);
+    for (const tile of gap) {
+      const [tileX, tileY] = tile.split(",").map(Number);
+      expect(terrainAt(seaMap, tileX!, tileY!)).toBe(Terrain.Shoal);
+      expect(inHubDisc(seaMap, tileX!, tileY!)).toBe(false);
+    }
+    const issues = issuesFor(editedMap(Object.fromEntries(gap.map((tile) => [tile, "."]))));
+    expect(issues.length).toBeGreaterThan(0);
+    for (const issue of issues) expect(issue).toMatch(/^(Palm Key|Ember Rock) \w dock to (Palm Key|Ember Rock) \w dock: a shortest route avoids the hub at \d+,\d+$/);
+  });
+
+  it("a hub off the open sea or away from the centre", () => {
+    const island = seaMap.islands[0]!;
+    const onLand = { tileX: island.tileX + 5, tileY: island.tileY + 4 };
+    expect(terrainAt(seaMap, onLand.tileX, onLand.tileY)).toBe(Terrain.Land);
+    expect(issuesFor({ ...sliceSeaSource, hub: onLand })).toEqual([`the hub at ${onLand.tileX},${onLand.tileY} is not on open sea`]);
+    const [slot] = sliceSeaSource.spawnSlots;
+    expect(issuesFor({ ...sliceSeaSource, hub: { tileX: slot!.tileX, tileY: slot!.tileY } })).toEqual([
+      `the hub at ${slot!.tileX},${slot!.tileY} is not near the map's centre`,
+    ]);
+  });
+
+  it("spawn slots in engagement range, on land, inside the archipelago or missing", () => {
+    const moved = (index: number, tileX: number, tileY: number) =>
+      editedMap({}, { spawnSlots: sliceSeaSource.spawnSlots.map((slot, each) => (each === index ? { ...slot, tileX, tileY } : slot)) });
+    const [zero] = sliceSeaSource.spawnSlots;
+    expect(issuesFor(moved(1, zero!.tileX + 4, zero!.tileY + 4))).toEqual([expect.stringMatching(/slot 0 .*within engagement range of slot 1/)]);
+    expect(issuesFor(moved(1, palm.tileX + 5, palm.tileY + 4))).toEqual(
+      expect.arrayContaining([expect.stringMatching(/not on open sea/), expect.stringMatching(/inside the archipelago/)]),
+    );
+    expect(issuesFor(moved(1, seaMap.hub.tileX, seaMap.hub.tileY))).toEqual([expect.stringMatching(/inside the archipelago, not on the outer sea/)]);
+    expect(issuesFor(editedMap({}, { spawnSlots: sliceSeaSource.spawnSlots.slice(1) }))).toContain("7 spawn slots, not 8");
+  });
+
+  // Ships sped up or slowed down just enough, from the slice sea's own report, to break each travel-time target.
+  const report = sliceReport();
+  const slowest = Math.max(...report.nearestIsland.map((entry) => entry.seconds));
+  const faster = Math.floor(slowest / travelTargets.neighbourIslandMinSeconds) + 1;
+  const slowerToCross = Math.floor(travelTargets.longestCrossingMaxSeconds / report.longestCrossing.seconds) + 1;
+  const firstDock = Math.max(...report.firstDock.map((entry) => entry.seconds));
+  const slowerToDock = Math.floor(travelTargets.firstDockMaxSeconds / firstDock) + 1;
+
+  it("islands too close or crossings too long for the ship's speed", () => {
+    const fast = issuesFor(sliceSeaSource, { ...shipTuning, maxSpeed: faster * shipTuning.maxSpeed });
+    expect(fast.filter((issue) => /nearest island, .* outside 20–40 s/.test(issue))).toHaveLength(4);
+    const slow = issuesFor(sliceSeaSource, { ...shipTuning, maxSpeed: shipTuning.maxSpeed / slowerToCross });
+    expect(slow).toEqual(expect.arrayContaining([expect.stringMatching(/takes [\d.]+ s, over 90 s/)]));
+  });
+
+  it("a spawn slot far from every dock", () => {
+    const slow = issuesFor(sliceSeaSource, { ...shipTuning, maxSpeed: shipTuning.maxSpeed / slowerToDock });
+    expect(slow).toEqual(expect.arrayContaining([expect.stringMatching(/spawn slot \d: the nearest dock is [\d.]+ s away, over 40 s/)]));
+  });
+
+  const sockets = sliceSeaSource.finalSockets!;
+  const socket0 = sockets[0]!;
+  const claim0 = socket0.claimTile;
+  const withSockets = (finalSockets: SeaMapSource["finalSockets"], edits: Record<string, string> = {}) => editedMap(edits, { finalSockets });
+  const moveSocket0 = (tileX: number, tileY: number, claimX: number, claimY: number) => {
+    // Socket 0 cleared, and a one-tile islet in its place elsewhere.
+    const edits = { ...fill(socket0.rect.tileX, socket0.rect.tileY, socket0.rect.widthTiles, socket0.rect.heightTiles, "."), [`${tileX},${tileY}`]: "#" };
+    const moved = { rect: { tileX, tileY, widthTiles: 1, heightTiles: 1 }, claimTile: { tileX: claimX, tileY: claimY } };
+    return withSockets([moved, ...sockets.slice(1)], edits);
+  };
+
+  it("a final socket's claim tile cut off from the spawn slots, or too far from them", () => {
+    // Shoals around the claim tile's open sides: the islet closes the rest.
+    const walled = { ...fill(claim0.tileX - 1, claim0.tileY, 1, 2, "%"), ...fill(claim0.tileX + 1, claim0.tileY, 1, 2, "%"), [`${claim0.tileX},${claim0.tileY + 1}`]: "%" };
+    const issues = issuesFor(editedMap(walled));
+    expect(issues.length).toBeGreaterThan(0);
+    for (const issue of issues) expect(issue).toMatch(/^final socket 0 at 41,11: its claim tile 43,16 is not reachable by sea from spawn slot \d$/);
+    // Slow enough that every claim tile is over 90 s from its farthest spawn slot.
+    const worst = Math.max(...report.finalSockets.map((entry) => entry.worstSpawn.seconds));
+    const slower = Math.floor(travelTargets.longestCrossingMaxSeconds / worst) + 1;
+    const slow = validateFinalSockets(seaMap, { ...shipTuning, maxSpeed: shipTuning.maxSpeed / slower });
+    expect(slow.ok ? [] : slow.issues).toHaveLength(4);
+    expect(slow.ok ? [] : slow.issues).toEqual(expect.arrayContaining([expect.stringMatching(/its claim tile is [\d.]+ s from spawn slot \d, over 90 s/)]));
+  });
+
+  it("a sector holding only one final socket", () => {
+    const lone = withSockets(sockets.slice(1), fill(socket0.rect.tileX, socket0.rect.tileY, socket0.rect.widthTiles, socket0.rect.heightTiles, "."));
+    const result = validateSeaMap(createSeaMap(lone), shipTuning, { ...sliceSeaRules, finalSockets: 3 });
+    expect(result.ok ? [] : result.issues).toEqual([
+      "final socket 0 at 65,11: the only final socket in sector column 1, row 0; a sector holding one holds at least two",
+    ]);
+    expect(issuesFor(lone)).toContain("3 final-island sockets, not 4");
+  });
+
+  it("a treasure circle with too little sea to stop in", () => {
+    // Shoals over the circle, except a channel straight south from the claim tile out of it.
+    const edits: Record<string, string> = {};
+    const radius = TREASURE_CIRCLE_RADIUS_TILES;
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const [tileX, tileY] = [claim0.tileX + dx, claim0.tileY + dy];
+        if (dx * dx + dy * dy <= radius * radius && terrainAt(seaMap, tileX, tileY) === Terrain.Sea && !(dx === 0 && dy >= 0)) edits[`${tileX},${tileY}`] = "%";
+      }
+    }
+    expect(issuesFor(editedMap(edits))).toEqual([`final socket 0 at 41,11: its treasure circle holds ${radius + 1} navigable tiles, fewer than 12`]);
+  });
+
+  it("a final socket or its claim tile within 8 tiles of what the running tests sail on", () => {
+    expect(FINAL_SOCKET_KEEP_CLEAR_TILES).toBe(8);
+    // Seven tiles from spawn slot 0, still in the north-centre sector.
+    expect(issuesFor(moveSocket0(38, 1, 38, 2))).toEqual(["final socket 0 at 38,1: within 8 tiles of spawn slot 0"]);
+    // Only the claim tile comes close: it lies 8 tiles east of spawn slot 0.
+    expect(issuesFor(moveSocket0(40, 5, 39, 5))).toEqual(["final socket 0 at 40,5: within 8 tiles of spawn slot 0"]);
+    // Beside the sail-and-dock route south of Palm Key's south dock, the hub, a dock and the out-of-sight row.
+    const palmSouth = seaMap.docks.find((dock) => dock.island === 0 && dock.side === "S")!;
+    const near = [
+      [moveSocket0(palmSouth.tileX + 4, palmSouth.tileY + 12, palmSouth.tileX + 5, palmSouth.tileY + 12), /within 8 tiles of Palm Key S dock or its run out to sea/],
+      [moveSocket0(seaMap.hub.tileX - 5, seaMap.hub.tileY - 3, seaMap.hub.tileX - 5, seaMap.hub.tileY - 4), /within 8 tiles of the hub/],
+      [moveSocket0(seaMap.hub.tileX - 18, seaMap.hub.tileY + 9, seaMap.hub.tileX - 18, seaMap.hub.tileY + 10), /within 8 tiles of the out-of-sight row/],
+      [moveSocket0(palmSouth.tileX - 5, palmSouth.tileY + 3, palmSouth.tileX - 5, palmSouth.tileY + 4), /within 8 tiles of Palm Key S dock/],
+    ] as const;
+    for (const [source, pattern] of near) expect(issuesFor(source)).toEqual(expect.arrayContaining([expect.stringMatching(pattern)]));
+    // The zones cover the sail-and-dock route: the 14 rows south of Palm Key's south dock.
+    const zone = keepClearZones(seaMap).find((each) => each.label.startsWith("Palm Key S dock"))!;
+    expect(zone.tiles).toContainEqual({ tileX: palmSouth.tileX, tileY: palmSouth.tileY + 14 });
+  });
+
+  it("a final socket that is too large, holds a dock, or has its claim tile on land or away from the islet", () => {
+    const { rect } = socket0;
+    const grown = withSockets([{ ...socket0, rect: { ...rect, tileX: rect.tileX - 1, widthTiles: 7 } }, ...sockets.slice(1)]);
+    expect(issuesFor(grown)).toEqual(["final socket 0 at 40,11: 7 × 5 tiles is larger than 6 × 6"]);
+    const docked = editedMap({ [`${rect.tileX},${rect.tileY}`]: "D" });
+    expect(issuesFor(docked)).toEqual(["dock at 41,11: inside final socket 0, which has no dock"]);
+    const alone = validateFinalSockets(createSeaMap(docked), shipTuning);
+    expect(alone.ok ? [] : alone.issues).toEqual(["final socket 0 at 41,11: a dock at 41,11 (a final socket has none)"]);
+    const onLand = withSockets([{ ...socket0, claimTile: { tileX: rect.tileX + 2, tileY: rect.tileY + 2 } }, ...sockets.slice(1)]);
+    expect(issuesFor(onLand)).toEqual(["final socket 0 at 41,11: its claim tile 43,13 is not open sea beside the islet's land"]);
+    const away = withSockets([{ ...socket0, claimTile: { tileX: claim0.tileX, tileY: claim0.tileY + 2 } }, ...sockets.slice(1)]);
+    expect(issuesFor(away)).toEqual(["final socket 0 at 41,11: its claim tile 43,18 is not open sea beside the islet's land"]);
+    const overlapping = validateFinalSockets(createSeaMap(withSockets([{ ...socket0, rect: { ...rect, tileX: 20, tileY: 20 } }, ...sockets.slice(1)])), shipTuning);
+    expect(overlapping.ok ? [] : overlapping.issues).toEqual(expect.arrayContaining(["final socket 0 at 20,20: overlaps Palm Key"]));
+  });
+});
+
+describe("the secret final-socket choice", () => {
+  const count = seaMap.finalSockets.length;
+
+  it("gives the same socket for the same secret, and refuses a secret that is not a 32-bit unsigned integer", () => {
+    for (const secret of [0, 1, 0x7fffffff, 0xffffffff, 123456789]) expect(chooseFinalSocket(seaMap, secret)).toBe(chooseFinalSocket(seaMap, secret));
+    for (const secret of [-1, 2 ** 32, 1.5, Number.NaN]) expect(() => chooseFinalSocket(seaMap, secret)).toThrow(RangeError);
+    expect(() => chooseFinalSocket({ finalSockets: [] }, 1)).toThrow(RangeError);
+  });
+
+  it("chooses every socket, uniformly within 5 % over 30,000 secrets, even when the secrets share their low bits", () => {
+    for (const secretOf of [(index: number) => index, (index: number) => (index * 4) >>> 0, (index: number) => (index << 16) >>> 0]) {
+      const tally = new Array<number>(count).fill(0);
+      for (let index = 0; index < 30_000; index++) {
+        tally[chooseFinalSocket(seaMap, secretOf(index))]!++;
+      }
+      expect(tally.reduce((sum, chosen) => sum + chosen, 0)).toBe(30_000);
+      for (const chosen of tally) expect(Math.abs(chosen - 30_000 / count)).toBeLessThanOrEqual((0.05 * 30_000) / count);
+    }
+  });
+});

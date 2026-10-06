@@ -1,0 +1,612 @@
+"""LangGraph-owned Claude processes. Herdr never launches these processes.
+
+Execution receipts are internal state, NOT verified WorkerResult evidence. Interrupted
+or failed launches require operator reconciliation; this module never retries them.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import threading
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+NODES = ("ui", "adapter")
+TERMINAL = {"succeeded", "failed", "blocked"}
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def save_json(path: Path, value: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4()}.tmp")
+    with temporary.open("x") as handle:
+        os.chmod(temporary, 0o600)
+        json.dump(value, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def run_lock(directory: Path, lock_name: str = "controller.lock"):
+    """Only the controller takes this lock. Observers need no lock or write access."""
+    with (directory / lock_name).open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("Another controller owns this run") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def git(repo: Path, *arguments: str) -> str:
+    return subprocess.check_output(["git", "-C", str(repo), *arguments], text=True).strip()
+
+
+def prepare(directory: Path, repo: Path, base: str, tasks: dict[str, str], allow_edits: bool) -> dict:
+    if set(tasks) != set(NODES) or any(not text.strip() for text in tasks.values()):
+        raise ValueError("Exactly two nonempty tasks are required: ui and adapter")
+    repo = repo.resolve()
+    if git(repo, "status", "--porcelain"):
+        raise ValueError("Commit or preserve source changes before creating worker worktrees")
+    revision = git(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+    # Require the pinned revision to include the shared contract.
+    git(repo, "cat-file", "-e", f"{revision}:contracts/workflow/workerResult.schema.json")
+    directory = directory.resolve()
+    if directory == repo or repo in directory.parents:
+        raise ValueError("Run data/worktrees must be outside the source repository")
+    directory.mkdir(parents=True, mode=0o700, exist_ok=False)
+    os.chmod(directory, 0o700)
+    plan = {"run_id": directory.name, "repository": str(repo), "base_commit": revision,
+            "allow_edits": allow_edits, "nodes": {}}
+    # Journal before allocation. Partial worktrees are retained on failure.
+    save_json(directory / "plan.json", plan)
+    for node in NODES:
+        worktree = directory / f"worktree-{node}"
+        plan["nodes"][node] = {"worktree": str(worktree), "task": tasks[node],
+                               "session_id": str(uuid.uuid4()), "observed_start_commit": None}
+        save_json(directory / "plan.json", plan)
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(worktree), revision], check=True, capture_output=True)
+        observed = git(worktree, "rev-parse", "HEAD")
+        if observed != revision or git(worktree, "status", "--porcelain"):
+            raise RuntimeError(f"Unclean or mismatched initial worktree: {worktree}")
+        plan["nodes"][node]["observed_start_commit"] = observed
+        save_json(directory / "plan.json", plan)
+    return plan
+
+
+def plan_digest(plan: dict) -> str:
+    return hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+
+
+def terminate(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+class ClaudeSessions:
+    def __init__(self, directory: Path, executable: str = "claude", timeout: float = 1800):
+        self.directory = directory.resolve()
+        self.plan = read_json(self.directory / "plan.json")
+        if set(self.plan["nodes"]) != set(NODES):
+            raise RuntimeError("Run preparation is incomplete; inspect retained allocation state")
+        for node in NODES:
+            info = self.plan["nodes"][node]
+            if Path(info["worktree"]).resolve() != self.directory / f"worktree-{node}" or info["observed_start_commit"] != self.plan["base_commit"]:
+                raise RuntimeError("Invalid worktree identity/start revision in plan")
+        self.executable = executable
+        self.timeout = timeout
+        self.cancelled = threading.Event()
+
+    def run(self, node: str) -> dict:
+        if node not in NODES:
+            raise ValueError("Unknown worker")
+        if self.cancelled.is_set():
+            raise RuntimeError("Controller cancelled before launch")
+        info = self.plan["nodes"][node]
+        path = self.directory / f"{node}.json"
+        digest = plan_digest(self.plan)
+        if path.exists():
+            previous = read_json(path)
+            if previous["plan_digest"] != digest:
+                raise RuntimeError("Run plan changed; refuse result reuse/relaunch")
+            if previous["status"] == "succeeded":
+                return previous
+            raise RuntimeError(f"{node}: existing {previous['status']} session {previous['session_id']}; reconcile before any relaunch")
+        cwd = Path(info["worktree"])
+        record = {"node_id": node, "session_id": info["session_id"], "attempt": 1,
+                  "status": "launching", "pid": None, "plan_digest": digest,
+                  "worktree": str(cwd), "base_commit": self.plan["base_commit"]}
+        save_json(path, record)  # A crash from here onward must never cause blind relaunch.
+        tools = "Read,Glob,Grep,Edit,Write" if self.plan["allow_edits"] else "Read,Glob,Grep"
+        command = [self.executable, "--print", "--verbose", "--output-format", "stream-json",
+                   "--session-id", info["session_id"], "--safe-mode", "--strict-mcp-config",
+                   "--mcp-config", '{"mcpServers":{}}', "--tools", tools,
+                   "--permission-mode", "acceptEdits" if self.plan["allow_edits"] else "dontAsk",
+                   "--permission-prompts", "none"]
+        prompt = ("You are an independent workflow worker. Do not launch other agents, modify shared contract files, "
+                  "commit, merge, push or change files outside your assigned worktree. "
+                  "Report changed files, checks actually executed, and open assumptions. "
+                  "No command execution tools are enabled in this initial session slice.\n\n" + info["task"])
+        # Do not let detached workers target the controller's Herdr pane through hooks.
+        env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+        env["TMPDIR"] = str(self.directory / f"tmp-{node}")
+        Path(env["TMPDIR"]).mkdir(exist_ok=True)
+        process = None
+        try:
+            if git(cwd, "rev-parse", "HEAD") != self.plan["base_commit"] or git(cwd, "status", "--porcelain"):
+                raise RuntimeError(f"{node}: worktree changed since preparation")
+            prompt_path = self.directory / f"{node}.prompt.txt"
+            prompt_path.write_text(prompt)
+            os.chmod(prompt_path, 0o600)
+            # A regular stdin file avoids blocking the controller on a full pipe.
+            with prompt_path.open("rb") as input_handle, (self.directory / f"{node}.stream.jsonl").open("wb") as output:
+                process = subprocess.Popen(command, cwd=cwd, env=env, stdin=input_handle,
+                                           stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                record.update(status="running", pid=process.pid)
+                save_json(path, record)
+                import time
+                deadline = time.monotonic() + self.timeout
+                while process.poll() is None:
+                    if self.cancelled.wait(0.1) or time.monotonic() > deadline:
+                        terminate(process)
+                        raise RuntimeError("Controller cancelled or session timed out; partial work preserved")
+                output.flush()
+                os.fsync(output.fileno())
+            terminal = None
+            with (self.directory / f"{node}.stream.jsonl").open(errors="replace") as output:
+                for line in output:
+                    try:
+                        message = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(message, dict) and message.get("type") == "result":
+                        terminal = message
+            record["exit_code"] = process.returncode
+            if not terminal or terminal.get("session_id") != info["session_id"]:
+                raise RuntimeError("Missing or mismatched Claude terminal result; reconciliation required")
+            record["claude_result"] = terminal
+            if process.returncode != 0 or terminal.get("is_error") is not False or terminal.get("subtype") != "success":
+                raise RuntimeError("Claude did not succeed; inspect retained result for usage, permission or execution failure. No automatic retry/provider switch.")
+            record["status"] = "succeeded"
+        except BaseException as error:
+            if process is not None and process.poll() is None:
+                terminate(process)
+            record.update(status="blocked", error=str(error))
+            raise
+        finally:
+            # Preserve work and a diff even after failure; untracked files remain in the worktree.
+            try:
+                record["git_status"] = git(cwd, "status", "--porcelain")
+                with (self.directory / f"{node}.patch").open("w") as patch:
+                    subprocess.run(["git", "-C", str(cwd), "diff", "--binary", self.plan["base_commit"]], stdout=patch, check=True)
+            except Exception as error:
+                record["evidence_error"] = str(error)
+                record["status"] = "blocked"
+            save_json(path, record)
+        if record["status"] != "succeeded":
+            raise RuntimeError("Session evidence capture failed")
+        return record
+"""One-command preparation/start of a committed feature; never skips human gates."""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from .pipeline import validate_pipeline_policy
+from .sessions import read_json
+
+
+FEATURES = ("project-workflows", "worker-lanes")
+
+
+def launch_commands(repo: Path, feature: str, run_id: str, run_root: Path, herdr: bool = True, automatic: bool = False,
+                    worker_timeout_seconds: int | None = None, review_timeout_seconds: int | None = None,
+                    reviewer_transport: str | None = None) -> tuple[Path, list[list[str]]]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        raise ValueError("run-id must be an opaque identifier, not a path")
+    folder = repo / "features" / feature
+    manifest = read_json(folder / "feature.json")
+    files = {}
+    for key in ("policy", "ui_task", "adapter_task"):
+        path = (folder / manifest[key]).resolve(strict=True)
+        if not path.is_relative_to(folder.resolve()):
+            raise ValueError("Feature file escapes feature directory")
+        files[key] = path
+    validate_pipeline_policy(read_json(files["policy"]))
+    run = (run_root / run_id).resolve()
+    if run == repo or repo in run.parents:
+        raise ValueError("Run storage must be outside the repository")
+    base = [sys.executable, "-m", "workflow"]
+    preflight = [*base, "preflight", str(run), "--repo", str(repo), "--policy", str(files["policy"])]
+    start = [*base, "start", str(run), "--live"]
+    if herdr:
+        preflight.append("--herdr")
+        start.append("--herdr")
+    branch = f"{manifest['branch_prefix']}/{run_id}"
+    commands = [
+        preflight,
+        ["git", "switch", "-c", branch],
+        [*base, "prepare", str(run), "--repo", str(repo), "--policy", str(files["policy"]),
+         "--ui-task", str(files["ui_task"]), "--adapter-task", str(files["adapter_task"])],
+        start,
+    ]
+    if automatic:
+        from .automatic import automatic_settings
+        # Reject bad deadlines or an unknown transport before any command runs.
+        settings = automatic_settings(worker_timeout_seconds, review_timeout_seconds, reviewer_transport)
+        commands[0].append("--automatic")
+        commands[2].extend(["--automatic", "--worker-timeout-seconds", str(settings["worker_timeout_seconds"]),
+                            "--review-timeout-seconds", str(settings["review_timeout_seconds"]),
+                            "--reviewer-transport", settings["reviewer_transport"]])
+        commands.append([*base, "automatic", str(run), "--live"])
+    elif worker_timeout_seconds is not None or review_timeout_seconds is not None or reviewer_transport is not None:
+        raise ValueError("Timeouts and the reviewer transport apply to --automatic runs only")
+    return run, commands
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("feature", choices=FEATURES)
+    parser.add_argument("--run-id", help="Opaque run identifier (default: <feature>-001)")
+    parser.add_argument("--run-root", type=Path, help="Run storage outside the repository (default: ~/.local/state/md-manager-workflows/<feature>)")
+    parser.add_argument("--live", action="store_true", help="Authorize Claude usage")
+    parser.add_argument("--automatic", action="store_true", help="Bypass worker permission prompts; run through independent review to a verified feature branch")
+    parser.add_argument("--worker-timeout-seconds", type=int, help="Automatic mode: per-worker deadline from launch to completion signal (default 4h, max 24h)")
+    parser.add_argument("--review-timeout-seconds", type=int, help="Automatic mode: reviewer deadline from its launch to its completion file (default 30m, max 24h)")
+    parser.add_argument("--reviewer-transport", choices=["native", "print"], help="Automatic mode: native attachable reviewer session (default) or headless claude --print")
+    parser.add_argument("--no-herdr", action="store_true", help="Explicitly omit terminal attachments")
+    parser.add_argument("--dry-run", action="store_true", help="Validate feature configuration and print commands only")
+    args = parser.parse_args(argv)
+    repo = Path(__file__).resolve().parents[1]
+    run_id = args.run_id or f"{args.feature}-001"
+    run_root = args.run_root or Path.home() / ".local/state/md-manager-workflows" / args.feature
+    try:
+        run, commands = launch_commands(repo, args.feature, run_id, run_root.resolve(), not args.no_herdr, args.automatic,
+                                        args.worker_timeout_seconds, args.review_timeout_seconds, args.reviewer_transport)
+        if args.dry_run:
+            print(json.dumps({"run_directory": str(run), "commands": commands, "executes": False}, indent=2))
+            return
+        if not args.live:
+            parser.error("Use --live to authorize worker usage, or --dry-run to inspect without running anything")
+        if run.exists():
+            raise ValueError(f"Run already exists: {run}. Inspect it with status; do not launch duplicate workers.")
+        try:
+            for command in commands:
+                subprocess.run(command, cwd=repo, check=True)
+        except KeyboardInterrupt:
+            parser.exit(130, f"Launch interrupted. Nothing was rolled back. If workers were started they are still running;\n"
+                             f"inspect with: {sys.executable} -m workflow status {run}\n"
+                             + (f"resume with:  {sys.executable} -m workflow automatic {run} --live\n" if args.automatic else ""))
+        if args.automatic:
+            print(f"\nAutomatic run finished. Evidence: {run / 'report.html'}. No main merge or push.")
+            return
+        print(f"\nRun: {run}\nWorkers are in their dedicated Herdr tab (unless --no-herdr).")
+        print("Watch/answer permission prompts. When both finish, return to Pi for handoffs and freeze.")
+        print("The intentional adapter verification drill will block its first attempt; retry that check explicitly after restarting the controller.")
+        print(f"Status: {sys.executable} -m workflow status {run}")
+        print("Review and integration still require separate explicit approval. Nothing is pushed.")
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"Launch blocked: {error}\nNo fallback, reset or cleanup was attempted. Inspect any retained branch/run state.\n")
+
+
+if __name__ == "__main__":
+    main()
+"""Reusable policy/evidence gates. No agents, browsers, shells or graph launches.
+
+Inputs must come from a trusted verifier plus backend-owned artifact registry, not
+unchecked agent prose. Passing this evidence gate never authorizes integration.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import shlex
+from datetime import datetime
+from pathlib import Path
+
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import ValidationError
+
+CONTRACTS = Path(__file__).resolve().parents[1] / "contracts" / "workflow"
+
+
+def validate_schema(name: str, value: dict) -> None:
+    schema = json.loads((CONTRACTS / f"{name}.schema.json").read_text())
+    Draft202012Validator(schema, format_checker=FormatChecker()).validate(value)
+
+
+def policy_digest(policy: dict) -> str:
+    """Canonical UTF-8 JSON: sorted keys, no whitespace, literal Unicode."""
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def safe_path(value: str) -> str:
+    normalized = value.rstrip("/")
+    if not normalized or normalized.startswith("/") or any(char in normalized for char in "\\:*?[]") or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ValueError(f"Not an exact repository-relative path/prefix: {value}")
+    return normalized
+
+
+def owns(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def unique(items: list[dict], key: str) -> dict:
+    result = {item[key]: item for item in items}
+    if len(result) != len(items):
+        raise ValueError(f"Duplicate {key}")
+    return result
+
+
+def validate_policy(policy: dict) -> dict:
+    validate_schema("verification", policy)
+    workers = unique(policy["workers"], "node_id")
+    claimed = []
+    for worker in workers.values():
+        paths = [safe_path(path) for path in worker["owned_paths"]]
+        for other_node, other_path in claimed:
+            if any(owns(path, other_path) or owns(other_path, path) for path in paths):
+                raise ValueError(f"Overlapping ownership: {worker['node_id']} and {other_node}")
+        claimed.extend((worker["node_id"], path) for path in paths)
+        checks = unique(worker["checks"], "id")
+        if len({tuple(check["argv"]) for check in checks.values()}) != len(checks):
+            raise ValueError("Each check needs a distinct command")
+        kinds = {check["kind"] for check in checks.values()}
+        required = {"build", "browser"} if worker["role"] == "frontend" else {"unit"}
+        if not required <= kinds:
+            raise ValueError(f"{worker['role']} requires {sorted(required)} checks")
+        for check in checks.values():
+            unique(check["scenarios"], "id")
+            if (check["kind"] == "browser") != bool(check["scenarios"]):
+                raise ValueError("Browser checks require named scenarios; other checks must not have scenarios")
+    drill = policy.get("failure_drill")
+    if drill and (drill["node_id"] not in workers or policy.get("max_verification_attempts", 3) < 2):
+        raise ValueError("Failure drill requires a configured worker and at least two allowed verification attempts")
+    return policy
+
+
+def evaluate_worker(policy: dict, result: dict, evidence: dict, *, expected: dict,
+                    artifact_root: Path, artifact_paths: dict[str, Path], enforce_ownership: bool = True) -> dict:
+    """Fail closed on absent, stale or inconsistent evidence.
+
+    `expected` is backend-owned: run_id, node_id, attempt, base_commit,
+    output_commit and verification_cwd. Caller must freeze edits and independently
+    derive the full Git diff/commit before invoking; this function cannot prove
+    that an agent has reported all changed files.
+    """
+    reasons = []
+    try:
+        validate_policy(policy)
+        validate_schema("workerResult", result)
+        validate_schema("verificationEvidence", evidence)
+        workers = {worker["node_id"]: worker for worker in policy["workers"]}
+        worker = workers[expected["node_id"]]
+        for field in ("run_id", "node_id", "attempt", "base_commit", "output_commit"):
+            if result[field] != expected[field]:
+                raise ValueError(f"Worker result has stale/mismatched {field}")
+        for field in ("run_id", "node_id", "attempt", "output_commit"):
+            if evidence[field] != expected[field]:
+                raise ValueError(f"Verification evidence has stale/mismatched {field}")
+        if evidence["policy_sha256"] != policy_digest(policy):
+            raise ValueError("Verification policy changed after evidence capture")
+        if result["status"] != "succeeded" or result["output_commit"] is None or result["error"] is not None:
+            raise ValueError("Worker did not produce a successful durable result")
+        prefixes = [safe_path(path) for path in worker["owned_paths"]]
+        for changed in result["changed_files"]:
+            if enforce_ownership and not any(owns(safe_path(changed), prefix) for prefix in prefixes):
+                reasons.append(f"Changed file outside ownership: {changed}")
+        artifacts = unique(result["artifacts"], "artifact_id")
+        root = artifact_root.resolve(strict=True)
+        resolved = {}
+        for artifact_id, artifact in artifacts.items():
+            path = artifact_paths[artifact_id].resolve(strict=True)
+            if not path.is_relative_to(root) or not path.is_file():
+                raise ValueError(f"Artifact escapes registry root: {artifact_id}")
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            if digest != artifact["sha256"]:
+                raise ValueError(f"Artifact hash mismatch: {artifact_id}")
+            resolved[artifact_id] = path
+        for check in result["checks"]:
+            if artifacts.get(check["log_artifact_id"], {}).get("kind") != "log":
+                reasons.append("Executed check is missing a log artifact")
+            if datetime.fromisoformat(check["finished_at"]) < datetime.fromisoformat(check["started_at"]):
+                reasons.append("Check finish precedes start")
+            if check["exit_code"] != 0:
+                reasons.append(f"Executed check failed: {check['command']}")
+        supplied = unique(evidence["checks"], "id")
+        required = {check["id"]: check for check in worker["checks"]}
+        if set(supplied) != set(required):
+            raise ValueError("Required check evidence missing or contains unknown check IDs")
+        indexes = [check["worker_check_index"] for check in supplied.values()]
+        if len(set(indexes)) != len(indexes):
+            raise ValueError("A command execution cannot satisfy multiple check IDs")
+        for check_id, requirement in required.items():
+            receipt = supplied[check_id]
+            execution = result["checks"][receipt["worker_check_index"]]
+            if execution["command"] != shlex.join(requirement["argv"]):
+                reasons.append(f"{check_id}: executed command differs from approved argv")
+            if Path(execution["cwd"]).resolve() != Path(expected["verification_cwd"]).resolve():
+                reasons.append(f"{check_id}: wrong verification worktree")
+            duration = (datetime.fromisoformat(execution["finished_at"]) - datetime.fromisoformat(execution["started_at"])).total_seconds()
+            if duration > requirement["timeout_seconds"]:
+                reasons.append(f"{check_id}: execution exceeded approved timeout")
+            if requirement["kind"] in {"unit", "browser", "integration", "contract"}:
+                tests = receipt["tests"]
+                if tests is None or tests["passed"] < 1 or tests["failed"] > 0:
+                    reasons.append(f"{check_id}: no passing test evidence or failed tests")
+            scenarios = unique(receipt["scenarios"], "id")
+            if requirement["kind"] == "browser" and receipt["tests"] is not None and receipt["tests"]["passed"] < len(requirement["scenarios"]):
+                reasons.append(f"{check_id}: fewer passing tests than required browser scenarios")
+            if set(scenarios) != {scenario["id"] for scenario in requirement["scenarios"]}:
+                reasons.append(f"{check_id}: missing/unknown browser scenarios")
+            screenshot_ids = []
+            for scenario in scenarios.values():
+                artifact_id = scenario["screenshot_artifact_id"]
+                if scenario["status"] != "passed":
+                    reasons.append(f"{check_id}/{scenario['id']}: browser scenario did not pass")
+                if artifact_id is None or artifacts.get(artifact_id, {}).get("kind") != "screenshot":
+                    reasons.append(f"{check_id}/{scenario['id']}: screenshot required")
+                    continue
+                screenshot_ids.append(artifact_id)
+                # Format sanity only, not proof of visual correctness/authenticity.
+                with resolved[artifact_id].open("rb") as image:
+                    header = image.read(24)
+                if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR" or int.from_bytes(header[16:20], "big") == 0 or int.from_bytes(header[20:24], "big") == 0:
+                    reasons.append(f"{check_id}/{scenario['id']}: expected a PNG screenshot")
+            if len(set(screenshot_ids)) != len(screenshot_ids):
+                reasons.append(f"{check_id}: each scenario needs a distinct screenshot artifact")
+    except (ValueError, KeyError, IndexError, TypeError, OSError) as error:
+        reasons.append(str(error))
+    except ValidationError as error:
+        reasons.append(error.message)
+    return {"status": "blocked" if reasons else "passed", "reasons": reasons,
+            "pending_gates": ["independent_review", "integration_approval"],
+            "integration_allowed": False}
+"""CLI for LangGraph-owned Claude sessions and optional Herdr observers."""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import signal
+from pathlib import Path
+from typing import TypedDict
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
+
+from .observer import open_panels
+from .sessions import ClaudeSessions, NODES, prepare, read_json, run_lock
+
+
+class SessionState(TypedDict, total=False):
+    run_id: str
+    ui: dict
+    adapter: dict
+
+
+def build_session_graph(checkpointer, sessions: ClaudeSessions):
+    def ui(_state: SessionState):
+        return {"ui": sessions.run("ui")}
+
+    def adapter(_state: SessionState):
+        return {"adapter": sessions.run("adapter")}
+
+    def join(state: SessionState):
+        # This slice cannot approve or merge: actual verification/review comes next.
+        interrupt({"kind": "verification_required", "run_id": state["run_id"],
+                   "message": "Claude sessions finished. Collect checks, browser evidence and independent review before integration."})
+        raise RuntimeError("Integration is intentionally unavailable in this session-launch slice")
+
+    graph = StateGraph(SessionState)
+    graph.add_node("ui", ui)
+    graph.add_node("adapter", adapter)
+    graph.add_node("join", join)
+    graph.add_edge(START, "ui")
+    graph.add_edge(START, "adapter")
+    graph.add_edge(["ui", "adapter"], "join")
+    graph.add_edge("join", END)
+    return graph.compile(checkpointer=checkpointer)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["prepare", "run", "status", "observe"])
+    parser.add_argument("directory", type=Path, help="New run directory OUTSIDE the source repository")
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--base", default="HEAD")
+    parser.add_argument("--ui-task", type=Path)
+    parser.add_argument("--adapter-task", type=Path)
+    parser.add_argument("--allow-edits", action="store_true", help="Allow file edits (no shell tools); defaults to read-only")
+    parser.add_argument("--live", action="store_true", help="Explicit consent to launch billable/authenticated Claude sessions")
+    parser.add_argument("--herdr", action="store_true", help="Create passive observer panes before running")
+    parser.add_argument("--timeout", type=float, default=1800)
+    args = parser.parse_args()
+    directory = args.directory.resolve()
+    try:
+        if args.action == "prepare":
+            if not args.ui_task or not args.adapter_task:
+                parser.error("prepare requires --ui-task and --adapter-task")
+            plan = prepare(directory, args.repo, args.base,
+                           {"ui": args.ui_task.read_text(), "adapter": args.adapter_task.read_text()}, args.allow_edits)
+            print(json.dumps(plan, indent=2))
+            return
+        if not (directory / "plan.json").is_file():
+            parser.error("Prepare the run first")
+        if args.action == "status":
+            print(json.dumps({node: read_json(directory / f"{node}.json") if (directory / f"{node}.json").exists()
+                              else {"status": "pending"} for node in NODES}, indent=2))
+            return
+        with run_lock(directory):
+            if args.action == "observe":
+                print(json.dumps(open_panels(directory), indent=2))
+                return
+            if not args.live:
+                parser.error("run requires --live; this can consume your Claude usage")
+            if args.timeout <= 0:
+                parser.error("timeout must be positive")
+            if not shutil.which("claude"):
+                parser.error("Claude CLI unavailable")
+            if args.herdr:
+                print(json.dumps(open_panels(directory), indent=2))
+            sessions = ClaudeSessions(directory, timeout=args.timeout)
+            previous = {sig: signal.signal(sig, lambda _sig, _frame: sessions.cancelled.set())
+                        for sig in (signal.SIGINT, signal.SIGTERM)}
+            try:
+                with SqliteSaver.from_conn_string(str(directory / "checkpoints.sqlite")) as saver:
+                    graph = build_session_graph(saver, sessions)
+                    config = {"configurable": {"thread_id": sessions.plan["run_id"]}, "max_concurrency": 2}
+                    snapshot = graph.get_state(config)
+                    if any(task.interrupts for task in snapshot.tasks):
+                        print("Sessions are awaiting verification/review; no agents relaunched.")
+                        return
+                    result = graph.invoke(None if snapshot.values else {"run_id": sessions.plan["run_id"]}, config)
+                    print(json.dumps(result, indent=2, default=str))
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+    except (RuntimeError, ValueError, OSError) as error:
+        parser.exit(1, f"Blocked: {error}\nRun state/partial work retained at {directory}\n")
+
+
+if __name__ == "__main__":
+    main()
+"""`python -m workflow` exposes the complete operator-driven pipeline CLI."""
+import sys
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "launch":
+        from .launch import main
+        main(sys.argv[2:])
+    else:
+        from .pipeline import main
+        main()

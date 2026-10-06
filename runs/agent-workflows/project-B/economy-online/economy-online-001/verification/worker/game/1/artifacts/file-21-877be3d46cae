@@ -1,0 +1,545 @@
+import * as Phaser from "phaser";
+import { HEADING_COUNT, insideIsland, ISLAND_THEMES, SIGHT_RADIUS_TILES, Terrain, terrainAt } from "@pirate-sea-race/content";
+import { encounterRules } from "@pirate-sea-race/content/encounters";
+import { defaultSimulationConfig } from "@pirate-sea-race/simulation";
+import { ArenaScene, type ArenaSource } from "./arenaScene.js";
+import { followScroll, TILE_PIXELS, VIEW_HEIGHT, VIEW_WIDTH } from "./camera.js";
+import { FogOfWar } from "./fog.js";
+import { sectorOverlay, type SectorOverlay } from "./journal.js";
+import { drawCaches, drawCrates, drawDuelMarkers, drawPedestals, type DrawnCache, type DrawnMarker, type MarkerPen } from "./markers.js";
+import { cssColor, slotColor, type MatchView } from "./matchView.js";
+import { treasureView, type TreasureGeometry } from "./treasureView.js";
+import {
+  AIM_COLOR,
+  CACHE_COLOR,
+  CACHE_TRIM,
+  CRATE_COLOR,
+  CRATE_TRIM,
+  DOCK_COLOR,
+  DOCK_PLANK,
+  FOG_COLOR,
+  FRUIT_COLOR,
+  GRID_COLOR,
+  INCOMING_COLOR,
+  SECTOR_COLOR,
+  LAND_COLORS,
+  MARKER_COLOR,
+  OWN_RING_COLOR,
+  PEDESTAL_COLOR,
+  PROTECTION_COLOR,
+  SEA_COLOR,
+  SHOAL_COLOR,
+  SHOAL_FLECK,
+  SIGHT_COLOR,
+  TELEGRAPH_COLOR,
+  TREASURE_COLOR,
+} from "./palette.js";
+
+const { map } = defaultSimulationConfig;
+const WORLD_WIDTH = map.widthTiles * TILE_PIXELS;
+const WORLD_HEIGHT = map.heightTiles * TILE_PIXELS;
+const PIXELS_PER_SUB_UNIT = TILE_PIXELS / map.subUnitsPerTile;
+/** The placeholder art was drawn for 16 px tiles; its details scale with the tile. */
+const ART_SCALE = TILE_PIXELS / 16;
+
+/** Tile indexes in the generated tileset texture. */
+const TILE_SEA = 0;
+const TILE_SHOAL = 1;
+const TILE_DOCK = 2;
+const TILE_LAND = 3;
+
+const MINIMAP_SCALE = 1.25;
+const MINIMAP_MARGIN = 8;
+
+const TREASURE_GEOMETRY: TreasureGeometry = {
+  pixelsPerSubUnit: PIXELS_PER_SUB_UNIT,
+  tilePixels: TILE_PIXELS,
+  minimapScale: MINIMAP_SCALE,
+  minimapMargin: MINIMAP_MARGIN,
+  artScale: ART_SCALE,
+};
+
+/** A grapple's reach and hit area as drawn: the range, and ±hit cone headings either side of the aim. */
+const GRAPPLE_RANGE_PIXELS = encounterRules.grapple.rangeTiles * TILE_PIXELS;
+const GRAPPLE_HALF_ANGLE = (encounterRules.grapple.hitConeHeadings * 2 * Math.PI) / HEADING_COUNT;
+
+/** A telegraph as drawn this frame, for the DOM report tests read: whose, at whom, and from whose side. */
+export interface DrawnTelegraph {
+  readonly attackerId: string;
+  readonly defenderId: string;
+  readonly aim: number;
+  /** "own" (this player's aim), "incoming" (aimed at this player) or "other". */
+  readonly role: "own" | "incoming" | "other";
+}
+
+export type { DrawnCache, DrawnMarker };
+
+/** A ship as drawn this frame, in canvas pixels, for the DOM report tests read. */
+export interface DrawnShip {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly color: string;
+}
+
+function landTile(tileX: number, tileY: number): number {
+  const theme = map.islands.find((island) => insideIsland(island, tileX, tileY))?.theme ?? "tropical";
+  return TILE_LAND + ISLAND_THEMES.indexOf(theme);
+}
+
+function tileIndex(tileX: number, tileY: number): number {
+  switch (terrainAt(map, tileX, tileY)) {
+    case Terrain.Land:
+      return landTile(tileX, tileY);
+    case Terrain.Shoal:
+      return TILE_SHOAL;
+    case Terrain.Dock:
+      return TILE_DOCK;
+    default:
+      return TILE_SEA;
+  }
+}
+
+function tileColor(tileX: number, tileY: number): number {
+  const index = tileIndex(tileX, tileY);
+  if (index >= TILE_LAND) return LAND_COLORS[ISLAND_THEMES[index - TILE_LAND]!];
+  return [SEA_COLOR, SHOAL_COLOR, DOCK_COLOR][index]!;
+}
+
+/**
+ * Draws the sea: the tile map from content, the ships the server sent at interpolated positions, a camera that
+ * follows the player's ship, the sight circle, and a minimap whose fog clears along the player's path. The encounters
+ * of §6 are drawn over it: each grapple's telegraph (its reach and hit area along the locked aim, filling in as the
+ * windup runs out; the player's own in green, one aimed at the player in red with a warning arrow on its ship, others
+ * in sand), a duel marker (crossed swords and the elapsed time) where a duel runs, and a ring round the player's ship
+ * while it is protected; a chest on each recovery cache's dock in sight (§12, no contents); and each unclaimed supply
+ * crate in sight (§11). Each frame it records what it drew in data attributes on the report element
+ * (`data-drawn-ships`, `data-telegraphs`, `data-markers`, `data-caches`, `data-crates`, `data-camera`, `data-fog-revealed`, and once `data-minimap`: the minimap's left, top and scale on
+ * the canvas) for the browser tests.
+ */
+export class SeaScene extends Phaser.Scene {
+  private readonly shipGraphics = new Map<string, Phaser.GameObjects.Graphics>();
+  private encounterGraphics!: Phaser.GameObjects.Graphics;
+  private treasureGraphics!: Phaser.GameObjects.Graphics;
+  private readonly markerLabels: Phaser.GameObjects.Text[] = [];
+  private lastEncounterReport = "";
+  private readonly fog = new FogOfWar(map.widthTiles, map.heightTiles, SIGHT_RADIUS_TILES);
+  private minimap!: Phaser.Textures.CanvasTexture;
+  private minimapMarks!: Phaser.GameObjects.Graphics;
+  private sight!: Phaser.GameObjects.Graphics;
+  private lastReport = "";
+  private sectorLines!: Phaser.GameObjects.Graphics;
+  private sectorLabel!: Phaser.GameObjects.Text;
+  private sectorEntered: { readonly sector: number; readonly at: number } | undefined;
+  private lastSectorReport = "";
+
+  constructor(
+    private readonly view: MatchView,
+    private readonly report: HTMLElement,
+  ) {
+    super("sea");
+  }
+
+  create(): void {
+    this.createTerrain();
+    this.sight = this.add.graphics();
+    this.sight.lineStyle(1, SIGHT_COLOR, 0.45);
+    this.sight.strokeCircle(0, 0, SIGHT_RADIUS_TILES * TILE_PIXELS);
+    this.sight.setDepth(1);
+    this.encounterGraphics = this.add.graphics().setDepth(1.5);
+    this.treasureGraphics = this.add.graphics().setDepth(1.6);
+    this.sectorLines = this.add.graphics().setDepth(0.5);
+    this.sectorLabel = this.add
+      .text(VIEW_WIDTH / 2, 36, "", { fontFamily: "system-ui, sans-serif", fontSize: `${10 * ART_SCALE}px`, color: cssColor(SECTOR_COLOR) })
+      .setOrigin(0.5, 0)
+      .setScrollFactor(0)
+      .setDepth(9);
+    this.createMinimap();
+  }
+
+  /** The tile map, as a Phaser tilemap over a tileset texture drawn here in placeholder colours. */
+  private createTerrain(): void {
+    const kinds = TILE_LAND + ISLAND_THEMES.length;
+    const tileset = this.textures.createCanvas("terrain-tiles", kinds * TILE_PIXELS, TILE_PIXELS)!;
+    const context = tileset.getContext();
+    const paint = (index: number, color: number) => {
+      context.fillStyle = cssColor(color);
+      context.fillRect(index * TILE_PIXELS, 0, TILE_PIXELS, TILE_PIXELS);
+    };
+    paint(TILE_SEA, SEA_COLOR);
+    paint(TILE_SHOAL, SHOAL_COLOR);
+    context.fillStyle = cssColor(SHOAL_FLECK);
+    for (const [x, y] of [[3, 4], [10, 2], [6, 10], [13, 12], [2, 13]] as const) {
+      context.fillRect(TILE_SHOAL * TILE_PIXELS + Math.round(x * ART_SCALE), Math.round(y * ART_SCALE), 2 * ART_SCALE, 2 * ART_SCALE);
+    }
+    paint(TILE_DOCK, DOCK_COLOR);
+    context.fillStyle = cssColor(DOCK_PLANK);
+    for (const y of [4, 9, 14]) context.fillRect(TILE_DOCK * TILE_PIXELS, Math.round(y * ART_SCALE), TILE_PIXELS, 1);
+    ISLAND_THEMES.forEach((theme, index) => paint(TILE_LAND + index, LAND_COLORS[theme]));
+    tileset.refresh();
+
+    // Open sea is left empty (-1): the camera's background is the sea, so the layer draws only the few land, shoal
+    // and dock tiles in view. Drawing every sea tile too costs a software renderer most of its frame rate.
+    const data = Array.from({ length: map.heightTiles }, (_, tileY) =>
+      Array.from({ length: map.widthTiles }, (_, tileX) => {
+        const index = tileIndex(tileX, tileY);
+        return index === TILE_SEA ? -1 : index;
+      }),
+    );
+    const tilemap = this.make.tilemap({ data, tileWidth: TILE_PIXELS, tileHeight: TILE_PIXELS });
+    const tiles = tilemap.addTilesetImage("terrain", "terrain-tiles", TILE_PIXELS, TILE_PIXELS, 0, 0)!;
+    tilemap.createLayer(0, tiles, 0, 0);
+
+    // A chart grid every eight tiles, so open water shows the ship's motion.
+    const grid = this.add.graphics();
+    grid.lineStyle(1, GRID_COLOR, 0.6);
+    for (let tile = 0; tile <= map.widthTiles; tile += 8) grid.lineBetween(tile * TILE_PIXELS, 0, tile * TILE_PIXELS, WORLD_HEIGHT);
+    for (let tile = 0; tile <= map.heightTiles; tile += 8) grid.lineBetween(0, tile * TILE_PIXELS, WORLD_WIDTH, tile * TILE_PIXELS);
+
+    for (const island of map.islands) {
+      const label = this.add.text((island.tileX + island.widthTiles / 2) * TILE_PIXELS, (island.tileY - 1.2) * TILE_PIXELS, island.name, {
+        fontFamily: "system-ui, sans-serif",
+        fontSize: `${12 * ART_SCALE}px`,
+        color: "#e8f1f5",
+      });
+      label.setOrigin(0.5, 0.5).setAlpha(0.85);
+    }
+  }
+
+  /** The minimap: one pixel per tile, fogged until the player's ship has seen it. */
+  private createMinimap(): void {
+    this.minimap = this.textures.createCanvas("minimap", map.widthTiles, map.heightTiles)!;
+    const context = this.minimap.getContext();
+    context.fillStyle = cssColor(FOG_COLOR);
+    context.fillRect(0, 0, map.widthTiles, map.heightTiles);
+    this.minimap.refresh();
+    const left = VIEW_WIDTH - MINIMAP_MARGIN - map.widthTiles * MINIMAP_SCALE;
+    const frame = this.add.graphics().setScrollFactor(0).setDepth(10);
+    frame.lineStyle(2, 0x9bb8c6, 0.9);
+    frame.strokeRect(left - 1, MINIMAP_MARGIN - 1, map.widthTiles * MINIMAP_SCALE + 2, map.heightTiles * MINIMAP_SCALE + 2);
+    this.add.image(left, MINIMAP_MARGIN, "minimap").setOrigin(0, 0).setScale(MINIMAP_SCALE).setScrollFactor(0).setDepth(10);
+    this.minimapMarks = this.add.graphics().setScrollFactor(0).setDepth(11);
+    this.report.dataset["minimap"] = `${left},${MINIMAP_MARGIN},${MINIMAP_SCALE}`;
+  }
+
+  private revealFog(x: number, y: number): void {
+    const fresh = this.fog.revealAround(Math.floor(x / TILE_PIXELS), Math.floor(y / TILE_PIXELS));
+    if (fresh.length === 0) return;
+    const context = this.minimap.getContext();
+    for (const [tileX, tileY] of fresh) {
+      context.fillStyle = cssColor(tileColor(tileX, tileY));
+      context.fillRect(tileX, tileY, 1, 1);
+    }
+    this.minimap.refresh();
+    this.report.dataset["fogRevealed"] = String(this.fog.revealedCount);
+  }
+
+  override update(): void {
+    const now = performance.now();
+    const own = this.view.renderPosition(this.view.selfId, now);
+    if (own !== undefined) {
+      const x = own.x * PIXELS_PER_SUB_UNIT;
+      const y = own.y * PIXELS_PER_SUB_UNIT;
+      const scroll = followScroll(x, y);
+      this.cameras.main.setScroll(scroll.x, scroll.y);
+      this.sight.setPosition(x, y);
+      this.revealFog(x, y);
+    }
+    const camera = this.cameras.main;
+    const minimapLeft = VIEW_WIDTH - MINIMAP_MARGIN - map.widthTiles * MINIMAP_SCALE;
+    this.minimapMarks.clear();
+
+    const drawn: DrawnShip[] = [];
+    const present = new Set<string>();
+    for (const ship of this.view.ships()) {
+      const position = this.view.renderPosition(ship.id, now);
+      if (position === undefined) continue;
+      present.add(ship.id);
+      const mine = ship.id === this.view.selfId;
+      let graphics = this.shipGraphics.get(ship.id);
+      if (graphics === undefined) {
+        graphics = this.drawShip(slotColor(ship.slot), mine);
+        this.shipGraphics.set(ship.id, graphics);
+      }
+      const x = position.x * PIXELS_PER_SUB_UNIT;
+      const y = position.y * PIXELS_PER_SUB_UNIT;
+      graphics.setPosition(x, y);
+      graphics.setRotation((ship.heading * 2 * Math.PI) / HEADING_COUNT);
+      drawn.push({ id: ship.id, x: Math.round(x - camera.scrollX), y: Math.round(y - camera.scrollY), color: cssColor(slotColor(ship.slot)) });
+      this.minimapMarks.fillStyle(mine ? OWN_RING_COLOR : slotColor(ship.slot), 1);
+      this.minimapMarks.fillRect(minimapLeft + (x / TILE_PIXELS) * MINIMAP_SCALE - 1.5, MINIMAP_MARGIN + (y / TILE_PIXELS) * MINIMAP_SCALE - 1.5, 3, 3);
+    }
+    for (const [id, graphics] of this.shipGraphics) {
+      if (present.has(id)) continue;
+      graphics.destroy();
+      this.shipGraphics.delete(id);
+    }
+    const report = JSON.stringify(drawn);
+    if (report !== this.lastReport) {
+      this.report.dataset["drawnShips"] = report;
+      this.lastReport = report;
+    }
+    this.drawEncounters(now);
+    this.drawTreasure(now, minimapLeft);
+    this.drawSectors(now, own === undefined ? undefined : { x: own.x, y: own.y });
+    this.report.dataset["camera"] = `${camera.scrollX},${camera.scrollY}`;
+  }
+
+  /** Telegraphs, duel markers and the player's protection ring (§6), under the ships. */
+  private drawEncounters(now: number): void {
+    const graphics = this.encounterGraphics;
+    graphics.clear();
+    const camera = this.cameras.main;
+    const tick = this.view.worldTick();
+    const pixels = (position: { x: number; y: number }) => ({ x: position.x * PIXELS_PER_SUB_UNIT, y: position.y * PIXELS_PER_SUB_UNIT });
+
+    const telegraphs: DrawnTelegraph[] = [];
+    for (const grapple of this.view.grapples()) {
+      const role = grapple.attackerId === this.view.selfId ? "own" : grapple.defenderId === this.view.selfId ? "incoming" : "other";
+      telegraphs.push({ attackerId: grapple.attackerId, defenderId: grapple.defenderId, aim: grapple.aim, role });
+      const from = this.view.renderPosition(grapple.attackerId, now);
+      if (from === undefined) continue;
+      const { x, y } = pixels(from);
+      const color = role === "own" ? AIM_COLOR : role === "incoming" ? INCOMING_COLOR : TELEGRAPH_COLOR;
+      const angle = (grapple.aim * 2 * Math.PI) / HEADING_COUNT;
+      const progress = Math.min(1, Math.max(0, (tick - grapple.startTick) / Math.max(1, grapple.landTick - grapple.startTick)));
+      // The hit area: a wedge whose fill deepens as the windup runs out, and the aim line down its middle.
+      graphics.fillStyle(color, 0.12 + 0.3 * progress);
+      graphics.slice(x, y, GRAPPLE_RANGE_PIXELS, angle - GRAPPLE_HALF_ANGLE, angle + GRAPPLE_HALF_ANGLE, false);
+      graphics.fillPath();
+      graphics.lineStyle(2, color, 0.9);
+      graphics.lineBetween(x, y, x + Math.cos(angle) * GRAPPLE_RANGE_PIXELS, y + Math.sin(angle) * GRAPPLE_RANGE_PIXELS);
+      if (role !== "incoming") continue;
+      // The target's warning: an arrow on its own ship pointing back at the attacker.
+      const own = this.view.renderPosition(this.view.selfId, now);
+      if (own === undefined) continue;
+      const at = pixels(own);
+      const back = Math.atan2(y - at.y, x - at.x);
+      const tip = { x: at.x + Math.cos(back) * 30 * ART_SCALE / 2, y: at.y + Math.sin(back) * 30 * ART_SCALE / 2 };
+      graphics.fillStyle(INCOMING_COLOR, 1);
+      graphics.fillTriangle(
+        tip.x,
+        tip.y,
+        at.x + Math.cos(back + 0.35) * 16 * ART_SCALE / 2,
+        at.y + Math.sin(back + 0.35) * 16 * ART_SCALE / 2,
+        at.x + Math.cos(back - 0.35) * 16 * ART_SCALE / 2,
+        at.y + Math.sin(back - 0.35) * 16 * ART_SCALE / 2,
+      );
+    }
+
+    const labels = this.markerLabels;
+    const pen: MarkerPen = {
+      swords: (x, y, size) => {
+        graphics.lineStyle(3, MARKER_COLOR, 1);
+        graphics.lineBetween(x - size, y - size, x + size, y + size);
+        graphics.lineBetween(x - size, y + size, x + size, y - size);
+        // Hilts across each blade's lower end.
+        graphics.lineBetween(x - size - 3, y + size - 5, x - size + 5, y + size + 3);
+        graphics.lineBetween(x + size + 3, y + size - 5, x + size - 5, y + size + 3);
+      },
+      label: (index, x, y, text) => {
+        let label = labels[index];
+        if (label === undefined) {
+          label = this.add.text(0, 0, "", { fontFamily: "system-ui, sans-serif", fontSize: `${9 * ART_SCALE}px`, color: cssColor(MARKER_COLOR) });
+          label.setOrigin(0.5, 0).setDepth(3);
+          labels.push(label);
+        }
+        label.setPosition(x, y).setText(text).setVisible(true);
+      },
+      chest: (x, y, half) => {
+        graphics.fillStyle(CACHE_COLOR, 1);
+        graphics.fillRect(x - half, y - half * 0.7, half * 2, half * 1.4);
+        graphics.lineStyle(2, CACHE_TRIM, 1);
+        graphics.strokeRect(x - half, y - half * 0.7, half * 2, half * 1.4);
+        graphics.lineBetween(x - half, y - half * 0.1, x + half, y - half * 0.1);
+      },
+    };
+    const markers = drawDuelMarkers(pen, this.view.markers(), tick, { x: camera.scrollX, y: camera.scrollY });
+    for (const label of labels.slice(markers.length)) label.setVisible(false);
+    const caches = drawCaches(pen, this.view.caches(), { x: camera.scrollX, y: camera.scrollY });
+    const pedestals = drawPedestals(
+      {
+        stone: (x, y, half) => {
+          graphics.fillStyle(PEDESTAL_COLOR, 1);
+          graphics.fillRect(x - half, y - half, half * 2, half * 2);
+        },
+        fruit: (x, y, radius) => {
+          graphics.fillStyle(FRUIT_COLOR, 1);
+          graphics.fillCircle(x, y, radius);
+        },
+      },
+      this.view.pedestals(),
+      { x: camera.scrollX, y: camera.scrollY },
+    );
+
+    const crates = drawCrates(
+      {
+        crate: (x, y, half) => {
+          graphics.fillStyle(CRATE_COLOR, 1);
+          graphics.fillRect(x - half, y - half, half * 2, half * 2);
+          graphics.lineStyle(2, CRATE_TRIM, 1);
+          graphics.strokeRect(x - half, y - half, half * 2, half * 2);
+          graphics.lineBetween(x - half, y - half, x + half, y + half);
+        },
+      },
+      this.view.crates(),
+      { x: camera.scrollX, y: camera.scrollY },
+    );
+
+    const status = this.view.status();
+    const own = this.view.renderPosition(this.view.selfId, now);
+    if (status !== undefined && status.protection !== "" && own !== undefined) {
+      const { x, y } = pixels(own);
+      graphics.lineStyle(2, PROTECTION_COLOR, 0.35 + 0.35 * Math.abs(Math.sin(now / 250)));
+      graphics.strokeCircle(x, y, 13 * ART_SCALE);
+    }
+
+    const report = JSON.stringify({ telegraphs, markers, caches, pedestals, crates });
+    if (report !== this.lastEncounterReport) {
+      this.report.dataset["telegraphs"] = JSON.stringify(telegraphs);
+      this.report.dataset["markers"] = JSON.stringify(markers);
+      this.report.dataset["caches"] = JSON.stringify(caches);
+      this.report.dataset["pedestals"] = JSON.stringify(pedestals);
+      this.report.dataset["crates"] = JSON.stringify(crates);
+      this.lastEncounterReport = report;
+    }
+  }
+
+  /**
+   * The final island (§5), as this player knows it: with a route, the treasure circle drawn at its point (bright while
+   * the route is active, faint while it is not), a gold mark on the minimap and an arrow off the player's own ship
+   * pointing at it; and on every ship in sight channelling a claim, a gold ring that fills as the channel runs, so
+   * nearby rivals see it. It records `data-route` (x, y, active) and `data-claiming` (ids) for the browser tests.
+   * Every decision is `treasureView`'s; this draws its shapes.
+   */
+  private drawTreasure(now: number, minimapLeft: number): void {
+    const graphics = this.treasureGraphics;
+    graphics.clear();
+    const view = treasureView(
+      {
+        claim: this.view.claim(),
+        own: this.view.renderPosition(this.view.selfId, now),
+        claiming: [...this.view.claimingShips()].map(([id, held]) => ({ id, held, at: this.view.renderPosition(id, now) })),
+        treasureRadius: this.view.treasureRadius(),
+        now,
+        minimapLeft,
+      },
+      TREASURE_GEOMETRY,
+    );
+    for (const circle of view.circles) {
+      graphics.fillStyle(TREASURE_COLOR, circle.fillAlpha);
+      graphics.fillCircle(circle.x, circle.y, circle.radius);
+      graphics.lineStyle(3, TREASURE_COLOR, circle.lineAlpha);
+      graphics.strokeCircle(circle.x, circle.y, circle.radius);
+    }
+    // An X marks the spot.
+    for (const cross of view.crosses) {
+      graphics.lineStyle(3, TREASURE_COLOR, cross.alpha);
+      graphics.lineBetween(cross.x - cross.half, cross.y - cross.half, cross.x + cross.half, cross.y + cross.half);
+      graphics.lineBetween(cross.x - cross.half, cross.y + cross.half, cross.x + cross.half, cross.y - cross.half);
+    }
+    for (const cross of view.minimapCrosses) {
+      this.minimapMarks.lineStyle(2, TREASURE_COLOR, cross.alpha);
+      this.minimapMarks.lineBetween(cross.x - cross.half, cross.y - cross.half, cross.x + cross.half, cross.y + cross.half);
+      this.minimapMarks.lineBetween(cross.x - cross.half, cross.y + cross.half, cross.x + cross.half, cross.y - cross.half);
+    }
+    for (const arrow of view.arrows) {
+      graphics.fillStyle(TREASURE_COLOR, 0.95);
+      graphics.fillTriangle(...arrow.points);
+    }
+    for (const ring of view.rings) {
+      graphics.lineStyle(2, TREASURE_COLOR, 0.35);
+      graphics.strokeCircle(ring.x, ring.y, ring.radius);
+      graphics.lineStyle(4, TREASURE_COLOR, 1);
+      graphics.beginPath();
+      graphics.arc(ring.x, ring.y, ring.radius, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * ring.fraction, false);
+      graphics.strokePath();
+    }
+    this.report.dataset["route"] = view.route;
+    this.report.dataset["claiming"] = view.claiming;
+  }
+
+  /**
+   * §3's sectors: faint 3 × 3 borders on the sea and the name of the sector the ship enters, only while the journal is
+   * open or a sector lead is active (`sectorOverlay` decides). It records `data-sectors` ("hidden", or "shown:<sector>")
+   * and `data-sector-name` for the browser tests.
+   */
+  private drawSectors(now: number, own: { x: number; y: number } | undefined): void {
+    const journal = this.view.journal();
+    const { overlay, entered } = sectorOverlay({ journalOpen: journal.open, entries: journal.entries, own, entered: this.sectorEntered, now });
+    this.sectorEntered = entered;
+    const report = `${overlay.visible ? `shown:${overlay.sector}` : "hidden"}|${overlay.label}`;
+    if (report === this.lastSectorReport) return;
+    this.lastSectorReport = report;
+    this.drawSectorLines(overlay);
+    this.sectorLabel.setText(overlay.label).setVisible(overlay.label !== "");
+    this.report.dataset["sectors"] = overlay.visible ? `shown:${overlay.sector}` : "hidden";
+    this.report.dataset["sectorName"] = overlay.label;
+  }
+
+  private drawSectorLines(overlay: SectorOverlay): void {
+    const graphics = this.sectorLines;
+    graphics.clear();
+    graphics.lineStyle(2, SECTOR_COLOR, 0.35);
+    for (const tile of overlay.columns) graphics.lineBetween(tile * TILE_PIXELS, 0, tile * TILE_PIXELS, WORLD_HEIGHT);
+    for (const tile of overlay.rows) graphics.lineBetween(0, tile * TILE_PIXELS, WORLD_WIDTH, tile * TILE_PIXELS);
+  }
+
+  /** A round hull with a bow pointing along +x; the player's own ship gets a pale ring. */
+  private drawShip(color: number, own: boolean): Phaser.GameObjects.Graphics {
+    const graphics = this.add.graphics();
+    graphics.setDepth(2);
+    graphics.fillStyle(color, 1);
+    graphics.fillCircle(0, 0, 6 * ART_SCALE);
+    graphics.fillTriangle(3 * ART_SCALE, -5 * ART_SCALE, 12 * ART_SCALE, 0, 3 * ART_SCALE, 5 * ART_SCALE);
+    if (own) {
+      graphics.lineStyle(2, OWN_RING_COLOR, 1);
+      graphics.strokeCircle(0, 0, 10 * ART_SCALE);
+    }
+    return graphics;
+  }
+}
+
+/**
+ * The match's one game (one Phaser game per page): the sea, and the arena it gives way to for a duel at sea. The page
+ * switches between them; `data-scene` on the parent says which is showing.
+ *
+ * It uses Phaser's canvas renderer, like the standalone arena: on a machine without a GPU, WebGL runs in software on
+ * the main thread and starves the duel client's 4 ms tick (measured in headless Chromium by the `sea-duel` browser
+ * test: a 95th-percentile tick interval of 135 ms with `Phaser.AUTO`); the canvas renderer keeps it under a frame.
+ */
+export class MatchGame {
+  readonly game: Phaser.Game;
+
+  constructor(
+    private readonly parent: HTMLElement,
+    view: MatchView,
+  ) {
+    this.game = new Phaser.Game({
+      type: Phaser.CANVAS,
+      parent,
+      width: VIEW_WIDTH,
+      height: VIEW_HEIGHT,
+      backgroundColor: SEA_COLOR,
+      banner: false,
+      audio: { noAudio: true },
+      // The sea starts; the arena is added asleep and started with each duel's source.
+      scene: [new SeaScene(view, parent), new ArenaScene(parent)],
+    });
+    parent.dataset["scene"] = "sea";
+  }
+
+  /** A duel at sea: the sea sleeps (it keeps its state) and the arena draws this duel. */
+  showArena(source: ArenaSource): void {
+    this.game.scene.sleep("sea");
+    this.game.scene.start("arena", { source });
+    this.parent.dataset["scene"] = "arena";
+  }
+
+  /** Back to the world: the arena stops and the sea wakes where it was. */
+  showSea(): void {
+    this.game.scene.stop("arena");
+    this.game.scene.wake("sea");
+    this.parent.dataset["scene"] = "sea";
+  }
+}

@@ -1,0 +1,224 @@
+import { Client, ErrorCode, type Room } from "@colyseus/sdk";
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import {
+  MALFORMED_MATCH_REQUEST_MESSAGE,
+  MATCH_CODE_REQUIRED_MESSAGE,
+  MATCH_ROOM,
+  MATCH_UNAVAILABLE_MESSAGE,
+  matchFullMessage,
+  NO_SUCH_MATCH_MESSAGE,
+  PROTOCOL_VERSION,
+} from "@pirate-sea-race/protocol";
+import { MatchRoom, startGameServer, type MatchMetadata, type RunningGameServer } from "@pirate-sea-race/server";
+import type { MatchStateSchema } from "@pirate-sea-race/server/schema";
+import { HeadlessClient, newCreateToken } from "@pirate-sea-race/test-tools";
+
+/**
+ * Private-match admission (skeleton-fixes decisions): a private match can be neither joined nor have a seat reserved
+ * in it without its code, whichever matchmaker method the caller uses over HTTP.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+const players: HeadlessClient[] = [];
+const rooms: Room<unknown, MatchStateSchema>[] = [];
+
+async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
+  const joined = await client;
+  players.push(joined);
+  return joined;
+}
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  await Promise.all(players.splice(0).map((player) => player.leave()));
+  await Promise.all(rooms.splice(0).map((room) => room.leave(true).catch(() => undefined)));
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+type Method = "join" | "joinOrCreate" | "joinById";
+
+/** One raw matchmaker request through the SDK, as any HTTP caller could send it. Joined rooms are left afterwards. */
+async function request(method: Method, target: string, options: Record<string, unknown>): Promise<Room<unknown, MatchStateSchema>> {
+  const client = new Client(endpoint);
+  let room: Room<unknown, MatchStateSchema>;
+  if (method === "join") room = await client.join<MatchStateSchema>(target, options);
+  else if (method === "joinOrCreate") room = await client.joinOrCreate<MatchStateSchema>(target, options);
+  else room = await client.joinById<MatchStateSchema>(target, options);
+  rooms.push(room);
+  return room;
+}
+
+/** The refusal a request ends with; fails the test if the request succeeds. */
+async function refusal(attempt: Promise<unknown>): Promise<{ code: unknown; message: string }> {
+  const error: unknown = await attempt.then(
+    () => expect.fail("the request was admitted"),
+    (reason: unknown) => reason,
+  );
+  return { code: (error as { code?: unknown }).code, message: (error as Error).message };
+}
+
+function listingOf(roomId: string) {
+  return matchMaker.query({ roomId });
+}
+
+function roomOf(player: HeadlessClient): MatchRoom {
+  return matchMaker.getLocalRoomById(player.room.roomId) as unknown as MatchRoom;
+}
+
+/** The host's ship still moves under its own input: the room kept running. */
+async function expectRunning(host: HeadlessClient): Promise<void> {
+  expect(host.connected).toBe(true);
+  const start = host.ship()!;
+  const direction = start.x < (seaMap.widthTiles * seaMap.subUnitsPerTile) / 2 ? 1 : -1;
+  await host.hold({ moveX: direction, moveY: 0 }, 300);
+  await host.waitFor(() => (host.ship()!.x - start.x) * direction > 0);
+}
+
+describe("private match admission", () => {
+  it("refuses join, joinOrCreate and joinById without the code, with a wrong code, or with a code and a token", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const other = await track(HeadlessClient.create(endpoint));
+    const unknownCode = host.code === "ZZZZZ9" || other.code === "ZZZZZ9" ? "ZZZZZ8" : "ZZZZZ9";
+    const version = { protocolVersion: PROTOCOL_VERSION };
+
+    for (const method of ["join", "joinOrCreate"] as const) {
+      expect(await refusal(request(method, MATCH_ROOM, version))).toEqual({ code: 400, message: MALFORMED_MATCH_REQUEST_MESSAGE });
+      expect(await refusal(request(method, MATCH_ROOM, { ...version, code: unknownCode }))).toEqual({
+        code: 404,
+        message: NO_SUCH_MATCH_MESSAGE,
+      });
+      expect(await refusal(request(method, MATCH_ROOM, { ...version, code: host.code, createToken: newCreateToken() }))).toEqual({
+        code: 400,
+        message: MALFORMED_MATCH_REQUEST_MESSAGE,
+      });
+    }
+
+    const roomId = host.room.roomId;
+    expect(await refusal(request("joinById", roomId, version))).toEqual({ code: 400, message: MALFORMED_MATCH_REQUEST_MESSAGE });
+    expect(await refusal(request("joinById", roomId, { ...version, code: unknownCode }))).toEqual({
+      code: 404,
+      message: NO_SUCH_MATCH_MESSAGE,
+    });
+    // Another live match's code passes the matchmaker's check but not the room's own.
+    expect(await refusal(request("joinById", roomId, { ...version, code: other.code }))).toEqual({
+      code: 404,
+      message: NO_SUCH_MATCH_MESSAGE,
+    });
+    expect(await refusal(request("joinById", roomId, { ...version, code: host.code, createToken: newCreateToken() }))).toEqual({
+      code: 400,
+      message: MALFORMED_MATCH_REQUEST_MESSAGE,
+    });
+    // A token passes the matchmaker's check as a create, but the room admits only its own creator's token.
+    expect(await refusal(request("joinById", roomId, { ...version, createToken: newCreateToken() }))).toEqual({
+      code: 403,
+      message: MATCH_CODE_REQUIRED_MESSAGE,
+    });
+    // A create request that carries a code instead of a token makes no match.
+    expect(await refusal(new Client(endpoint).create(MATCH_ROOM, { ...version, code: host.code }))).toEqual({
+      code: ErrorCode.MATCHMAKE_INVALID_CRITERIA,
+      message: MATCH_UNAVAILABLE_MESSAGE,
+    });
+
+    expect(host.playerCount).toBe(1);
+    expect(roomOf(host).clients.length).toBe(1);
+    await expectRunning(host);
+    // The real code still gets in, by every join method.
+    const guest = await request("join", MATCH_ROOM, { ...version, code: host.code });
+    const joinOrCreateGuest = await request("joinOrCreate", MATCH_ROOM, { ...version, code: host.code });
+    const byIdGuest = await request("joinById", roomId, { ...version, code: host.code });
+    for (const room of [guest, joinOrCreateGuest, byIdGuest]) expect(room.roomId).toBe(roomId);
+    await host.waitFor(() => host.playerCount === 4);
+  });
+
+  it("reserves no seat for requests without the code, so players with the code still fill the match", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const roomId = host.room.roomId;
+    const version = { protocolVersion: PROTOCOL_VERSION };
+    const attempts: Promise<unknown>[] = [];
+    for (let round = 0; round < 4; round++) {
+      attempts.push(
+        refusal(request("join", MATCH_ROOM, version)),
+        refusal(request("joinOrCreate", MATCH_ROOM, version)),
+        refusal(request("joinById", roomId, version)),
+        refusal(request("joinById", roomId, { ...version, createToken: newCreateToken() })),
+      );
+    }
+    await Promise.all(attempts);
+    const [listing] = await listingOf(roomId);
+    expect(listing?.clients).toBe(1);
+    expect(listing?.locked).toBe(false);
+
+    for (let seat = 0; seat < 7; seat++) await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 8);
+    await expectRunning(host);
+  });
+
+  it("creates a new match for a joinOrCreate carrying a token, never landing in an existing one", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const version = { protocolVersion: PROTOCOL_VERSION };
+    const created = new Set<string>();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const room = await request("joinOrCreate", MATCH_ROOM, { ...version, createToken: newCreateToken() });
+      expect(room.roomId).not.toBe(host.room.roomId);
+      expect(created.has(room.roomId)).toBe(false);
+      created.add(room.roomId);
+    }
+    // A plain join carrying a token matches no listing at all.
+    expect(await refusal(request("join", MATCH_ROOM, { ...version, createToken: newCreateToken() }))).toEqual({
+      code: ErrorCode.MATCHMAKE_INVALID_CRITERIA,
+      message: "no rooms found with provided criteria",
+    });
+    expect(host.playerCount).toBe(1);
+    for (const roomId of created) expect((await listingOf(roomId))[0]?.clients).toBe(1);
+  });
+
+  it("keeps the creator's token out of the listing and admits it once", async () => {
+    const createToken = newCreateToken();
+    const creator = await new Client(endpoint).create<MatchStateSchema>(MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION, createToken });
+    rooms.push(creator);
+    const listings = await matchMaker.query({ name: MATCH_ROOM });
+    expect(listings.length).toBeGreaterThan(0);
+    for (const listing of listings) expect(JSON.stringify(listing)).not.toContain(createToken);
+    const [own] = await listingOf(creator.roomId);
+    const room = matchMaker.getLocalRoomById(creator.roomId) as unknown as MatchRoom;
+    expect(own?.metadata).toEqual({ code: room.state.code, custom: true } satisfies MatchMetadata);
+    expect(await matchMaker.query({ name: MATCH_ROOM, createToken })).toEqual([]);
+
+    // The token was spent on the creator's seat: replaying it does not get a second one.
+    expect(await refusal(request("joinById", creator.roomId, { protocolVersion: PROTOCOL_VERSION, createToken }))).toEqual({
+      code: 403,
+      message: MATCH_CODE_REQUIRED_MESSAGE,
+    });
+    // Nor does it lead anyone into this match: a request carrying it can only create another one.
+    const elsewhere = await request("joinOrCreate", MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION, createToken });
+    expect(elsewhere.roomId).not.toBe(creator.roomId);
+    expect(room.clients.length).toBe(1);
+  });
+
+  it("tells the loser of a race for the last seat that the match is full, not that it is missing", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let seat = 0; seat < 6; seat++) await track(HeadlessClient.join(endpoint, host.code));
+    const racers = await Promise.allSettled([0, 1, 2].map(() => HeadlessClient.join(endpoint, host.code)));
+    const joined = racers.flatMap((racer) => (racer.status === "fulfilled" ? [racer.value] : []));
+    players.push(...joined);
+    expect(joined).toHaveLength(1);
+    // The loser gets the server's own full-match refusal, or, when both passed its check at once, Colyseus's
+    // generic "no rooms found", which the web client words as MATCH_UNAVAILABLE_MESSAGE (apps/web connection.test.ts).
+    for (const racer of racers) {
+      if (racer.status === "fulfilled") continue;
+      const { code, message } = racer.reason as { code: unknown; message: string };
+      if (code === ErrorCode.MATCHMAKE_INVALID_CRITERIA) continue;
+      expect({ code, message }).toEqual({ code: 409, message: matchFullMessage(8) });
+    }
+    await host.waitFor(() => host.playerCount === 8);
+  });
+});

@@ -1,0 +1,122 @@
+import { DuelMessageType, type DuelReadyMessage } from "@pirate-sea-race/protocol";
+import type { MatchRoom } from "./connection.js";
+import type { DuelRoom } from "./duelConnection.js";
+
+/** A duel's synced lobby as the client reads it: a duel room's own state, or this fighter's duel in a match's state. */
+export interface DuelLobby {
+  readonly code: string;
+  readonly practice: boolean;
+  readonly phase: string;
+  readonly countdown: number;
+  readonly seed: number;
+  /** Both fighters' kits, player one's first ("ember,duelist"): part of the duel's frame-0 state. */
+  readonly kits: string;
+  readonly inputDelay: number;
+  readonly seats: Iterable<{ readonly sessionId: string; readonly slot: number; readonly connected: boolean }>;
+  readonly winner: number;
+  readonly reason: string;
+}
+
+/**
+ * What a `DuelClient` needs from the room it plays over, so the same client runs a standalone duel (`duelRoomTransport`)
+ * or a duel at sea inside a match room (`SeaDuelRouter`): the lobby, the duel messages both ways, and the connection's
+ * drop, return and end. Every subscription returns its unsubscribe.
+ */
+export interface DuelTransport {
+  readonly sessionId: string;
+  /** The duel's lobby, or undefined before it is known (or at sea, once the duel is over and gone). */
+  lobby(): DuelLobby | undefined;
+  send(type: string, message: unknown): void;
+  onMessage(type: string, handler: (message: unknown) => void): () => void;
+  onDrop(handler: () => void): () => void;
+  onReconnect(handler: () => void): () => void;
+  onLeave(handler: () => void): () => void;
+  /** This fighter's arena is loaded (§6): at sea the fight waits for both; a duel room needs no report. */
+  ready(): void;
+}
+
+type Signal = { (handler: () => void): unknown; remove(handler: () => void): void };
+
+function subscribe(signal: Signal, handler: () => void): () => void {
+  signal(handler);
+  return () => signal.remove(handler);
+}
+
+/** The duel's own room: the lobby is the room's state. */
+export function duelRoomTransport(room: DuelRoom): DuelTransport {
+  return {
+    sessionId: room.sessionId,
+    lobby: () => room.state,
+    send: (type, message) => room.send(type, message),
+    onMessage: (type, handler) => room.onMessage(type, handler),
+    onDrop: (handler) => subscribe(room.onDrop as unknown as Signal, handler),
+    onReconnect: (handler) => subscribe(room.onReconnect as unknown as Signal, handler),
+    onLeave: (handler) => subscribe(room.onLeave as unknown as Signal, handler),
+    ready: () => undefined,
+  };
+}
+
+/** The duel message types a match room sends its fighters. */
+const SERVER_DUEL_MESSAGES = [DuelMessageType.Probe, DuelMessageType.Frames] as const;
+/** Messages kept for a duel client that is not listening yet (the first probes can beat the lobby's patch). */
+const BUFFERED_MESSAGES = 16;
+
+/**
+ * Duels at sea on one match room: it listens for the duel messages once, for the whole match, and hands them to the
+ * duel client of the moment (a message that arrives before that client exists waits for it). `current()` names this
+ * player's duel in the synced state, whose key changes with every new duel; `transport(key)` is that duel's seam.
+ */
+export class SeaDuelRouter {
+  private readonly handlers = new Map<string, Set<(message: unknown) => void>>();
+  private readonly waiting: { type: string; message: unknown }[] = [];
+
+  constructor(private readonly room: MatchRoom) {
+    for (const type of SERVER_DUEL_MESSAGES) {
+      room.onMessage(type, (message: unknown) => {
+        const listeners = this.handlers.get(type);
+        if (listeners === undefined || listeners.size === 0) {
+          this.waiting.push({ type, message });
+          if (this.waiting.length > BUFFERED_MESSAGES) this.waiting.shift();
+          return;
+        }
+        for (const listener of listeners) listener(message);
+      });
+    }
+  }
+
+  /** Drops messages nobody took, when a duel client goes: they belong to the duel that ended. */
+  forget(): void {
+    this.waiting.length = 0;
+  }
+
+  /** The key of this player's duel in the match state, if the room holds one for it. */
+  current(): string | undefined {
+    const duels = this.room.state?.duels;
+    if (duels === undefined) return undefined;
+    for (const [key, duel] of duels.entries()) if ([...duel.seats].some((seat) => seat.sessionId === this.room.sessionId)) return key;
+    return undefined;
+  }
+
+  transport(key: string): DuelTransport {
+    const room = this.room;
+    return {
+      sessionId: room.sessionId,
+      lobby: () => room.state?.duels?.get(key),
+      send: (type, message) => room.send(type, message),
+      onMessage: (type, handler) => {
+        let listeners = this.handlers.get(type);
+        if (listeners === undefined) this.handlers.set(type, (listeners = new Set()));
+        listeners.add(handler);
+        for (const waiting of this.waiting.filter((each) => each.type === type)) {
+          this.waiting.splice(this.waiting.indexOf(waiting), 1);
+          handler(waiting.message);
+        }
+        return () => listeners.delete(handler);
+      },
+      onDrop: (handler) => subscribe(room.onDrop as unknown as Signal, handler),
+      onReconnect: (handler) => subscribe(room.onReconnect as unknown as Signal, handler),
+      onLeave: (handler) => subscribe(room.onLeave as unknown as Signal, handler),
+      ready: () => room.send(DuelMessageType.Ready, {} satisfies DuelReadyMessage),
+    };
+  }
+}

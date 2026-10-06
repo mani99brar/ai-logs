@@ -1,0 +1,625 @@
+import { createSeaMap, isNavigable, type SeaMapDefinition } from "@pirate-sea-race/content";
+import { describe, expect, it } from "vitest";
+import {
+  createEncounterConfig,
+  createEncounterState,
+  duelMarkers,
+  hashState,
+  stepEncounters,
+  tileCentre,
+  tileOf,
+  type DuelReport,
+  type EncounterConfig,
+  type EncounterEvent,
+  type EncounterPlayerInput,
+  type EncounterState,
+  type EncounterStateOptions,
+} from "./index.js";
+
+/**
+ * A 40 × 24 test sea: land at column 20, rows 3–6, a shoal at (20, 10), and a dock in each corner (ids 0–3:
+ * (1,1), (38,1), (1,22), (38,22)).
+ */
+const ROWS = Array.from({ length: 24 }, (_, row) => {
+  const tiles = Array.from({ length: 40 }, () => ".");
+  if (row >= 3 && row <= 6) tiles[20] = "#";
+  if (row === 10) tiles[20] = "%";
+  if (row === 1 || row === 22) tiles[1] = tiles[38] = "D";
+  return tiles.join("");
+});
+const map: SeaMapDefinition = createSeaMap({ name: "test", widthTiles: 40, heightTiles: 24, rows: ROWS, islands: [], spawnSlots: [], hub: { tileX: 20, tileY: 12 } });
+const config = createEncounterConfig({ map });
+const TILE = map.subUnitsPerTile;
+const at = (tileX: number, tileY: number) => tileCentre(map, { tileX, tileY });
+
+function ship(id: string, tileX: number, tileY: number, heading = 0, extra: Partial<EncounterPlayerInput> = {}): EncounterPlayerInput {
+  return { id, mode: "ship", ...at(tileX, tileY), heading, connected: true, attack: false, ready: false, protectionEndedBy: null, ...extra };
+}
+
+interface TickOptions {
+  readonly press?: readonly string[];
+  readonly reports?: readonly DuelReport[];
+  readonly matchOver?: boolean;
+}
+
+/** A scripted match: players persist between ticks; presses last one tick. */
+class World {
+  state: EncounterState;
+  readonly players = new Map<string, EncounterPlayerInput>();
+  readonly log: EncounterEvent[] = [];
+
+  constructor(
+    players: readonly EncounterPlayerInput[],
+    options: EncounterStateOptions = {},
+    readonly cfg: EncounterConfig = config,
+  ) {
+    this.state = createEncounterState(cfg, options);
+    for (const player of players) this.players.set(player.id, player);
+  }
+
+  get tick(): number {
+    return this.state.tick;
+  }
+
+  set(id: string, change: Partial<EncounterPlayerInput>): void {
+    this.players.set(id, { ...this.players.get(id)!, ...change });
+  }
+
+  remove(id: string): void {
+    this.players.delete(id);
+  }
+
+  step(options: TickOptions = {}): EncounterEvent[] {
+    const press = new Set(options.press ?? []);
+    const players = [...this.players.values()].map((player) => ({ ...player, attack: press.has(player.id) }));
+    const result = stepEncounters(this.cfg, this.state, { tick: this.state.tick + 1, players, reports: options.reports ?? [], matchOver: options.matchOver ?? false });
+    this.state = result.state;
+    this.log.push(...result.events);
+    // Reported protection ends are one-tick signals.
+    for (const player of this.players.values()) if (player.protectionEndedBy !== null) this.set(player.id, { protectionEndedBy: null });
+    return [...result.events];
+  }
+
+  /** Steps until `tick` has been processed, returning every event on the way. */
+  runTo(tick: number): EncounterEvent[] {
+    const events: EncounterEvent[] = [];
+    while (this.state.tick < tick) events.push(...this.step());
+    return events;
+  }
+
+  record(id: string) {
+    return this.state.players.find((player) => player.id === id);
+  }
+}
+
+const kinds = (events: readonly EncounterEvent[]) => events.map((event) => event.kind);
+const started = (events: readonly EncounterEvent[]) => events.filter((event) => event.kind === "attempt-started");
+const ofKind = <K extends EncounterEvent["kind"]>(events: readonly EncounterEvent[], kind: K) =>
+  events.filter((event): event is Extract<EncounterEvent, { kind: K }> => event.kind === kind);
+
+/** Presses once on tick 1 and runs to the landing tick (21). */
+function grapple(world: World, attacker: string): EncounterEvent[] {
+  const events = world.step({ press: [attacker] });
+  return [...events, ...world.runTo(1 + config.modes.ship.windupTicks)];
+}
+
+describe("starting an attempt (§6)", () => {
+  it("picks the nearest eligible ship in range, line of sight and the front cone, and locks the aim toward it", () => {
+    const world = new World([ship("a", 5, 12), ship("far", 9, 12), ship("near", 8, 12), ship("behind", 3, 12)]);
+    const events = world.step({ press: ["a"] });
+    expect(events).toEqual([{ kind: "attempt-started", tick: 1, attackerId: "a", defenderId: "near", mode: "ship", aim: 0, landTick: 21 }]);
+    expect(world.state.attempts).toEqual([{ attackerId: "a", defenderId: "near", mode: "ship", aim: 0, startTick: 1, landTick: 21 }]);
+  });
+
+  it("takes a target at the ±8 cone's edge and not one just outside it", () => {
+    // (2, -2) tiles is heading 56, 8 off heading 0; (1, -2) is heading 53, 11 off.
+    const edge = new World([ship("a", 5, 12), ship("edge", 7, 10), ship("ahead", 9, 12)]);
+    expect(started(edge.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "edge", aim: 56 });
+    const outside = new World([ship("a", 5, 12), ship("steep", 6, 10), ship("ahead", 9, 12)]);
+    expect(started(outside.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "ahead", aim: 0 });
+  });
+
+  it("reaches exactly the grapple range and not one sub-unit further", () => {
+    const world = new World([ship("a", 5, 12), { ...ship("b", 11, 12), x: at(5, 12).x + 6 * TILE + 1 }]);
+    expect(world.step({ press: ["a"] })).toEqual([]);
+    world.set("b", { x: at(5, 12).x + 6 * TILE });
+    expect(started(world.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "b" });
+  });
+
+  it("passes over a nearer ship behind land, but not one behind a shoal", () => {
+    // Land at column 20 rows 3–6; a shoal at (20, 10).
+    const land = new World([ship("a", 17, 5), ship("hidden", 22, 5), ship("seen", 17, 9, 16)]);
+    land.set("a", { heading: 0 });
+    expect(land.step({ press: ["a"] })).toEqual([]);
+    const shoal = new World([ship("a", 17, 10), ship("reef", 22, 10)]);
+    expect(started(shoal.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "reef" });
+  });
+
+  it("breaks a distance tie to the lower id, wherever the players stand and whatever order they arrive in", () => {
+    for (const [first, second] of [
+      ["zed", "bob"],
+      ["bob", "zed"],
+    ] as const) {
+      const world = new World([ship(first, 8, 11), ship("a", 5, 12), ship(second, 8, 13)]);
+      expect(started(world.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "bob" });
+    }
+  });
+
+  it("starts nothing and costs nothing when a press finds no target", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 12, 12)], { spawnProtected: ["a"] });
+    expect(world.step({ press: ["a"] })).toEqual([]);
+    expect(world.state.attempts).toEqual([]);
+    // No cooldown and the attacker keeps their protection.
+    expect(world.record("a")).toEqual({ id: "a", protection: { source: "spawn", endTick: 900 }, cooldownEndTick: 0, respawn: null });
+    world.set("b", { ...at(10, 12) });
+    expect(kinds(world.step({ press: ["a"] }))).toEqual(["protection-ended", "attempt-started"]);
+  });
+
+  it("ignores a press while the player's own attempt winds up", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 6, 12)]);
+    world.step({ press: ["a"] });
+    expect(world.step({ press: ["a"] })).toEqual([]);
+    expect(world.state.attempts).toHaveLength(1);
+  });
+});
+
+describe("escape (§6)", () => {
+  it("lands a hit on a defender who stayed", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
+    const events = grapple(world, "a");
+    expect(ofKind(events, "duel-reserved")).toEqual([
+      { kind: "duel-reserved", tick: 21, duelId: "duel:21:1:a:b", mode: "ship", players: ["a", "b"], x: Math.floor((at(5, 12).x + at(8, 12).x) / 2), y: at(5, 12).y },
+    ]);
+    expect(world.state.attempts).toEqual([]);
+  });
+
+  it("misses a defender who left the range, costing the attacker the cooldown", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
+    world.step({ press: ["a"] });
+    world.runTo(20);
+    world.set("b", at(12, 12));
+    expect(world.step()).toEqual([{ kind: "attempt-missed", tick: 21, attackerId: "a", defenderId: "b", reason: "out-of-range", cooldownEndTick: 141 }]);
+  });
+
+  it("misses a defender who left the aim, even within range", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
+    world.step({ press: ["a"] });
+    world.runTo(20);
+    // (3, -3) tiles: heading 56, 8 off the locked aim of 0.
+    world.set("b", at(8, 9));
+    expect(ofKind(world.step(), "attempt-missed")[0]).toMatchObject({ reason: "out-of-aim" });
+  });
+
+  it("misses a defender who slipped behind land", () => {
+    const world = new World([ship("a", 16, 7), ship("b", 21, 7)]);
+    world.step({ press: ["a"] });
+    world.runTo(20);
+    // (5, -1) tiles: heading 62, inside the aim, but the line crosses the land at (20, 6).
+    world.set("b", at(21, 6));
+    expect(ofKind(world.step(), "attempt-missed")[0]).toMatchObject({ reason: "no-line-of-sight" });
+  });
+
+  it("follows the aim while the defender stays inside it: moving within ±4 headings is no escape", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 9, 12)]);
+    world.step({ press: ["a"] });
+    world.runTo(20);
+    world.set("b", at(9, 11)); // (4, -1): heading 60, 4 off.
+    expect(kinds(world.step())).toEqual(["duel-reserved"]);
+  });
+});
+
+describe("cooldown on a miss only", () => {
+  it("refuses presses until the six seconds are over, then starts again", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
+    world.step({ press: ["a"] });
+    world.runTo(20);
+    world.set("b", at(12, 12));
+    world.step();
+    world.set("b", at(8, 12));
+    for (let tick = 22; tick < 141; tick++) expect(world.step({ press: ["a"] })).toEqual([]);
+    expect(world.record("a")?.cooldownEndTick).toBe(141);
+    expect(started(world.step({ press: ["a"] }))).toHaveLength(1);
+    expect(world.tick).toBe(141);
+    // A record with nothing left to remember is dropped.
+    expect(world.record("a")).toBeUndefined();
+  });
+
+  it("costs nothing for a preempted hit or a cancelled attempt", () => {
+    // b's attempt on c loses to a's closer hit on b, so b is reserved: a preemption.
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 10, 12), ship("d", 5, 20), ship("e", 7, 20)]);
+    world.step({ press: ["a", "b", "d"] });
+    world.set("d", { connected: false });
+    const events = world.runTo(21);
+    expect(ofKind(events, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "b", defenderId: "c", reason: "conflict" }]);
+    expect(ofKind(events, "attempt-cancelled")).toEqual([{ kind: "attempt-cancelled", tick: 2, attackerId: "d", defenderId: "e", reason: "attacker-ineligible" }]);
+    expect(world.record("d")).toBeUndefined();
+    world.set("d", { connected: true });
+    expect(started(world.step({ press: ["d"] }))).toHaveLength(1);
+  });
+});
+
+describe("eligibility at the start and at landing", () => {
+  it("never targets a protected defender, and a protected attacker's start ends their own protection", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 9, 12)], { spawnProtected: ["a", "b"] });
+    const events = world.step({ press: ["a"] });
+    expect(events).toEqual([
+      { kind: "protection-ended", tick: 1, playerId: "a", reason: "attack" },
+      { kind: "attempt-started", tick: 1, attackerId: "a", defenderId: "c", mode: "ship", aim: 0, landTick: 21 },
+    ]);
+    expect(world.record("b")?.protection).toEqual({ source: "spawn", endTick: 900 });
+  });
+
+  it("targets a protected player who presses on the same tick only from the next tick, whatever the input order", () => {
+    for (const order of [["a", "b"], ["b", "a"]]) {
+      const players = { a: ship("a", 5, 12), b: ship("b", 7, 12, 32) };
+      const world = new World(order.map((id) => players[id as "a" | "b"]), { spawnProtected: ["b"] });
+      const events = world.step({ press: ["a", "b"] });
+      expect(started(events).map((event) => [event.attackerId, event.defenderId])).toEqual([["b", "a"]]);
+    }
+  });
+
+  it("misses a defender reserved by someone else's hit during the windup, and never targets a reserved one", () => {
+    const world2 = new World([ship("a", 3, 12), ship("b", 7, 12), ship("c", 9, 12, 32)]);
+    world2.step({ press: ["c"] }); // c → b lands on tick 21
+    world2.runTo(5);
+    world2.step({ press: ["a"] }); // a → b, lands on tick 26
+    expect(ofKind(world2.runTo(21), "duel-reserved")).toHaveLength(1);
+    expect(world2.step({ press: ["a"] })).toEqual([]); // already attacking; and b is reserved anyway
+    expect(ofKind(world2.runTo(26), "attempt-missed")).toEqual([
+      { kind: "attempt-missed", tick: 26, attackerId: "a", defenderId: "b", reason: "defender-ineligible", cooldownEndTick: 146 },
+    ]);
+    // A fresh attacker finds no target among the reserved.
+    const world3 = new World([ship("a", 3, 12), ship("b", 7, 12), ship("c", 9, 12, 32)]);
+    world3.step({ press: ["c"] });
+    world3.runTo(21);
+    expect(world3.step({ press: ["a"] })).toEqual([]);
+  });
+
+  it("neither lets a respawning loser attack nor be attacked", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
+    world.set("a", { ready: true });
+    world.set("b", { ready: true });
+    grapple(world, "a");
+    world.runTo(81);
+    world.step({ reports: [{ kind: "end", duelId: "duel:21:1:a:b", tick: 82, outcome: "win", winner: "a" }] });
+    world.step({ reports: [{ kind: "settled", duelId: "duel:21:1:a:b", tick: 83 }] });
+    expect(world.record("b")?.respawn).toMatchObject({ respawnTick: 382 });
+    world.players.set("c", ship("c", 6, 12));
+    world.set("b", { heading: 32 });
+    expect(world.step({ press: ["c", "b"] })).toEqual([]);
+  });
+
+  it("refuses new attempts at the cap of four duels and preempts a hit that would exceed it, without cooldown", () => {
+    const pairs = [1, 8, 15, 22].flatMap((row, index) => [ship(`p${index}a`, 3, row), ship(`p${index}b`, 5, row)]);
+    const world = new World([...pairs, ship("x", 30, 12), ship("y", 32, 12)]);
+    world.step({ press: ["p0a", "p1a", "p2a", "p3a"] });
+    expect(ofKind(world.runTo(21), "duel-reserved")).toHaveLength(4);
+    expect(world.step({ press: ["x"] })).toEqual([]);
+    expect(duelMarkers(world.state)).toHaveLength(4);
+
+    // Three duels running, two hits landing together: the nearer takes the last place.
+    const three = [1, 8, 15].flatMap((row, index) => [ship(`p${index}a`, 3, row), ship(`p${index}b`, 5, row)]);
+    const race = new World([...three, ship("q", 28, 4), ship("r", 30, 4), ship("s", 28, 16), ship("t", 31, 16)]);
+    race.step({ press: ["p0a", "p1a", "p2a", "q", "s"] });
+    const events = race.runTo(21);
+    expect(ofKind(events, "duel-reserved").map((event) => event.players)).toEqual([
+      ["p0a", "p0b"],
+      ["p1a", "p1b"],
+      ["p2a", "p2b"],
+      ["q", "r"],
+    ]);
+    expect(ofKind(events, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "s", defenderId: "t", reason: "duel-cap" }]);
+    expect(race.record("s")).toBeUndefined();
+  });
+
+  it("keeps modes apart: a ship never grapples a player on foot, and changing mode during the windup escapes", () => {
+    const world = new World([ship("a", 5, 12), { ...ship("walker", 6, 12), mode: "foot" }]);
+    expect(world.step({ press: ["a", "walker"] })).toEqual([]);
+    const escape = new World([ship("a", 5, 12), ship("b", 7, 12)]);
+    escape.step({ press: ["a"] });
+    escape.set("b", { mode: "foot" });
+    expect(ofKind(escape.runTo(21), "attempt-missed")[0]).toMatchObject({ reason: "defender-ineligible" });
+  });
+
+  it("lets a disconnected defender be attacked (§12) but not a disconnected attacker start", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12, 32, { connected: false })]);
+    expect(world.step({ press: ["b"] })).toEqual([]);
+    world.step({ press: ["a"] });
+    expect(ofKind(world.runTo(22), "duel-reserved")).toHaveLength(1);
+  });
+
+  it("cancels an attempt whose attacker leaves the match, with no cooldown", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12)]);
+    world.step({ press: ["a"] });
+    world.remove("a");
+    expect(world.step()).toEqual([{ kind: "attempt-cancelled", tick: 2, attackerId: "a", defenderId: "b", reason: "attacker-ineligible" }]);
+  });
+});
+
+describe("same-tick resolution (§5)", () => {
+  it("resolves a chain by distance: A→B and B→C on one tick", () => {
+    const chain = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 10, 12)]);
+    chain.step({ press: ["a", "b"] });
+    expect(kinds(chain.runTo(21))).toEqual(["duel-reserved", "attempt-preempted"]);
+    expect(chain.state.duels.map((duel) => duel.players)).toEqual([["a", "b"]]);
+
+    const reversed = new World([ship("a", 4, 12), ship("b", 7, 12), ship("c", 9, 12)]);
+    reversed.step({ press: ["a", "b"] });
+    const reversedEvents = reversed.runTo(21);
+    expect(ofKind(reversedEvents, "duel-reserved").map((event) => event.players)).toEqual([["b", "c"]]);
+    expect(ofKind(reversedEvents, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "a", defenderId: "b", reason: "conflict" }]);
+  });
+
+  it("resolves mutual attacks A→B and B→A to the lower attacker id", () => {
+    for (const [left, right] of [
+      ["a", "b"],
+      ["b", "a"],
+    ] as const) {
+      const world = new World([ship(left, 5, 12, 0), ship(right, 7, 12, 32)]);
+      world.step({ press: [left, right] });
+      expect(world.state.attempts).toHaveLength(2);
+      const events = world.runTo(21);
+      expect(ofKind(events, "duel-reserved")[0]!.players).toEqual(["a", "b"]);
+      expect(ofKind(events, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "b", defenderId: "a", reason: "conflict" }]);
+    }
+  });
+
+  it("cancels the pending attempt of a player reserved as a defender", () => {
+    const world = new World([ship("a", 5, 12, 0), ship("b", 7, 12, 32)]);
+    world.step({ press: ["a"] });
+    world.runTo(4);
+    world.step({ press: ["b"] });
+    expect(world.runTo(21).filter((event) => event.kind !== "duel-reserved")).toEqual([
+      { kind: "attempt-cancelled", tick: 21, attackerId: "b", defenderId: "a", reason: "attacker-ineligible" },
+    ]);
+  });
+});
+
+describe("reservation and transition", () => {
+  function reserved(ready: { a: boolean; b: boolean }): World {
+    const world = new World([ship("a", 5, 12, 0, { ready: ready.a }), ship("b", 8, 12, 0, { ready: ready.b })]);
+    grapple(world, "a");
+    expect(world.state.duels[0]).toMatchObject({ id: "duel:21:1:a:b", phase: "transition", reservedTick: 21 });
+    return world;
+  }
+
+  it("starts the fight once the three-second countdown is over with both clients ready", () => {
+    const world = reserved({ a: true, b: true });
+    expect(world.runTo(80)).toEqual([]);
+    expect(world.step()).toEqual([{ kind: "duel-started", tick: 81, duelId: "duel:21:1:a:b" }]);
+    expect(world.state.duels[0]).toMatchObject({ phase: "fighting", startTick: 81 });
+  });
+
+  it("waits for a late client and starts when it is ready", () => {
+    const world = reserved({ a: true, b: false });
+    world.runTo(120);
+    world.set("b", { ready: true });
+    expect(world.step()).toEqual([{ kind: "duel-started", tick: 121, duelId: "duel:21:1:a:b" }]);
+  });
+
+  it("forfeits a client still not ready ten seconds after the reservation, ending the duel in the state", () => {
+    const world = reserved({ a: true, b: false });
+    expect(world.runTo(220)).toEqual([]);
+    expect(world.step()).toEqual([{ kind: "duel-forfeited", tick: 221, duelId: "duel:21:1:a:b", forfeiter: "b", winner: "a" }]);
+    expect(world.state.duels[0]).toMatchObject({ phase: "ended", end: { tick: 221, outcome: "win", winner: "a", loser: "b", cause: "readiness" } });
+    // The caller reports only the settlement; a second end is refused and changes nothing.
+    const before = world.state;
+    const refused = world.step({ reports: [{ kind: "end", duelId: "duel:21:1:a:b", tick: 222, outcome: "draw" }] });
+    expect(refused).toEqual([{ kind: "report-refused", tick: 222, duelId: "duel:21:1:a:b", report: "end", reason: "already-ended" }]);
+    expect(world.state).toEqual({ ...before, tick: 222 });
+  });
+
+  it("cancels when both clients are still not ready at ten seconds (§12's double forfeit)", () => {
+    const world = reserved({ a: false, b: false });
+    world.runTo(220);
+    expect(world.step()).toEqual([{ kind: "duel-cancelled", tick: 221, duelId: "duel:21:1:a:b" }]);
+    expect(world.state.duels[0]!.end).toEqual({ tick: 221, outcome: "cancelled", winner: null, loser: null, cause: "readiness" });
+  });
+
+  it("shows other players only a marker: position and start tick", () => {
+    const world = reserved({ a: true, b: true });
+    expect(duelMarkers(world.state)).toEqual([{ x: Math.floor((at(5, 12).x + at(8, 12).x) / 2), y: at(5, 12).y, startTick: 21 }]);
+  });
+});
+
+describe("duel reports", () => {
+  function fighting(): World {
+    const world = new World([ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true })]);
+    grapple(world, "a");
+    world.runTo(81);
+    return world;
+  }
+  const id = "duel:21:1:a:b";
+
+  it("accept one end per duel and refuse a second, an unknown duel, a stranger's win, a future tick and an early settlement", () => {
+    const world = fighting();
+    expect(world.step({ reports: [{ kind: "settled", duelId: id, tick: 82 }] })).toEqual([
+      { kind: "report-refused", tick: 82, duelId: id, report: "settled", reason: "not-ended" },
+    ]);
+    expect(world.step({ reports: [{ kind: "end", duelId: "ghost", tick: 83, outcome: "draw" }] })[0]).toMatchObject({ reason: "unknown-duel" });
+    expect(world.step({ reports: [{ kind: "end", duelId: id, tick: 84, outcome: "win", winner: "c" }] })[0]).toMatchObject({ reason: "invalid" });
+    expect(world.step({ reports: [{ kind: "end", duelId: id, tick: 99, outcome: "draw" }] })[0]).toMatchObject({ reason: "invalid" });
+    // Two ends on one tick: the draw sorts first, whatever order they arrive in.
+    const both: DuelReport[] = [
+      { kind: "end", duelId: id, tick: 86, outcome: "win", winner: "b" },
+      { kind: "end", duelId: id, tick: 86, outcome: "draw" },
+    ];
+    const events = world.step({ reports: [...both].reverse() });
+    expect(events).toEqual([
+      { kind: "duel-ended", tick: 86, duelId: id, outcome: "draw", winner: null, endTick: 86 },
+      { kind: "report-refused", tick: 86, duelId: id, report: "end", reason: "already-ended" },
+    ]);
+  });
+});
+
+describe("return to the world (§6)", () => {
+  const id = "duel:21:1:a:b";
+  function ended(outcome: "win" | "draw" | "cancelled", players = [ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true })]): World {
+    const world = new World(players);
+    grapple(world, "a");
+    world.runTo(99);
+    const report: DuelReport = outcome === "win" ? { kind: "end", duelId: id, tick: 100, outcome, winner: "a" } : { kind: "end", duelId: id, tick: 100, outcome };
+    world.step({ reports: [report] });
+    return world;
+  }
+
+  it("returns the winner where they were with eight seconds, and respawns the loser 15 s after the fight at the nearest clear dock", () => {
+    const world = ended("win");
+    world.runTo(150);
+    const events = world.step({ reports: [{ kind: "settled", duelId: id, tick: 150 }] });
+    expect(events).toEqual([
+      { kind: "duel-settled", tick: 151, duelId: id },
+      { kind: "player-returned", tick: 151, duelId: id, playerId: "a", ...at(5, 12), protection: { source: "win", endTick: 310 } },
+      { kind: "player-respawning", tick: 151, duelId: id, playerId: "b", respawnTick: 400 },
+    ]);
+    expect(world.state.duels).toEqual([]);
+    expect(world.runTo(399)).toEqual([{ kind: "protection-ended", tick: 310, playerId: "a", reason: "expired" }]);
+    // The encounter is at column 6.5, row 12: the south-west dock (1, 22) is nearest, and nobody is near it.
+    expect(world.step()).toEqual([
+      { kind: "player-respawned", tick: 400, playerId: "b", ...at(1, 22), dockId: 2, protection: { source: "respawn", endTick: 800 } },
+    ]);
+    expect(world.record("b")).toEqual({ id: "b", protection: { source: "respawn", endTick: 800 }, cooldownEndTick: 0, respawn: null });
+  });
+
+  it("skips a dock with an opponent within sight, and falls back to the dock farthest from its nearest opponent", () => {
+    const camped = ended("win", [ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true }), ship("camper", 3, 20)]);
+    camped.step({ reports: [{ kind: "settled", duelId: id, tick: 101 }] });
+    expect(ofKind(camped.runTo(400), "player-respawned")[0]).toMatchObject({ dockId: 0, ...at(1, 1) });
+
+    // Every dock watched: the north-east one's watcher is farthest from it.
+    const watchers = [ship("w0", 3, 3), ship("w1", 33, 5), ship("w2", 3, 20), ship("w3", 36, 20)];
+    const everywhere = ended("win", [ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true }), ...watchers]);
+    everywhere.step({ reports: [{ kind: "settled", duelId: id, tick: 101 }] });
+    expect(ofKind(everywhere.runTo(400), "player-respawned")[0]).toMatchObject({ dockId: 1, ...at(38, 1) });
+  });
+
+  it("respawns at the settlement when it comes more than 15 s after the fight", () => {
+    const world = ended("win");
+    world.runTo(449);
+    const events = world.step({ reports: [{ kind: "settled", duelId: id, tick: 450 }] });
+    expect(kinds(events)).toEqual(["duel-settled", "player-returned", "player-respawning", "player-respawned"]);
+    expect(ofKind(events, "player-respawning")[0]!.respawnTick).toBe(450);
+  });
+
+  it.each(["draw", "cancelled"] as const)("returns both players of a %s to separate navigable points nearby with eight seconds", (outcome) => {
+    const world = ended(outcome);
+    const events = world.step({ reports: [{ kind: "settled", duelId: id, tick: 101 }] });
+    const returns = ofKind(events, "player-returned");
+    expect(returns.map((event) => [event.playerId, event.protection])).toEqual([
+      ["a", { source: "draw", endTick: 261 }],
+      ["b", { source: "draw", endTick: 261 }],
+    ]);
+    checkSeparated(returns, world.state, { x: Math.floor((at(5, 12).x + at(8, 12).x) / 2), y: at(5, 12).y });
+  });
+
+  it("separates a readiness cancellation's players too, next to land", () => {
+    const world = new World([ship("a", 18, 5), ship("b", 18, 7)]);
+    world.set("a", { heading: 16 });
+    grapple(world, "a");
+    world.runTo(221);
+    const events = world.step({ reports: [{ kind: "settled", duelId: "duel:21:1:a:b", tick: 221 }] });
+    checkSeparated(ofKind(events, "player-returned"), world.state, { x: at(18, 6).x, y: at(18, 6).y - 128 });
+  });
+
+  function checkSeparated(returns: readonly Extract<EncounterEvent, { kind: "player-returned" }>[], state: EncounterState, encounter: { x: number; y: number }): void {
+    expect(returns).toHaveLength(2);
+    const [p, q] = returns as [(typeof returns)[0], (typeof returns)[0]];
+    for (const point of [p, q]) {
+      const tile = tileOf(map, point);
+      expect(isNavigable(map, tile.tileX, tile.tileY)).toBe(true);
+      expect((point.x - encounter.x) ** 2 + (point.y - encounter.y) ** 2).toBeLessThanOrEqual((6 * TILE) ** 2);
+    }
+    expect((p.x - q.x) ** 2 + (p.y - q.y) ** 2).toBeGreaterThanOrEqual((3 * TILE) ** 2);
+    expect(state.duels).toEqual([]);
+  }
+});
+
+describe("protection (§2, §6)", () => {
+  it("ends by expiry, by an attack, and by a collection or claim reported from the previous tick", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 5, 18), ship("d", 5, 4)], { spawnProtected: ["a", "b", "c", "d"] });
+    world.set("c", { protectionEndedBy: "collection" });
+    world.set("d", { protectionEndedBy: "claim" });
+    expect(world.step()).toEqual([
+      { kind: "protection-ended", tick: 1, playerId: "c", reason: "collection" },
+      { kind: "protection-ended", tick: 1, playerId: "d", reason: "claim" },
+    ]);
+    // An ended protection makes the player a target on that same tick.
+    world.set("b", { protectionEndedBy: "collection" });
+    expect(world.step({ press: ["a"] })).toEqual([
+      { kind: "protection-ended", tick: 2, playerId: "b", reason: "collection" },
+      { kind: "protection-ended", tick: 2, playerId: "a", reason: "attack" },
+      { kind: "attempt-started", tick: 2, attackerId: "a", defenderId: "b", mode: "ship", aim: 0, landTick: 22 },
+    ]);
+    expect(world.runTo(899).filter((event) => event.kind === "protection-ended")).toEqual([]);
+    expect(world.step().filter((event) => event.kind === "protection-ended")).toEqual([]);
+  });
+
+  it("expires at its end tick", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12)], { spawnProtected: ["b"] });
+    world.runTo(899);
+    expect(world.step({ press: ["a"] })).toEqual([
+      { kind: "protection-ended", tick: 900, playerId: "b", reason: "expired" },
+      { kind: "attempt-started", tick: 900, attackerId: "a", defenderId: "b", mode: "ship", aim: 0, landTick: 920 },
+    ]);
+  });
+});
+
+describe("match end", () => {
+  it("cancels every attempt, stops new ones and freezes the state", () => {
+    const world = new World([ship("a", 5, 12), ship("b", 7, 12, 32), ship("c", 5, 18, 0, { ready: true }), ship("d", 7, 18, 0, { ready: true })]);
+    world.step({ press: ["c"] });
+    world.runTo(10);
+    world.step({ press: ["a", "b"] });
+    const events = world.step({ matchOver: true });
+    expect(events).toEqual([
+      { kind: "attempt-cancelled", tick: 12, attackerId: "a", defenderId: "b", reason: "match-over" },
+      { kind: "attempt-cancelled", tick: 12, attackerId: "b", defenderId: "a", reason: "match-over" },
+      { kind: "attempt-cancelled", tick: 12, attackerId: "c", defenderId: "d", reason: "match-over" },
+    ]);
+    const frozen = world.state;
+    expect(frozen.closed).toBe(true);
+    expect(world.step({ press: ["a", "b", "c", "d"] })).toEqual([]);
+    expect(world.state).toBe(frozen);
+    expect(hashState(world.state)).toBe(hashState(frozen));
+  });
+});
+
+describe("the island challenge (foot mode)", () => {
+  const foot = (id: string, x: number, y: number, heading = 0): EncounterPlayerInput => ({ ...ship(id, 0, 0, heading), mode: "foot", x, y });
+
+  it("lunges for 0.6 s within two tiles and the cone, and costs six seconds on a miss", () => {
+    const world = new World([foot("a", 1000, 1000), foot("b", 1000 + 2 * TILE + 1, 1000)]);
+    expect(world.step({ press: ["a"] })).toEqual([]);
+    world.set("b", { x: 1000 + 2 * TILE });
+    expect(started(world.step({ press: ["a"] }))[0]).toMatchObject({ mode: "foot", landTick: 2 + 12 });
+    world.set("b", { x: 1000 + 2 * TILE + 1 });
+    world.runTo(13);
+    expect(world.step()).toEqual([{ kind: "attempt-missed", tick: 14, attackerId: "a", defenderId: "b", reason: "out-of-range", cooldownEndTick: 134 }]);
+    world.set("b", { x: 1100 });
+    expect(world.runTo(133).filter((event) => event.kind === "attempt-started")).toEqual([]);
+  });
+
+  it("hits within ±4 of the aim and picks targets in the ±8 front cone", () => {
+    const behind = new World([foot("a", 1000, 1000), foot("b", 800, 1000)]);
+    expect(behind.step({ press: ["a"] })).toEqual([]);
+    const world = new World([foot("a", 1000, 1000), foot("b", 1300, 1000)]);
+    world.step({ press: ["a"] });
+    world.runTo(12);
+    expect(kinds(world.step())).toEqual(["duel-reserved"]);
+    expect(world.state.duels[0]!.mode).toBe("foot");
+  });
+
+  it("returns a draw's players to where they stood and respawns a loser in place, until walking exists", () => {
+    const world = new World([
+      { ...foot("a", 1000, 1000), ready: true },
+      { ...foot("b", 1300, 1000), ready: true },
+    ]);
+    world.step({ press: ["a"] });
+    world.runTo(73);
+    const idOf = world.state.duels[0]!.id;
+    world.step({ reports: [{ kind: "end", duelId: idOf, tick: 74, outcome: "win", winner: "b" }] });
+    const events = world.step({ reports: [{ kind: "settled", duelId: idOf, tick: 75 }] });
+    expect(ofKind(events, "player-returned")[0]).toMatchObject({ playerId: "b", x: 1300, y: 1000 });
+    expect(ofKind(world.runTo(374), "player-respawned")[0]).toMatchObject({ playerId: "a", x: 1000, y: 1000, dockId: null });
+  });
+});

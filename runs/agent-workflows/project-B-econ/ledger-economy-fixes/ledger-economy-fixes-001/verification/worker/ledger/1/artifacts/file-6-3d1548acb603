@@ -1,0 +1,222 @@
+import { commitWin, recordResult } from "./duels.js";
+import {
+  atTick,
+  isPlayerId,
+  isPosition,
+  noEffects,
+  openCache,
+  playerRejection,
+  tickRejection,
+  updatePlayer,
+  type Effects,
+  type LedgerRejection,
+  type LedgerStep,
+  type Transfer,
+} from "./internal.js";
+import {
+  activeDuelOf,
+  findDuel,
+  findPlayer,
+  findSource,
+  type LedgerDuel,
+  type LedgerPlayer,
+  type LedgerSource,
+  type LedgerState,
+  type Position,
+} from "./state.js";
+
+export interface PlayerResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The player as they now stand, or null for an unknown player. */
+  readonly player: LedgerPlayer | null;
+  /** A duel this request forfeited or settled (a player leaving mid-duel), as it now stands. */
+  readonly duel: LedgerDuel | null;
+  readonly transfers: readonly Transfer[];
+  readonly cacheIds: readonly string[];
+}
+
+function rejected(state: LedgerState, rejection: LedgerRejection, playerId: unknown): LedgerStep<PlayerResult> {
+  const player = typeof playerId === "string" ? (findPlayer(state, playerId) ?? null) : null;
+  return { state, result: { ok: false, rejection, player, duel: null, transfers: [], cacheIds: [] } };
+}
+
+function applied(
+  state: LedgerState,
+  playerId: string,
+  effects: Effects,
+  duelId: string | null = null,
+): LedgerStep<PlayerResult> {
+  return {
+    state,
+    result: {
+      ok: true,
+      rejection: null,
+      player: findPlayer(state, playerId) ?? null,
+      duel: duelId === null ? null : (findDuel(state, duelId) ?? null),
+      ...effects,
+    },
+  };
+}
+
+export interface AddPlayerRequest {
+  readonly playerId: string;
+  readonly tick: number;
+}
+
+/**
+ * A player joins with the rules' `startingGold` and no rubbings; the caller never chooses the purse. An id is never
+ * reused, even after its player left.
+ */
+export function addPlayer(state: LedgerState, request: AddPlayerRequest): LedgerStep<PlayerResult> {
+  const { playerId, tick } = request;
+  const gold = state.rules.startingGold;
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(state, bad, playerId);
+  if (!isPlayerId(playerId)) return rejected(state, "invalid-request", playerId);
+  if (findPlayer(state, playerId)) return rejected(state, "duplicate", playerId);
+  const player: LedgerPlayer = {
+    id: playerId,
+    gold,
+    status: "connected",
+    reservationDeadline: null,
+    exit: null,
+    channel: null,
+    freshRumors: [],
+    tonics: 0,
+    tonicEffect: null,
+  };
+  const next = { ...atTick(state, tick), players: [...state.players, player], goldIssued: state.goldIssued + gold };
+  return applied(next, playerId, noEffects());
+}
+
+export interface PlayerTickRequest {
+  readonly playerId: string;
+  readonly tick: number;
+}
+
+/**
+ * §12: a disconnect cancels the player's channel and reserves their seat until `tick + seatReservationTicks`. Their
+ * rubbings stay where they are; a duel they are in carries on. A repeated disconnect keeps the original deadline.
+ */
+export function disconnectPlayer(state: LedgerState, request: PlayerTickRequest): LedgerStep<PlayerResult> {
+  const { playerId, tick } = request;
+  const bad = tickRejection(state, tick) ?? playerRejection(state, playerId);
+  if (bad) return rejected(state, bad, playerId);
+  if (findPlayer(state, playerId)!.status === "disconnected") return rejected(state, "duplicate", playerId);
+  const deadline = tick + state.rules.seatReservationTicks;
+  const next = updatePlayer(atTick(state, tick), playerId, (player) => ({
+    ...player,
+    status: "disconnected",
+    reservationDeadline: deadline,
+    channel: null,
+  }));
+  return applied(next, playerId, noEffects());
+}
+
+/** §12: a return before the deadline reattaches the same player to their current state. */
+export function reconnectPlayer(state: LedgerState, request: PlayerTickRequest): LedgerStep<PlayerResult> {
+  const { playerId, tick } = request;
+  const bad = tickRejection(state, tick) ?? playerRejection(state, playerId);
+  if (bad) return rejected(state, bad, playerId);
+  const player = findPlayer(state, playerId)!;
+  if (player.status !== "disconnected" || player.reservationDeadline === null) return rejected(state, "not-disconnected", playerId);
+  if (tick >= player.reservationDeadline) return rejected(state, "reservation-expired", playerId);
+  const next = updatePlayer(atTick(state, tick), playerId, (current) => ({
+    ...current,
+    status: "connected",
+    reservationDeadline: null,
+  }));
+  return applied(next, playerId, noEffects());
+}
+
+export interface LeaveRequest {
+  readonly playerId: string;
+  readonly tick: number;
+  /** Where the recovery cache goes: the respawn dock for an expiry, the player's position for a quit (§12). */
+  readonly position: Position;
+}
+
+/**
+ * §12: at or after the reservation deadline a disconnected player is removed and their remaining rubbings go into a
+ * recovery cache at the given position. A rubbing already transferred by a duel they lost is not among them.
+ */
+export function expireReservation(state: LedgerState, request: LeaveRequest): LedgerStep<PlayerResult> {
+  const { playerId, tick, position } = request;
+  const bad = tickRejection(state, tick) ?? playerRejection(state, playerId);
+  if (bad) return rejected(state, bad, playerId);
+  if (!isPosition(position)) return rejected(state, "invalid-request", playerId);
+  const player = findPlayer(state, playerId)!;
+  if (player.status !== "disconnected" || player.reservationDeadline === null) return rejected(state, "not-disconnected", playerId);
+  if (tick < player.reservationDeadline) return rejected(state, "reservation-active", playerId);
+  return leave(state, playerId, position, tick);
+}
+
+/** §12: an explicit quit forfeits a duel in progress, then releases the player's remaining rubbings into a cache. */
+export function quitPlayer(state: LedgerState, request: LeaveRequest): LedgerStep<PlayerResult> {
+  const { playerId, tick, position } = request;
+  const bad = tickRejection(state, tick) ?? playerRejection(state, playerId);
+  if (bad) return rejected(state, bad, playerId);
+  if (!isPosition(position)) return rejected(state, "invalid-request", playerId);
+  return leave(state, playerId, position, tick);
+}
+
+/**
+ * Removes a player from the match; their tonics, and any tonic still active, are gone. Outside a duel, everything they hold goes into one cache. In a fight, they forfeit:
+ * the opponent wins and the settlement later sends what the winner does not take into a cache at `position`. As the
+ * loser in a choice window, the same happens when the window settles. As the winner in a choice window, the duel
+ * settles at once and they take nothing, except when that win came from the opponent's forfeit on this same tick:
+ * both forfeited on the same tick, so the duel is cancelled (§12) and each inventory goes into its owner's cache.
+ */
+function leave(state: LedgerState, playerId: string, position: Position, tick: number): LedgerStep<PlayerResult> {
+  const effects = noEffects();
+  let next = updatePlayer(atTick(state, tick), playerId, (player) => ({
+    ...player,
+    status: "left",
+    reservationDeadline: null,
+    exit: { x: position.x, y: position.y },
+    channel: null,
+    tonics: 0,
+    tonicEffect: null,
+  }));
+  const duel = activeDuelOf(next, playerId);
+  if (duel === undefined) {
+    const owned = next.rubbings.filter((rubbing) => rubbing.location.kind === "player" && rubbing.location.playerId === playerId);
+    next = openCache(next, position, owned.map((rubbing) => rubbing.id), tick, effects);
+    return applied(next, playerId, effects);
+  }
+  if (duel.phase === "fighting") {
+    const opponent = duel.players[0] === playerId ? duel.players[1] : duel.players[0];
+    next = recordResult(next, duel, "win", opponent, true, tick, effects);
+  } else if (duel.result?.winner === playerId) {
+    next =
+      duel.result.forfeit && duel.result.tick === tick
+        ? recordResult(next, { ...duel, result: null, choiceDeadline: null }, "cancelled", null, true, tick, effects)
+        : commitWin(next, duel, tick, null, effects);
+  }
+  return applied(next, playerId, effects, duel.id);
+}
+
+export interface SourceResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  readonly source: LedgerSource | null;
+}
+
+export interface UnlockSourceRequest {
+  readonly sourceId: string;
+  readonly tick: number;
+}
+
+/** Unlocks a source for collection; the ruin guarding it (a later feature) calls this once solved. */
+export function unlockSource(state: LedgerState, request: UnlockSourceRequest): LedgerStep<SourceResult> {
+  const { sourceId, tick } = request;
+  const source = typeof sourceId === "string" ? findSource(state, sourceId) : undefined;
+  const bad = tickRejection(state, tick) ?? (source ? (source.unlocked ? "duplicate" : null) : "unknown-source");
+  if (bad) return { state, result: { ok: false, rejection: bad, source: source ?? null } };
+  const next = {
+    ...atTick(state, tick),
+    sources: state.sources.map((existing) => (existing.id === sourceId ? { ...existing, unlocked: true } : existing)),
+  };
+  return { state: next, result: { ok: true, rejection: null, source: findSource(next, sourceId) ?? null } };
+}

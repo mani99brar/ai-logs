@@ -1,0 +1,209 @@
+import { randomBytes } from "node:crypto";
+import { Client, type Room } from "@colyseus/sdk";
+import {
+  CREATE_TOKEN_BYTES,
+  formatCreateToken,
+  MATCH_ROOM,
+  MessageType,
+  normalizeMatchCode,
+  PROTOCOL_VERSION,
+  TEST_PLACEMENT_PATH,
+  type InputMessage,
+  type TestPlacement,
+} from "@pirate-sea-race/protocol";
+import type { MatchStateSchema } from "@pirate-sea-race/server/schema";
+
+export interface HeadlessClientOptions {
+  /** Override the protocol version sent on join, to exercise the version check. */
+  readonly protocolVersion?: number;
+}
+
+export interface ShipView {
+  readonly id: string;
+  readonly slot: number;
+  readonly x: number;
+  readonly y: number;
+  readonly heading: number;
+  readonly speed: number;
+  /** The dock the ship is moored at, or -1 at sea. */
+  readonly dock: number;
+}
+
+/** Protocol axes: `moveX` turns (positive to starboard), `moveY` is the throttle (negative ahead, positive astern). */
+export interface Movement {
+  readonly moveX: number;
+  readonly moveY: number;
+  readonly buttons?: number;
+}
+
+/** Full ahead, no turn. */
+export const AHEAD: Movement = { moveX: 0, moveY: -1 };
+
+/**
+ * A browserless player: joins a private match through the real Colyseus SDK, decodes the synced state, and sends
+ * frame-tagged inputs with increasing sequence numbers, exactly as the web client does. It also keeps every raw frame
+ * the server sent it, so tests can check what actually crossed the network.
+ */
+export class HeadlessClient {
+  private seq = 0;
+  private open = true;
+  private readonly frames: Uint8Array[] = [];
+
+  private constructor(readonly room: Room<unknown, MatchStateSchema>) {
+    room.onLeave(() => {
+      this.open = false;
+    });
+    const events = room.connection.events;
+    const decode = events.onmessage;
+    events.onmessage = (event: { data: ArrayBuffer }) => {
+      this.frames.push(new Uint8Array(event.data.slice(0)));
+      decode?.(event);
+    };
+  }
+
+  /** Creates a private match on the server at `endpoint` (for example `http://127.0.0.1:2593`). */
+  static async create(endpoint: string, options: HeadlessClientOptions = {}): Promise<HeadlessClient> {
+    const client = new Client(endpoint);
+    const room = await client.create<MatchStateSchema>(MATCH_ROOM, {
+      protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
+      createToken: newCreateToken(),
+    });
+    const headless = new HeadlessClient(room);
+    await headless.waitFor(() => headless.code !== "" && headless.ship() !== undefined);
+    return headless;
+  }
+
+  /** Joins the private match with `code` (any case). */
+  static async join(endpoint: string, code: string, options: HeadlessClientOptions = {}): Promise<HeadlessClient> {
+    const client = new Client(endpoint);
+    const room = await client.join<MatchStateSchema>(MATCH_ROOM, {
+      protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
+      code: normalizeMatchCode(code),
+    });
+    const headless = new HeadlessClient(room);
+    await headless.waitFor(() => headless.ship() !== undefined);
+    return headless;
+  }
+
+  get sessionId(): string {
+    return this.room.sessionId;
+  }
+
+  get connected(): boolean {
+    return this.open;
+  }
+
+  get code(): string {
+    return this.room.state?.code ?? "";
+  }
+
+  get frame(): number {
+    return this.room.state?.frame ?? 0;
+  }
+
+  /** Players in the match, whether this client can see their ships or not. */
+  get playerCount(): number {
+    return this.room.state?.players ?? 0;
+  }
+
+  /** The ships in this client's decoded state: its own and those in its sight. */
+  visibleShipIds(): string[] {
+    return [...(this.room.state?.ships?.keys() ?? [])].sort();
+  }
+
+  /** The authoritative state of a ship as last decoded, by default this client's own. */
+  ship(id: string = this.sessionId): ShipView | undefined {
+    const ship = this.room.state?.ships?.get(id);
+    if (ship === undefined) return undefined;
+    return { id: ship.id, slot: ship.slot, x: ship.x, y: ship.y, heading: ship.heading, speed: ship.speed, dock: ship.dock };
+  }
+
+  /** How many raw frames the server has sent this client so far; a mark for `framesSince`. */
+  get frameCount(): number {
+    return this.frames.length;
+  }
+
+  /** The raw frames received since a `frameCount` mark. */
+  framesSince(mark: number): readonly Uint8Array[] {
+    return this.frames.slice(mark);
+  }
+
+  /**
+   * Test-only: asks the server at `endpoint` to put this client's ship at rest on a tile. Works only on a server
+   * started with its test-placement setting on. Resolves once this client has decoded the new position.
+   */
+  async placeShip(endpoint: string, placement: Omit<TestPlacement, "code" | "sessionId">): Promise<void> {
+    const response = await fetch(`${endpoint}${TEST_PLACEMENT_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: this.code, sessionId: this.sessionId, ...placement }),
+    });
+    if (!response.ok) throw new Error(`placement refused: HTTP ${response.status} ${await response.text()}`);
+    const placed = (await response.json()) as { x: number; y: number };
+    await this.waitFor(() => this.ship()?.x === placed.x && this.ship()?.y === placed.y && this.ship()?.speed === 0);
+  }
+
+  /** Sends one input tagged with the last decoded frame and the next sequence number. */
+  sendInput(movement: Movement): InputMessage {
+    const message: InputMessage = {
+      seq: ++this.seq,
+      frame: this.frame,
+      buttons: movement.buttons ?? 0,
+      moveX: movement.moveX,
+      moveY: movement.moveY,
+    };
+    this.room.send(MessageType.Input, message);
+    return message;
+  }
+
+  /** Sends anything at all, for tests of the server's validation. */
+  sendRaw(type: string, payload: unknown): void {
+    this.room.send(type, payload);
+  }
+
+  /** Holds a movement for `durationMs`, refreshing it faster than the server's hold window, then releases it. */
+  async hold(movement: Movement, durationMs: number): Promise<void> {
+    const until = Date.now() + durationMs;
+    while (Date.now() < until) {
+      this.sendInput(movement);
+      await sleep(100);
+    }
+    this.sendInput({ moveX: 0, moveY: 0 });
+  }
+
+  /** Keeps sending a movement until `predicate` holds (or `timeoutMs` passes), then releases it. */
+  async holdUntil(movement: Movement, predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    try {
+      while (!predicate()) {
+        if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs} ms of holding ${JSON.stringify(movement)}`);
+        this.sendInput(movement);
+        await sleep(50);
+      }
+    } finally {
+      this.sendInput({ moveX: 0, moveY: 0 });
+    }
+  }
+
+  /** Resolves once `predicate` holds, polling the decoded state; rejects after `timeoutMs`. */
+  async waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs} ms`);
+      await sleep(20);
+    }
+  }
+
+  async leave(): Promise<void> {
+    if (this.open) await this.room.leave(true);
+  }
+}
+
+/** A fresh one-time create token from Node's crypto API. */
+export function newCreateToken(): string {
+  return formatCreateToken(randomBytes(CREATE_TOKEN_BYTES));
+}
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

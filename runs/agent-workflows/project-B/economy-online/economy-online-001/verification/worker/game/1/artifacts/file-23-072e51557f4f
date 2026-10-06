@@ -1,0 +1,343 @@
+import { WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import {
+  parseTonicPurchaseMessage,
+  parseTonicUsedMessage,
+  ShopMessageType,
+  type BuyTonicMessage,
+  type RumorResultMessage,
+  type TonicPurchaseMessage,
+  type TonicPurchaseRefusalName,
+  type TonicUsedMessage,
+  type TonicUseRefusalName,
+  type UseTonicMessage,
+} from "@pirate-sea-race/protocol";
+import { isTyping } from "./keyboard.js";
+import { buyButtons, resultLine, type BuyButton, type JournalStatus, type Line } from "./journal.js";
+import type { KeyPanel } from "./pageKeys.js";
+
+/**
+ * §11's dockside shop and sail tonic in the browser. Moored at a dock, B opens the shop (B or Escape closes it; Tab moves
+ * among its buttons; casting off or a grapple closes it: the shop is no safe zone). It sells the sail tonic and, for each
+ * missing type, the targeted rumor the journal sells, through the journal's own purchase. T drinks a tonic at sea: one
+ * `use-tonic` per key press, never on the key's auto-repeat. The HUD shows the tonics carried, the active tonic's timer
+ * and the server's top speed. Everything down to `ShopPanel` is plain data, for unit tests.
+ */
+
+/** The sail tonic's price and carry limit and how long it works (§11), as the server's rules have them. */
+export const TONIC_PRICE = 30;
+export const TONIC_CARRY_LIMIT = 2;
+
+/** This player's shop fields, from its private status and its ship. */
+export interface ShopStatus {
+  readonly gold: number;
+  readonly tonics: number;
+  /** The active tonic's last boosted world tick, 0 when none was drunk. */
+  readonly tonicUntil: number;
+  /** The server's top speed for the ship's next step. */
+  readonly maxSpeed: number;
+  /** Moored at a dock and in the world (not in a duel, not waiting to respawn): where the shop opens. */
+  readonly moored: boolean;
+}
+
+/** The shop's fields of this player's private status, as decoded. */
+export interface ShopStatusFields {
+  readonly gold: number;
+  readonly tonics: number;
+  readonly tonicUntil: number;
+  readonly maxSpeed: number;
+  readonly mode: string;
+}
+
+/** The shop's status from the decoded private status and the dock this player's ship is moored at (-1 at sea). */
+export function shopStatusOf(fields: ShopStatusFields | undefined, dock: number | undefined): ShopStatus | undefined {
+  if (fields === undefined) return undefined;
+  return {
+    gold: fields.gold,
+    tonics: fields.tonics,
+    tonicUntil: fields.tonicUntil,
+    maxSpeed: fields.maxSpeed,
+    moored: dock !== undefined && dock !== -1 && fields.mode === "sea",
+  };
+}
+
+/** The tonic's Buy button: `available`, `pending`, `limit` (two carried), `gold` or `not-at-dock`. */
+export interface TonicButton {
+  readonly label: string;
+  readonly state: string;
+  readonly disabled: boolean;
+}
+
+export function tonicButton(status: ShopStatus | undefined, pending: boolean): TonicButton {
+  const button = (state: string, label: string, disabled = true): TonicButton => ({ state, label, disabled });
+  if (status === undefined) return button("not-at-dock", "Sail tonic: moor at a dock to buy");
+  if (pending) return button("pending", "Sail tonic: buying…");
+  if (status.tonics >= TONIC_CARRY_LIMIT) return button("limit", `Sail tonic: you carry ${TONIC_CARRY_LIMIT}, the most you can`);
+  if (!status.moored) return button("not-at-dock", "Sail tonic: moor at a dock to buy");
+  if (status.gold < TONIC_PRICE) return button("gold", `Sail tonic: not enough gold (${TONIC_PRICE})`);
+  return button("available", `Buy a sail tonic (${TONIC_PRICE} gold)`, false);
+}
+
+/** "You carry 1 of 2". */
+export function carriedText(status: ShopStatus | undefined): string {
+  return `You carry ${status?.tonics ?? 0} of ${TONIC_CARRY_LIMIT}`;
+}
+
+const PURCHASE_REFUSALS: Readonly<Record<TonicPurchaseRefusalName, string>> = {
+  busy: "Two requests are already waiting",
+  "not-in-play": "The shop is open only during the match",
+  "not-at-dock": "Moor at a dock to buy",
+  "player-in-duel": "Not during a duel",
+  "player-disconnected": "Not while disconnected",
+  "tonic-limit": `You already carry ${TONIC_CARRY_LIMIT} tonics`,
+  "insufficient-gold": "Not enough gold",
+};
+
+/** The answer to the last tonic purchase, as the shop says it. */
+export function purchaseLine(result: TonicPurchaseMessage | undefined): Line {
+  if (result === undefined) return { text: "", state: "none" };
+  if (result.outcome === "bought") return { text: `Bought a sail tonic (−${result.price} gold): you carry ${result.tonics} of ${TONIC_CARRY_LIMIT}`, state: "bought" };
+  return { text: `Sail tonic: ${PURCHASE_REFUSALS[result.reason]}, nothing charged`, state: result.reason };
+}
+
+const USE_REFUSALS: Readonly<Record<TonicUseRefusalName, string>> = {
+  busy: "Two requests are already waiting",
+  "not-in-play": "Only during the match",
+  "tonic-active": "One is already working",
+  "no-tonic": "You carry none: buy one at a dock (B)",
+  "not-at-sea": "Only at sea",
+  grappled: "Not while being grappled",
+  "player-in-duel": "Not during a duel",
+  "player-disconnected": "Not while disconnected",
+};
+
+/** The answer to the last drink (T), as the HUD says it: nothing once it worked (the timer says that). */
+export function useLine(result: TonicUsedMessage | undefined): Line {
+  if (result === undefined || result.outcome === "active") return { text: "", state: result === undefined ? "none" : "active" };
+  return { text: `Tonic: ${USE_REFUSALS[result.reason]}`, state: result.reason };
+}
+
+/** The HUD's tonic lines: the count carried, the active tonic's timer, and the server's top speed. */
+export interface TonicHud {
+  /** "1 of 2". */
+  readonly carried: string;
+  /** "Sail tonic: 11 s left · +10% speed" while one works, else "". */
+  readonly timer: string;
+  readonly active: boolean;
+  readonly maxSpeed: number;
+}
+
+/**
+ * The tonic's HUD at `worldTick`: active while the world tick is before its last boosted tick (the server's own rule, so
+ * the page shows what the server reports), with the seconds left rounded up.
+ */
+export function tonicHud(status: ShopStatus | undefined, worldTick: number): TonicHud {
+  const left = status === undefined ? 0 : status.tonicUntil - worldTick;
+  const active = left > 0;
+  return {
+    carried: `${status?.tonics ?? 0} of ${TONIC_CARRY_LIMIT}`,
+    timer: active ? `Sail tonic: ${Math.ceil(left / WORLD_STEPS_PER_SECOND)} s left · +10% speed` : "",
+    active,
+    maxSpeed: status?.maxSpeed ?? 0,
+  };
+}
+
+export interface ShopView {
+  readonly hidden: boolean;
+  readonly gold: string;
+  readonly tonic: TonicButton;
+  readonly carried: string;
+  /** The journal's Buy buttons, one per missing type: the same purchase. */
+  readonly rumors: readonly BuyButton[];
+  /** The last answer, a tonic's or a rumor's, whichever came last. */
+  readonly message: Line;
+}
+
+export function shopView(
+  open: boolean,
+  status: ShopStatus | undefined,
+  pending: boolean,
+  rumors: readonly BuyButton[],
+  last: { readonly kind: "tonic"; readonly result: TonicPurchaseMessage } | { readonly kind: "rumor"; readonly result: RumorResultMessage } | undefined,
+): ShopView {
+  return {
+    hidden: !open,
+    gold: `${status?.gold ?? 0} gold`,
+    tonic: tonicButton(status, pending),
+    carried: carriedText(status),
+    rumors,
+    message: last === undefined ? { text: "", state: "none" } : last.kind === "tonic" ? purchaseLine(last.result) : resultLine(last.result),
+  };
+}
+
+/** The journal's side of the shop: its status and pending purchase (for the rumor buttons), and its Buy. */
+export interface RumorCounter {
+  readonly status: JournalStatus | undefined;
+  readonly pendingType: string | undefined;
+  buy(type: string): void;
+}
+
+/** A world tick count after which a request with no answer (dropped by the rate cap) no longer holds the button. */
+const PENDING_TIMEOUT_TICKS = 5 * WORLD_STEPS_PER_SECOND;
+
+/**
+ * The shop's behaviour, as `main.ts` wires it: B toggles it where the ship is moored, Escape closes it, Tab and Shift+Tab
+ * move focus among its buttons, the tonic's button sends `buy-tonic` with a fresh request id and waits for its answer,
+ * a rumor's button is the journal's own Buy. It closes itself when the ship is no longer moored (cast off, grappled).
+ */
+export class ShopPanel implements KeyPanel {
+  private open = false;
+  private status: ShopStatus | undefined;
+  private pending: { readonly requestId: string; readonly since: number } | undefined;
+  private last: Parameters<typeof shopView>[4];
+  private requests = 0;
+  private worldTick = 0;
+
+  constructor(
+    private readonly send: (type: string, message: unknown) => void,
+    private readonly render: (view: ShopView) => void,
+    private readonly focus: (backwards: boolean) => void,
+    private readonly rumors: RumorCounter,
+  ) {}
+
+  get isOpen(): boolean {
+    return this.open;
+  }
+
+  keydown(event: Pick<KeyboardEvent, "code" | "repeat"> & { readonly shiftKey?: boolean }): boolean {
+    if (event.code === "KeyB") {
+      if (!event.repeat && (this.open || this.status?.moored === true)) this.toggle();
+      return this.open || this.status?.moored === true;
+    }
+    if (!this.open) return false;
+    if (event.code === "Escape") {
+      this.toggle();
+      return true;
+    }
+    if (event.code === "Tab") {
+      this.focus(event.shiftKey === true);
+      return true;
+    }
+    return false;
+  }
+
+  toggle(): void {
+    this.open = !this.open;
+    this.draw();
+    if (this.open) this.focus(false);
+  }
+
+  update(status: ShopStatus | undefined, worldTick: number): void {
+    this.status = status;
+    this.worldTick = worldTick;
+    if (this.pending !== undefined && worldTick - this.pending.since > PENDING_TIMEOUT_TICKS) this.pending = undefined;
+    // Not a safe zone: casting off or a grapple (the status leaves "sea") closes it.
+    if (this.open && status?.moored !== true) this.open = false;
+    this.draw();
+  }
+
+  /** The tonic's Buy button: only an available one sends. */
+  buyTonic(): void {
+    if (tonicButton(this.status, this.pending !== undefined).disabled) return;
+    const requestId = `b${++this.requests}`;
+    this.pending = { requestId, since: this.worldTick };
+    this.send(ShopMessageType.BuyTonic, { requestId } satisfies BuyTonicMessage);
+    this.draw();
+  }
+
+  /** A rumor's Buy button: the journal's purchase. */
+  buyRumor(type: string): void {
+    this.rumors.buy(type);
+    this.draw();
+  }
+
+  /** The answer to a tonic purchase. */
+  purchased(message: unknown): void {
+    const result = parseTonicPurchaseMessage(message);
+    if (result === undefined) return;
+    if (this.pending?.requestId === result.requestId) this.pending = undefined;
+    this.last = { kind: "tonic", result };
+    this.draw();
+  }
+
+  /** The answer to a rumor purchase, from the shop or the journal: the shop shows it too. */
+  rumorResult(result: RumorResultMessage): void {
+    this.last = { kind: "rumor", result };
+    this.draw();
+  }
+
+  private draw(): void {
+    this.render(shopView(this.open, this.status, this.pending !== undefined, buyButtons(this.rumors.status, this.rumors.pendingType), this.last));
+  }
+}
+
+/**
+ * T drinks a sail tonic: one `use-tonic` message per key press, with a fresh request id. A held key's auto-repeat and a
+ * key typed into a text field send nothing. The server answers each id once; the HUD shows a refusal.
+ */
+export class TonicKey {
+  private requests = 0;
+  private lastResult: TonicUsedMessage | undefined;
+
+  constructor(private readonly send: (type: string, message: unknown) => void) {}
+
+  /** True when the key was T (whether or not it sent). */
+  keydown(event: Pick<KeyboardEvent, "code" | "repeat" | "target">): boolean {
+    if (event.code !== "KeyT" || isTyping(event.target)) return false;
+    if (!event.repeat) this.send(ShopMessageType.UseTonic, { requestId: `t${++this.requests}` } satisfies UseTonicMessage);
+    return true;
+  }
+
+  /** The answer to a drink. */
+  used(message: unknown): void {
+    const result = parseTonicUsedMessage(message);
+    if (result !== undefined) this.lastResult = result;
+  }
+
+  get last(): TonicUsedMessage | undefined {
+    return this.lastResult;
+  }
+}
+
+function field(root: ParentNode, id: string): HTMLElement {
+  const element = root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  if (element === null) throw new Error(`missing shop field ${id}`);
+  return element;
+}
+
+/** Writes the shop into the page: the gold, the tonic's button and count, the rumor buttons and the last answer. */
+export function applyShop(root: ParentNode, view: ShopView): void {
+  field(root, "shop").hidden = view.hidden;
+  field(root, "shop-gold").textContent = view.gold;
+  const tonic = field(root, "shop-tonic") as HTMLButtonElement;
+  tonic.textContent = view.tonic.label;
+  tonic.dataset["state"] = view.tonic.state;
+  tonic.disabled = view.tonic.disabled;
+  field(root, "shop-tonic-carried").textContent = view.carried;
+  const rumors = field(root, "shop-rumors");
+  const existing = new Map([...rumors.querySelectorAll<HTMLButtonElement>("button[data-type]")].map((button) => [button.dataset["type"]!, button]));
+  const buttons = view.rumors.map((buy) => {
+    const button = existing.get(buy.type) ?? document.createElement("button");
+    button.type = "button";
+    button.dataset["type"] = buy.type;
+    button.dataset["state"] = buy.state;
+    button.textContent = buy.label;
+    button.disabled = buy.disabled;
+    return button;
+  });
+  // The same button elements stay while the types do, so focus stays across redraws.
+  const same = existing.size === view.rumors.length && view.rumors.every((buy) => existing.has(buy.type));
+  if (!same) rumors.replaceChildren(...buttons);
+  const message = field(root, "shop-message");
+  message.textContent = view.message.text;
+  message.dataset["state"] = view.message.state;
+}
+
+/** Writes the HUD's tonic lines, and the server's top speed as the HUD's `data-max-speed`. */
+export function renderTonicHud(root: ParentNode, hud: HTMLElement, tonic: TonicHud, last: Line): void {
+  field(root, "purse-tonics").textContent = tonic.carried;
+  const timer = field(root, "purse-tonic-timer");
+  timer.textContent = tonic.timer;
+  timer.dataset["active"] = String(tonic.active);
+  field(root, "purse-tonic-message").textContent = last.text;
+  hud.dataset["maxSpeed"] = String(tonic.maxSpeed);
+}

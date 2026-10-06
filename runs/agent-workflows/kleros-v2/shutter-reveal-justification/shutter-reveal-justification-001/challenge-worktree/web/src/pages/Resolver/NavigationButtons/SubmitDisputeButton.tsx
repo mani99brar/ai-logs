@@ -1,0 +1,161 @@
+import React, { useMemo, useState } from "react";
+import styled from "styled-components";
+
+import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
+import { useAccount, useBalance, usePublicClient } from "wagmi";
+
+import { Button } from "@kleros/ui-components-library";
+
+import DisputeIcon from "svgs/icons/dispute.svg";
+
+import { IDisputeTemplate, useNewDisputeContext } from "context/NewDisputeContext";
+import {
+  useWriteDisputeResolverCreateDisputeForTemplate,
+  useSimulateDisputeResolverCreateDisputeForTemplate,
+} from "hooks/contracts/generated";
+import { isUndefined } from "utils/index";
+import { parseWagmiError } from "utils/parseWagmiError";
+import { retrieveDisputeIdFromLogs } from "utils/retrieveDisputeId";
+import { wrapWithToast } from "utils/wrapWithToast";
+
+import { DisputeKits } from "src/dispute-kits";
+import { prepareArbitratorExtradata } from "src/dispute-kits/prepareArbitratorExtradata";
+
+import { EnsureChain } from "components/EnsureChain";
+import { ErrorButtonMessage } from "components/ErrorButtonMessage";
+import Popup, { PopupType } from "components/Popup";
+import ClosedCircleIcon from "components/StyledIcons/ClosedCircleIcon";
+
+const StyledButton = styled(Button)``;
+
+const SubmitDisputeButton: React.FC = () => {
+  const navigate = useNavigate();
+  const { t } = useTranslation();
+  const publicClient = usePublicClient();
+  const [isPopupOpen, setIsPopupOpen] = useState(false);
+  const [courtId, setCourtId] = useState("");
+  const [disputeId, setDisputeId] = useState<number>();
+
+  const { disputeTemplate, disputeData, resetDisputeData, isSubmittingCase, setIsSubmittingCase } =
+    useNewDisputeContext();
+
+  const { address } = useAccount();
+  const { data: userBalance, isLoading: isBalanceLoading } = useBalance({ address });
+
+  const insufficientBalance = useMemo(() => {
+    const arbitrationCost = disputeData.arbitrationCost ? BigInt(disputeData.arbitrationCost) : BigInt(0);
+    return userBalance && userBalance.value < arbitrationCost;
+  }, [userBalance, disputeData]);
+
+  const {
+    data: submitCaseConfig,
+    error,
+    isLoading: isLoadingConfig,
+    isError,
+  } = useSimulateDisputeResolverCreateDisputeForTemplate({
+    query: {
+      enabled: !insufficientBalance && isTemplateValid(disputeTemplate),
+    },
+    args: [
+      prepareArbitratorExtradata(
+        disputeData.courtId ?? "1",
+        disputeData.numberOfJurors ?? 3,
+        disputeData.disputeKitId ?? DisputeKits.Classic,
+        disputeData.disputeKitData
+      ),
+      JSON.stringify(disputeTemplate),
+      "",
+      BigInt(disputeTemplate.answers.length),
+    ],
+    value: BigInt(disputeData.arbitrationCost ?? 0),
+  });
+
+  const { writeContractAsync: submitCase } = useWriteDisputeResolverCreateDisputeForTemplate();
+
+  const isButtonDisabled = useMemo(
+    () =>
+      isError ||
+      isSubmittingCase ||
+      !isTemplateValid(disputeTemplate) ||
+      isBalanceLoading ||
+      insufficientBalance ||
+      isLoadingConfig,
+    [isSubmittingCase, insufficientBalance, isBalanceLoading, disputeTemplate, isLoadingConfig, isError]
+  );
+
+  const errorMsg = useMemo(() => {
+    if (insufficientBalance) return t("forms.messages.insufficient_balance");
+    else if (error) {
+      return parseWagmiError(error);
+    }
+    return null;
+  }, [error, insufficientBalance, t]);
+
+  return (
+    <>
+      {" "}
+      <EnsureChain>
+        <div>
+          <StyledButton
+            text={t("buttons.submit_the_case")}
+            disabled={isButtonDisabled}
+            isLoading={(isSubmittingCase || isBalanceLoading || isLoadingConfig) && !insufficientBalance}
+            onClick={() => {
+              if (submitCaseConfig && publicClient) {
+                setIsSubmittingCase(true);
+                wrapWithToast(async () => await submitCase(submitCaseConfig.request), publicClient)
+                  .then((res) => {
+                    if (res.status && !isUndefined(res.result)) {
+                      const id = retrieveDisputeIdFromLogs(res.result.logs);
+                      if (id) {
+                        setDisputeId(Number(id));
+                        setCourtId(disputeData.courtId ?? "1");
+                        setIsPopupOpen(true);
+                      } else {
+                        // if unable to retrieve dispute id, just navigate to cases page
+                        navigate("/cases/display/1/desc/all");
+                      }
+
+                      resetDisputeData();
+                    }
+                  })
+                  .finally(() => {
+                    setIsSubmittingCase(false);
+                  });
+              }
+            }}
+          />
+          {errorMsg && (
+            <ErrorButtonMessage>
+              <ClosedCircleIcon /> {errorMsg}
+            </ErrorButtonMessage>
+          )}
+        </div>
+      </EnsureChain>
+      {isPopupOpen && disputeId && (
+        <Popup
+          title={t("resolver.case_submitted", { disputeId })}
+          icon={DisputeIcon}
+          popupType={PopupType.DISPUTE_CREATED}
+          setIsOpen={setIsPopupOpen}
+          disputeId={disputeId}
+          courtId={courtId}
+        />
+      )}
+    </>
+  );
+};
+
+export const isTemplateValid = (disputeTemplate: IDisputeTemplate) => {
+  const areVotingOptionsFilled =
+    disputeTemplate.question !== "" &&
+    disputeTemplate.answers.every((answer) => answer.title !== "" && answer.description !== "");
+
+  return (disputeTemplate.title &&
+    disputeTemplate.description &&
+    disputeTemplate.policyURI &&
+    areVotingOptionsFilled) as boolean;
+};
+
+export default SubmitDisputeButton;

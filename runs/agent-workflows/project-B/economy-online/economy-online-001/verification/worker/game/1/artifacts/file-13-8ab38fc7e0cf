@@ -1,0 +1,564 @@
+import { describe, expect, it } from "vitest";
+import { Buttons, FruitMessageType, type FruitInspectedMessage } from "@pirate-sea-race/protocol";
+import {
+  createDuelState,
+  defaultDuelConfig as config,
+  duelInput as I,
+  fighterTells,
+  findMove,
+  strikesWithHitbox,
+  traceDuel,
+  type DuelInputs,
+  type DuelState,
+  type KitId,
+} from "@pirate-sea-race/simulation/duel";
+import { kitDescriptions } from "@pirate-sea-race/simulation/fruits";
+import { arenaDrawing, drawTells, FLOOR, OUTLINE, outlineColor, toCanvas, type ArenaPen, type Rect } from "./arenaDrawing.js";
+import { kitText, renderDuelHud, type DuelHudModel } from "./duelHud.js";
+import {
+  applyFruit,
+  canInspect,
+  eatProgress,
+  FRUIT_LINGER_TICKS,
+  FruitPanel,
+  fruitPanelView,
+  kitLine,
+  kitSummary,
+  lingers,
+  pedestalLine,
+  renderFruitHud,
+  resultLine,
+  type FruitPanelView,
+  type FruitStatus,
+} from "./fruitPanel.js";
+import { drawPedestals, PEDESTAL_HALF, PEDESTAL_OFFSET, worldPixels } from "./markers.js";
+import { MatchView } from "./matchView.js";
+import { panelKeydown, type KeyPanel } from "./pageKeys.js";
+
+const status = (patch: Partial<FruitStatus> = {}): FruitStatus => ({ kit: "duelist", pedestal: "full", fruitHeld: 0, fruitTotal: 60, fruitResult: "", fruitResultAt: 0, ...patch });
+const { name, advantage, vulnerability, specials } = kitDescriptions.ember;
+const ember: FruitInspectedMessage = { island: 0, full: true, kit: "ember", name, specials: [specials[0], specials[1]], advantage, vulnerability };
+
+/** The page's fields without a DOM: each `[data-testid]` lookup gets a recording stand-in. */
+function fakePage() {
+  interface FakeField {
+    textContent: string;
+    hidden: boolean;
+    readonly dataset: Record<string, string>;
+    readonly style: { setProperty(name: string, value: string): void; getPropertyValue(name: string): string };
+  }
+  const fields = new Map<string, FakeField>();
+  const field = (id: string): FakeField => {
+    let found = fields.get(id);
+    if (found === undefined) {
+      const properties = new Map<string, string>();
+      found = { textContent: "", hidden: false, dataset: {}, style: { setProperty: (name, value) => properties.set(name, value), getPropertyValue: (name) => properties.get(name) ?? "" } };
+      fields.set(id, found);
+    }
+    return found;
+  };
+  const root = { querySelector: (selector: string) => field(/data-testid="([^"]+)"/.exec(selector)![1]!) } as unknown as ParentNode;
+  return { root, field };
+}
+
+describe("the HUD's fruit lines (§9)", () => {
+  it("names the player's kit and its specials on U and I, the Duelist's until they eat", () => {
+    expect(kitLine(status({ kit: "ember" }))).toEqual({ text: "Ember: U flame bolt, I rising flare", state: "ember" });
+    expect(kitLine(status({ kit: "smoke" }))).toEqual({ text: "Smoke: U short feint dash, I smoke screen", state: "smoke" });
+    expect(kitLine(status())).toEqual({ text: "Duelist: U advancing thrust, I counter slash", state: "duelist" });
+    expect(kitLine(undefined)).toEqual({ text: "", state: "none" });
+    // A kit the page does not know shows nothing rather than a broken line.
+    expect(kitLine(status({ kit: "spring" }))).toEqual({ text: "", state: "none" });
+    expect(kitLine(status({ kit: "toString" }))).toEqual({ text: "", state: "none" });
+    expect(kitSummary("")).toBe("");
+  });
+
+  it("offers F at a full pedestal, says when one is empty, and nothing away from one", () => {
+    expect(pedestalLine(status())).toEqual({ text: "F: inspect fruit", state: "full" });
+    expect(pedestalLine(status({ pedestal: "empty" }))).toEqual({ text: "Fruit pedestal: empty", state: "empty" });
+    expect(pedestalLine(status({ pedestal: "" }))).toEqual({ text: "", state: "none" });
+    expect(pedestalLine(undefined)).toEqual({ text: "", state: "none" });
+    expect([canInspect(status()), canInspect(status({ pedestal: "empty" })), canInspect(status({ pedestal: "" })), canInspect(undefined)]).toEqual([true, true, false, false]);
+  });
+
+  it("writes both lines into the page", () => {
+    const page = fakePage();
+    renderFruitHud(page.root, status({ kit: "ember", pedestal: "empty" }));
+    expect(page.field("hud-kit").textContent).toBe("Ember: U flame bolt, I rising flare");
+    expect(page.field("hud-kit").dataset["state"]).toBe("ember");
+    expect(page.field("hud-pedestal").textContent).toBe("Fruit pedestal: empty");
+  });
+});
+
+describe("the fruit panel's model (§9)", () => {
+  it("is hidden until a pedestal is inspected", () => {
+    expect(fruitPanelView(undefined, status(), 0)).toMatchObject({ hidden: true, name: "", specials: [], progress: 0, message: { state: "none" } });
+  });
+
+  it("shows the kit's name, its specials on U and I and §9's description, and how to eat it", () => {
+    const view = fruitPanelView(ember, status(), 0);
+    expect(view).toMatchObject({
+      hidden: false,
+      island: 0,
+      full: true,
+      kit: "ember",
+      name: "Ember",
+      specials: ["U: Flame bolt", "I: Rising flare"],
+      advantage: "Controls space and punishes jumps",
+      vulnerability: "Long recovery if attacks miss",
+      hint: { text: "Hold F for 3 s to eat it", state: "ready" },
+      eating: false,
+    });
+    // A fed player reads it, and is told why holding F will not eat it.
+    expect(fruitPanelView(ember, status({ kit: "smoke" }), 0).hint).toEqual({ text: "You have already eaten a fruit this match", state: "fed" });
+  });
+
+  it("shows an empty pedestal as such", () => {
+    expect(fruitPanelView({ island: 2, full: false }, status({ pedestal: "empty" }), 0)).toMatchObject({
+      hidden: false,
+      island: 2,
+      full: false,
+      name: "Empty pedestal",
+      specials: [],
+      hint: { state: "empty" },
+      eating: false,
+    });
+  });
+
+  it("fills its ring as F is held", () => {
+    expect(eatProgress(status({ fruitHeld: 30 }))).toBe(0.5);
+    expect(eatProgress(status({ fruitHeld: 90 }))).toBe(1);
+    expect(eatProgress(undefined)).toBe(0);
+    expect(fruitPanelView(ember, status({ fruitHeld: 15 }), 0)).toMatchObject({ progress: 0.25, eating: true });
+  });
+
+  it("says why an attempt was refused or interrupted, the meal, and a cast-off; never a result older than the panel", () => {
+    const cases: [string, string, string?][] = [
+      ["refused:taken", "refused:taken"],
+      ["interrupted:taken", "Another captain ate this fruit first"],
+      ["refused:already-eaten", "You have already eaten a fruit this match"],
+      ["refused:empty", "This pedestal is empty"],
+      ["refused:reserved", "Not during a duel"],
+      ["interrupted:reserved", "A duel interrupted your meal"],
+      ["refused:disconnected", "Not while disconnected"],
+      ["interrupted:disconnected", "Your connection dropped: eating stopped"],
+      ["interrupted:released", "You let go of F: eating stopped"],
+      ["interrupted:moved", "You moved to another pedestal: eating stopped"],
+      ["interrupted:gap", "Eating was interrupted"],
+      ["interrupted:left", "You left the match"],
+      ["refused:left", "You left the match"],
+    ];
+    for (const [result, text] of cases) expect(resultLine(status({ fruitResult: result })), result).toEqual({ text, state: result });
+    expect(resultLine(status({ fruitResult: "eaten:ember", kit: "ember", pedestal: "empty" }))).toEqual({ text: "You ate the fruit. Ember: U flame bolt, I rising flare", state: "eaten:ember" });
+    expect(resultLine(status({ fruitResult: "interrupted:released", pedestal: "" }))).toEqual({ text: "You cast off: eating stopped", state: "interrupted:cast-off" });
+    expect(resultLine(status())).toEqual({ text: "", state: "none" });
+    expect(resultLine(undefined)).toEqual({ text: "", state: "none" });
+    expect(fruitPanelView(ember, status({ fruitResult: "refused:empty", fruitResultAt: 99 }), 100).message).toEqual({ text: "", state: "none" });
+    expect(fruitPanelView(ember, status({ fruitResult: "interrupted:taken", fruitResultAt: 100 }), 100).message.state).toBe("interrupted:taken");
+  });
+
+  it("writes into the page", () => {
+    const page = fakePage();
+    applyFruit(page.root, fruitPanelView(ember, status({ fruitHeld: 30, fruitResult: "interrupted:reserved", fruitResultAt: 5 }), 0));
+    expect(page.field("fruit-panel").hidden).toBe(false);
+    expect(page.field("fruit-panel").dataset["kit"]).toBe("ember");
+    expect(page.field("fruit-name").textContent).toBe("Ember");
+    expect(page.field("fruit-special-u").textContent).toBe("U: Flame bolt");
+    expect(page.field("fruit-special-i").textContent).toBe("I: Rising flare");
+    expect(page.field("fruit-advantage").textContent).toBe("Advantage: Controls space and punishes jumps");
+    expect(page.field("fruit-vulnerability").textContent).toBe("Vulnerability: Long recovery if attacks miss");
+    expect(page.field("fruit-progress").hidden).toBe(false);
+    expect(page.field("fruit-progress").dataset["progress"]).toBe("0.50");
+    expect(page.field("fruit-progress").style.getPropertyValue("--progress")).toBe("50%");
+    expect(page.field("fruit-message").textContent).toBe("A duel interrupted your meal");
+    applyFruit(page.root, fruitPanelView({ island: 1, full: false }, status({ pedestal: "empty" }), 0));
+    expect([page.field("fruit-special-u").textContent, page.field("fruit-advantage").textContent, page.field("fruit-vulnerability").textContent]).toEqual(["", "", ""]);
+    expect(page.field("fruit-progress").hidden).toBe(true);
+    applyFruit(page.root, fruitPanelView(undefined, undefined, 0));
+    expect(page.field("fruit-panel").hidden).toBe(true);
+  });
+});
+
+describe("the fruit panel's behaviour (FruitPanel)", () => {
+  const panel = () => {
+    const sent: [string, unknown][] = [];
+    const views: FruitPanelView[] = [];
+    const fruit = new FruitPanel(
+      (type, message) => sent.push([type, message]),
+      (view) => views.push(view),
+    );
+    return { fruit, sent, views, last: () => views.at(-1)! };
+  };
+  const key = (code: string, repeat = false) => ({ code, repeat });
+
+  it("sends an inspection on F where the HUD offers one, and opens on the answer", () => {
+    const { fruit, sent, last } = panel();
+    // Nothing at sea.
+    fruit.update(status({ pedestal: "" }), 10);
+    expect(fruit.keydown(key("KeyF"))).toBe(false);
+    expect(sent).toEqual([]);
+    fruit.update(status(), 11);
+    expect(fruit.keydown(key("KeyF", true))).toBe(false);
+    expect(fruit.keydown(key("KeyR"))).toBe(false);
+    expect(fruit.keydown(key("KeyF"))).toBe(true);
+    expect(sent).toEqual([[FruitMessageType.Inspect, {}]]);
+    expect(fruit.isOpen).toBe(false);
+    // A reply that is not one is ignored; the real one opens the panel.
+    fruit.inspected({ island: 0, full: true, kit: "duelist" });
+    expect(fruit.isOpen).toBe(false);
+    fruit.inspected(ember);
+    expect(fruit.isOpen).toBe(true);
+    expect(last()).toMatchObject({ hidden: false, name: "Ember" });
+    // A malformed reply while open changes nothing.
+    fruit.inspected({ island: 0 });
+    expect(fruit.isOpen).toBe(true);
+    expect(last()).toMatchObject({ hidden: false, name: "Ember" });
+  });
+
+  it("holds the input's fruit button while F is held with the panel open, until F is released or the window blurs", () => {
+    const { fruit } = panel();
+    fruit.update(status(), 1);
+    expect(fruit.buttons()).toBe(0);
+    fruit.keydown(key("KeyF"));
+    expect(fruit.buttons()).toBe(0);
+    fruit.inspected(ember);
+    // The press that inspected does not eat; the next one, held, does.
+    expect(fruit.buttons()).toBe(0);
+    expect(fruit.keydown(key("KeyF"))).toBe(true);
+    expect(fruit.buttons()).toBe(Buttons.Fruit);
+    expect(fruit.keydown(key("KeyF", true))).toBe(true);
+    fruit.keyup("KeyE");
+    expect(fruit.buttons()).toBe(Buttons.Fruit);
+    fruit.keyup("KeyF");
+    expect(fruit.buttons()).toBe(0);
+    fruit.keydown(key("KeyF"));
+    fruit.blur();
+    expect(fruit.buttons()).toBe(0);
+  });
+
+  it("closes on Escape, and when the player is no longer at a pedestal (casting off, a duel)", () => {
+    const { fruit, last } = panel();
+    fruit.update(status(), 1);
+    fruit.inspected(ember);
+    fruit.keydown(key("KeyF"));
+    expect(fruit.keydown(key("Escape"))).toBe(true);
+    expect(fruit.isOpen).toBe(false);
+    expect(fruit.buttons()).toBe(0);
+    expect(last().hidden).toBe(true);
+    expect(fruit.keydown(key("Escape"))).toBe(false);
+    fruit.inspected(ember);
+    fruit.update(status({ pedestal: "empty" }), 2);
+    expect(fruit.isOpen).toBe(true);
+    fruit.update(status({ pedestal: "" }), 3);
+    expect(fruit.isOpen).toBe(false);
+  });
+
+  it("never starts eating on the auto-repeat of the F press that opened it; a fresh press does, and a repeat then keeps it held", () => {
+    const { fruit } = panel();
+    fruit.update(status(), 10);
+    fruit.keydown(key("KeyF"));
+    fruit.inspected(ember);
+    // F still down: the browser repeats it. The panel takes the key, but holds nothing.
+    expect(fruit.keydown(key("KeyF", true))).toBe(true);
+    expect(fruit.keydown(key("KeyF", true))).toBe(true);
+    expect(fruit.buttons()).toBe(0);
+    fruit.keyup("KeyF");
+    // A fresh press holds it; its own repeats keep it held.
+    fruit.keydown(key("KeyF"));
+    expect(fruit.buttons()).toBe(Buttons.Fruit);
+    fruit.keydown(key("KeyF", true));
+    expect(fruit.buttons()).toBe(Buttons.Fruit);
+  });
+
+  it("stays open long enough to say why eating stopped when a duel or casting off took the player from the pedestal, then closes", () => {
+    for (const [result, text] of [
+      ["interrupted:reserved", "A duel interrupted your meal"],
+      ["interrupted:released", "You cast off: eating stopped"],
+    ] as const) {
+      const { fruit, last } = panel();
+      fruit.update(status(), 10);
+      fruit.inspected(ember);
+      fruit.keydown(key("KeyF"));
+      fruit.update(status({ fruitHeld: 20 }), 30);
+      // The reason and the pedestal's absence arrive together (the room writes both on one tick).
+      fruit.update(status({ pedestal: "", fruitResult: result, fruitResultAt: 31 }), 31);
+      expect(fruit.isOpen).toBe(true);
+      expect(last()).toMatchObject({ hidden: false, message: { text } });
+      // Holding F is over, and F away from the pedestal holds nothing.
+      expect(fruit.buttons()).toBe(0);
+      fruit.keydown(key("KeyF"));
+      expect(fruit.buttons()).toBe(0);
+      fruit.update(status({ pedestal: "", fruitResult: result, fruitResultAt: 31 }), 31 + FRUIT_LINGER_TICKS - 1);
+      expect(fruit.isOpen).toBe(true);
+      fruit.update(status({ pedestal: "", fruitResult: result, fruitResultAt: 31 }), 31 + FRUIT_LINGER_TICKS);
+      expect(fruit.isOpen).toBe(false);
+      expect(last().hidden).toBe(true);
+    }
+    // An old interruption, from before the panel opened, does not keep it up.
+    const { fruit } = panel();
+    fruit.update(status({ fruitResult: "interrupted:released", fruitResultAt: 5 }), 10);
+    fruit.inspected(ember);
+    fruit.update(status({ pedestal: "", fruitResult: "interrupted:released", fruitResultAt: 5 }), 11);
+    expect(fruit.isOpen).toBe(false);
+    expect(lingers(status({ fruitResult: "refused:empty", fruitResultAt: 11 }), 10, 11)).toBe(false);
+  });
+
+  it("shows only results from after it opened, and keeps its opening tick across a second inspection", () => {
+    const { fruit, last } = panel();
+    fruit.update(status({ fruitResult: "interrupted:released", fruitResultAt: 5 }), 10);
+    fruit.inspected(ember);
+    expect(last().message.state).toBe("none");
+    fruit.update(status({ fruitResult: "interrupted:taken", fruitResultAt: 11 }), 12);
+    fruit.inspected({ island: 0, full: false });
+    expect(last()).toMatchObject({ full: false, message: { state: "interrupted:taken" } });
+  });
+});
+
+describe("the match page's panel keys", () => {
+  const recording = (open: boolean, takes: boolean) => {
+    const seen: string[] = [];
+    const keyPanel: KeyPanel = {
+      isOpen: open,
+      keydown: (event) => {
+        seen.push(event.code);
+        return takes;
+      },
+    };
+    return { keyPanel, seen };
+  };
+  const event = (code: string, target: unknown = {}) => ({ code, repeat: false, target: target as EventTarget });
+  /** The journal, closed and taking none of these keys (its own routing is `journal.test.ts`'s). */
+  const journal = recording(false, false).keyPanel;
+  /** The shop, closed and taking none of these keys (its own routing is `shop.test.ts`'s). */
+  const shop = recording(false, false).keyPanel;
+
+  it("skips a key typed into a text field, for the ruin panel as for the fruit panel", () => {
+    for (const tagName of ["INPUT", "TEXTAREA"]) {
+      const ruins = recording(false, true);
+      const fruit = recording(false, true);
+      expect(panelKeydown(event("KeyR", { tagName }), { ruins: ruins.keyPanel, fruit: fruit.keyPanel, journal, shop })).toBe(false);
+      expect(panelKeydown(event("KeyF", { tagName }), { ruins: ruins.keyPanel, fruit: fruit.keyPanel, journal, shop })).toBe(false);
+      expect([ruins.seen, fruit.seen]).toEqual([[], []]);
+    }
+    // The same keys aimed at the page (a button, the body) reach the panels.
+    const ruins = recording(false, true);
+    expect(panelKeydown(event("KeyR", { tagName: "BUTTON" }), { ruins: ruins.keyPanel, fruit: recording(false, false).keyPanel, journal, shop })).toBe(true);
+    expect(ruins.seen).toEqual(["KeyR"]);
+  });
+
+  it("gives a key to one panel at a time: the ruin panel first, the fruit panel when the ruin's did not take it", () => {
+    const panels = (ruinsOpen: boolean, ruinsTakes: boolean, fruitOpen: boolean, fruitTakes: boolean) => {
+      const ruins = recording(ruinsOpen, ruinsTakes);
+      const fruit = recording(fruitOpen, fruitTakes);
+      return { ruins, fruit, taken: panelKeydown(event("KeyF"), { ruins: ruins.keyPanel, fruit: fruit.keyPanel, journal, shop }) };
+    };
+    // Both closed: the ruin panel does not take F, the fruit panel does.
+    const closed = panels(false, false, false, true);
+    expect([closed.taken, closed.ruins.seen, closed.fruit.seen]).toEqual([true, ["KeyF"], ["KeyF"]]);
+    // The ruin panel took the key: the fruit panel never hears it.
+    const ruinTook = panels(false, true, false, true);
+    expect([ruinTook.taken, ruinTook.fruit.seen]).toEqual([true, []]);
+    // The fruit panel open: the ruin panel never hears the key (R opens no ruin over it).
+    const fruitOpen = panels(false, true, true, true);
+    expect([fruitOpen.taken, fruitOpen.ruins.seen, fruitOpen.fruit.seen]).toEqual([true, [], ["KeyF"]]);
+    // The ruin panel open and not taking the key: the fruit panel does not hear it either.
+    const ruinOpen = panels(true, false, false, true);
+    expect([ruinOpen.taken, ruinOpen.fruit.seen]).toEqual([false, []]);
+  });
+});
+
+describe("the pedestals on the sea (§9, §16)", () => {
+  it("draws each pedestal in sight beside its dock, with its fruit while full, and reports it", () => {
+    const view = new MatchView("me");
+    view.ingestPedestals([
+      { island: 3, x: 3000, y: 4000, full: false },
+      { island: 0, x: 1000, y: 2000, full: true },
+    ]);
+    expect(view.pedestals().map((pedestal) => pedestal.island)).toEqual([0, 3]);
+    const drawn: string[] = [];
+    const reported = drawPedestals(
+      { stone: (x, y, half) => drawn.push(`stone ${x},${y} ${half}`), fruit: (x, y, radius) => drawn.push(`fruit ${x},${y} ${radius}`) },
+      view.pedestals(),
+      { x: 10, y: 20 },
+    );
+    const at = worldPixels({ x: 1000, y: 2000 });
+    const empty = worldPixels({ x: 3000, y: 4000 });
+    // The full one gets its fruit on top of its stone; the empty one only its stone.
+    expect(drawn).toEqual([
+      `stone ${at.x + PEDESTAL_OFFSET},${at.y - PEDESTAL_OFFSET} ${PEDESTAL_HALF}`,
+      `fruit ${at.x + PEDESTAL_OFFSET},${at.y - PEDESTAL_OFFSET - PEDESTAL_HALF} ${PEDESTAL_HALF * 0.8}`,
+      `stone ${empty.x + PEDESTAL_OFFSET},${empty.y - PEDESTAL_OFFSET} ${PEDESTAL_HALF}`,
+    ]);
+    expect(reported[0]).toEqual({ x: Math.round(at.x + PEDESTAL_OFFSET - 10), y: Math.round(at.y - PEDESTAL_OFFSET - 20), island: 0, full: true });
+  });
+});
+
+/** Runs a duel from the kits' frame-0 state with `[frame, p1, p2]` presses (frames from 1). */
+function trace(kits: readonly [KitId, KitId], frames: number, ...presses: readonly (readonly [number, number, number])[]): DuelState[] {
+  const inputs: DuelInputs[] = Array.from({ length: frames }, () => [0, 0] as const);
+  for (const [frame, p1, p2] of presses) inputs[frame - 1] = [p1, p2];
+  return traceDuel(config, createDuelState(config, { kits }), inputs);
+}
+
+describe("the arena's drawing (§9: what the renderer must show)", () => {
+  it("draws the flame bolt as a moving sprite from its release, never the cast's box as a threat", () => {
+    const cast = findMove(config.moveset, "flame-bolt-cast");
+    expect(strikesWithHitbox(cast)).toBe(false);
+    const states = trace(["ember", "duelist"], 60, [1, I("special1"), 0]);
+    const released = states.findIndex((state) => state.fighters[0].bolt !== null);
+    expect(released).toBe(cast.timing.startup + 1);
+    const first = arenaDrawing(config, states[released]!);
+    const later = arenaDrawing(config, states[released + 5]!);
+    expect(first.bolts).toHaveLength(1);
+    expect(first.bolts[0]!.owner).toBe(0);
+    expect(first.bolts[0]!.box).toEqual(toCanvas(config, fighterTells(config, states[released]!.fighters[0]).bolt!));
+    // It moves toward the opponent (player one starts on the left).
+    expect(later.bolts[0]!.box.x).toBeGreaterThan(first.bolts[0]!.box.x);
+    // The cast's active frames draw no threat.
+    for (const state of states) expect(arenaDrawing(config, state).fighters[0].threat).toBeNull();
+    expect(arenaDrawing(config, states[0]!).bolts).toEqual([]);
+  });
+
+  it("draws a striking move's active hitbox as a threat", () => {
+    const jab = findMove(config.moveset, config.moveset.commands.light);
+    expect(strikesWithHitbox(jab)).toBe(true);
+    const states = trace(["duelist", "duelist"], 20, [1, I("light"), 0]);
+    const threats = states.map((state) => arenaDrawing(config, state).fighters[0].threat !== null);
+    expect(threats.filter(Boolean)).toHaveLength(jab.timing.active);
+    const active = states.findIndex((state) => arenaDrawing(config, state).fighters[0].threat !== null);
+    expect(arenaDrawing(config, states[active]!).fighters[0].threat).toEqual(toCanvas(config, fighterTells(config, states[active]!.fighters[0]).activeHitbox!));
+  });
+
+  it("draws the smoke screen as a zone, and an obscured fighter's startup as a generic flash with its move hidden", () => {
+    const screen = findMove(config.moveset, "smoke-screen");
+    const states = trace(["smoke", "duelist"], 60, [1, I("special2"), 0], [40, I("light"), 0]);
+    const laid = states.findIndex((state) => state.fighters[0].zone !== null);
+    expect(laid).toBe(screen.timing.startup + 1);
+    const drawing = arenaDrawing(config, states[laid]!);
+    expect(drawing.zones).toHaveLength(1);
+    expect(drawing.zones[0]!.owner).toBe(0);
+    expect(drawing.fighters[0].obscured).toBe(true);
+    // The screen's own box never strikes.
+    expect(states.every((state) => arenaDrawing(config, state).fighters[0].threat === null || state.frame > 40)).toBe(true);
+    // The jab started inside the screen: a generic flash, its name hidden; the body and facing still drawn.
+    const starting = states.findIndex((state, frame) => frame >= 40 && fighterTells(config, state.fighters[0]).startingUp);
+    const obscured = arenaDrawing(config, states[starting]!).fighters[0];
+    expect(obscured).toMatchObject({ obscured: true, startupFlash: true, startingUp: false, label: "…" });
+    expect(obscured.body).toEqual(toCanvas(config, fighterTells(config, states[starting]!.fighters[0]).hurtbox));
+    // Out of the smoke, the same startup shows the move.
+    const clear = arenaDrawing(config, trace(["duelist", "duelist"], 2, [1, I("light"), 0])[1]!).fighters[0];
+    expect(clear).toMatchObject({ obscured: false, startupFlash: false, startingUp: true });
+    expect(clear.label).toMatch(/^Jab 1$/i);
+  });
+
+  it("draws the feint's readable reappearance", () => {
+    const states = trace(["smoke", "duelist"], 40, [1, I("special1"), 0]);
+    const reappearing = states.flatMap((state, frame) => (arenaDrawing(config, state).fighters[0].reappearing ? [frame] : []));
+    expect(reappearing.length).toBeGreaterThan(0);
+    expect(reappearing).toEqual(states.flatMap((state, frame) => (fighterTells(config, state.fighters[0]).reappearing ? [frame] : [])));
+  });
+
+  it("places boxes on the canvas with y down from the floor, and labels a crouching block as low", () => {
+    expect(toCanvas(config, { x0: 0, x1: 32, y0: 0, y1: 32 })).toEqual({ x: 0, y: FLOOR - 32 / config.moveset.arena.subPixelsPerPixel, w: 2, h: 2 });
+    const state = createDuelState(config);
+    const crouching = { ...state, fighters: [{ ...state.fighters[0], action: "blockstun" as const, crouching: true }, state.fighters[1]] as const };
+    expect(arenaDrawing(config, crouching as DuelState).fighters[0].label).toBe("blockstun (low)");
+    const crouch = { ...state, fighters: [{ ...state.fighters[0], action: "crouch" as const, crouching: true }, state.fighters[1]] as const };
+    expect(arenaDrawing(config, crouch as DuelState).fighters[0].label).toBe("crouch");
+  });
+});
+
+describe("the arena's pen (§9's tells) and outlines", () => {
+  const recordingPen = () => {
+    const drawn: string[] = [];
+    const at = (box: Rect) => `${Math.round(box.x)},${Math.round(box.y)}`;
+    const pen: ArenaPen = {
+      zone: (box) => drawn.push(`zone ${at(box)}`),
+      bolt: (box) => drawn.push(`bolt ${at(box)}`),
+      startupFlash: (body) => drawn.push(`flash ${at(body)}`),
+      reappearance: (body) => drawn.push(`reappear ${at(body)}`),
+    };
+    return { pen, drawn };
+  };
+
+  it("draws a bolt, a smoke screen, an obscured startup's flash and a reappearance, and nothing for a plain fighter", () => {
+    const quiet = recordingPen();
+    drawTells(quiet.pen, arenaDrawing(config, createDuelState(config)));
+    expect(quiet.drawn).toEqual([]);
+
+    const bolt = trace(["ember", "duelist"], 30, [1, I("special1"), 0]).at(-1)!;
+    const flying = recordingPen();
+    drawTells(flying.pen, arenaDrawing(config, bolt));
+    const box = arenaDrawing(config, bolt).bolts[0]!.box;
+    expect(flying.drawn).toEqual([`bolt ${Math.round(box.x)},${Math.round(box.y)}`]);
+
+    const smoky = trace(["smoke", "duelist"], 60, [1, I("special2"), 0], [40, I("light"), 0]);
+    const starting = smoky.findIndex((state, frame) => frame >= 40 && fighterTells(config, state.fighters[0]).startingUp);
+    const screened = recordingPen();
+    drawTells(screened.pen, arenaDrawing(config, smoky[starting]!));
+    expect(screened.drawn.map((line) => line.split(" ")[0])).toEqual(["zone", "flash"]);
+
+    const feint = trace(["smoke", "duelist"], 40, [1, I("special1"), 0]);
+    const back = feint.findIndex((state) => fighterTells(config, state.fighters[0]).reappearing);
+    const reappearing = recordingPen();
+    drawTells(reappearing.pen, arenaDrawing(config, feint[back]!));
+    expect(reappearing.drawn.map((line) => line.split(" ")[0])).toEqual(["reappear"]);
+  });
+
+  it("outlines a striking move's active frames as a threat, a cast's as a startup, and an obscured startup as the flash's white", () => {
+    const outline = (state: DuelState) => outlineColor(state.fighters[0], arenaDrawing(config, state).fighters[0]);
+    const jab = trace(["duelist", "duelist"], 20, [1, I("light"), 0]);
+    expect(outline(jab[1]!)).toBe(OUTLINE.startup);
+    expect(jab.some((state) => outline(state) === OUTLINE.threat)).toBe(true);
+    const cast = trace(["ember", "duelist"], 40, [1, I("special1"), 0]);
+    expect(cast.slice(1, 30).every((state) => outline(state) === OUTLINE.startup)).toBe(true);
+    const smoky = trace(["smoke", "duelist"], 60, [1, I("special2"), 0], [40, I("light"), 0]);
+    const starting = smoky.findIndex((state, frame) => frame >= 40 && fighterTells(config, state.fighters[0]).startingUp);
+    expect(outline(smoky[starting]!)).toBe(OUTLINE.hidden);
+    const base = createDuelState(config);
+    const as = (action: DuelState["fighters"][0]["action"]) => {
+      const state = { ...base, fighters: [{ ...base.fighters[0], action }, base.fighters[1]] as const } as DuelState;
+      return outline(state);
+    };
+    expect([as("hitstun"), as("knockdown"), as("blockstun"), as("stagger"), as("thrown"), as("throw-break"), as("idle")]).toEqual([
+      OUTLINE.hit,
+      OUTLINE.hit,
+      OUTLINE.block,
+      OUTLINE.stagger,
+      OUTLINE.thrown,
+      OUTLINE.thrown,
+      OUTLINE.free,
+    ]);
+  });
+});
+
+describe("the duel HUD's kits (§9)", () => {
+  it("shows each fighter's kit and its U and I moves", () => {
+    expect(kitText("ember")).toBe("Ember · U Flame bolt · I Rising flare");
+    const page = fakePage();
+    const confirmed = createDuelState(config, { kits: ["smoke", "duelist"] });
+    const { rules } = config.moveset;
+    const model: DuelHudModel = {
+      code: "ABC123",
+      practice: false,
+      phase: "fighting",
+      status: "connected",
+      self: 1,
+      countdown: 0,
+      connected: [true, true],
+      confirmed,
+      maxHealth: rules.maxHealth,
+      maxStamina: rules.maxStamina,
+      roundFrames: rules.roundFrames,
+      overtimeFrames: rules.overtimeFrames,
+      rttMs: 0,
+      inputDelay: 4,
+      corrections: 0,
+      result: undefined,
+    };
+    renderDuelHud(page.root, model);
+    expect(page.field("duel-kit-0").textContent).toBe("Smoke · U Short feint dash · I Smoke screen");
+    expect(page.field("duel-kit-0").dataset["kit"]).toBe("smoke");
+    expect(page.field("duel-kit-1").textContent).toBe("Duelist · U Advancing thrust · I Counter slash");
+  });
+});

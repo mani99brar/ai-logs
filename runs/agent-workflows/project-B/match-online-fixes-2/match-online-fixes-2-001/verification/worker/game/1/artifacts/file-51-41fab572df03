@@ -1,0 +1,225 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { intelRules } from "@pirate-sea-race/content/intel";
+import { recordedOutcomes, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { sleep, type HeadlessClient, type ResultLineView } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, HOST_SEAT, lastDuel, placePair } from "./rubbingsSetup.js";
+import { CLAIM_SEAT, collectFullSet, controlStartOf, flowTuning } from "./matchFlowSetup.js";
+import { collectAt, dockFor, expectRoomChecks, grapple, HOLD_E, playersAt, resultOf, roomOf, tracker, until } from "./seaDuelSetup.js";
+
+/**
+ * §2 and §12's endings through the real room, each with its exact results screen: a claim, the deadline (no winner),
+ * a claim completing on the deadline tick (it wins), everyone leaving (abandoned) and a server fault (aborted, through
+ * the room's test-only fault hook). Test-only timings: a two-second channel and a 20 s match.
+ */
+const CHANNEL = 40;
+const MATCH_TICKS = 400;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  // The minute-20 reveal falls due on the deadline tick: a match that has ended sends nothing more.
+  const intel = { ...intelRules, sectorRevealTicks: MATCH_TICKS, carrierRevealTicks: MATCH_TICKS + 200 };
+  const matchTuning = flowTuning({ claim: { ...claimRules, channelTicks: CHANNEL, deadlineTicks: MATCH_TICKS }, intel });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+/** Old Stones' first dock: its sources are Suns in the test layout. */
+const OLD_STONES = seaMap.docks.find((dock) => dock.island === 2)!;
+
+/** A results line with nothing accomplished: the starting gold, and `seat` and `winner`/`left` as given. */
+const line = (seat: number, change: Partial<ResultLineView> = {}): ResultLineView => ({
+  seat,
+  winner: false,
+  left: false,
+  rubbingsHeld: 0,
+  collected: 0,
+  thefts: 0,
+  lost: 0,
+  duelsWon: 0,
+  duelsLost: 0,
+  duelsDrawn: 0,
+  gold: 50,
+  cachesClaimed: 0,
+  islandsVisited: 0,
+  ...change,
+});
+
+/** Both players' results screens, once both show one; they are the same. */
+async function resultsOf(host: HeadlessClient, guest: HeadlessClient, timeoutMs = 25_000) {
+  for (const client of [host, guest]) await client.waitFor(() => client.results() !== undefined, timeoutMs);
+  expect(guest.results()).toEqual(host.results());
+  for (const client of [host, guest]) expect(client.phase).toBe("ended");
+  return host.results()!;
+}
+
+describe.concurrent("the endings (§2, §12)", () => {
+  it("ends by a claim: the winner first, and every player's accomplishments", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    await collectAt(guest, endpoint, OLD_STONES, "sun");
+    await collectFullSet(host, endpoint);
+    await host.placeShip(endpoint, CLAIM_SEAT);
+    await host.holdUntil(HOLD_E, () => host.results() !== undefined, 8000);
+    const results = await resultsOf(host, guest);
+    const controlStart = controlStartOf(host);
+    expect(results).toMatchObject({ reason: "claim", winnerSeat: host.seat });
+    expect(results.elapsedTicks).toBe(results.tick - controlStart);
+    // The results are synced once: later patches add no line.
+    await sleep(300);
+    expect(roomOf(host).state.results.length).toBe(2);
+    expect(results.players).toEqual([
+      line(host.seat, { winner: true, rubbingsHeld: 2, collected: 2, islandsVisited: 2 }),
+      line(guest.seat, { rubbingsHeld: 1, collected: 1, islandsVisited: 1 }),
+    ]);
+  }, 30_000);
+
+  it("ends at the deadline with no winner, counting a duel, its theft and its gold", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The guest never readies its arena: it forfeits the duel.
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { clients: [{}, { autoReady: false }] })) as [HeadlessClient, HeadlessClient];
+    await collectAt(host, endpoint, dockFor("sun"), "sun");
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => host.objectives()!.theftOptions.join(",") === "moon", 10_000);
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "sun,moon");
+    // The loser respawns moored at a dock: that island counts as visited too.
+    await guest.waitFor(() => guest.status()?.mode === "sea" && guest.ship()!.dock >= 0, 10_000);
+    const guestIslands = new Set([dockFor("moon").island, seaMap.docks[guest.ship()!.dock]!.island]).size;
+    const results = await resultsOf(host, guest);
+    expect(results).toMatchObject({ reason: "deadline", winnerSeat: 0, tick: controlStartOf(host) + MATCH_TICKS, elapsedTicks: MATCH_TICKS });
+    for (const client of [host, guest]) expect(client.reveals.filter((reveal) => reveal.kind === "sector-reveal")).toEqual([]);
+    expect(results.players).toEqual([
+      line(host.seat, { rubbingsHeld: 2, collected: 1, thefts: 1, duelsWon: 1, gold: 60, islandsVisited: 1 }),
+      line(guest.seat, { rubbingsHeld: 0, collected: 1, lost: 1, duelsLost: 1, gold: 40, islandsVisited: guestIslands }),
+    ]);
+  }, 35_000);
+
+  it("lets a claim completing on the deadline tick win", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    await collectFullSet(host, endpoint);
+    await host.placeShip(endpoint, CLAIM_SEAT);
+    const room = roomOf(host);
+    const deadline = controlStartOf(host) + MATCH_TICKS;
+    expect(room.claimConfiguration!.deadlineTick).toBe(deadline);
+    // The clock stops after the tick before the channel's start that completes it on the deadline tick; E goes
+    // down while it is stopped, so the channel starts on the next tick.
+    room.pauseAfterTick(deadline - CHANNEL - 1);
+    await until(() => room.worldPaused, 20_000, "the pause");
+    const stopped = room.matchState.worldTick;
+    expect(stopped).toBe(deadline - CHANNEL - 1);
+    const holding = host.holdUntil(HOLD_E, () => host.results() !== undefined, 8000);
+    await sleep(250);
+    // Stopped: no world tick ran meanwhile.
+    expect(room.matchState.worldTick).toBe(stopped);
+    room.resumeWorld();
+    await holding;
+    const results = await resultsOf(host, guest);
+    expect(room.claimState!.result).toEqual({ reason: "claim", winner: host.sessionId, tick: deadline });
+    expect(results).toMatchObject({ reason: "claim", winnerSeat: host.seat, tick: deadline, elapsedTicks: MATCH_TICKS });
+    expect(results.players[0]).toEqual(line(host.seat, { winner: true, rubbingsHeld: 2, collected: 2, islandsVisited: 2 }));
+  }, 35_000);
+
+  it("ends abandoned, with no winner, when everyone leaves after the start", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    const code = host.code;
+    const room = roomOf(host);
+    await collectAt(host, endpoint, dockFor("sun"), "sun");
+    const seats = [host.seat, guest.seat];
+    await Promise.all([host.leave(), guest.leave()]);
+    await until(() => recordedOutcomes().some((outcome) => outcome.code === code), 5000, "the recorded outcome");
+    const results = recordedOutcomes().find((outcome) => outcome.code === code)!.results;
+    expect(results).toMatchObject({ reason: "abandoned", winner: null, custom: true });
+    // Neither holds a rubbing at the end, so the lines are in id order; compared here by seat.
+    const bySeat = results.players.map(({ id, ...rest }) => ({ ...rest, seat: room.seatOf(id) })).sort((a, b) => a.seat - b.seat);
+    expect(bySeat).toEqual([
+      // The host's Sun went into a cache when it quit: collected, then lost.
+      line(seats[0]!, { left: true, collected: 1, lost: 1, islandsVisited: 1 }),
+      line(seats[1]!, { left: true }),
+    ]);
+    expectRoomChecks(room);
+  });
+
+  it("counts a cancelled duel for neither fighter (neither readied its arena)", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { clients: [{ autoReady: false }, { autoReady: false }] })) as [HeadlessClient, HeadlessClient];
+    await grapple(host, guest);
+    await until(() => lastDuel(host)?.phase === "settled", 8000, "the cancellation");
+    expect(lastDuel(host)).toMatchObject({ result: { outcome: "cancelled" } });
+    for (const client of [host, guest]) await client.waitFor(() => client.status()?.mode === "sea", 3000);
+    roomOf(host).injectFault();
+    const results = await resultsOf(host, guest, 5000);
+    expect(results).toMatchObject({ reason: "aborted", winnerSeat: 0 });
+    // Nobody holds a rubbing, so the lines are in id order: compared here by seat.
+    expect([...results.players].sort((a, b) => a.seat - b.seat)).toEqual([line(host.seat), line(guest.seat)].sort((a, b) => a.seat - b.seat));
+  }, 20_000);
+
+  it("cancels a duel still being fought when the match ends, and counts it for neither fighter", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    await grapple(host, guest);
+    for (const client of [host, guest]) await client.waitFor(() => client.fighter.phase === "fighting", 8000);
+    roomOf(host).injectFault();
+    const results = await resultsOf(host, guest, 5000);
+    expect(results).toMatchObject({ reason: "aborted", winnerSeat: 0 });
+    expect([...results.players].sort((a, b) => a.seat - b.seat)).toEqual([line(host.seat), line(guest.seat)].sort((a, b) => a.seat - b.seat));
+    // The end takes the duel's marker off the sea at once.
+    expect(roomOf(host).state.markers.size).toBe(0);
+    // Outcomes freeze: the ledger cancels the fight (nothing moves), and both fighters see it end, cancelled.
+    expect(lastDuel(host)).toMatchObject({ phase: "settled", result: { outcome: "cancelled" }, settlement: { choice: "none", gold: 0 } });
+    expect(await resultOf(host, guest, 3000)).toEqual({ phase: "over", winner: -1, reason: "cancelled" });
+    // The cancelled duel is shown for a moment, then leaves both views: back to the sea and its results screen.
+    for (const client of [host, guest]) await client.waitFor(() => client.duelCount === 0, 5000);
+  }, 20_000);
+
+  it("keeps running while a quitter's rubbing waits in the winner's theft window, and counts the forfeit and the theft", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "fighting", 8000);
+    const room = roomOf(host);
+    const seats = [host.seat, guest.seat];
+    // The guest quits mid-fight: a forfeit, its Moon held for the host's choice while its ship is gone.
+    await guest.leave();
+    await host.waitFor(() => host.objectives()?.theftOptions.join(",") === "moon", 5000);
+    expect(room.ledgerState.rubbings.filter((rubbing) => rubbing.location.kind === "duel")).toHaveLength(1);
+    await sleep(300);
+    expect(host.phase).not.toBe("ended");
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "moon");
+    room.injectFault();
+    await host.waitFor(() => host.results() !== undefined, 5000);
+    const results = host.results()!;
+    expect(results).toMatchObject({ reason: "aborted", winnerSeat: 0 });
+    expect(results.players).toEqual([
+      line(seats[0]!, { rubbingsHeld: 1, thefts: 1, duelsWon: 1, gold: 60 }),
+      line(seats[1]!, { left: true, collected: 1, lost: 1, duelsLost: 1, gold: 40, islandsVisited: 1 }),
+    ]);
+  }, 25_000);
+
+  it("ends aborted, with no winner and no penalty, on a server fault", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    await collectAt(host, endpoint, dockFor("sun"), "sun");
+    roomOf(host).injectFault();
+    const results = await resultsOf(host, guest, 5000);
+    expect(results).toMatchObject({ reason: "aborted", winnerSeat: 0 });
+    expect(results.players).toEqual([line(host.seat, { rubbingsHeld: 1, collected: 1, islandsVisited: 1 }), line(guest.seat)]);
+    // Nothing moves after the fault.
+    const tick = roomOf(host).flowState.tick;
+    await host.hold({ moveX: 0, moveY: -1 }, 300);
+    expect(roomOf(host).flowState.tick).toBe(tick);
+  });
+});

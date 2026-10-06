@@ -1,0 +1,290 @@
+import { rulesPresets } from "@pirate-sea-race/content";
+import { describe, expect, it } from "vitest";
+import {
+  checkFruitState,
+  createFruitConfig,
+  createFruitState,
+  fruitRules,
+  hashState,
+  inspectPedestal,
+  kitDescriptions,
+  kitOf,
+  stepFruits,
+  type FruitPlayer,
+  type FruitResult,
+  type FruitSite,
+  type FruitState,
+} from "./index.js";
+
+const config = createFruitConfig();
+const EAT = config.eatTicks;
+const SITES: FruitSite[] = [
+  { id: "north", x: 1000, y: 200 },
+  { id: "east", x: 2000, y: 1000 },
+  { id: "south", x: 1000, y: 2000 },
+  { id: "west", x: 200, y: 1000 },
+];
+const SEED = 0x5eed;
+const fresh = () => createFruitState(SITES, SEED, rulesPresets.slice);
+
+/** A player holding interact at a pedestal, connected, free and present. */
+function at(playerId: string, pedestalId: string | null, change: Partial<FruitPlayer> = {}): FruitPlayer {
+  return { playerId, pedestalId, holding: true, reserved: false, disconnected: false, left: false, ...change };
+}
+
+/** Recursively frozen, so a step that mutated its input would throw. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+/** Steps the next tick with frozen input and state, checking neither changes and the invariants hold. */
+function step(state: FruitState, players: FruitPlayer[], tick = state.tick + 1) {
+  const before = hashState(deepFreeze(state));
+  const stepped = stepFruits(config, state, deepFreeze({ tick, players }));
+  expect(hashState(state)).toBe(before);
+  expect(checkFruitState(stepped.state)).toEqual([]);
+  return stepped;
+}
+
+/** Steps `count` identical ticks, returning the final state and every result. */
+function hold(state: FruitState, players: FruitPlayer[], count: number) {
+  const results: FruitResult[] = [];
+  let current = state;
+  for (let index = 0; index < count; index++) {
+    const stepped = step(current, players);
+    current = stepped.state;
+    results.push(...stepped.results);
+  }
+  return { state: current, results };
+}
+
+const completions = (results: readonly FruitResult[]) => results.filter((result) => result.kind === "eat-completed");
+
+describe("dealing (§9)", () => {
+  it("deals two of each fruit kit onto the sites, the same way for the same seed and sites", () => {
+    const state = fresh();
+    expect(state.tick).toBe(0);
+    expect(state.channels).toEqual([]);
+    expect(state.meals).toEqual([]);
+    expect(state.pedestals.map((pedestal) => pedestal.id)).toEqual(SITES.map((site) => site.id));
+    expect(state.pedestals.map((pedestal) => pedestal.kit).sort()).toEqual(["ember", "ember", "smoke", "smoke"]);
+    expect(state.pedestals.every((pedestal) => pedestal.eatenBy === null)).toBe(true);
+    expect(hashState(fresh())).toBe(hashState(state));
+    expect(checkFruitState(state)).toEqual([]);
+  });
+
+  it("deals differently across seeds, and every deal is a permutation of the deck", () => {
+    const deals = new Set<string>();
+    for (let seed = 0; seed < 200; seed++) {
+      const kits = createFruitState(SITES, seed, rulesPresets.slice).pedestals.map((pedestal) => pedestal.kit);
+      expect([...kits].sort()).toEqual(["ember", "ember", "smoke", "smoke"]);
+      deals.add(kits.join());
+    }
+    // All six arrangements of two Ember and two Smoke appear.
+    expect(deals.size).toBe(6);
+  });
+
+  it("refuses too few or too many sites, duplicate ids and fractional positions", () => {
+    expect(() => createFruitState(SITES.slice(0, 3), SEED, rulesPresets.slice)).toThrow(/needs 4 pedestal sites .* got 3/);
+    expect(() => createFruitState([...SITES, { id: "hub", x: 0, y: 0 }], SEED, rulesPresets.slice)).toThrow(/needs 4 pedestal sites .* got 5/);
+    expect(() => createFruitState([...SITES.slice(0, 3), { ...SITES[0]! }], SEED, rulesPresets.slice)).toThrow(/appears twice/);
+    expect(() => createFruitState([...SITES.slice(0, 3), { id: "", x: 0, y: 0 }], SEED, rulesPresets.slice)).toThrow(/non-empty/);
+    expect(() => createFruitState([...SITES.slice(0, 3), { id: "w", x: 0.5, y: 0 }], SEED, rulesPresets.slice)).toThrow(/safe integer/);
+    expect(() => createFruitState(SITES, 1.5, rulesPresets.slice)).toThrow(/seed/);
+  });
+
+  it("refuses the alpha preset until its six fruit kits exist", () => {
+    const alphaSites = Array.from({ length: 12 }, (_, index) => ({ id: `p${index}`, x: index, y: 0 }));
+    expect(() => createFruitState(alphaSites, SEED, rulesPresets.alpha)).toThrow("the alpha preset deals 6 fruit kits, but only 2 exist (ember, smoke)");
+    expect(() => createFruitState(SITES, SEED, rulesPresets.alpha)).toThrow(/deals 6 fruit kits/);
+  });
+
+  it("refuses invalid fruit rules and follows valid ones", () => {
+    expect(() => createFruitConfig({ ...fruitRules, eatTicks: 0 })).toThrow(/invalid fruit rules/);
+    const six = Array.from({ length: 6 }, (_, index) => ({ id: `p${index}`, x: index, y: 0 }));
+    const state = createFruitState(six, SEED, rulesPresets.slice, { rules: { ...fruitRules, pedestalsPerKit: 3 }, tick: 40 });
+    expect(state.pedestals).toHaveLength(6);
+    expect(state.tick).toBe(40);
+  });
+});
+
+describe("eating (§9)", () => {
+  it("eats after 60 held ticks, not 59", () => {
+    expect(EAT).toBe(60);
+    const almost = hold(fresh(), [at("a", "north")], EAT - 1);
+    expect(almost.results[0]).toEqual({ kind: "eat-started", tick: 1, playerId: "a", pedestalId: "north" });
+    expect(completions(almost.results)).toEqual([]);
+    expect(almost.state.channels).toEqual([{ playerId: "a", pedestalId: "north", startTick: 1, lastTick: EAT - 1, held: EAT - 1 }]);
+    expect(kitOf(almost.state, "a")).toBe("duelist");
+
+    const eaten = step(almost.state, [at("a", "north")]);
+    const kit = fresh().pedestals[0]!.kit;
+    expect(eaten.results).toEqual([{ kind: "eat-completed", tick: EAT, playerId: "a", pedestalId: "north", kit }]);
+    expect(eaten.state.channels).toEqual([]);
+    expect(eaten.state.meals).toEqual([{ playerId: "a", pedestalId: "north", kit, tick: EAT }]);
+    expect(eaten.state.pedestals[0]!.eatenBy).toBe("a");
+    expect(kitOf(eaten.state, "a")).toBe(kit);
+  });
+
+  it("resets on a released tick, and on an absent one", () => {
+    for (const gapTick of [at("a", "north", { holding: false }), at("a", null)]) {
+      const first = hold(fresh(), [at("a", "north")], EAT - 1);
+      const gap = step(first.state, [gapTick]);
+      expect(gap.results).toEqual([{ kind: "eat-interrupted", tick: EAT, playerId: "a", pedestalId: "north", reason: "released", held: EAT - 1 }]);
+      const again = hold(gap.state, [at("a", "north")], EAT - 1);
+      expect(completions(again.results)).toEqual([]);
+      expect(completions(step(again.state, [at("a", "north")]).results)).toHaveLength(1);
+    }
+    const absent = step(hold(fresh(), [at("a", "north")], 5).state, []);
+    expect(absent.results).toEqual([{ kind: "eat-interrupted", tick: 6, playerId: "a", pedestalId: "north", reason: "released", held: 5 }]);
+  });
+
+  it("resets on a skipped world tick", () => {
+    const first = hold(fresh(), [at("a", "north")], 10);
+    const skipped = step(first.state, [at("a", "north")], 12);
+    expect(skipped.results).toEqual([
+      { kind: "eat-interrupted", tick: 12, playerId: "a", pedestalId: "north", reason: "gap", held: 10 },
+      { kind: "eat-started", tick: 12, playerId: "a", pedestalId: "north" },
+    ]);
+    expect(skipped.state.channels[0]).toMatchObject({ startTick: 12, held: 1 });
+  });
+
+  it.each(["reserved", "disconnected", "left"] as const)("resets when the player is %s, and refuses while it lasts", (flag) => {
+    const first = hold(fresh(), [at("a", "north")], 30);
+    const broken = step(first.state, [at("a", "north", { [flag]: true })]);
+    expect(broken.results).toEqual([{ kind: "eat-interrupted", tick: 31, playerId: "a", pedestalId: "north", reason: flag, held: 30 }]);
+    const still = step(broken.state, [at("a", "north", { [flag]: true })]);
+    expect(still.results).toEqual([{ kind: "eat-refused", tick: 32, playerId: "a", pedestalId: "north", reason: flag }]);
+    expect(still.state.channels).toEqual([]);
+    const resumed = hold(still.state, [at("a", "north")], EAT);
+    expect(resumed.results[0]).toMatchObject({ kind: "eat-started", tick: 33 });
+    expect(completions(resumed.results)).toEqual([expect.objectContaining({ tick: 32 + EAT })]);
+  });
+
+  it("refuses a second fruit and an empty pedestal", () => {
+    const eaten = hold(fresh(), [at("a", "north")], EAT).state;
+    const again = step(eaten, [at("a", "east"), at("b", "north")]);
+    expect(again.results).toEqual([
+      { kind: "eat-refused", tick: EAT + 1, playerId: "a", pedestalId: "east", reason: "already-eaten" },
+      { kind: "eat-refused", tick: EAT + 1, playerId: "b", pedestalId: "north", reason: "empty" },
+    ]);
+    const later = hold(again.state, [at("a", "east"), at("b", "north")], EAT * 2);
+    expect(completions(later.results)).toEqual([]);
+    expect(later.state.meals).toHaveLength(1);
+    expect(kitOf(later.state, "a")).toBe(kitOf(eaten, "a"));
+  });
+
+  it("resets when the player moves to another pedestal", () => {
+    const first = hold(fresh(), [at("a", "north")], EAT - 1);
+    const moved = step(first.state, [at("a", "east")]);
+    expect(moved.results).toEqual([
+      { kind: "eat-interrupted", tick: EAT, playerId: "a", pedestalId: "north", reason: "moved", held: EAT - 1 },
+      { kind: "eat-started", tick: EAT, playerId: "a", pedestalId: "east" },
+    ]);
+    const rest = hold(moved.state, [at("a", "east")], EAT - 1);
+    expect(completions(rest.results)).toEqual([expect.objectContaining({ pedestalId: "east", tick: 2 * EAT - 1 })]);
+  });
+
+  it("rejects a stale or repeated tick with the very same state", () => {
+    const state = hold(fresh(), [at("a", "north")], 10).state;
+    for (const tick of [10, 9, 0, -3]) {
+      const stepped = stepFruits(config, state, { tick, players: [at("a", "north")] });
+      expect(stepped.state).toBe(state);
+      expect(stepped.results).toEqual([{ kind: "tick-rejected", tick, lastTick: 10 }]);
+    }
+    const next = stepFruits(config, state, { tick: 11, players: [at("a", "north")] });
+    expect(stepFruits(config, next.state, { tick: 11, players: [at("a", "north")] }).state).toBe(next.state);
+  });
+
+  it("refuses malformed facts", () => {
+    const state = fresh();
+    expect(() => stepFruits(config, state, { tick: 1, players: [at("a", "nowhere")] })).toThrow(/unknown pedestal/);
+    expect(() => stepFruits(config, state, { tick: 1, players: [at("a", "north"), at("a", "east")] })).toThrow(/appears twice/);
+    expect(() => stepFruits(config, state, { tick: 1, players: [at("", "north")] })).toThrow(/non-empty/);
+    expect(() => stepFruits(config, state, { tick: 1.5, players: [] })).toThrow(/safe integer/);
+  });
+});
+
+describe("contested pedestals", () => {
+  /** Every ordering of a list. */
+  function permutations<T>(items: readonly T[]): T[][] {
+    if (items.length <= 1) return [[...items]];
+    return items.flatMap((item, index) => permutations([...items.slice(0, index), ...items.slice(index + 1)]).map((rest) => [item, ...rest]));
+  }
+
+  it("gives one fruit to the lowest id when several finish on the same tick, whatever the input order", () => {
+    // Code-unit order: "B" < "a" < "p10" < "p2".
+    const ids = ["p2", "a", "p10", "B"];
+    let reference: string | null = null;
+    for (const order of permutations(ids)) {
+      const players = order.map((id) => at(id, "north"));
+      const run = hold(fresh(), players, EAT);
+      const done = completions(run.results);
+      expect(done).toEqual([expect.objectContaining({ playerId: "B", pedestalId: "north", tick: EAT })]);
+      const taken = run.results.filter((result) => result.kind === "eat-interrupted");
+      expect(taken).toEqual(
+        ["a", "p10", "p2"].map((playerId) => ({ kind: "eat-interrupted", tick: EAT, playerId, pedestalId: "north", reason: "taken", held: EAT })),
+      );
+      expect(run.state.meals).toHaveLength(1);
+      expect(run.state.channels).toEqual([]);
+      const hash = hashState(run.state) + JSON.stringify(run.results);
+      reference ??= hash;
+      expect(hash).toBe(reference);
+    }
+  });
+
+  it("interrupts a slower eater at that pedestal as taken, and leaves other pedestals alone", () => {
+    const early = hold(fresh(), [at("z", "north")], 20).state;
+    const run = hold(early, [at("z", "north"), at("m", "north"), at("k", "east")], EAT - 20);
+    expect(completions(run.results)).toEqual([expect.objectContaining({ playerId: "z", tick: EAT })]);
+    expect(run.results).toContainEqual({ kind: "eat-interrupted", tick: EAT, playerId: "m", pedestalId: "north", reason: "taken", held: EAT - 20 });
+    expect(run.state.channels).toEqual([expect.objectContaining({ playerId: "k", pedestalId: "east", held: EAT - 20 })]);
+  });
+});
+
+describe("commitment (§9)", () => {
+  it("is the Duelist before eating and for unknown ids, the fruit after, and never changes", () => {
+    let state = fresh();
+    expect(kitOf(state, "a")).toBe("duelist");
+    expect(kitOf(state, "nobody")).toBe("duelist");
+    state = hold(state, [at("a", "north")], EAT).state;
+    const kit = state.pedestals[0]!.kit;
+    expect(kitOf(state, "a")).toBe(kit);
+    // Holding at every other pedestal, while reserved, disconnected or leaving: nothing changes the kit.
+    for (const pedestal of SITES.slice(1)) {
+      for (const change of [{}, { reserved: true }, { disconnected: true }, { left: true }]) {
+        state = hold(state, [at("a", pedestal.id, change)], EAT).state;
+        expect(kitOf(state, "a")).toBe(kit);
+      }
+    }
+    expect(state.meals).toHaveLength(1);
+  });
+
+  it("keeps the kit through defeat and leaving: nothing clears a meal or refills a pedestal", () => {
+    const eaten = hold(fresh(), [at("a", "north")], EAT).state;
+    // A defeat is a reservation, then nothing: the rules have no operation that takes a fruit back.
+    const defeated = hold(eaten, [at("a", null, { reserved: true })], 100).state;
+    expect(kitOf(defeated, "a")).toBe(kitOf(eaten, "a"));
+    const left = hold(defeated, [at("a", null, { left: true, disconnected: true })], 100).state;
+    const gone = hold(left, [], 100).state;
+    expect(kitOf(gone, "a")).toBe(kitOf(eaten, "a"));
+    expect(gone.pedestals[0]!.eatenBy).toBe("a");
+    expect(step(gone, [at("b", "north")]).results).toEqual([expect.objectContaining({ kind: "eat-refused", reason: "empty" })]);
+  });
+});
+
+describe("inspection (§9)", () => {
+  it("shows a full pedestal's kit and description, an empty one as empty, and nothing for an unknown id", () => {
+    const state = fresh();
+    for (const pedestal of state.pedestals) {
+      expect(inspectPedestal(state, pedestal.id)).toEqual({ pedestalId: pedestal.id, full: true, kit: pedestal.kit, description: kitDescriptions[pedestal.kit] });
+    }
+    const eaten = hold(state, [at("a", "north")], EAT).state;
+    expect(inspectPedestal(eaten, "north")).toEqual({ pedestalId: "north", full: false });
+    expect(inspectPedestal(eaten, "nowhere")).toBeNull();
+  });
+});

@@ -1,0 +1,606 @@
+     1	"""Complete operator-driven graph: launch → freeze → verify → review → approve → integrate.
+     2	
+     3	No agent starts without `start --live`. Operator controls are local CLI-only.
+     4	"""
+     5	from __future__ import annotations
+     6	
+     7	import argparse
+     8	import hashlib
+     9	import html
+    10	import json
+    11	import os
+    12	import re
+    13	import shutil
+    14	import subprocess
+    15	import threading
+    16	from pathlib import Path
+    17	from typing import TypedDict
+    18	
+    19	from langgraph.checkpoint.sqlite import SqliteSaver
+    20	from langgraph.graph import END, START, StateGraph
+    21	from langgraph.types import Command, interrupt
+    22	
+    23	from .checks import now, recheck_packet, verify_revision
+    24	from .export_state import export_state
+    25	from .interactive import InteractiveSessions, attach_panels
+    26	from .sessions import NODES, git, prepare, read_json, run_lock, save_json
+    27	from .verification import owns, policy_digest, safe_path, validate_policy
+    28	
+    29	
+    30	def validate_pipeline_policy(policy: dict) -> dict:
+    31	    validate_policy(policy)
+    32	    if {worker["node_id"]: worker["role"] for worker in policy["workers"]} != {"ui": "frontend", "adapter": "backend"}:
+    33	        raise ValueError("This graph requires ui/frontend and adapter/backend policies")
+    34	    return policy
+    35	
+    36	
+    37	def pid_alive(pid: int) -> bool:
+    38	    try:
+    39	        os.kill(pid, 0)
+    40	    except ProcessLookupError:
+    41	        return False
+    42	    return True
+    43	
+    44	
+    45	def digest_file(path: Path) -> str:
+    46	    with path.open("rb") as handle:
+    47	        return hashlib.file_digest(handle, "sha256").hexdigest()
+    48	
+    49	
+    50	def commit_env() -> dict:
+    51	    env = dict(os.environ)
+    52	    env.update(GIT_AUTHOR_NAME="Workflow snapshot", GIT_AUTHOR_EMAIL="workflow@localhost",
+    53	               GIT_COMMITTER_NAME="Workflow snapshot", GIT_COMMITTER_EMAIL="workflow@localhost")
+    54	    return env
+    55	
+    56	
+    57	def changed_files(cwd: Path, base: str) -> list[str]:
+    58	    tracked = subprocess.check_output(["git", "-C", str(cwd), "diff", "--no-renames", "--name-only", "-z", base]).decode().split("\0")
+    59	    untracked = subprocess.check_output(["git", "-C", str(cwd), "ls-files", "--others", "--exclude-standard", "-z"]).decode().split("\0")
+    60	    return sorted(set(filter(None, tracked + untracked)))
+    61	
+    62	
+    63	class PipelineState(TypedDict, total=False):
+    64	    run_id: str
+    65	    ui: dict
+    66	    adapter: dict
+    67	    snapshots: dict
+    68	    ui_packet: str
+    69	    adapter_packet: str
+    70	    bundle: str
+    71	    review: dict
+    72	    approved_bundle: str
+    73	    integrated_commit: str
+    74	
+    75	
+    76	class Pipeline:
+    77	    def __init__(self, directory: Path, sessions=None):
+    78	        self.directory = directory.resolve()
+    79	        self.plan = read_json(self.directory / "plan.json")
+    80	        if "automatic" in self.plan:
+    81	            from .automatic import validate_automatic
+    82	            validate_automatic(self.plan)
+    83	        self.policy = validate_pipeline_policy(read_json(self.directory / "policy.json"))
+    84	        if self.plan.get("policy_sha256") != policy_digest(self.policy):
+    85	            raise ValueError("Pinned policy changed")
+    86	        if {worker["node_id"] for worker in self.policy["workers"]} != set(NODES):
+    87	            raise ValueError("This small graph requires policy nodes ui and adapter")
+    88	        self.sessions = sessions or InteractiveSessions(self.directory, timeout=45)
+    89	        self._events_lock = threading.Lock()
+    90	
+    91	    def event(self, node: str, status: str, message: str):
+    92	        with self._events_lock:
+    93	            path = self.directory / "events.jsonl"
+    94	            prior = path.read_text().splitlines() if path.exists() else []
+    95	            sequence = json.loads(prior[-1])["sequence"] + 1 if prior else 1
+    96	            record = {"sequence": sequence, "time": now(), "node": node, "status": status, "message": message}
+    97	            with path.open("a") as handle:
+    98	                handle.write(json.dumps(record) + "\n")
+    99	                handle.flush()
+   100	                os.fsync(handle.fileno())
+   101	
+   102	    def launch(self, node: str) -> dict:
+   103	        self.event(node, "running", "Launching or reconciling the exact native session")
+   104	        try:
+   105	            receipt = self.sessions.run(node)
+   106	        except Exception as error:
+   107	            self.event(node, "blocked", str(error))
+   108	            raise
+   109	        self.event(node, "interactive", "Awaiting explicit completion signal; idle is not acceptance")
+   110	        return receipt
+   111	
+   112	    def stop_workers(self):
+   113	        """Persist native identity before stopping. Never signal guessed/reused PIDs."""
+   114	        for node in NODES:
+   115	            marker = self.directory / f"{node}.stop.json"
+   116	            if marker.exists():
+   117	                intent = read_json(marker)
+   118	            else:
+   119	                row = self.sessions.locate(node, self.sessions.inventory())
+   120	                if row is None:
+   121	                    raise RuntimeError("Worker missing before freeze; reconcile before snapshotting")
+   122	                intent = {"background_id": row["id"], "session_id": row["sessionId"], "pid": row["pid"], "stopped": False}
+   123	                save_json(marker, intent)
+   124	            if not intent["stopped"]:
+   125	                rows = self.sessions.inventory()
+   126	                matching = [row for row in rows if row.get("sessionId") == intent["session_id"] and row.get("pid")]
+   127	                if matching:
+   128	                    row = self.sessions.locate(node, rows)
+   129	                    if row is None or row["id"] != intent["background_id"] or row["pid"] != intent["pid"]:
+   130	                        raise RuntimeError("Native worker identity changed after stop intent; reconcile manually")
+   131	                    result = subprocess.run([self.sessions.executable, "stop", intent["background_id"]], capture_output=True, text=True, timeout=20)
+   132	                    if result.returncode != 0:
+   133	                        raise RuntimeError(f"Stop failed for {node}; inspect native session before retrying")
+   134	                # Recover stop-before-receipt without issuing another stop command.
+   135	                rows = self.sessions.inventory()
+   136	                if any(row.get("sessionId") == intent["session_id"] and row.get("pid") for row in rows) or pid_alive(intent["pid"]):
+   137	                    raise RuntimeError("Worker termination is not established; retry freeze after reconciliation")
+   138	                intent["stopped"] = True
+   139	                save_json(marker, intent)
+   140	        stopped_ids = {read_json(self.directory / f"{node}.stop.json")["session_id"] for node in NODES}
+   141	        if any(row.get("sessionId") in stopped_ids and row.get("pid") for row in self.sessions.inventory()):
+   142	            raise RuntimeError("A stopped worker was restarted; reconcile before snapshot capture")
+   143	        self.event("freeze", "stopped", "Both native workers stopped before snapshot capture")
+   144	
+   145	    def freeze(self) -> dict:
+   146	        record = self.directory / "snapshots.json"
+   147	        if record.exists():
+   148	            return read_json(record)
+   149	        handoffs = {}
+   150	        for node in NODES:
+   151	            handoff_path = self.directory / f"{node}.handoff.json"
+   152	            if not handoff_path.exists():
+   153	                raise ValueError(f"Missing {node} handoff: summary and open_assumptions are required")
+   154	            handoff = read_json(handoff_path)
+   155	            if set(handoff) != {"summary", "open_assumptions"} or not isinstance(handoff["summary"], str) or not handoff["summary"].strip() or not isinstance(handoff["open_assumptions"], list) or any(not isinstance(item, str) for item in handoff["open_assumptions"]):
+   156	                raise ValueError("Malformed worker handoff")
+   157	            handoffs[node] = handoff
+   158	        self.stop_workers()
+   159	        snapshots = {}
+   160	        for node in NODES:
+   161	            worker = next(item for item in self.policy["workers"] if item["node_id"] == node)
+   162	            cwd = Path(self.plan["nodes"][node]["worktree"])
+   163	            if git(cwd, "rev-parse", "HEAD") != self.plan["base_commit"]:
+   164	                raise ValueError("Worker changed HEAD; reconcile commits rather than silently accepting them")
+   165	            changed = changed_files(cwd, self.plan["base_commit"])
+   166	            for name in changed:
+   167	                safe_path(name)
+   168	                if not any(owns(name, safe_path(prefix)) for prefix in worker["owned_paths"]):
+   169	                    raise ValueError(f"{node} edited unowned path: {name}")
+   170	                if (cwd / name).is_symlink():
+   171	                    raise ValueError("Symlink changes require manual review before snapshot")
+   172	            index = self.directory / f"{node}.snapshot-index"
+   173	            if index.exists():
+   174	                index.unlink()  # Only our private temporary index, never a user's index.
+   175	            env = commit_env()
+   176	            env["GIT_INDEX_FILE"] = str(index)
+   177	            subprocess.run(["git", "-C", str(cwd), "read-tree", self.plan["base_commit"]], env=env, check=True)
+   178	            subprocess.run(["git", "-C", str(cwd), "add", "-A", "--", "."], env=env, check=True)
+   179	            tree = subprocess.check_output(["git", "-C", str(cwd), "write-tree"], env=env, text=True).strip()
+   180	            # Validate paths from the actual captured tree, including staged renames/deletes.
+   181	            captured = git(cwd, "diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", self.plan["base_commit"], tree).splitlines()
+   182	            if sorted(captured) != changed:
+   183	                raise ValueError("Files changed during snapshot; refuse inconsistent evidence")
+   184	            commit = self.plan["base_commit"]
+   185	            if changed:
+   186	                commit = subprocess.check_output(["git", "-C", str(cwd), "-c", "commit.gpgsign=false", "commit-tree", tree,
+   187	                                                  "-p", self.plan["base_commit"], "-m", f"Workflow {self.plan['run_id']}: {node}"], env=env, text=True).strip()
+   188	            ref = f"refs/workflow/{hashlib.sha256(str(self.directory).encode()).hexdigest()[:16]}/{node}"
+   189	            subprocess.run(["git", "-C", str(cwd), "update-ref", ref, commit], check=True)
+   190	            receipt = read_json(self.directory / f"{node}.interactive.json")
+   191	            snapshots[node] = {"commit": commit, "changed_files": changed, "session_id": receipt["session_id"], **handoffs[node]}
+   192	        save_json(record, snapshots)
+   193	        self.event("freeze", "succeeded", "Immutable snapshots captured; worker-reported checks are not trusted")
+   194	        return snapshots
+   195	
+   196	    def attempt(self, phase: str, node: str) -> int:
+   197	        path = self.directory / "attempts.json"
+   198	        value = read_json(path).get(f"{phase}:{node}", 1) if path.exists() else 1
+   199	        if type(value) is not int or value < 1 or value > self.policy.get("max_verification_attempts", 3):
+   200	            raise ValueError("Verification attempt exceeds the run's hard limit")
+   201	        return value
+   202	
+   203	    def retry_check(self, phase: str, node: str) -> int:
+   204	        value = self.attempt(phase, node) + 1
+   205	        if value > self.policy.get("max_verification_attempts", 3):
+   206	            raise ValueError("Verification attempt limit reached; inspect evidence and create an explicitly revised run")
+   207	        path = self.directory / "attempts.json"
+   208	        attempts = read_json(path) if path.exists() else {}
+   209	        attempts[f"{phase}:{node}"] = value
+   210	        save_json(path, attempts)
+   211	        return value
+   212	
+   213	    def native_evidence(self) -> dict:
+   214	        return {node: {key: read_json(self.directory / f"{node}.interactive.json").get(key)
+   215	                       for key in ("session_id", "background_id", "launcher_invocations", "native_started_at")}
+   216	                for node in NODES}
+   217	
+   218	    def verify(self, node: str, snapshots: dict) -> str:
+   219	        snap = snapshots[node]
+   220	        attempt = self.attempt("worker", node)
+   221	        self.event(f"verify_{node}", "running", f"Attempt {attempt}; revision {snap['commit']}")
+   222	        packet = verify_revision(self.directory, self.plan, self.policy, node, snap["commit"], snap["changed_files"], snap["session_id"], attempt=attempt)
+   223	        path = self.directory / "verification" / "worker" / node / str(attempt) / "packet.json"
+   224	        drill = self.policy.get("failure_drill")
+   225	        if drill and drill["node_id"] == node and attempt == 1:
+   226	            marker = "Intentional lab drill: verification branch failure, not a worker or test failure"
+   227	            if marker not in packet["capture_errors"]:
+   228	                packet["capture_errors"].append(marker)
+   229	                packet["gate"]["reasons"].append(marker)
+   230	            packet["gate"]["status"] = "blocked"
+   231	            drill_path = self.directory / "failure-drill.json"
+   232	            if not drill_path.exists():
+   233	                save_json(drill_path, {"node_id": node, "phase": "worker", "attempt": 1,
+   234	                                       "injected_at": now(), "native_before": self.native_evidence()})
+   235	        packet["result"]["summary"] = snap["summary"]
+   236	        packet["result"]["open_assumptions"] = snap["open_assumptions"]
+   237	        save_json(path, packet)
+   238	        self.event(f"verify_{node}", packet["gate"]["status"], "; ".join(packet["gate"]["reasons"]) or "Required tests and artifacts passed")
+   239	        if packet["gate"]["status"] != "passed":
+   240	            raise RuntimeError(f"{node} verification blocked; see {path}. Retry explicitly or start a revised run.")
+   241	        return str(path)
+   242	
+   243	    def candidate(self, state: PipelineState) -> str:
+   244	        # Validate branch evidence again before combining anything.
+   245	        worker_paths = [Path(state[f"{node}_packet"]) for node in NODES]
+   246	        for path in worker_paths:
+   247	            packet = recheck_packet(read_json(path), self.policy, self.directory)
+   248	            if packet["gate"]["status"] != "passed":
+   249	                raise ValueError("Worker evidence no longer passes")
+   250	        saved = self.directory / "candidate.json"
+   251	        if saved.exists():
+   252	            candidate = read_json(saved)
+   253	        else:
+   254	            cwd = self.directory / "candidate"
+   255	            if cwd.exists():
+   256	                raise ValueError("Partial candidate worktree exists; inspect before recovery")
+   257	            subprocess.run(["git", "-C", self.plan["repository"], "worktree", "add", "--detach", str(cwd), self.plan["base_commit"]], check=True, capture_output=True)
+   258	            for node in NODES:
+   259	                commit = state["snapshots"][node]["commit"]
+   260	                if commit != self.plan["base_commit"]:
+   261	                    subprocess.run(["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "cherry-pick", commit], env=commit_env(), check=True, capture_output=True)
+   262	            candidate = {"commit": git(cwd, "rev-parse", "HEAD"), "worktree": str(cwd)}
+   263	            save_json(saved, candidate)
+   264	        candidate_paths = []
+   265	        for node in NODES:
+   266	            attempt = self.attempt("candidate", node)
+   267	            packet = verify_revision(self.directory, self.plan, self.policy, node, candidate["commit"],
+   268	                                     changed_files(Path(candidate["worktree"]), self.plan["base_commit"]),
+   269	                                     state["snapshots"][node]["session_id"], phase="candidate", attempt=attempt)
+   270	            path = self.directory / "verification" / "candidate" / node / str(attempt) / "packet.json"
+   271	            self.event(f"candidate_{node}", packet["gate"]["status"], f"Combined revision {candidate['commit']}")
+   272	            if packet["gate"]["status"] != "passed":
+   273	                raise RuntimeError(f"Combined candidate failed {node} checks; see {path}")
+   274	            candidate_paths.append(path)
+   275	        bundle = {"run_id": self.plan["run_id"], "base_commit": self.plan["base_commit"],
+   276	                  "candidate_commit": candidate["commit"], "policy_sha256": policy_digest(self.policy),
+   277	                  "snapshots": state["snapshots"],
+   278	                  "packets": [{"path": str(path), "sha256": digest_file(path)} for path in worker_paths + candidate_paths]}
+   279	        path = self.directory / "review-bundle.json"
+   280	        drill_path = self.directory / "failure-drill.json"
+   281	        if drill_path.exists():
+   282	            before = read_json(drill_path)["native_before"]
+   283	            after = self.native_evidence()
+   284	            audit = {"run_id": self.plan["run_id"], "native_before": before, "native_after": after,
+   285	                     "workers_with_changed_launch_evidence": [node for node in NODES if before[node] != after[node]],
+   286	                     "verification_attempts": {node: sorted(int(item.name) for item in (self.directory / "verification" / "worker" / node).iterdir() if item.is_dir() and item.name.isdigit()) for node in NODES},
+   287	                     "scope": "Pipeline-issued sessions; native launch times/counts are null when unavailable. Out-of-band manual restarts are not certified."}
+   288	            save_json(self.directory / "failure-report.json", audit)
+   289	            bundle["failure_drill"] = audit
+   290	        save_json(path, bundle)
+   291	        return str(path)
+   292	
+   293	    def validate_bundle(self) -> tuple[dict, str]:
+   294	        path = self.directory / "review-bundle.json"
+   295	        bundle = read_json(path)
+   296	        if bundle["run_id"] != self.plan["run_id"] or bundle["policy_sha256"] != policy_digest(self.policy):
+   297	            raise ValueError("Bundle identity/policy changed")
+   298	        for reference in bundle["packets"]:
+   299	            packet_path = Path(reference["path"]).resolve()
+   300	            if not packet_path.is_relative_to(self.directory) or digest_file(packet_path) != reference["sha256"]:
+   301	                raise ValueError("Review evidence changed")
+   302	            packet = recheck_packet(read_json(packet_path), self.policy, self.directory)
+   303	            if packet["gate"]["status"] != "passed":
+   304	                raise ValueError("Review artifact missing, changed or failing")
+   305	        return bundle, digest_file(path)
+   306	
+   307	    def validate_review(self, review: dict) -> None:
+   308	        bundle, digest = self.validate_bundle()
+   309	        required = {"run_id", "bundle_sha256", "candidate_commit", "reviewer", "independent", "verdict", "findings"}
+   310	        if set(review) != required or review["run_id"] != bundle["run_id"] or review["bundle_sha256"] != digest or review["candidate_commit"] != bundle["candidate_commit"]:
+   311	            raise ValueError("Review must reference this exact run, bundle hash and candidate")
+   312	        worker_ids = {item["session_id"] for item in bundle["snapshots"].values()}
+   313	        if review["independent"] is not True or not isinstance(review["reviewer"], str) or not review["reviewer"].strip() or review["reviewer"] in worker_ids:
+   314	            raise ValueError("Independent reviewer identity required")
+   315	        if review["verdict"] != "approved" or not isinstance(review["findings"], list):
+   316	            raise ValueError("Review is not approved")
+   317	        for finding in review["findings"]:
+   318	            if not isinstance(finding, dict) or set(finding) != {"severity", "message", "disposition"} or finding["severity"] not in {"P0", "P1", "P2"} or finding["disposition"] not in {"open", "resolved", "accepted"} or not isinstance(finding["message"], str) or not finding["message"].strip():
+   319	                raise ValueError("Malformed review finding")
+   320	            if finding["severity"] in {"P0", "P1"} and finding["disposition"] != "resolved":
+   321	                raise ValueError("Unresolved blocking review finding")
+   322	
+   323	    def integrate(self, approved: str) -> str:
+   324	        bundle, digest = self.validate_bundle()
+   325	        review = read_json(self.directory / "review.json")
+   326	        self.validate_review(review)
+   327	        if approved != digest:
+   328	            raise ValueError("Approval references stale evidence")
+   329	        repo = Path(self.plan["repository"])
+   330	        candidate = bundle["candidate_commit"]
+   331	        intent = self.directory / "integration-intent.json"
+   332	        if git(repo, "symbolic-ref", "--short", "HEAD") != self.plan["source_branch"]:
+   333	            raise ValueError("Source branch changed")
+   334	        if git(repo, "status", "--porcelain"):
+   335	            raise ValueError("Source worktree is dirty; refusing integration")
+   336	        if intent.exists():
+   337	            if read_json(intent) != {"bundle_sha256": digest, "candidate_commit": candidate}:
+   338	                raise ValueError("Integration intent changed")
+   339	            if git(repo, "rev-parse", "HEAD") == candidate:
+   340	                return candidate
+   341	        if git(repo, "rev-parse", "HEAD") != self.plan["base_commit"]:
+   342	            raise ValueError("Source advanced since preparation; rebase/review explicitly")
+   343	        save_json(intent, {"bundle_sha256": digest, "candidate_commit": candidate})
+   344	        subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", candidate], check=True, capture_output=True)
+   345	        self.event("integrate", "succeeded", f"Fast-forwarded to {candidate}; no push performed")
+   346	        return candidate
+   347	
+   348	
+   349	def build_pipeline(checkpointer, runtime: Pipeline):
+   350	    def ui(_state): return {"ui": runtime.launch("ui")}
+   351	    def adapter(_state): return {"adapter": runtime.launch("adapter")}
+   352	    def handoff(_state):
+   353	        message = "Awaiting explicit completion signals and automatic freeze." if runtime.plan.get("automatic") else "Type in Claude terminals; provide both handoffs, then explicitly freeze."
+   354	        decision = interrupt({"kind": "worker_handoff", "message": message})
+   355	        if decision != {"freeze": True}:
+   356	            raise ValueError("Explicit freeze required")
+   357	        return {"snapshots": runtime.freeze()}
+   358	    def verify_ui(state): return {"ui_packet": runtime.verify("ui", state["snapshots"])}
+   359	    def verify_adapter(state): return {"adapter_packet": runtime.verify("adapter", state["snapshots"])}
+   360	    def candidate(state): return {"bundle": runtime.candidate(state)}
+   361	    def review(_state):
+   362	        _, digest = runtime.validate_bundle()
+   363	        if runtime.plan.get("automatic"):
+   364	            from .automatic import review_candidate
+   365	            decision = review_candidate(runtime)
+   366	        else:
+   367	            decision = interrupt({"kind": "independent_review", "bundle_sha256": digest,
+   368	                                  "bundle_path": str(runtime.directory / "review-bundle.json")})
+   369	        runtime.validate_review(decision)
+   370	        save_json(runtime.directory / "review.json", decision)
+   371	        runtime.event("review", "approved", decision["reviewer"])
+   372	        return {"review": decision}
+   373	    def approval(_state):
+   374	        _, digest = runtime.validate_bundle()
+   375	        if runtime.plan.get("automatic"):
+   376	            from .automatic import validate_automatic
+   377	            validate_automatic(runtime.plan)
+   378	            decision = {"approve": digest}  # Explicit run-level authority: feature branch only.
+   379	        else:
+   380	            decision = interrupt({"kind": "integration_approval", "bundle_sha256": digest,
+   381	                                  "message": "Approve fast-forward of source branch; no push."})
+   382	        if decision != {"approve": digest}:
+   383	            raise ValueError("Explicit exact-bundle approval required")
+   384	        return {"approved_bundle": digest}
+   385	    def integrate(state): return {"integrated_commit": runtime.integrate(state["approved_bundle"])}
+   386	    graph = StateGraph(PipelineState)
+   387	    for name, function in (("launch_ui", ui), ("launch_adapter", adapter), ("handoff", handoff),
+   388	                           ("verify_ui", verify_ui), ("verify_adapter", verify_adapter), ("candidate", candidate),
+   389	                           ("review", review), ("approval", approval), ("integrate", integrate)):
+   390	        graph.add_node(name, function)
+   391	    graph.add_edge(START, "launch_ui"); graph.add_edge(START, "launch_adapter")
+   392	    graph.add_edge(["launch_ui", "launch_adapter"], "handoff")
+   393	    graph.add_edge("handoff", "verify_ui"); graph.add_edge("handoff", "verify_adapter")
+   394	    graph.add_edge(["verify_ui", "verify_adapter"], "candidate")
+   395	    graph.add_edge("candidate", "review"); graph.add_edge("review", "approval")
+   396	    graph.add_edge("approval", "integrate"); graph.add_edge("integrate", END)
+   397	    return graph.compile(checkpointer=checkpointer)
+   398	
+   399	
+   400	def report(runtime: Pipeline, state) -> Path:
+   401	    """Escaped local results viewer, generated on every CLI boundary; no server needed."""
+   402	    export_state(runtime, state)
+   403	    events_path = runtime.directory / "events.jsonl"
+   404	    events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
+   405	    packets = list((runtime.directory / "verification").glob("*/*/*/packet.json"))
+   406	    flow = ("Launch workers → completion signals → isolated checks → combined checks → independent review → verified feature branch (no main merge or push)"
+   407	            if runtime.plan.get("automatic") else "Launch workers → human handoff → isolated checks → combined checks → independent review → approval → integration")
+   408	    parts = ['<!doctype html><meta charset="utf-8"><title>Workflow report</title><style>body{font:16px system-ui;max-width:1100px;margin:40px auto;background:#151820;color:#eee}pre{white-space:pre-wrap}a{color:#8dcaff}img{max-width:100%}section{border:1px solid #555;padding:16px;margin:16px 0}</style>',
+   409	             '<h1>Workflow report</h1><p>' + html.escape(flow) + '</p>',
+   410	             '<h2>Current state</h2><pre>' + html.escape(json.dumps({"next": state.next, "interrupts": [str(task.interrupts) for task in state.tasks if task.interrupts], "errors": [str(task.error) for task in state.tasks if task.error], "integrated_commit": state.values.get("integrated_commit")}, indent=2)) + '</pre>',
+   411	             '<h2>Timeline</h2><pre>' + html.escape(json.dumps(events, indent=2)) + '</pre>']
+   412	    positions = {"launch_ui": (90, 70), "launch_adapter": (90, 210), "handoff": (280, 140),
+   413	                 "verify_ui": (470, 70), "verify_adapter": (470, 210), "candidate": (660, 140),
+   414	                 "review": (850, 140), "approval": (1040, 140), "integrate": (1230, 140)}
+   415	    edges = [("launch_ui", "handoff"), ("launch_adapter", "handoff"), ("handoff", "verify_ui"),
+   416	             ("handoff", "verify_adapter"), ("verify_ui", "candidate"), ("verify_adapter", "candidate"),
+   417	             ("candidate", "review"), ("review", "approval"), ("approval", "integrate")]
+   418	    svg = ['<h2>Execution graph</h2><svg role="img" aria-label="Workflow execution graph" viewBox="0 0 1330 280">']
+   419	    for left, right in edges:
+   420	        x1, y1 = positions[left]; x2, y2 = positions[right]
+   421	        svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#9aa"/>')
+   422	    for name, (x, y) in positions.items():
+   423	        color = '#665000' if name in state.next else '#263747'
+   424	        svg.append(f'<rect x="{x-75}" y="{y-23}" width="150" height="46" rx="8" fill="{color}" stroke="#9aa"/><text x="{x}" y="{y+5}" text-anchor="middle" fill="white" font-size="14">{name}</text>')
+   425	    svg.append('</svg><p>Highlighted nodes are pending. A completed launch is not a completed worker task.</p>')
+   426	    parts[2:2] = svg
+   427	    from urllib.parse import quote
+   428	    for path in packets:
+   429	        packet = read_json(path)
+   430	        parts.append('<section><h2>' + html.escape(str(path.relative_to(runtime.directory))) + '</h2><pre>' + html.escape(json.dumps({"gate": packet["gate"], "result": packet["result"]}, indent=2)) + '</pre>')
+   431	        for artifact in packet["result"]["artifacts"]:
+   432	            local = Path(packet["artifact_paths"][artifact["artifact_id"]]).resolve()
+   433	            if not local.is_relative_to(runtime.directory):
+   434	                continue
+   435	            url = quote(str(local.relative_to(runtime.directory)), safe="/")
+   436	            parts.append(f'<p><a href="{url}">{html.escape(artifact["artifact_id"])}</a></p>')
+   437	            if artifact["kind"] == "screenshot":
+   438	                parts.append(f'<img alt="Browser scenario screenshot" src="{url}">')
+   439	        parts.append('</section>')
+   440	    failure_report = runtime.directory / "failure-report.json"
+   441	    if failure_report.exists():
+   442	        parts.append('<h2>Checkpoint failure drill</h2><pre>' + html.escape(failure_report.read_text()) + '</pre>')
+   443	    destination = runtime.directory / "report.html"
+   444	    destination.write_text("\n".join(parts))
+   445	    return destination
+   446	
+   447	
+   448	def main():
+   449	    parser = argparse.ArgumentParser(description=__doc__)
+   450	    parser.add_argument("action", choices=["preflight", "prepare", "start", "automatic", "automatic-step", "attach", "freeze", "retry", "reconcile", "review", "approve", "status"])
+   451	    parser.add_argument("directory", type=Path)
+   452	    parser.add_argument("--repo", type=Path, default=Path.cwd())
+   453	    parser.add_argument("--policy", type=Path)
+   454	    parser.add_argument("--ui-task", type=Path)
+   455	    parser.add_argument("--adapter-task", type=Path)
+   456	    parser.add_argument("--live", action="store_true")
+   457	    parser.add_argument("--automatic", action="store_true", help="Prepare run-scoped permission bypass and automatic feature-branch completion")
+   458	    parser.add_argument("--worker-timeout-seconds", type=int, help="Automatic mode: deadline per worker from launch until its completion signal (default 4h)")
+   459	    parser.add_argument("--review-timeout-seconds", type=int, help="Automatic mode: reviewer process timeout (default 30m)")
+   460	    parser.add_argument("--herdr", action="store_true")
+   461	    parser.add_argument("--ui-handoff", type=Path)
+   462	    parser.add_argument("--adapter-handoff", type=Path)
+   463	    parser.add_argument("--review-file", type=Path)
+   464	    parser.add_argument("--bundle-sha256")
+   465	    parser.add_argument("--node", choices=NODES)
+   466	    parser.add_argument("--phase", choices=["worker", "candidate"], default="worker")
+   467	    args = parser.parse_args()
+   468	    directory = args.directory.resolve()
+   469	    try:
+   470	        if args.action == "preflight":
+   471	            if not args.policy:
+   472	                parser.error("preflight requires --policy")
+   473	            policy = validate_pipeline_policy(read_json(args.policy))
+   474	            if {worker["node_id"] for worker in policy["workers"]} != set(NODES):
+   475	                parser.error("Policy must name ui and adapter")
+   476	            if git(args.repo.resolve(), "status", "--porcelain"):
+   477	                raise ValueError("Source must be clean before prepare")
+   478	            for executable in ("git", "claude", "node"):
+   479	                if not shutil.which(executable):
+   480	                    raise ValueError(f"Missing executable: {executable}")
+   481	            help_text = subprocess.check_output(["claude", "--help"], text=True, timeout=15)
+   482	            required_flags = ["--bg", "--safe-mode", "--tools", "--permission-mode"]
+   483	            if args.automatic:
+   484	                required_flags += ["--dangerously-skip-permissions", "--json-schema", "--print", "--permission-prompts", "--add-dir"]
+   485	            if not all(flag in help_text for flag in required_flags):
+   486	                raise ValueError("Installed Claude CLI lacks required flags")
+   487	            auth = json.loads(subprocess.check_output(["claude", "auth", "status"], text=True, timeout=15))
+   488	            if auth.get("loggedIn") is not True:
+   489	                raise ValueError("Claude is not authenticated")
+   490	            if args.herdr and os.environ.get("HERDR_ENV") != "1":
+   491	                raise ValueError("Herdr attachment requires a managed caller pane")
+   492	            print(json.dumps({"preflight": "passed", "base_commit": git(args.repo.resolve(), "rev-parse", "HEAD"),
+   493	                              "policy_sha256": policy_digest(policy), "note": "No agents launched. Actual dependency/test availability is checked in isolated verification worktrees."}, indent=2))
+   494	            return
+   495	        if args.action == "prepare":
+   496	            if not all((args.policy, args.ui_task, args.adapter_task)):
+   497	                parser.error("prepare requires --policy and both task files")
+   498	            policy = validate_pipeline_policy(read_json(args.policy))
+   499	            if {worker["node_id"] for worker in policy["workers"]} != set(NODES):
+   500	                parser.error("This graph requires policy nodes ui and adapter")
+   501	            if args.automatic and not git(args.repo.resolve(), "symbolic-ref", "--short", "HEAD").startswith("feature/"):
+   502	                raise ValueError("Automatic preparation requires a feature/ branch")
+   503	            tasks = {"ui": args.ui_task.read_text(), "adapter": args.adapter_task.read_text()}
+   504	            for worker in policy["workers"]:
+   505	                tasks[worker["node_id"]] += "\nApproved ownership and checks:\n" + json.dumps(worker)
+   506	            plan = prepare(directory, args.repo, "HEAD", tasks, True)
+   507	            plan.update(mode="interactive", policy_sha256=policy_digest(policy), created_at=now(), source_branch=git(args.repo.resolve(), "symbolic-ref", "--short", "HEAD"))
+   508	            if args.automatic:
+   509	                from .automatic import automatic_settings
+   510	                plan["automatic"] = automatic_settings(args.worker_timeout_seconds, args.review_timeout_seconds)
+   511	            elif args.worker_timeout_seconds or args.review_timeout_seconds:
+   512	                parser.error("Timeouts apply to --automatic runs only; manual runs have operator-controlled lifetimes")
+   513	            save_json(directory / "policy.json", policy)
+   514	            save_json(directory / "plan.json", plan)
+   515	            from types import SimpleNamespace
+   516	            export_state(Pipeline(directory), SimpleNamespace(values={}, next=("launch_ui", "launch_adapter"), tasks=[]))
+   517	            print(f"Prepared {directory}; no agents launched. Pin: {plan['base_commit']}")
+   518	            return
+   519	        if args.action == "automatic":
+   520	            if not args.live:
+   521	                parser.error("automatic requires --live because it can launch an independent reviewer")
+   522	            from .automatic import supervise
+   523	            supervise(directory)
+   524	            print(f"Automatic run reached a verified feature branch. Evidence: {directory / 'report.html'}. No main merge or push.")
+   525	            return
+   526	        with run_lock(directory):
+   527	            runtime = Pipeline(directory)
+   528	            if args.action == "automatic-step":
+   529	                if not args.live:
+   530	                    parser.error("automatic requires --live because it can launch an independent reviewer")
+   531	                from .automatic import drive
+   532	                commit = drive(runtime, single_step=True)
+   533	                if commit is None:
+   534	                    parser.exit(75, "Checkpoint persisted; continuing in a new controller process.\n")
+   535	                print(f"Verified feature branch: {runtime.plan['source_branch']} at {commit}. No main merge or push.")
+   536	                return
+   537	            if args.action == "attach":
+   538	                print(json.dumps(attach_panels(runtime.sessions), indent=2)); return
+   539	            with SqliteSaver.from_conn_string(str(directory / "pipeline.sqlite")) as saver:
+   540	                graph = build_pipeline(saver, runtime)
+   541	                config = {"configurable": {"thread_id": runtime.plan["run_id"]}, "max_concurrency": 2}
+   542	                state = graph.get_state(config)
+   543	                pending = [item.value.get("kind") for task in state.tasks for item in task.interrupts]
+   544	                value = None
+   545	                if args.action == "start":
+   546	                    if not args.live:
+   547	                        parser.error("start requires --live; do not use it for offline tests")
+   548	                    if state.values:
+   549	                        parser.error("Run already started; use status/explicit controls, never start again")
+   550	                    value = {"run_id": runtime.plan["run_id"]}
+   551	                elif args.action == "freeze":
+   552	                    if pending != ["worker_handoff"]:
+   553	                        parser.error("Run is not waiting for worker handoff")
+   554	                    for node, handoff_path in (("ui", args.ui_handoff), ("adapter", args.adapter_handoff)):
+   555	                        if handoff_path:
+   556	                            save_json(directory / f"{node}.handoff.json", read_json(handoff_path))
+   557	                    value = Command(resume={"freeze": True})
+   558	                elif args.action == "review":
+   559	                    if pending != ["independent_review"] or not args.review_file:
+   560	                        parser.error("Review requires pending review and --review-file")
+   561	                    decision = read_json(args.review_file)
+   562	                    runtime.validate_review(decision)
+   563	                    value = Command(resume=decision)
+   564	                elif args.action == "approve":
+   565	                    if pending != ["integration_approval"]:
+   566	                        parser.error("Run is not waiting for integration approval")
+   567	                    _, digest = runtime.validate_bundle()
+   568	                    if args.bundle_sha256 != digest:
+   569	                        parser.error("Provide the exact --bundle-sha256 displayed at approval")
+   570	                    value = Command(resume={"approve": digest})
+   571	                elif args.action == "reconcile":
+   572	                    if pending or not state.next or not any(step.startswith("launch_") for step in state.next):
+   573	                        parser.error("Reconcile requires failed launch steps")
+   574	                    for step in state.next:
+   575	                        if step.startswith("launch_"):
+   576	                            node = step.removeprefix("launch_")
+   577	                            if not (directory / f"{node}.interactive.json").exists():
+   578	                                parser.error("No durable launch intent; cannot reconcile without potentially launching a new agent")
+   579	                            runtime.sessions.run(node)  # Existing receipt path never starts a new process.
+   580	                elif args.action == "retry":
+   581	                    if not state.values or pending or not state.next:
+   582	                        parser.error("Retry requires a failed graph step, not an interrupt/completed run")
+   583	                    if args.node:
+   584	                        step = f"verify_{args.node}" if args.phase == "worker" else "candidate"
+   585	                        if step not in state.next:
+   586	                            parser.error("Selected check is not a failed/pending step")
+   587	                        runtime.retry_check(args.phase, args.node)
+   588	                    # No new agent launch is ever permitted during retry.
+   589	                    if any(step.startswith("launch_") for step in state.next):
+   590	                        parser.error("Launch failure requires explicit session reconciliation; do not blindly retry")
+   591	                if args.action != "status":
+   592	                    try:
+   593	                        graph.invoke(value, config)
+   594	                    finally:
+   595	                        print(f"Report: {report(runtime, graph.get_state(config))}")
+   596	                    if args.action == "start" and args.herdr:
+   597	                        print(json.dumps(attach_panels(runtime.sessions), indent=2))
+   598	                else:
+   599	                    print(json.dumps({"next": state.next, "pending": pending, "errors": [str(task.error) for task in state.tasks if task.error]}, indent=2))
+   600	                    print(f"Report: {report(runtime, state)}")
+   601	    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+   602	        parser.exit(1, f"Blocked: {error}\nAll work/evidence retained at {directory}. No automatic fallback or push.\n")
+   603	
+   604	
+   605	if __name__ == "__main__":
+   606	    main()

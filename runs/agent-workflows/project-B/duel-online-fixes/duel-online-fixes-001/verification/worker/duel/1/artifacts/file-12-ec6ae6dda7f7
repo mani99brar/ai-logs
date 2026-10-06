@@ -1,0 +1,82 @@
+import type { Room } from "@colyseus/sdk";
+
+/**
+ * Development only (`npm run dev`; main.ts imports this module only when `import.meta.env.DEV`, so the production
+ * build does not contain it): delays everything a room's socket sends and receives, the server's round-trip probes
+ * and Colyseus's own pings included, by half of `rttMs` each way plus a uniform ±jitter/2, never reordering. It lets
+ * the operator playtest §19's latencies on one machine: `?rtt=80&jitter=20`.
+ */
+export const DEV_LATENCY_MARKER = "pirate-sea-race dev latency";
+
+export interface DevLatency {
+  readonly rttMs: number;
+  readonly jitterMs: number;
+}
+
+/** The setting from the page's query string, or undefined when it asks for none. */
+export function devLatencyFromQuery(search: string): DevLatency | undefined {
+  const query = new URLSearchParams(search);
+  const rttMs = Number(query.get("rtt") ?? 0);
+  const jitterMs = Number(query.get("jitter") ?? 0);
+  if (!(rttMs > 0 || jitterMs > 0) || !Number.isFinite(rttMs) || !Number.isFinite(jitterMs)) return undefined;
+  return { rttMs: Math.max(0, rttMs), jitterMs: Math.max(0, jitterMs) };
+}
+
+/** Where a delay line takes its time and its jitter from; tests pass a fake clock and a fixed sequence. */
+export interface DelaySource {
+  /** Milliseconds on a monotonic clock, the one `setTimeout` runs on. */
+  readonly now: () => number;
+  /** A uniform draw in [0, 1). */
+  readonly random: () => number;
+}
+
+const REAL_TIME: DelaySource = { now: () => performance.now(), random: Math.random };
+
+/**
+ * An ordered delay line: each item is due half the round trip plus a uniform ±jitter/2 after it was pushed, and
+ * leaves at the later of that and the previous item's time, so jitter only ever delays and never reorders. It uses
+ * only `setTimeout`, no DOM, so Node tests load it as it is.
+ */
+export class DelayLine {
+  private last = Number.NEGATIVE_INFINITY;
+
+  constructor(
+    private readonly latency: DevLatency,
+    private readonly source: DelaySource = REAL_TIME,
+  ) {}
+
+  push(deliver: () => void): void {
+    const now = this.source.now();
+    const delay = Math.max(0, this.latency.rttMs / 2 + (this.source.random() - 0.5) * this.latency.jitterMs);
+    const at = Math.max(this.last, now + delay);
+    this.last = at;
+    setTimeout(deliver, at - now);
+  }
+}
+
+/**
+ * Wraps a joined room's connection in both directions: everything the socket sends and everything it receives goes
+ * through its own delay line. It survives the SDK's reconnection, which reuses both hooks.
+ */
+export function applyDevLatency(room: Room, latency: DevLatency, source: DelaySource = REAL_TIME): void {
+  console.info(`${DEV_LATENCY_MARKER}: ${latency.rttMs} ms round trip, ${latency.jitterMs} ms jitter`);
+  const connection = room.connection as unknown as {
+    transport: { send(data: Uint8Array): void };
+    events: { onmessage?: (event: unknown) => void };
+  };
+  const outgoing = new DelayLine(latency, source);
+  const send = connection.transport.send.bind(connection.transport);
+  connection.transport.send = (data: Uint8Array) => {
+    const copy = new Uint8Array(data);
+    outgoing.push(() => {
+      try {
+        send(copy);
+      } catch {
+        // The socket closed meanwhile; a real network would have lost it too.
+      }
+    });
+  };
+  const incoming = new DelayLine(latency, source);
+  const receive = connection.events.onmessage;
+  connection.events.onmessage = (event: unknown) => incoming.push(() => receive?.call(connection.events, event));
+}

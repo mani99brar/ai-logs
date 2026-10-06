@@ -1,0 +1,42 @@
+export const meta = {
+  name: 'review-visibility-fix-controller',
+  description: 'Fix the audit findings in the Python controller (workflow/**) of the review-visibility change set, with tests',
+  phases: [{ title: 'Fix controller', detail: 'seven audit findings in workflow/**' }],
+}
+
+const REPORT = {
+  type: 'object',
+  required: ['changed_files', 'tests_run', 'findings_addressed', 'deviations', 'concerns'],
+  properties: {
+    changed_files: { type: 'array', items: { type: 'string' } },
+    tests_run: { type: 'array', items: { type: 'object', required: ['command', 'result'], properties: { command: { type: 'string' }, result: { type: 'string' } } } },
+    findings_addressed: { type: 'array', items: { type: 'object', required: ['id', 'how'], properties: { id: { type: 'string' }, how: { type: 'string' } } } },
+    deviations: { type: 'array', items: { type: 'string' } },
+    concerns: { type: 'array', items: { type: 'string' } },
+  },
+}
+
+const prompt = [
+  'You are fixing audit findings in the Python workflow controller of the md-manager repository at /home/agentops/dev/md-manager-ultra (run pwd to confirm). The work is UNCOMMITTED on branch ultra; read it with git diff / git status. Do not commit, stash, push or cd elsewhere. Python: /home/agentops/dev/md-manager/.venv/bin/python (never create a venv). Ownership: ONLY files under workflow/ (production and tests). Another engineer is concurrently editing server/, contracts/, src/, tests/project-workflows and docs/ in this same checkout: never touch those, and if a fix needs one of them, put it in "concerns". Match the existing code style and the fail-closed philosophy (never launch a second reviewer, never invent evidence).',
+  '',
+  'Read first: workflow/automatic.py (review_candidate, _review_native, _accept_native, _decide, wait_review, read_review_completion), workflow/pipeline.py (launch_reviewer, stop_session, stop_reviewer, review node, reconcile action), workflow/interactive.py (run_reviewer, launch, reconcile, attach_panels, attach_reviewer_panel), workflow/export_state.py, workflow/test_pipeline.py (FakeSessions, OfflinePipeline), workflow/test_automatic.py (GraphFixture, PrintReviewerGraphTests, NativeReviewerGraphTests), workflow/test_interactive.py, workflow/test_export.py, and workflow/RUNBOOK.md. Then fix each finding below with red-first tests (write the test, see it fail for the behavioural reason, fix, re-run):',
+  '',
+  'F1 (launch-window interrupt strands the reviewer). In _review_native the launch is wrapped in except BaseException -> needs_reconciliation; a KeyboardInterrupt after claude --bg returned (settle poll, pane attach) therefore leaves a live, identified reviewer that review_candidate refuses forever. Fix: on KeyboardInterrupt, if review.interactive.json exists (the launch was issued), write automatic-review.json with status "running" (session_id/background_id from the interactive receipt when already bound, else absent), emit the review/interrupted event with the resume note, and re-raise; keep needs_reconciliation for other exceptions. In review_candidate, the running-resume branch must reconcile a receipt that lacks session_id: call the sessions reconcile path for the review node (InteractiveSessions.reconcile via a Pipeline method, mirrored in FakeSessions), copy session_id/background_id into automatic-review.json, then continue with _accept_native. Also make Pipeline.launch_reviewer catch BaseException (not just Exception) around the best-effort pane attach so a Ctrl-C there does not escape as a launch failure but is handled by the rule above. Tests: interrupt raised from launch_reviewer after the fake receipt exists (both with and without session_id) -> receipt running, event interrupted, no stop file; next drive resumes, accepts the file, exactly one launch.',
+  '',
+  'F2 (post-acceptance stop never retried). _accept_native marks the receipt succeeded before runtime.stop_reviewer(); a failing stop propagates with no event and the succeeded branch of review_candidate later returns the review without stopping. Fix: in the succeeded branch, if review.stop.json is absent or its stopped flag is false, call runtime.stop_reviewer() (the stop intent makes it idempotent) before returning; wrap the post-acceptance stop so a failure emits a review/running event "Could not confirm reviewer stop: ...; resume retries the stop" and re-raises. Test: OfflinePipeline.stop_reviewer failing once -> drive raises, receipt succeeded, no stopped stop file, event recorded; second drive stops (assert the stop was attempted again, review.stop.json stopped true) and integrates.',
+  '',
+  'F3 (post-wait re-checks untested). Give FakeSessions knobs so tests can make locate("review") return a row with a different sessionId, a worker session id from the bundle snapshots, or None after the completion file exists, and a callback run after the completion file is written that dirties review-worktree or rewrites review.diff. Add NativeReviewerGraphTests cases asserting the exact RuntimeError messages ("identity changed or is not independent", "Reviewer worktree changed", "Evidence changed during review"), receipt blocked, stop_reviewer called once, review.json absent, and no second launch on a further drive. Confirm each test fails when the corresponding guard line is removed (do this on a scratch copy under /tmp or by temporarily editing and reverting; never leave the guard removed).',
+  '',
+  'F4 (print-mode worker/requirement untested). Make the fake print executable read an optional findings JSON file (like the verdict file) and add a PrintReviewerGraphTests case supplying a finding with worker/requirement, asserting review.json and run-state.json review.findings carry them; add a negative case with a finding lacking worker -> the print reviewer result is rejected (schema) and the run blocks without relaunch.',
+  '',
+  'F5 (best-effort pane and launch-failure receipt untested). Unit tests: Pipeline.launch_reviewer with a SimpleNamespace sessions whose run_reviewer returns a receipt, terminals.json present, HERDR_ENV=1 patched, attach_reviewer_panel patched to raise -> the receipt is returned and a review/running "Reviewer pane not attached" event is recorded; and a run_reviewer that raises RuntimeError -> automatic-review.json status needs_reconciliation with the error, review node blocked event, no stop attempted, and a further drive raises the reconciliation error without launching.',
+  '',
+  'F6 (attach does not add the reviewer pane to an existing tab, contradicting RUNBOOK line about attach). In attach_panels: when terminals.json exists and has the ui/adapter entries but no review entry and review.interactive.json exists, delegate to attach_reviewer_panel and return its mapping; otherwise keep the existing refusal. Test it with the fake herdr in test_interactive (a split of the adapter pane, rename to "Claude: reviewer", attach-one --node review command, mapping saved).',
+  '',
+  'F7 (export invents reviewer_transport for plans pinned before the setting). In export_state.inputs_section, when plan.automatic lacks reviewer_transport, do not default to "native": use the transport the run actually recorded (the same derivation review_section uses: "native" when review.interactive.json exists, "print" when automatic-review.json exists without it) and null when no reviewer receipt exists. Update the docstring/comment and the feature README sentence in features/project-workflows/README.md ONLY IF it is under your ownership (it is not: report the needed wording change in concerns instead). Tests in test_export: legacy print-mode run -> "print"; legacy plan with no review yet -> null; plan with the key -> the key. NOTE: the TS side (contract nullable field, adapter schema, UI) is being changed concurrently by the other engineer; do not wait for it.',
+  '',
+  'When done run: /home/agentops/dev/md-manager/.venv/bin/python -m unittest workflow.test_automatic workflow.test_interactive workflow.test_feature_launch workflow.test_sessions workflow.test_verification workflow.test_pipeline workflow.test_graph workflow.test_export -v (expect 108 currently, more after your additions) and git diff --check; report counts. Your final answer must be the structured report.',
+].join('\n')
+
+phase('Fix controller')
+return await agent(prompt, { label: 'fix:controller', phase: 'Fix controller', schema: REPORT })

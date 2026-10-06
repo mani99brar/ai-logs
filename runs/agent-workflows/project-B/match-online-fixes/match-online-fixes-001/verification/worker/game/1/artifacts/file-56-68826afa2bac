@@ -1,0 +1,149 @@
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { seaMap, shipTuning, SIGHT_RADIUS_TILES, SUB_UNITS_PER_TILE } from "@pirate-sea-race/content";
+import { defaultSimulationConfig, hullPathIsClear, tileCentre } from "@pirate-sea-race/simulation";
+import { MatchRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { AHEAD, HeadlessClient, sleep, type ShipView } from "@pirate-sea-race/test-tools";
+import { expectRoomChecks, quickStart, startThroughLobby } from "./seaDuelSetup.js";
+
+/**
+ * Server-enforced visibility (§3, §16) on real clients: what each headless client decodes, and the raw bytes it
+ * received, hold its own ship and the ships inside its sight radius, and nothing else.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+const clients: HeadlessClient[] = [];
+const SIGHT = SIGHT_RADIUS_TILES * SUB_UNITS_PER_TILE;
+/** The row three tiles south of the hub, which the map keeps clear for 20 tiles either side of the hub. */
+const OPEN_ROW = seaMap.hub.tileY + 3;
+const HUB_X = seaMap.hub.tileX;
+
+/** The match rooms this test's clients joined: checked after it, like `tracker`'s (`expectRoomChecks`). */
+const rooms = new Set<MatchRoom>();
+
+async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
+  const joined = await client;
+  clients.push(joined);
+  rooms.add(matchMaker.getLocalRoomById(joined.room.roomId) as unknown as MatchRoom);
+  return joined;
+}
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning: quickStart() });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  const checked = [...rooms];
+  rooms.clear();
+  await Promise.all(clients.splice(0).map((client) => client.leave()));
+  await sleep(150);
+  for (const room of checked) expectRoomChecks(room);
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+function distance(a: ShipView, b: ShipView): number {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function containsText(frame: Uint8Array, text: string): boolean {
+  return Buffer.from(frame).includes(Buffer.from(text, "utf8"));
+}
+
+/**
+ * Two players in one match, placed on the open row `apartTiles` apart either side of the hub; the guest faces the
+ * host. The row is clear for a hull from both ships to a few tiles beyond them, where they back away.
+ */
+async function pairApart(apartTiles: number): Promise<{ host: HeadlessClient; guest: HeadlessClient }> {
+  const [hostX, guestX] = [HUB_X - apartTiles / 2, HUB_X + apartTiles / 2];
+  const [west, east] = [tileCentre(defaultSimulationConfig, hostX - 5, OPEN_ROW), tileCentre(defaultSimulationConfig, guestX + 5, OPEN_ROW)];
+  expect(hullPathIsClear(defaultSimulationConfig, west.x, west.y, east.x, east.y)).toBe(true);
+  const host = await track(HeadlessClient.create(endpoint));
+  const guest = await track(HeadlessClient.join(endpoint, host.code));
+  await host.waitFor(() => host.playerCount === 2);
+  await host.placeShip(endpoint, { tileX: hostX, tileY: OPEN_ROW, heading: 0 });
+  await guest.placeShip(endpoint, { tileX: guestX, tileY: OPEN_ROW, heading: 32 });
+  await startThroughLobby(endpoint, [host, guest]);
+  return { host, guest };
+}
+
+describe("sight radius", () => {
+  it("keeps a ship out of sight out of the other client's state and payload until it sails within the radius, and drops it when it leaves", async () => {
+    const { host, guest } = await pairApart(2 * SIGHT_RADIUS_TILES);
+    const hostShip = host.ship()!;
+    await sleep(300);
+
+    // Out of sight: each client decodes only its own ship, both know there are two players, and the room's views
+    // agree.
+    expect(guest.visibleShipIds()).toEqual([guest.sessionId]);
+    expect(host.visibleShipIds()).toEqual([host.sessionId]);
+    expect(guest.playerCount).toBe(2);
+    const room = matchMaker.getLocalRoomById(host.room.roomId) as unknown as MatchRoom;
+    expect(room.viewedShipIds(guest.sessionId)).toEqual([guest.sessionId]);
+
+    // The guest sails toward the host. Until the host is in its state, it is out of range; once it is, it is in range.
+    let wasHidden = false;
+    await guest.holdUntil(AHEAD, () => {
+      const ownShip = guest.ship()!;
+      const seen = guest.ship(host.sessionId);
+      if (seen === undefined) {
+        expect(distance(ownShip, hostShip)).toBeGreaterThan(SIGHT - 3 * shipTuning.maxSpeed);
+        wasHidden = true;
+        return false;
+      }
+      expect(distance(ownShip, seen)).toBeLessThanOrEqual(SIGHT);
+      return true;
+    });
+    expect(wasHidden).toBe(true);
+    expect(guest.ship(host.sessionId)).toEqual(hostShip);
+    // Sight is mutual: the host now sees the guest too.
+    await host.waitFor(() => host.ship(guest.sessionId) !== undefined);
+
+    // Every frame the guest received while the host was hidden, including the join's full state, never named the
+    // host's ship: its id first crosses the network in the patch that reveals it.
+    const guestFrames = guest.framesSince(0);
+    const firstMention = guestFrames.findIndex((frame) => containsText(frame, host.sessionId));
+    expect(firstMention).toBeGreaterThan(0);
+    expect(guestFrames.slice(0, firstMention).some((frame) => containsText(frame, guest.sessionId))).toBe(true);
+
+    // The guest backs away (brake, then slow reverse) until the host drops out of its state again.
+    await guest.holdUntil({ moveX: 0, moveY: 1 }, () => guest.ship(host.sessionId) === undefined, 15_000);
+    expect(distance(guest.ship()!, hostShip)).toBeGreaterThan(SIGHT);
+    await host.waitFor(() => host.ship(guest.sessionId) === undefined);
+    // Its own ship never leaves a client's state.
+    expect(guest.visibleShipIds()).toEqual([guest.sessionId]);
+    expect(host.visibleShipIds()).toEqual([host.sessionId]);
+
+    // Once hidden again, the host's changes no longer reach the guest: it backs away west, further out of sight.
+    const mark = guest.frameCount;
+    const before = host.ship()!;
+    await host.hold({ moveX: 0, moveY: 1 }, 500);
+    await host.waitFor(() => host.ship()!.x < before.x);
+    await sleep(200);
+    expect(guest.framesSince(mark).length).toBeGreaterThan(0);
+    expect(guest.framesSince(mark).some((frame) => containsText(frame, host.sessionId))).toBe(false);
+    expect(guest.ship(host.sessionId)).toBeUndefined();
+  });
+
+  it("shows each client exactly the ships within its own radius among several players", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const second = await track(HeadlessClient.join(endpoint, host.code));
+    const third = await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 3);
+    // host 8 tiles west of the hub, second at the hub (in sight of both), third 8 tiles east (in sight of second only).
+    await host.placeShip(endpoint, { tileX: HUB_X - 8, tileY: OPEN_ROW, heading: 0 });
+    await second.placeShip(endpoint, { tileX: HUB_X, tileY: OPEN_ROW, heading: 0 });
+    await third.placeShip(endpoint, { tileX: HUB_X + 8, tileY: OPEN_ROW, heading: 0 });
+    await host.waitFor(() => host.visibleShipIds().length === 2);
+    await second.waitFor(() => second.visibleShipIds().length === 3);
+    await third.waitFor(() => third.visibleShipIds().length === 2);
+    await sleep(200);
+    expect(host.visibleShipIds()).toEqual([host.sessionId, second.sessionId].sort());
+    expect(second.visibleShipIds()).toEqual([host.sessionId, second.sessionId, third.sessionId].sort());
+    expect(third.visibleShipIds()).toEqual([second.sessionId, third.sessionId].sort());
+    for (const client of [host, second, third]) expect(client.playerCount).toBe(3);
+  });
+});

@@ -1,0 +1,595 @@
+import { describe, expect, it } from "vitest";
+import { createDuelState, defaultDuelConfig as config, duelInput as I, hashState, replayDuel, stepDuel, type DuelState, type PlayerIndex } from "../duel/index.js";
+import {
+  BUNDLE_FRAMES,
+  CATCH_UP_FRAMES,
+  chooseInputDelay,
+  DuelAuthority,
+  DuelClientSession,
+  DuelClock,
+  DuelEventFeed,
+  DuelRollback,
+  duelEventId,
+  FRAME_MS,
+  HELD_INPUT_FRAMES,
+  HISTORY_FRAMES,
+  inputDelayFromSamples,
+  INPUTS_PER_MESSAGE,
+  linkStats,
+  MAX_INPUT_DELAY,
+  MESSAGES_PER_SECOND,
+  MIN_INPUT_DELAY,
+  RESYNC_FRAMES,
+  type AuthorityBundle,
+  type OutgoingDuelInput,
+} from "./index.js";
+
+const { fighter: body, arena } = config.moveset;
+const R = I("right");
+const L = I("left");
+const J = I("light");
+const K = I("heavy");
+
+/** The fighters `gapPx` pixels apart about the arena's centre. */
+function closeDuel(gapPx: number): DuelState {
+  const centre = arena.width / 2;
+  const gap = gapPx * arena.subPixelsPerPixel;
+  return createDuelState(config, { x: [centre - gap / 2, centre + gap / 2] });
+}
+
+/** The fighters `gapPx` apart, player two with `health` left: a jab (45) at that range is a KO. */
+function nearKo(gapPx: number, health = 45): DuelState {
+  const state = closeDuel(gapPx);
+  return { ...state, fighters: [state.fighters[0], { ...state.fighters[1], health }] };
+}
+
+/** What each player holds at a client frame (before the input delay). */
+type Script = (clientFrame: number) => number;
+
+interface NetworkResult {
+  readonly authority: DuelAuthority;
+  readonly clients: readonly [DuelRollback, DuelRollback];
+}
+
+/**
+ * A lockstep model of the duel network in whole frames: both clients run on the server's frame, tag the input held
+ * at frame c for c + delay, send the last four tagged frames every second frame, and the messages and bundles arrive
+ * `up` and `down` frames later. Everything is deterministic, so exact counts can be asserted.
+ */
+function network(options: { initial: DuelState; delay: number; up: number; down: number; frames: number; scripts: readonly [Script, Script] }): NetworkResult {
+  const authority = new DuelAuthority(config, options.initial);
+  const clients = [new DuelRollback(config, 0, options.initial), new DuelRollback(config, 1, options.initial)] as const;
+  const toServer: { at: number; player: PlayerIndex; message: OutgoingDuelInput }[] = [];
+  const toClients: { at: number; bundle: AuthorityBundle }[] = [{ at: options.down, bundle: authority.snapshotBundle() }];
+  const seq = [0, 0];
+  // During the countdown each client tagged and sent the first frames of the fight, with nothing held.
+  for (const player of [0, 1] as const) {
+    for (let early = 1; early < options.delay; early++) clients[player].setLocalInput(early, 0);
+    for (let last = 2; last < options.delay + 1; last += 2) {
+      const frame = Math.min(last, options.delay - 1);
+      const inputs = Array.from({ length: Math.min(4, frame) }, () => 0);
+      toServer.push({ at: 0, player, message: { seq: ++seq[player]!, frame, inputs } });
+    }
+  }
+  for (let frame = 1; frame <= options.frames; frame++) {
+    // Clients: tag and send, as of the previous frame (the one they are on when the server steps this one).
+    for (const player of [0, 1] as const) {
+      const client = clients[player];
+      const tagged = frame - 1 + options.delay;
+      client.setLocalInput(tagged, options.scripts[player](frame - 1));
+      if (frame % 2 === 1) {
+        const first = Math.max(1, tagged - 3);
+        const inputs = Array.from({ length: tagged - first + 1 }, (_, index) => client.localInput(first + index) ?? 0);
+        toServer.push({ at: frame + options.up, player, message: { seq: ++seq[player]!, frame: tagged, inputs } });
+      }
+    }
+    // Server: the messages due, then the step.
+    for (const item of toServer.filter((entry) => entry.at <= frame)) authority.receive(item.player, item.message.frame, item.message.inputs);
+    toServer.splice(0, toServer.filter((entry) => entry.at <= frame).length);
+    const bundle = authority.step();
+    if (bundle !== undefined) toClients.push({ at: frame + options.down, bundle });
+    // Clients: the bundles due, then predict up to this frame.
+    const due = toClients.filter((entry) => entry.at <= frame);
+    toClients.splice(0, due.length);
+    for (const client of clients) {
+      for (const entry of due) client.applyBundle(entry.bundle);
+      client.stepTo(frame);
+    }
+  }
+  // Drain the network so every frame is confirmed.
+  for (const client of clients) for (const entry of toClients) client.applyBundle(entry.bundle);
+  return { authority, clients };
+}
+
+describe("input delay", () => {
+  it("summarises round trips as the median and the interquartile range", () => {
+    expect(linkStats([])).toBeUndefined();
+    expect(linkStats([40, 10, 30, 20, 50])).toEqual({ rttMs: 30, jitterMs: 20, samples: 5 });
+  });
+
+  it("covers the slower player's one-way latency and jitter, within 3 to 8 frames", () => {
+    const link = (rttMs: number, jitterMs: number) => ({ rttMs, jitterMs, samples: 20 });
+    expect(chooseInputDelay([link(1, 0), link(2, 1)])).toBe(MIN_INPUT_DELAY);
+    // 80 ms and 12 ms of spread (what 20 ms of jitter each way measures as): (40 + 24) / 16.7 → 4, plus 2.
+    expect(chooseInputDelay([link(80, 12), link(10, 0)])).toBe(6);
+    expect(chooseInputDelay([link(10, 0), link(150, 30)])).toBe(MAX_INPUT_DELAY);
+    expect(chooseInputDelay([link(10, 0), undefined])).toBe(MAX_INPUT_DELAY);
+  });
+
+  it("turns each player's round-trip samples into exact frames", () => {
+    const steady = (rttMs: number) => Array.from({ length: 25 }, () => rttMs);
+    // 25 samples spread evenly over `rttMs ± 12`: median rttMs, interquartile range 12.
+    const spread = (rttMs: number) => Array.from({ length: 25 }, (_, index) => rttMs - 12 + index);
+    // A local link: well under a frame one way, so the minimum.
+    expect(inputDelayFromSamples([steady(1), steady(2)])).toBe(3);
+    // 80 ms steady: 40 ms one way → 3 frames, plus 2.
+    expect(inputDelayFromSamples([steady(80), steady(1)])).toBe(5);
+    // 80 ms with 12 ms of spread: 40 + 24 ms → 4 frames, plus 2. Jitter raises it by a frame.
+    expect(inputDelayFromSamples([spread(80), steady(1)])).toBe(6);
+    // The slower player decides, whichever seat it is in.
+    expect(inputDelayFromSamples([steady(1), spread(80)])).toBe(6);
+    // 110 ms steady: 55 ms → 4 frames, plus 2; with the spread 55 + 24 ms → 5 frames, plus 2.
+    expect(inputDelayFromSamples([steady(110), steady(110)])).toBe(6);
+    expect(inputDelayFromSamples([spread(110), steady(1)])).toBe(7);
+    // A stall behind a lost packet is one late sample: it moves neither the median nor the spread.
+    expect(inputDelayFromSamples([[...steady(80).slice(1), 280], steady(1)])).toBe(5);
+    // §19's worst case is past the cap, and a player never measured gets the maximum.
+    expect(inputDelayFromSamples([spread(150), steady(1)])).toBe(MAX_INPUT_DELAY);
+    expect(inputDelayFromSamples([steady(1), []])).toBe(MAX_INPUT_DELAY);
+    // Rising latency never lowers the delay.
+    const delays = [20, 40, 60, 80, 100, 120, 140, 160].map((rttMs) => inputDelayFromSamples([spread(rttMs), steady(1)]));
+    expect(delays).toEqual([...delays].sort((a, b) => a - b));
+    expect(new Set(delays).size).toBeGreaterThan(3);
+  });
+});
+
+describe("DuelClock", () => {
+  it("estimates the server's frame from stamped messages and the round trip", () => {
+    const clock = new DuelClock();
+    expect(clock.serverFrameAt(0)).toBeUndefined();
+    // Frame 60 left the server at t = 1000 and took half of an 80 ms round trip.
+    clock.observe(60, 1040, 80);
+    expect(clock.serverFrameAt(1040)).toBeCloseTo(60 + 40 / FRAME_MS);
+    expect(clock.serverFrameAt(2040)).toBeCloseTo(120 + 40 / FRAME_MS);
+  });
+
+  it("ignores messages delayed by jitter or a stall, and forgets old samples", () => {
+    const clock = new DuelClock(2000);
+    clock.observe(0, 40, 80);
+    clock.observe(6, 40 + 6 * FRAME_MS + 200, 80);
+    expect(clock.serverFrameAt(40)).toBeCloseTo(40 / FRAME_MS);
+    // A server that fell 12 frames behind is followed once the early sample leaves the window.
+    clock.observe(300, 40 + 312 * FRAME_MS, 80);
+    expect(clock.serverFrameAt(40 + 312 * FRAME_MS)).toBeCloseTo(300 + 40 / FRAME_MS);
+  });
+});
+
+describe("DuelEventFeed", () => {
+  it("reports each event once, whatever re-simulates its frame", () => {
+    const feed = new DuelEventFeed();
+    const state = { ...closeDuel(40), frame: 9, events: [{ kind: "hit" as const, attacker: 0 as const, moveId: "jab", damage: 45 }] };
+    feed.observe(state);
+    feed.observe(state);
+    expect(feed.drain().map((event) => event.id)).toEqual([duelEventId(9, state.events[0]!)]);
+    feed.observe(state);
+    expect(feed.drain()).toEqual([]);
+    feed.prune(10);
+    feed.observe(state);
+    expect(feed.drain()).toHaveLength(1);
+  });
+});
+
+describe("DuelAuthority", () => {
+  it("takes each frame's input from the first message that carries it and never rewrites a stepped frame", () => {
+    const authority = new DuelAuthority(config, closeDuel(40));
+    expect(authority.receive(0, 3, [R, R, R])).toBe(3);
+    expect(authority.receive(0, 4, [L, L, L, L])).toBe(1);
+    expect(authority.stats.duplicates[0]).toBe(3);
+    authority.step();
+    authority.step();
+    const bundle = authority.step()!;
+    expect(bundle.inputs).toEqual([[R, 0], [R, 0], [R, 0]]);
+    expect(authority.receive(0, 3, [J, J, J])).toBe(0);
+    expect(authority.step()).toBeUndefined();
+    expect(authority.step()).toBeUndefined();
+    expect(authority.receive(0, 5, [J, J])).toBe(0);
+    // Frames 1 to 4 had their input, so later copies are duplicates; frame 5 was substituted, so its input came late.
+    expect(authority.stats).toMatchObject({ late: [1, 0], duplicates: [7, 0], repeated: [1, 0] });
+    expect(authority.state.fighters[0].moveId).toBeNull();
+  });
+
+  it("repeats a missing input for 250 ms, then substitutes neutral, and flags every substitution", () => {
+    const authority = new DuelAuthority(config, closeDuel(100));
+    authority.receive(0, 1, [R]);
+    authority.receive(1, 1, [L]);
+    const bundles: AuthorityBundle[] = [];
+    for (let frame = 1; frame <= 1 + HELD_INPUT_FRAMES + 2; frame++) {
+      const bundle = authority.step();
+      if (bundle !== undefined) bundles.push(bundle);
+    }
+    const pairs = bundles.flatMap((bundle) => bundle.inputs);
+    expect(pairs.slice(0, 1 + HELD_INPUT_FRAMES)).toEqual(Array.from({ length: 1 + HELD_INPUT_FRAMES }, () => [R, L]));
+    expect(pairs.slice(1 + HELD_INPUT_FRAMES)).toEqual([[0, 0], [0, 0]]);
+    expect(authority.stats).toMatchObject({ received: [1, 1], repeated: [HELD_INPUT_FRAMES, HELD_INPUT_FRAMES], neutral: [2, 2] });
+    // Frame 1 was received; frames 2 and 3 were substituted for both players.
+    expect(bundles[0]!.substituted).toBe(0b111100);
+  });
+
+  it("bundles every third frame, with a snapshot in every second bundle and a hash otherwise", () => {
+    const authority = new DuelAuthority(config, closeDuel(100));
+    const bundles = Array.from({ length: 12 }, () => authority.step()).filter((bundle) => bundle !== undefined);
+    expect(bundles.map((bundle) => bundle.frame)).toEqual([3, 6, 9, 12]);
+    expect(bundles.map((bundle) => (bundle.snapshot === undefined ? "hash" : "snapshot"))).toEqual(["hash", "snapshot", "hash", "snapshot"]);
+    expect(bundles[0]!.hash).toBe(hashState(authority.inputLog() && replayDuel(config, closeDuel(100), { ...authority.inputLog(), inputs: authority.inputLog().inputs.slice(0, 3) }).state));
+    expect(hashState(bundles[1]!.snapshot)).toBe(hashState(replayDuel(config, closeDuel(100), { ...authority.inputLog(), inputs: authority.inputLog().inputs.slice(0, 6) }).state));
+    expect(BUNDLE_FRAMES).toBe(3);
+  });
+
+  it("records a log that replays to its state", () => {
+    const authority = new DuelAuthority(config, closeDuel(60));
+    authority.receive(0, 4, [R, R, J, J]);
+    for (let frame = 0; frame < 30; frame++) authority.step();
+    expect(replayDuel(config, closeDuel(60), authority.inputLog()).hash).toBe(hashState(authority.state));
+  });
+});
+
+describe("DuelRollback", () => {
+  it("predicts both fighters: its own input as sent, the opponent's last confirmed input repeated", () => {
+    const rollback = new DuelRollback(config, 1, closeDuel(100));
+    rollback.setLocalInput(1, L);
+    rollback.applyBundle({ frame: 0, inputs: [], snapshot: closeDuel(100) });
+    rollback.stepTo(1);
+    expect(rollback.inputsFor(1)).toEqual([0, L]);
+    rollback.applyBundle({ frame: 1, inputs: [[R, L]] });
+    expect(rollback.confirmedFrame).toBe(1);
+    rollback.stepTo(4);
+    // Frames 2 to 4: the own input repeats (none was tagged), the opponent's confirmed R is repeated.
+    expect(rollback.inputsFor(4)).toEqual([R, L]);
+    expect(rollback.stats.corrections).toBe(1);
+  });
+
+  it("replays confirmed frames with the inputs the server applied, not the ones it sent", () => {
+    const initial = closeDuel(40);
+    const rollback = new DuelRollback(config, 0, initial);
+    // A tap of J held for three frames, then released.
+    for (let frame = 1; frame <= 10; frame++) rollback.setLocalInput(frame, frame <= 3 ? J : 0);
+    rollback.stepTo(10);
+    expect(rollback.state.fighters[0].moveId).toBe("jab");
+    // The jab arrived too late: the server stepped frames 1 to 3 with neutral.
+    rollback.applyBundle({ frame: 3, inputs: [[0, 0], [0, 0], [0, 0]], substituted: 0b010101 });
+    let server = initial;
+    for (let frame = 1; frame <= 3; frame++) server = stepDuel(config, server, [0, 0]);
+    expect(rollback.confirmedFrame).toBe(3);
+    expect(hashState(rollback.confirmedState)).toBe(hashState(server));
+    expect(rollback.state.fighters[0].moveId).toBeNull();
+    expect(rollback.stats).toMatchObject({ corrections: 1, replayedFrames: 10, substitutedFrames: [3, 0] });
+  });
+
+  it("hashes its own state at the server's frame before restoring the snapshot, and counts a desync", () => {
+    const server = closeDuel(100);
+    const wrong = closeDuel(96);
+    const rollback = new DuelRollback(config, 0, wrong);
+    rollback.stepTo(5);
+    // A hash alone can only be counted...
+    rollback.applyBundle({ frame: 0, inputs: [], hash: hashState(server) });
+    expect(rollback.stats).toMatchObject({ hashChecks: 1, desyncs: 1, snapshotRestores: 0 });
+    // ...a snapshot also puts the client back on the server's state, and prediction continues from it.
+    rollback.applyBundle({ frame: 0, inputs: [], snapshot: server });
+    expect(rollback.stats).toMatchObject({ hashChecks: 2, desyncs: 2, snapshotRestores: 1 });
+    let expected = server;
+    for (let frame = 1; frame <= 5; frame++) expected = stepDuel(config, expected, [0, 0]);
+    expect(hashState(rollback.state)).toBe(hashState(expected));
+    rollback.applyBundle({ frame: 3, inputs: [[0, 0], [0, 0], [0, 0]], hash: hashState(stepDuel(config, stepDuel(config, stepDuel(config, server, [0, 0]), [0, 0]), [0, 0])) });
+    expect(rollback.stats).toMatchObject({ hashChecks: 3, desyncs: 2, corrections: 0 });
+  });
+
+  it("waits for a snapshot after a gap in the server's frames, then restarts from it", () => {
+    const authority = new DuelAuthority(config, closeDuel(100));
+    const rollback = new DuelRollback(config, 0, closeDuel(100));
+    const bundles = Array.from({ length: 18 }, () => authority.step()).filter((bundle) => bundle !== undefined);
+    rollback.stepTo(18);
+    rollback.applyBundle(bundles[2]!);
+    expect(rollback.waitingForSnapshot).toBe(true);
+    expect(rollback.confirmedFrame).toBe(0);
+    rollback.applyBundle(bundles[3]!);
+    expect(rollback.waitingForSnapshot).toBe(false);
+    expect(rollback.confirmedFrame).toBe(12);
+    rollback.applyBundle(bundles[4]!);
+    rollback.applyBundle(bundles[5]!);
+    expect(rollback.confirmedFrame).toBe(18);
+    expect(hashState(rollback.confirmedState)).toBe(hashState(authority.state));
+    expect(rollback.stats.desyncs).toBe(0);
+  });
+
+  it("keeps two seconds of states, and stops predicting two seconds past its last confirmed frame", () => {
+    const rollback = new DuelRollback(config, 0, closeDuel(100));
+    expect(rollback.stepTo(500)).toBe(HISTORY_FRAMES);
+    expect(rollback.canStep).toBe(false);
+    expect(rollback.stateAt(0)?.frame).toBe(0);
+    expect(rollback.stateAt(HISTORY_FRAMES / 2)?.frame).toBe(HISTORY_FRAMES / 2);
+    // Confirming the frames lets it go on, and the states more than two seconds old are let go.
+    const pairs = Array.from({ length: HISTORY_FRAMES }, () => [0, 0] as const);
+    rollback.applyBundle({ frame: HISTORY_FRAMES, inputs: pairs });
+    expect(rollback.confirmedFrame).toBe(HISTORY_FRAMES);
+    expect(rollback.stepTo(2 * HISTORY_FRAMES + 10)).toBe(HISTORY_FRAMES);
+    expect(rollback.stateAt(HISTORY_FRAMES - 1)).toBeUndefined();
+    expect(rollback.stateAt(HISTORY_FRAMES)?.frame).toBe(HISTORY_FRAMES);
+  });
+
+  it("reports a hit once although a correction steps its frame again", () => {
+    const rollback = new DuelRollback(config, 0, closeDuel(40));
+    rollback.setLocalInput(1, J);
+    rollback.stepTo(20);
+    const hits = rollback.drainEvents().filter((event) => event.event?.kind === "hit");
+    expect(hits).toHaveLength(1);
+    const hitFrame = hits[0]!.frame;
+    // The opponent pressed dash while in hitstun: every frame is stepped again, the hit among them.
+    const inputs = Array.from({ length: hitFrame + 1 }, (_, index) => [index === 0 ? J : 0, index === hitFrame ? I("dash") : 0] as const);
+    rollback.applyBundle({ frame: hitFrame + 1, inputs });
+    expect(rollback.stats.corrections).toBe(1);
+    expect(rollback.drainEvents().filter((event) => event.event?.kind === "hit")).toEqual([]);
+    expect(rollback.state.fighters[1].health).toBe(1000 - 45);
+  });
+
+  it("reports a KO once although a correction steps its frame again, and predicts nothing past it", () => {
+    const rollback = new DuelRollback(config, 0, nearKo(40));
+    rollback.setLocalInput(1, J);
+    rollback.stepTo(40);
+    const predicted = rollback.drainEvents();
+    const kos = predicted.filter((event) => event.result !== null);
+    expect(kos).toHaveLength(1);
+    const koFrame = kos[0]!.frame;
+    expect(kos[0]!.result).toMatchObject({ winner: 0, reason: "ko", frame: koFrame });
+    expect(predicted.filter((event) => event.event?.kind === "hit").map((event) => event.frame)).toEqual([koFrame]);
+    // Prediction stops at the end: no frame after the KO is stepped.
+    expect(rollback.frame).toBe(koFrame);
+    expect(rollback.stepTo(koFrame + 30)).toBe(0);
+    // The opponent pressed dash on the frame it was hit: the server's pairs differ from the prediction there, so every
+    // frame up to the KO is stepped again.
+    const inputs = Array.from({ length: koFrame }, (_, index) => [index === 0 ? J : 0, index === koFrame - 1 ? I("dash") : 0] as const);
+    rollback.applyBundle({ frame: koFrame, inputs });
+    expect(rollback.stats).toMatchObject({ corrections: 1, replayedFrames: koFrame });
+    expect(rollback.confirmedFrame).toBe(koFrame);
+    expect(rollback.confirmedState.result).toMatchObject({ winner: 0, reason: "ko", frame: koFrame });
+    expect(rollback.confirmedState.fighters[1].held).toBe(I("dash"));
+    // The re-stepped hit and KO carry the ids already reported.
+    expect(rollback.drainEvents()).toEqual([]);
+  });
+
+  it("goes on predicting when a correction takes back a predicted KO", () => {
+    const rollback = new DuelRollback(config, 0, nearKo(40));
+    // A tap: J on frame 1 only.
+    for (let frame = 1; frame <= 60; frame++) rollback.setLocalInput(frame, frame === 1 ? J : 0);
+    rollback.stepTo(40);
+    const koFrame = rollback.drainEvents().find((event) => event.result !== null)!.frame;
+    // The server never got the jab in time: it stepped frame 1 with neutral, so there is no KO and no end.
+    rollback.applyBundle({ frame: 1, inputs: [[0, 0]], substituted: 0b01 });
+    expect(rollback.stats.corrections).toBe(1);
+    expect(rollback.state.result).toBeNull();
+    expect(rollback.stepTo(koFrame + 30)).toBe(30);
+    expect(rollback.state.fighters[1].health).toBe(45);
+  });
+});
+
+describe("prediction and rollback over a network", () => {
+  // Player two stands in the corner. Player one walks in and taps J twice: the first jab is guarded (player two holds
+  // back), the second hits. Player two then walks in and throws with rollover, K a frame after J.
+  const walkAndJab: Script = (frame) => (frame < 20 ? R : frame === 40 || frame === 90 ? J : 0);
+  const guardAndThrow: Script = (frame) => (frame < 70 ? R : frame >= 140 && frame < 156 ? L : frame === 165 ? J : frame === 166 ? J | K : 0);
+  const cornered = () => createDuelState(config, { x: [arena.width - body.pushbox.halfWidth - 120 * 16, arena.width - body.pushbox.halfWidth] });
+  /** How often a script's input changes: the most corrections the opponent's input can cause. */
+  const changes = (script: Script, frames: number) => Array.from({ length: frames }, (_, frame) => frame).filter((frame) => frame > 0 && script(frame) !== script(frame - 1)).length;
+
+  it.each([
+    ["no latency", { up: 0, down: 0, delay: 3 }],
+    ["2 frames each way", { up: 2, down: 2, delay: 4 }],
+    ["5 frames each way", { up: 5, down: 5, delay: 8 }],
+  ])("keeps both clients on the server's state with %s", (_label, link) => {
+    const { authority, clients } = network({ initial: cornered(), ...link, frames: 240, scripts: [walkAndJab, guardAndThrow] });
+    for (const client of clients) {
+      expect(client.confirmedFrame).toBe(240);
+      expect(hashState(client.confirmedState)).toBe(hashState(authority.state));
+      expect(client.stats.desyncs).toBe(0);
+      expect(client.stats.hashChecks).toBeGreaterThanOrEqual(80);
+    }
+    expect(authority.stats.late).toEqual([0, 0]);
+    expect(authority.stats.received).toEqual([240, 240]);
+    // The duel did happen: a jab was guarded, one hit, and the throw landed.
+    const events = authority.inputLog().inputs.length;
+    expect(events).toBe(240);
+    expect(authority.state.fighters.map((fighter) => fighter.health)).toEqual([1000 - 120, 1000 - 45]);
+  });
+
+  it("corrects at most once per change of the opponent's input, plus once per own input the server substituted", () => {
+    const quiet = network({ initial: cornered(), delay: 6, up: 1, down: 1, frames: 240, scripts: [walkAndJab, guardAndThrow] });
+    const scripts = [walkAndJab, guardAndThrow] as const;
+    for (const player of [0, 1] as const) {
+      const client = quiet.clients[player];
+      expect(client.stats.corrections).toBeGreaterThan(0);
+      expect(client.stats.corrections).toBeLessThanOrEqual(changes(scripts[player === 0 ? 1 : 0], 240));
+    }
+    expect(quiet.authority.stats.late).toEqual([0, 0]);
+    // A delay shorter than the way up: inputs arrive after their frame, are substituted, and come back corrected.
+    const slow = network({ initial: cornered(), delay: 3, up: 5, down: 5, frames: 240, scripts: [walkAndJab, guardAndThrow] });
+    expect(slow.authority.stats.late[0] + slow.authority.stats.late[1]).toBeGreaterThan(0);
+    for (const client of slow.clients) {
+      expect(client.stats.desyncs).toBe(0);
+      expect(hashState(client.confirmedState)).toBe(hashState(slow.authority.state));
+    }
+  });
+});
+
+/** A client session driven by a fake clock at an exact 60 Hz, with the server's probes and bundles fed in. */
+function sessionRig(options: { player?: PlayerIndex; initial?: DuelState; delay?: number } = {}) {
+  const initial = options.initial ?? closeDuel(40);
+  const session = new DuelClientSession({ config, player: options.player ?? 0, initial });
+  session.inputDelay = options.delay ?? 3;
+  // The server's frame 0 is at local time 1000 and the link is instant: messages arrive on a frame's edge, and the
+  // client ticks in the middle of a frame.
+  const edge = (frame: number) => 1000 + frame * FRAME_MS;
+  const at = (frame: number) => edge(frame) + FRAME_MS / 2;
+  session.receiveProbe({ frame: -60, rtt: 0 }, edge(-60));
+  const sent: OutgoingDuelInput[] = [];
+  const sentAt: number[] = [];
+  const tick = (now: number, bits: number) => {
+    const message = session.tick(now, bits);
+    if (message === undefined) return;
+    sent.push(message);
+    sentAt.push(now);
+  };
+  return { session, sent, sentAt, at, edge, tick, initial };
+}
+
+describe("DuelClientSession", () => {
+  it("tags held input for the frame the delay names and sends the last four frames every second frame", () => {
+    const { session, sent, at, tick } = sessionRig({ delay: 3 });
+    for (let frame = -5; frame <= 10; frame++) tick(at(frame), frame >= 2 ? R : 0);
+    expect(session.frame).toBe(10);
+    expect(session.rollback.frame).toBe(10);
+    // Held at frame 2 → tagged for frame 5.
+    expect(session.rollback.localInput(4)).toBe(0);
+    expect(session.rollback.localInput(5)).toBe(R);
+    expect(sent.every((message) => message.inputs.length <= INPUTS_PER_MESSAGE)).toBe(true);
+    expect(sent.at(-1)).toMatchObject({ frame: 12, inputs: [R, R, R, R] });
+    // Every frame travels in two messages.
+    const carried = new Map<number, number>();
+    for (const message of sent) message.inputs.forEach((_, index) => carried.set(message.frame - message.inputs.length + 1 + index, (carried.get(message.frame - message.inputs.length + 1 + index) ?? 0) + 1));
+    expect([...carried.entries()].filter(([frame]) => frame <= 10).map(([, count]) => count)).toEqual(Array.from({ length: 10 }, () => 2));
+    expect(sent.map((message) => message.seq)).toEqual(sent.map((_, index) => index + 1));
+  });
+
+  it("presses the throw chord with a gap of one and of two frames, and throws each time", () => {
+    for (const gap of [1, 2]) {
+      const initial = closeDuel(34);
+      const { session, sent, at, edge, tick } = sessionRig({ initial, delay: 3 });
+      const authority = new DuelAuthority(config, initial);
+      // J goes down at frame 10 and stays held; K follows `gap` frames later; both are held through the throw.
+      for (let frame = 1; frame <= 60; frame++) {
+        tick(at(frame), frame >= 10 ? J | (frame >= 10 + gap ? K : 0) : 0);
+        for (const message of sent.splice(0)) authority.receive(0, message.frame, message.inputs);
+        const bundle = authority.step();
+        if (bundle !== undefined) session.receiveBundle(bundle, edge(frame + 1));
+      }
+      expect(session.stats.corrections).toBe(0);
+      expect(session.stats.desyncs).toBe(0);
+      expect(hashState(session.confirmedState)).toBe(hashState(authority.state));
+      expect(authority.stats.received[0]).toBe(60);
+      // J alone would have been a jab (45); the chord became the throw, which landed after the escape window.
+      expect(authority.state.fighters[1].health).toBe(1000 - 120);
+    }
+  });
+
+  it("catches up at most four frames a tick, and resyncs from the latest snapshot after a long gap", () => {
+    const { session, at, edge, tick } = sessionRig();
+    tick(at(1), 0);
+    tick(at(1 + 3 * CATCH_UP_FRAMES), 0);
+    expect(session.frame).toBe(1 + CATCH_UP_FRAMES);
+    const authority = new DuelAuthority(config, closeDuel(40));
+    let bundle: AuthorityBundle | undefined;
+    for (let frame = 1; frame <= 90; frame++) bundle = authority.step() ?? bundle;
+    session.receiveBundle(authority.snapshotBundle(), edge(90));
+    tick(at(90 + RESYNC_FRAMES), 0);
+    expect(session.frame).toBe(90 + RESYNC_FRAMES);
+    expect(session.stats.resyncs).toBe(1);
+    expect(bundle).toBeDefined();
+    // It restarted from the server's state, not its own.
+    expect(session.rollback.confirmedFrame).toBe(90);
+    expect(session.confirmedState).toEqual(authority.state);
+    expect(session.stats.desyncs).toBe(0);
+  });
+
+  it("resyncs to the server's state when its ticks stall while contiguous bundles keep arriving (a hidden tab)", () => {
+    const initial = closeDuel(100);
+    const { session, sent, at, edge, tick } = sessionRig({ initial, delay: 3 });
+    const authority = new DuelAuthority(config, initial);
+    const serverStates = new Map<number, DuelState>([[0, initial]]);
+    session.receiveBundle(authority.snapshotBundle(), edge(0));
+    // Player one walks right the whole time; player two walks left from frame 20 to 80. The tab is hidden from frame
+    // 31 to 120: its timers do not run, but every bundle still arrives, in order and without a gap.
+    const hidden = (frame: number) => frame > 30 && frame <= 120;
+    const step = (frame: number) => {
+      if (!hidden(frame)) tick(at(frame), R);
+      for (const message of sent.splice(0)) authority.receive(0, message.frame, message.inputs);
+      authority.receive(1, frame, [frame >= 20 && frame < 80 ? L : 0]);
+      const bundle = authority.step();
+      serverStates.set(frame, authority.state);
+      if (bundle !== undefined) session.receiveBundle(bundle, edge(frame + 1));
+    };
+    for (let frame = 1; frame <= 120; frame++) step(frame);
+    expect(session.frame).toBe(30);
+    expect(session.rollback.receivedFrame).toBe(120);
+    expect(session.stats.resyncs).toBe(0);
+
+    // The first tick after the stall is far behind the server: it restarts from the latest snapshot (frame 120) instead
+    // of catching up four frames at a time, and its confirmed state is the server's.
+    tick(at(121), R);
+    expect(session.stats.resyncs).toBe(1);
+    // (The bundles arrive a frame after they leave, so the clock puts the server a frame back from the tick's own.)
+    expect(session.frame).toBe(120);
+    expect(session.rollback.confirmedFrame).toBe(120);
+    expect(session.confirmedState).toEqual(serverStates.get(120));
+    // During the stall the server held player one's walk for 250 ms and then substituted neutral; the client uses
+    // what the server applied, not what it would have sent.
+    expect(session.confirmedState.fighters[0].x).toBe(serverStates.get(120)!.fighters[0].x);
+    expect(authority.stats.neutral[0]).toBeGreaterThan(0);
+
+    for (let frame = 121; frame <= 180; frame++) step(frame);
+    tick(at(181), R);
+    expect(session.rollback.confirmedFrame).toBe(180);
+    expect(session.confirmedState).toEqual(serverStates.get(180));
+    expect(session.stats).toMatchObject({ desyncs: 0, resyncs: 1 });
+    expect(session.stats.hashChecks).toBeGreaterThanOrEqual(20);
+  });
+
+  it("after the result steps only to the final bundle's frame, so it ends on the KO and never passes it", () => {
+    const initial = nearKo(40);
+    const { session, sent, at, edge, tick } = sessionRig({ initial, delay: 3 });
+    const authority = new DuelAuthority(config, initial);
+    // The player taps J at frame 2. The client's timer then falls behind (a busy main thread) while the server steps
+    // on to the KO and its bundles arrive; the room's result follows them.
+    for (let frame = 1; !authority.over; frame++) {
+      if (frame <= 6) tick(at(frame), frame === 2 ? J : 0);
+      for (const message of sent.splice(0)) authority.receive(0, message.frame, message.inputs);
+      const bundle = authority.step();
+      if (bundle !== undefined) session.receiveBundle(bundle, edge(frame + 1));
+    }
+    const koFrame = authority.frame;
+    expect(authority.state.result).toMatchObject({ winner: 0, reason: "ko", frame: koFrame });
+    expect(session.rollback.receivedFrame).toBe(koFrame);
+    // Where the HUD stood when the result came: short of the KO.
+    expect(session.rollback.confirmedFrame).toBeLessThan(koFrame);
+
+    session.finish();
+    expect(session.frame).toBe(6);
+    expect(session.rollback.frame).toBe(koFrame);
+    expect(session.rollback.confirmedFrame).toBe(koFrame);
+    expect(session.confirmedState).toEqual(authority.state);
+    expect(session.confirmedState.result).toMatchObject({ winner: 0, reason: "ko" });
+    // Nothing moves it past the end: not another finish, nor a tick far ahead.
+    session.finish();
+    tick(at(koFrame + 60), 0);
+    expect(session.rollback.frame).toBe(koFrame);
+    expect(session.state.frame).toBe(koFrame);
+    expect(session.stats.desyncs).toBe(0);
+  });
+
+  it("sends one message every second frame, and never more than 30 in a second when its clock races ahead", () => {
+    const steady = sessionRig();
+    for (let frame = 0; frame < 240; frame++) steady.tick(steady.at(frame), R);
+    expect(steady.sent).toHaveLength(steady.session.stats.messages);
+    expect(steady.sent.length).toBeGreaterThanOrEqual(118);
+    expect(steady.session.stats.throttledSends).toBe(0);
+
+    // Messages keep arriving stamped ten frames further ahead than before: the clock keeps catching up.
+    const racing = sessionRig();
+    for (let step = 0; step < 1500; step++) {
+      const now = racing.edge(0) + step * 4;
+      if (step % 50 === 0) racing.session.receiveProbe({ frame: Math.floor((now - 1000) / FRAME_MS) + (step / 50) * 10, rtt: 0 }, now);
+      racing.tick(now, R);
+    }
+    expect(racing.session.stats.throttledSends).toBeGreaterThan(0);
+    for (const [index, time] of racing.sentAt.entries()) {
+      expect(racing.sentAt.filter((other, otherIndex) => otherIndex >= index && other < time + 1000).length).toBeLessThanOrEqual(MESSAGES_PER_SECOND);
+    }
+  });
+});

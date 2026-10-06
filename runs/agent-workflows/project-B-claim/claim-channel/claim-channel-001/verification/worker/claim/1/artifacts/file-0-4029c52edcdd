@@ -1,0 +1,64 @@
+# Claim
+
+The §5 treasure claim as pure, integer rules: who may claim, the ten-second channel, what resets it, and how same-tick events and §2's deadline are ordered. The rules live in `packages/simulation/src/claim` (`@pirate-sea-race/simulation/claim`) and their tuning in `packages/content/src/claim` (`@pirate-sea-race/content/claim`). Nothing is wired into the match room yet.
+
+## Content
+
+`claimRules` holds the tuning in world ticks (20 a second) and tiles, and `validateClaimRules` checks it with zod:
+
+| Rule | Value | Source |
+| --- | --- | --- |
+| `channelTicks` | 200 (10 s); 0 means instant victory on arrival, §5's alternative | `CLAIM_CHANNEL_SECONDS` |
+| `deadlineTicks` | 42 000 (35 min after player control starts) | `MATCH_DURATION_MINUTES` |
+| `circleRadiusTiles` | 4, a placeholder until playtests (below the 6-tile engagement range) | `TREASURE_CIRCLE_RADIUS_TILES` |
+
+`createClaimConfig({ claimPoint, controlStartTick?, rules? })` turns them into a match's `ClaimConfig`: the claim point and circle radius in sub-units, the channel length and the absolute deadline tick. The caller picks the final island's claim point.
+
+## State
+
+`ClaimState` is plain integer data that `hashState` covers entirely:
+
+- `tick`: the last world tick processed. `createClaimState(config, tick = 0)` starts before the deadline.
+- `channel`: the one active channel or `null`: `playerId`, `startTick`, the position `x, y` the channeller stopped at, and `progress`, the ticks held since `startTick`.
+- `result`: `null` while the match runs. Then `{reason: "claim", winner, tick}` or `{reason: "deadline", winner: null, tick}`, set once.
+
+## A tick
+
+`stepClaim(config, state, input)` returns `{state, events}` and never changes its arguments. The caller supplies each tick's `input`:
+
+- `tick`: the state's tick plus one (anything else is refused).
+- `players`: `{id, x, y, speed, holdsAllTypes, interact, connected, protected}` for each relevant player. `holdsAllTypes` comes from the ledger, so this module does not depend on it. A player missing from the list counts as disconnected.
+- `encounters`: every accepted encounter reservation on this tick, newly accepted or still running, as `{id, playerIds: [a, b]}`. A player may be in only one of them.
+
+Both lists are read as sets. Ids compare by UTF-16 code unit (so `"B" < "a"` and `"p10" < "p9"`), never by locale. Malformed input (duplicate ids, non-integers, a player in two encounters) throws a `RangeError`.
+
+Once `result` is set, the step returns the same state object and no events, whatever the input, so nothing arriving after a win can cancel it. Otherwise it runs five phases in order:
+
+1. **Reservations.** If the channeller is in an encounter, the channel resets (`duel`). This comes before the channel phase, so a duel accepted on the tick a claim would complete stops the claim.
+2. **The active channel.** It breaks if the channeller is absent or disconnected (`disconnected`), no longer holds all four types (`ineligible`), has a nonzero speed or has moved from where the channel started (`moved`), or has released interact (`released`), checked in that order. Otherwise `progress` goes up by one. A break always resets progress to zero because the channel is discarded.
+3. **Starting.** With no channel active, including one that broke earlier in this tick, a player may start if they are connected, hold all four types, hold interact, are not reserved, have speed 0 and are inside the treasure circle (squared distance ≤ radius², so the edge counts). If several can start, the closest to the claim point wins, then the lowest id. Other eligible players wait, and they start on the first tick the channel is free. A protected player may start: the step emits `protection-ended` before `claim-started`, and protection is not read again during the channel (§6: claiming ends protection first). A player who is waiting keeps their protection.
+4. **Completion.** A channel whose `progress` has reached `channelTicks` completes. With the default of 200, that is the 200th tick after the tick it started on. Completion sets `result` to the winner.
+5. **Deadline.** If there is still no result and this is the deadline tick, any unfinished channel is cancelled (`deadline`) and the match ends with no winner. Completion runs first, so a claim completing on the deadline tick wins (§2).
+
+When the match ends, by claim or by deadline, every encounter in the tick's input is reported as ending without theft (sorted by id), because match outcomes are frozen. `match-ended` comes last.
+
+## Events
+
+Each tick's events are listed in the order of the phases above:
+
+| Event | Fields | The caller should |
+| --- | --- | --- |
+| `claim-interrupted` | `playerId`, `reason` (`duel`, `disconnected`, `ineligible`, `moved`, `released`, `deadline`), `progress` lost | Clear the claim UI or alarm |
+| `protection-ended` | `playerId` | End that player's spawn or return protection |
+| `claim-started` | `playerId` | Show the channel and warn nearby players |
+| `claim-completed` | `playerId` | Commit the winner |
+| `duel-ended-without-theft` | `encounterId`, `playerIds` | End the duel with no rubbing transfer |
+| `match-ended` | `reason` (`claim` or `deadline`), `winner` or `null` | Freeze outcomes and show results |
+
+Every event also carries `tick`. `replayClaim(config, state, inputs)` steps a list of ticks and returns the final state, every event and the final `hashState`.
+
+## Tests
+
+- `claim.test.ts`: scripted cases for each rule, with frozen inputs to prove the step does not mutate them.
+- `determinism.test.ts`: 60 seeded random scripts. It checks that at most one winner is committed, that the state is frozen after the result, the per-tick invariants, and identical hashes on replay. The symmetry checks are reordered input, rotated and mirrored positions, order-preserving relabelling, and a 1 000-trial oracle for the closest-then-lowest-id rule under random relabelling.
+- `packages/content/src/claim/claim.test.ts`: the constants and the validator.

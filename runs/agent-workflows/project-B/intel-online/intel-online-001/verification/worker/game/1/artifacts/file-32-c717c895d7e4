@@ -1,0 +1,111 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import type { JournalMessage } from "@pirate-sea-race/protocol";
+import { DEFAULT_MATCH_TUNING, startGameServer, testTimingsTuning, type RunningGameServer } from "@pirate-sea-race/server";
+import { createIntelConfig, sectorOf } from "@pirate-sea-race/simulation/intel";
+import { objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import type { HeadlessClient } from "@pirate-sea-race/test-tools";
+import { tuned } from "./rubbingsSetup.js";
+import { collectAt, dockFor, EAST, HOLD_E, HUB_X, OPEN_ROW, playersAt, roomOf, tracker, until, type Seat } from "./seaDuelSetup.js";
+
+/**
+ * §3 and §11's carrier sightings through the real room, with test-only short timings: carrier snapshots every second
+ * (`carrierInterval`, which is also the sighting delay), the sector reveal at 5 s and the carrier reveal at 20 s. The
+ * slice has four copies of each type and a player holds one of each at most, so four players carry every Sun and a
+ * fifth, the seeker, lacks it: its lead about the Sun can only be a sighting, delayed by an interval, one per snapshot.
+ */
+const INTERVAL = 20;
+const SECTORS = 100;
+const CARRIERS = 400;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  const intel = testTimingsTuning({ sectors: SECTORS, carriers: CARRIERS, carrierInterval: INTERVAL }, DEFAULT_MATCH_TUNING).intel!;
+  const matchTuning = tuned({ objectives: { ...objectiveRules, collectTicks: 20, cacheClaimTicks: 20 }, intel, testHooks: true });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+const seat = (index: number): Seat => ({ tileX: HUB_X - 8 + index * 4, tileY: OPEN_ROW, heading: EAST });
+const config = createIntelConfig({ preset: "slice", finalIsland: { x: 0, y: 0 }, map: seaMap });
+type Sighting = Extract<JournalMessage, { kind: "carrier-sighting" }>;
+const sightingsOf = (client: HeadlessClient) => client.leads.filter((lead): lead is Sighting => lead.kind === "carrier-sighting");
+
+describe("carrier sightings (§3, §11)", () => {
+  it("points a player at a carrier's sector as it was an interval before, when every copy of the type it lacks is carried: at most one sighting per snapshot, and free from the carrier reveal on", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const clients = (await playersAt(endpoint, [0, 1, 2, 3, 4].map(seat), track)) as HeadlessClient[];
+    const [seeker, ...carriers] = clients as [HeadlessClient, ...HeadlessClient[]];
+    const room = roomOf(seeker);
+    const controlStart = room.flowState.controlStartTick!;
+    // The four Suns: two at Palm Key's docks, two at Old Stones'.
+    const docks = [dockFor("sun", 0), dockFor("sun", 1), seaMap.docks.filter((dock) => dock.island === 2)[0]!, seaMap.docks.filter((dock) => dock.island === 2)[1]!];
+    await Promise.all([collectAt(carriers[0]!, endpoint, docks[0]!, "sun"), collectAt(carriers[2]!, endpoint, docks[2]!, "sun")]);
+    await Promise.all([collectAt(carriers[1]!, endpoint, docks[1]!, "sun"), collectAt(carriers[3]!, endpoint, docks[3]!, "sun")]);
+    expect(room.ledgerState.rubbings.filter((rubbing) => rubbing.type === "sun").every((rubbing) => rubbing.location.kind === "player")).toBe(true);
+    const carriedFrom = room.matchState.worldTick;
+    const carrierSectors = new Set(docks.map((dock) => sectorOf(config, { x: dock.tileX * seaMap.subUnitsPerTile, y: dock.tileY * seaMap.subUnitsPerTile })));
+    const moonDock = dockFor("moon", 0);
+    await seeker.placeShip(endpoint, { tileX: moonDock.tileX, tileY: moonDock.tileY, heading: 0 });
+    await seeker.holdUntil(HOLD_E, () => seeker.ship()?.dock === moonDock.id, 5000);
+
+    // Three snapshots after the last collection, the world held right after a snapshot boundary: any free sighting (a
+    // stale Sun rumor's replacement) has gone out in an earlier snapshot, and the older snapshot shows every carrier.
+    const boundary = controlStart + Math.ceil((carriedFrom + 3 * INTERVAL - controlStart) / INTERVAL) * INTERVAL;
+    expect(boundary + 4).toBeLessThan(controlStart + CARRIERS);
+    room.pauseAfterTick(boundary);
+    await until(() => room.worldPaused, 10_000, "the pause after the boundary");
+    expect(room.matchState.worldTick).toBe(boundary);
+    const gold = seeker.gold();
+    // Every Sun carried by others: a sighting is for sale, and the offers say so.
+    expect(room.state.status.get(seeker.sessionId)!.rumorOffers).toBe("sun:available,moon:available");
+
+    // A targeted request on the next tick buys a sighting; a second in the same snapshot is capped, before the intel step.
+    room.testBuyRumor(seeker.sessionId, { requestId: "buy", type: "sun" });
+    room.stepWorldTicks(1);
+    // Capped until the next snapshot: the seeker's offers say there is nothing to sell now.
+    expect(room.state.status.get(seeker.sessionId)!.rumorOffers).toBe("sun:none,moon:available");
+    room.testBuyRumor(seeker.sessionId, { requestId: "again", type: "sun" });
+    room.stepWorldTicks(1);
+    expect(room.intelState!.requestIds).toContain(`${seeker.sessionId}:buy`);
+    expect(room.intelState!.requestIds).not.toContain(`${seeker.sessionId}:again`);
+    room.resumeWorld();
+    await seeker.waitFor(() => seeker.rumorAnswers("again").length === 1);
+    expect(seeker.rumorAnswers("buy")[0]).toMatchObject({ outcome: "bought", price: objectiveRules.rumorPrice });
+    expect(seeker.rumorAnswers("again")[0]).toMatchObject({ outcome: "refused", reason: "capped" });
+    await seeker.waitFor(() => seeker.gold() === gold - objectiveRules.rumorPrice);
+    const bought = sightingsOf(seeker).find((lead) => lead.sightings.some((each) => each.reason === "targeted"))!;
+    expect(bought.tick).toBe(boundary + 1);
+    // Delayed: it reads the snapshot one interval older than the latest, never the current place.
+    expect(bought.seenTick).toBe(boundary - INTERVAL);
+    for (const sighting of bought.sightings) {
+      expect(sighting.type).toBe("sun");
+      expect(carrierSectors.has(sighting.sector)).toBe(true);
+    }
+    // Every sighting the seeker got, free or bought, is at least an interval old, and at most one came per snapshot.
+    const snapshots = sightingsOf(seeker).map((lead) => {
+      expect(lead.tick - lead.seenTick).toBeGreaterThanOrEqual(INTERVAL);
+      expect(lead.tick - lead.seenTick).toBeLessThan(2 * INTERVAL + 1);
+      return Math.floor((lead.tick - controlStart) / INTERVAL);
+    });
+    expect(new Set(snapshots).size).toBe(snapshots.length);
+    // Never a sighting of the player's own copy, and none for a player who holds the type.
+    for (const carrier of carriers) expect(sightingsOf(carrier)).toEqual([]);
+    // The journal logs each sighting's sector as its target.
+    await seeker.waitFor(() => seeker.journal().some((entry) => entry.kind === "sighting" && entry.reason === "targeted"));
+
+    // From the carrier reveal on, the broadcast is fresher than any sighting: a purchase of the Sun is covered, free.
+    await seeker.waitFor(() => seeker.rumorOffers().some((offer) => offer.type === "sun" && offer.offer === "covered"), 25_000);
+    expect(room.matchState.worldTick).toBeGreaterThanOrEqual(controlStart + CARRIERS);
+    const covered = seeker.buyRumor("sun");
+    await seeker.waitFor(() => seeker.rumorAnswers(covered).length === 1);
+    expect(seeker.rumorAnswers(covered)[0]).toMatchObject({ outcome: "refused", reason: "covered" });
+    expect(room.ledgerState.requests.filter((outcome) => outcome.playerId === seeker.sessionId)).toHaveLength(1);
+    expect(seeker.gold()).toBe(gold - objectiveRules.rumorPrice);
+  }, 60_000);
+});

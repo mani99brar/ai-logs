@@ -1,0 +1,97 @@
+import React, { useCallback, useMemo, useState } from "react";
+import styled from "styled-components";
+
+import { useParams } from "react-router-dom";
+import type { Address } from "viem";
+
+import { useCastCommit } from "hooks/useCastCommit";
+import { useCountdown } from "hooks/useCountdown";
+
+import { DisputeDetailsQuery, useDisputeDetailsQuery } from "queries/useDisputeDetailsQuery";
+
+import { DisputeKits } from "src/dispute-kits";
+import { isUndefined } from "src/utils";
+
+import { getDeadline } from "../../Timeline";
+import OptionsContainer from "../OptionsContainer";
+
+const Container = styled.div`
+  width: 100%;
+  height: auto;
+`;
+
+interface ICommit {
+  arbitrable: Address;
+  voteIDs: string[];
+  setIsOpen: (val: boolean) => void;
+  dispute: DisputeDetailsQuery["dispute"];
+  currentPeriodIndex: number;
+  disputeKitId: DisputeKits;
+}
+
+const Commit: React.FC<ICommit> = ({ arbitrable, voteIDs, setIsOpen, dispute, currentPeriodIndex, disputeKitId }) => {
+  const [justification, setJustification] = useState("");
+
+  const { id } = useParams();
+  const parsedDisputeID = useMemo(() => BigInt(id ?? 0), [id]);
+  const parsedVoteIDs = useMemo(() => voteIDs.map((voteID) => BigInt(voteID)), [voteIDs]);
+
+  const { data: disputeData } = useDisputeDetailsQuery(id);
+
+  const currentRoundIndex = disputeData?.dispute?.currentRoundIndex;
+  const deadlineCommitPeriod = getDeadline(
+    currentPeriodIndex,
+    dispute?.lastPeriodChange,
+    dispute?.currentRound.timesPerPeriod
+  );
+  const countdownToVotingPeriod = useCountdown(deadlineCommitPeriod);
+
+  const { mutateAsync: castCommit } = useCastCommit(() => {
+    setIsOpen(true);
+  });
+
+  const handleCommit = useCallback(
+    async (choice: bigint) => {
+      if (isUndefined(currentRoundIndex)) {
+        return;
+      }
+      /* an extra 300 seconds (5 minutes) of decryptionDelay is enforced after Commit period is over
+      to avoid premature decryption and voting attacks if no one passes the Commit period quickly */
+      const decryptionDelay = (countdownToVotingPeriod ?? 0) + 300;
+
+      await castCommit({
+        disputeKitId,
+        disputeId: parsedDisputeID,
+        choice,
+        voteIds: parsedVoteIDs,
+        roundIndex: Number(currentRoundIndex),
+        justification,
+        decryptionDelay,
+      });
+    },
+    [
+      justification,
+      parsedVoteIDs,
+      parsedDisputeID,
+      countdownToVotingPeriod,
+      disputeKitId,
+      castCommit,
+      currentRoundIndex,
+    ]
+  );
+
+  return id ? (
+    <Container>
+      <OptionsContainer
+        {...{
+          arbitrable,
+          justification,
+          setJustification,
+          handleSelection: handleCommit,
+        }}
+      />
+    </Container>
+  ) : null;
+};
+
+export default Commit;

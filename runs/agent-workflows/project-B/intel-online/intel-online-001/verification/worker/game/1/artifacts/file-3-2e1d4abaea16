@@ -1,0 +1,183 @@
+import { describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { journalMessageSchema, JOURNAL_LOG_LIMIT, revealMessageSchema, type JournalMessage } from "@pirate-sea-race/protocol";
+import { createIntelConfig, type IntelMessageBody } from "@pirate-sea-race/simulation/intel";
+import { addPlayer, objectiveRules, purchase } from "@pirate-sea-race/simulation/objectives";
+import { boughtLead, chargeRumor, intelMessageOf, intelRequestId, JournalLog, KEPT_RUMOR_REFUSALS, MAX_PENDING_RUMORS, RumorBook, rumorResult } from "./intel.js";
+import { createMatchLedger } from "./objectives.js";
+import { DEFAULT_MATCH_TUNING } from "./MatchRoom.js";
+import { testTimingsTuning } from "./server.js";
+
+const rumor = (entry: number, type: "sun" | "moon", reason: "start" | "fresh" | "targeted" | "replacement", island = 0, tick = 10): JournalMessage => ({
+  kind: "rumor",
+  tick,
+  entry,
+  type,
+  reason,
+  target: { kind: "island", island, name: `Island ${island}` },
+});
+
+describe("intel messages as the room delivers them (intelMessageOf)", () => {
+  it("maps every intel kind: the reveals as reveals, every lead as a journal message, each field copied by name", () => {
+    const extra = { playerId: "p1", rubbingId: "sun-1", holder: "p2" };
+    const bodies: IntelMessageBody[] = [
+      { kind: "final-sector", tick: 1, sector: 1, name: "Northern Waters" },
+      { kind: "final-route", tick: 1, x: 10, y: 20, restored: false },
+      { kind: "final-route-inactive", tick: 1 },
+      { kind: "sector-reveal", tick: 1, sources: [{ sector: 1, name: "Northern Waters" }], caches: [] },
+      { kind: "carrier-report", tick: 1, seenTick: 0, carriers: [{ sector: 4, name: "Central Waters", type: "sun" }] },
+      { kind: "rumor", tick: 1, entry: 1, type: "sun", reason: "start", target: { kind: "island", island: 2, name: "Old Stones" } },
+      { kind: "rumor", tick: 1, entry: 2, type: "moon", reason: "fresh", target: { kind: "sector", sector: 4, name: "Central Waters" } },
+      { kind: "carrier-sighting", tick: 1, seenTick: 0, sightings: [{ type: "sun", reason: "targeted", sector: 4, name: "Central Waters" }] },
+      { kind: "no-lead", tick: 1, type: "sun", reason: "fresh" },
+      { kind: "rumor-stale", tick: 1, entry: 1, type: "sun" },
+      { kind: "rumor-resolved", tick: 1, entry: 1, type: "sun" },
+    ];
+    const channels = bodies.map((body) => {
+      const smuggled = { ...body, ...extra } as IntelMessageBody;
+      const delivered = intelMessageOf(smuggled);
+      const schema = delivered.channel === "reveal" ? revealMessageSchema : journalMessageSchema;
+      // Nothing beyond the kind's own fields rides along: the strict schemas refuse any extra key.
+      expect(schema.safeParse(delivered.message).success, body.kind).toBe(true);
+      expect(delivered.message).toEqual(body);
+      return delivered.channel;
+    });
+    expect(channels).toEqual(["reveal", "reveal", "reveal", "reveal", "reveal", "journal", "journal", "journal", "journal", "journal", "journal"]);
+  });
+});
+
+describe("the room's journal log (JournalLog)", () => {
+  it("logs rumors, sightings per type and no-lead notices, and marks a stale rumor replaced by the next lead of its type, whatever its reason", () => {
+    const log = new JournalLog();
+    log.record("a", rumor(1, "sun", "start", 0, 5));
+    log.record("a", rumor(2, "moon", "targeted", 1, 6));
+    log.record("a", { kind: "rumor-stale", tick: 7, entry: 1, type: "sun" });
+    expect(log.entries("a").map(({ n, status, replacedBy }) => [n, status, replacedBy])).toEqual([
+      [1, "stale", 0],
+      [2, "active", 0],
+    ]);
+    // A fresh lead (a loss on the same tick), not a replacement: it still replaces the stale entry of its type.
+    log.record("a", { kind: "carrier-sighting", tick: 20, seenTick: 0, sightings: [{ type: "sun", reason: "fresh", sector: 4, name: "Central Waters" }, { type: "moon", reason: "fresh", sector: 1, name: "Northern Waters" }] });
+    const entries = log.entries("a");
+    expect(entries[0]).toMatchObject({ status: "stale", replacedBy: 3 });
+    expect(entries[1]).toMatchObject({ status: "active", replacedBy: 0 });
+    expect(entries.slice(2)).toEqual([
+      { n: 3, kind: "sighting", type: "sun", target: "Central Waters", island: -1, sector: 4, reason: "fresh", tick: 20, seenTick: 0, status: "active", replacedBy: 0 },
+      { n: 4, kind: "sighting", type: "moon", target: "Northern Waters", island: -1, sector: 1, reason: "fresh", tick: 20, seenTick: 0, status: "active", replacedBy: 0 },
+    ]);
+    // Only the first lead after it replaces a stale entry.
+    log.record("a", { kind: "no-lead", tick: 30, type: "sun", reason: "replacement" });
+    expect(log.entries("a")[0]!.replacedBy).toBe(3);
+    expect(log.entries("a")[4]).toMatchObject({ n: 5, kind: "no-lead", target: "", island: -1, sector: -1 });
+    // The journal is each player's own.
+    expect(log.entries("b")).toEqual([]);
+  });
+
+  it("links a stale entry only to a later lead of its own type", () => {
+    const log = new JournalLog();
+    log.record("a", rumor(1, "sun", "start"));
+    log.record("a", { kind: "rumor-stale", tick: 11, entry: 1, type: "sun" });
+    log.record("a", rumor(2, "moon", "targeted"));
+    expect(log.entries("a")[0]).toMatchObject({ status: "stale", replacedBy: 0 });
+    log.record("a", rumor(3, "sun", "replacement"));
+    expect(log.entries("a")[0]).toMatchObject({ status: "stale", replacedBy: 3 });
+  });
+
+  it("resolves a rumor on rumor-resolved, and ignores a notice about an entry it no longer has", () => {
+    const log = new JournalLog();
+    log.record("a", rumor(1, "sun", "start"));
+    log.record("a", { kind: "rumor", tick: 8, entry: 2, type: "moon", reason: "targeted", target: { kind: "sector", sector: 7, name: "Southern Waters" } });
+    log.record("a", { kind: "no-lead", tick: 9, type: "moon", reason: "fresh" });
+    log.record("a", { kind: "rumor-resolved", tick: 10, entry: 1, type: "sun" });
+    const before = JSON.stringify(log.entries("a"));
+    log.record("a", { kind: "rumor-stale", tick: 11, entry: 99, type: "sun" });
+    expect(log.entries("a").map((entry) => entry.status)).toEqual(["resolved", "active", "active"]);
+    expect(log.entries("a")[1]).toMatchObject({ kind: "sector", sector: 7, island: -1, target: "Southern Waters" });
+    // A notice about no entry of its log changes nothing.
+    expect(JSON.stringify(log.entries("a"))).toBe(before);
+  });
+
+  it("keeps the last 24 entries, numbered on, and forgets a player who left", () => {
+    const log = new JournalLog();
+    for (let entry = 1; entry <= JOURNAL_LOG_LIMIT + 3; entry++) log.record("a", rumor(entry, "sun", "replacement", 0, entry));
+    const entries = log.entries("a");
+    expect(entries).toHaveLength(JOURNAL_LOG_LIMIT);
+    expect(entries[0]!.n).toBe(4);
+    expect(entries.at(-1)!.n).toBe(JOURNAL_LOG_LIMIT + 3);
+    log.forget("a");
+    expect(log.entries("a")).toEqual([]);
+  });
+});
+
+describe("the book of targeted rumor purchases (RumorBook)", () => {
+  it("queues two requests per player, merges a pending id, refuses a third busy, and gives them back oldest first", () => {
+    const book = new RumorBook();
+    expect(book.arrive("a", { requestId: "b1", type: "sun" })).toBe("queued");
+    expect(book.arrive("a", { requestId: "b1", type: "moon" })).toBe("merged");
+    expect(book.arrive("a", { requestId: "b2", type: "moon" })).toBe("queued");
+    expect(book.arrive("a", { requestId: "b3", type: "moon" })).toBe("busy");
+    expect(book.arrive("b", { requestId: "b1", type: "moon" })).toBe("queued");
+    expect(MAX_PENDING_RUMORS).toBe(2);
+    expect(book.pendingCount("a")).toBe(2);
+    expect(book.waiting()).toEqual(["a", "b"]);
+    expect(book.take("a")).toEqual({ requestId: "b1", type: "sun" });
+    expect(book.take("a")).toEqual({ requestId: "b2", type: "moon" });
+    expect(book.take("a")).toBeUndefined();
+    expect(book.waiting()).toEqual(["b"]);
+    book.forget("b");
+    expect(book.waiting()).toEqual([]);
+    expect(book.take("nobody")).toBeUndefined();
+  });
+
+  it("keeps every bought id and the last 16 refusals per player, for replays", () => {
+    const book = new RumorBook();
+    const lead = rumor(3, "sun", "targeted");
+    book.decide("a", "bought", { outcome: "bought", type: "sun", price: 25, lead });
+    for (let index = 0; index <= KEPT_RUMOR_REFUSALS; index++) book.decide("a", `r${index}`, { outcome: "refused", type: "moon", reason: "insufficient-gold" });
+    expect(book.decided("a", "bought")).toEqual({ outcome: "bought", type: "sun", price: 25, lead });
+    // The seventeenth refusal evicted the first; purchases are never evicted.
+    expect(book.decided("a", "r0")).toBeUndefined();
+    expect(book.decided("a", "r1")).toMatchObject({ reason: "insufficient-gold" });
+    expect(book.decided("a", `r${KEPT_RUMOR_REFUSALS}`)).toBeDefined();
+    // Ids are per player.
+    expect(book.decided("b", "bought")).toBeUndefined();
+    expect(rumorResult("bought", book.decided("a", "bought")!, true)).toEqual({ requestId: "bought", type: "sun", outcome: "bought", price: 25, replayed: true });
+    expect(rumorResult("r1", book.decided("a", "r1")!, false)).toEqual({ requestId: "r1", type: "moon", outcome: "refused", reason: "insufficient-gold", replayed: false });
+  });
+
+  it("finds the lead a delivered request bought: the targeted rumor, or the sighting message holding its type", () => {
+    const sighting: JournalMessage = { kind: "carrier-sighting", tick: 5, seenTick: 0, sightings: [{ type: "moon", reason: "fresh", sector: 1, name: "Northern Waters" }, { type: "sun", reason: "targeted", sector: 4, name: "Central Waters" }] };
+    expect(boughtLead([rumor(1, "sun", "replacement"), rumor(2, "sun", "targeted")], "sun")).toEqual(rumor(2, "sun", "targeted"));
+    expect(boughtLead([sighting], "sun")).toBe(sighting);
+    expect(boughtLead([sighting], "moon")).toBeUndefined();
+    expect(boughtLead([rumor(1, "moon", "targeted")], "sun")).toBeUndefined();
+    expect(intelRequestId("abc", "b1")).toBe("abc:b1");
+  });
+});
+
+describe("charging a delivered rumor (chargeRumor)", () => {
+  const ledgerWith = (startingGold: number) =>
+    addPlayer(createMatchLedger({ map: seaMap, seed: 1, rules: { ...objectiveRules, startingGold } }), { playerId: "a", tick: 0 }).state;
+
+  it("charges the rumor's price under the client's request id", () => {
+    const charged = chargeRumor(ledgerWith(40), "a", "b1", 3);
+    expect(charged.price).toBe(objectiveRules.rumorPrice);
+    expect(charged.state.players[0]!.gold).toBe(40 - objectiveRules.rumorPrice);
+    expect(charged.state.requests).toEqual([expect.objectContaining({ kind: "purchase", requestId: "b1", playerId: "a", item: "rumor" })]);
+  });
+
+  it("throws on a refused charge or a replayed one: the room's checks make both impossible, so either is a broken invariant", () => {
+    expect(() => chargeRumor(ledgerWith(10), "a", "b1", 3)).toThrow(/refused a delivered rumor .*insufficient-gold/);
+    const once = purchase(ledgerWith(40), { requestId: "b1", playerId: "a", item: "rumor", tick: 3 }).state;
+    expect(() => chargeRumor(once, "a", "b1", 4)).toThrow(/refused a delivered rumor .*replayed/);
+  });
+});
+
+describe("the test-only carrier interval", () => {
+  it("sets the carrier interval and the sighting delay together, so the intel rules accept a carrier reveal on its beat", () => {
+    const tuning = { ...DEFAULT_MATCH_TUNING, ...testTimingsTuning({ sectors: 160, carriers: 240, carrierInterval: 80 }) };
+    expect(tuning.intel).toMatchObject({ carrierIntervalTicks: 80, sightingDelayTicks: 80, carrierRevealTicks: 240 });
+    expect(() => createIntelConfig({ preset: "slice", finalIsland: { x: 0, y: 0 }, rules: tuning.intel })).not.toThrow();
+    expect(testTimingsTuning({ ready: 5 }).intel).toEqual(DEFAULT_MATCH_TUNING.intel);
+  });
+});

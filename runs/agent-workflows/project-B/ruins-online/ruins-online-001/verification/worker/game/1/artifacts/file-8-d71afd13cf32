@@ -1,0 +1,135 @@
+import { describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { RUIN_KIND_NAMES, RUIN_MOVE_NAMES, RUIN_SYMBOL_NAMES } from "@pirate-sea-race/protocol";
+import { objectiveRules, unlockSource } from "@pirate-sea-race/simulation/objectives";
+import { clueFor, createRuins, RUIN_MOVES, RUIN_SYMBOLS } from "@pirate-sea-race/simulation/ruins";
+import { deriveSeed, MASTER_SECRET_BYTES, type SeedSystem } from "./matchSeeds.js";
+import { createMatchLedger } from "./objectives.js";
+import {
+  createMatchRuins,
+  islandCentre,
+  islandOfDock,
+  islandUnlocked,
+  nearestIslandPoint,
+  openIslandsInLedger,
+  REMEMBERED_RUIN_REQUESTS,
+  RUIN_PIN_TRIES,
+  ruinIslandsOf,
+  RuinRequests,
+  testRuinSetting,
+} from "./ruins.js";
+
+const ledger = createMatchLedger({ map: seaMap, seed: 11, rules: objectiveRules });
+const islands = ruinIslandsOf(ledger);
+const secretOf = (fill: number) => new Uint8Array(MASTER_SECRET_BYTES).fill(fill);
+/** The room's derivation: the ruins' own seed first, then `ruins:<n>` only to meet a pinned kind. */
+const seedsOf = (secret: Uint8Array) => (attempt: number) => deriveSeed(secret, attempt === 0 ? "ruins" : `ruins:${attempt}`);
+const kinds = (ruins: ReturnType<typeof createMatchRuins>["ruins"]) => Object.values(ruins.ruins).map((ruin) => ruin.puzzle.kind);
+
+describe("the ruins' seed (§3, §16)", () => {
+  it("is the ruins' own derivation of the master secret: distinct from every other system's seed, and the same for the same secret", () => {
+    const secret = secretOf(5);
+    const dealt = createMatchRuins({ islands, seed: seedsOf(secret) });
+    expect(dealt.seed).toBe(deriveSeed(secret, "ruins"));
+    expect(dealt.ruins).toEqual(createRuins({ seed: deriveSeed(secret, "ruins"), islands }));
+    const others: SeedSystem[] = ["world", "ledger", "final-socket", "intel", "fruit", "duel:1", "ruins:1"];
+    for (const system of others) expect(deriveSeed(secret, system)).not.toBe(dealt.seed);
+    // Not the ledger's seed, so the clues say nothing of the rubbings' deal.
+    const fromLedgerSeed = createRuins({ seed: deriveSeed(secret, "ledger"), islands });
+    expect(Object.values(fromLedgerSeed.ruins).map((ruin) => clueFor(ruin))).not.toEqual(Object.values(dealt.ruins.ruins).map((ruin) => clueFor(ruin)));
+    // The derivation reads only the secret and the system's name: no match code goes in, so matches with any codes
+    // and the same secret deal the same ruins, and another secret deals others.
+    expect(createMatchRuins({ islands, seed: seedsOf(secretOf(5)) }).ruins).toEqual(dealt.ruins);
+    expect(createMatchRuins({ islands, seed: seedsOf(secretOf(6)) }).ruins).not.toEqual(dealt.ruins);
+    expect(deriveSeed.length).toBe(2);
+  });
+
+  it("gives every regular island a ruin over its ledger sources, and none opened", () => {
+    expect(islands).toEqual([0, 1, 2, 3].map((island) => ({ island, sourceIds: [`source-${island}-0`, `source-${island}-1`] })));
+    const dealt = createMatchRuins({ islands, seed: seedsOf(secretOf(1)) });
+    expect(dealt.openIslands).toEqual([]);
+    expect(Object.keys(dealt.ruins.ruins)).toEqual(["0", "1", "2", "3"]);
+  });
+});
+
+describe("the test-only ruins", () => {
+  it("pins an island's kind by taking the first derived seed that deals it, still from the master secret", () => {
+    for (const fill of [1, 2, 3, 4]) {
+      const secret = secretOf(fill);
+      for (const kind of RUIN_KIND_NAMES) {
+        const dealt = createMatchRuins({ islands, seed: seedsOf(secret), settings: { "0": kind, "2": kind === "sequence" ? "navigation" : "sequence" } });
+        expect(dealt.ruins.ruins["0"]!.puzzle.kind).toBe(kind);
+        expect(dealt.ruins.ruins["2"]!.puzzle.kind).not.toBe(kind);
+        const attempt = Array.from({ length: RUIN_PIN_TRIES }, (_, index) => index).find((index) => seedsOf(secret)(index) === dealt.seed)!;
+        // Every earlier derived seed misses a pin.
+        for (let earlier = 0; earlier < attempt; earlier++) {
+          const missed = createRuins({ seed: seedsOf(secret)(earlier), islands });
+          expect(missed.ruins["0"]!.puzzle.kind === kind && missed.ruins["2"]!.puzzle.kind !== kind).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("opens islands from the start, by number or for the rest with *, and refuses pins no seed meets", () => {
+    const dealt = createMatchRuins({ islands, seed: seedsOf(secretOf(2)), settings: { "*": "open", "1": "navigation" } });
+    expect(dealt.openIslands).toEqual([0, 2, 3]);
+    expect(dealt.ruins.ruins["1"]!.puzzle.kind).toBe("navigation");
+    expect(testRuinSetting(undefined, 0)).toBeUndefined();
+    expect(testRuinSetting({ "1": "open" }, 0)).toBeUndefined();
+    const opened = openIslandsInLedger(ledger, dealt.openIslands);
+    expect([0, 1, 2, 3].map((island) => islandUnlocked(opened, island))).toEqual([true, false, true, true]);
+    expect([0, 1, 2, 3].map((island) => islandUnlocked(ledger, island))).toEqual([false, false, false, false]);
+    expect(islandUnlocked(opened, 9)).toBe(false);
+    // One source of two open is not an open island.
+    expect(islandUnlocked(unlockSource(ledger, { sourceId: "source-1-0", tick: 0 }).state, 1)).toBe(false);
+    // A constant seed deals the same kinds every try: asking for the other kind finds none.
+    const constant = createRuins({ seed: 4, islands });
+    const other = constant.ruins["0"]!.puzzle.kind === "sequence" ? "navigation" : "sequence";
+    expect(() => createMatchRuins({ islands, seed: () => 4, settings: { "0": other } })).toThrow(/no ruins seed/);
+    expect(kinds(createMatchRuins({ islands, seed: () => 4, settings: { "0": constant.ruins["0"]!.puzzle.kind } }).ruins)).toEqual(kinds(constant));
+  });
+});
+
+describe("the room's ruin helpers", () => {
+  it("keeps the protocol's symbol and move names equal to the content's", () => {
+    expect([...RUIN_SYMBOL_NAMES]).toEqual([...RUIN_SYMBOLS]);
+    expect([...RUIN_MOVE_NAMES]).toEqual([...RUIN_MOVES]);
+  });
+
+  it("finds a dock's island and an island's centre", () => {
+    const dock = seaMap.docks.find((each) => each.island === 2)!;
+    expect(islandOfDock(seaMap, dock.id)).toBe(2);
+    expect(islandOfDock(seaMap, -1)).toBeNull();
+    expect(islandOfDock({ ...seaMap, docks: [{ ...dock, island: -1 }] }, 0)).toBeNull();
+    const rect = seaMap.islands[2]!;
+    const centre = islandCentre(seaMap, 2);
+    expect(centre.x).toBe(Math.floor((rect.tileX + rect.widthTiles / 2) * seaMap.subUnitsPerTile));
+    expect(centre.y).toBe(Math.floor((rect.tileY + rect.heightTiles / 2) * seaMap.subUnitsPerTile));
+    expect(() => islandCentre(seaMap, 99)).toThrow(/no island 99/);
+  });
+
+  it("remembers each player's latest answers by request id, forgetting the oldest past the bound and a player who left", () => {
+    const requests = new RuinRequests<number>();
+    for (let index = 0; index <= REMEMBERED_RUIN_REQUESTS; index++) requests.remember("a", `r${index}`, index);
+    requests.remember("b", "r0", 100);
+    expect(requests.get("a", "r0")).toBeUndefined();
+    expect(requests.get("a", "r1")).toBe(1);
+    expect(requests.get("a", `r${REMEMBERED_RUIN_REQUESTS}`)).toBe(REMEMBERED_RUIN_REQUESTS);
+    expect(requests.get("b", "r0")).toBe(100);
+    requests.forget("a");
+    expect(requests.get("a", "r1")).toBeUndefined();
+    expect(requests.get("b", "r0")).toBe(100);
+  });
+});
+
+describe("an island in sight", () => {
+  it("is measured to the island's nearest point, so a ship off its shore sees it", () => {
+    const rect = seaMap.islands[0]!;
+    const tile = seaMap.subUnitsPerTile;
+    expect(nearestIslandPoint(seaMap, 0, 0, 0)).toEqual({ x: rect.tileX * tile, y: rect.tileY * tile });
+    const inside = islandCentre(seaMap, 0);
+    expect(nearestIslandPoint(seaMap, 0, inside.x, inside.y)).toEqual(inside);
+    expect(nearestIslandPoint(seaMap, 0, 10_000_000, inside.y)).toEqual({ x: (rect.tileX + rect.widthTiles) * tile, y: inside.y });
+    expect(() => nearestIslandPoint(seaMap, 99, 0, 0)).toThrow(/no island 99/);
+  });
+});

@@ -1,0 +1,436 @@
+import { expect, type APIRequestContext, type Browser, type BrowserContext, type Page, type TestInfo } from "@playwright/test";
+import { HEADING_COUNT, isNavigable, seaMap, shipTuning, SUB_UNITS_PER_TILE, TILE_PIXELS, WORLD_STEPS_PER_SECOND } from "../../packages/content/src/index.js";
+import { TEST_NEXT_MATCH_TIMINGS_PATH, TEST_PLACEMENT_PATH, type TestTimings } from "../../packages/protocol/src/index.js";
+
+export const SERVER_URL = "http://localhost:2593";
+export const TILE = SUB_UNITS_PER_TILE;
+const PIXELS_PER_SUB_UNIT = TILE_PIXELS / SUB_UNITS_PER_TILE;
+
+export interface Readout {
+  readonly id: string;
+  readonly slot: number;
+  readonly x: number;
+  readonly y: number;
+  readonly heading: number;
+  readonly speed: number;
+  readonly dock: number;
+}
+
+export interface DrawnShip {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly color: string;
+}
+
+export async function createMatch(page: Page): Promise<string> {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Create match" }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+  const code = page.getByTestId("hud-code");
+  await expect(code).toHaveText(/^[A-Z0-9]{6}$/);
+  return (await code.textContent())!;
+}
+
+export async function joinMatch(page: Page, code: string): Promise<void> {
+  await page.goto("/");
+  await page.getByLabel("Match code").fill(code);
+  await page.getByRole("button", { name: "Join", exact: true }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+}
+
+/**
+ * The pinned final-socket secret of the browser server (`PIRATE_SEA_RACE_TEST_FINAL_SECRET` in the Playwright config),
+ * so a scenario knows where the final island is.
+ */
+export const FINAL_SECRET = 3;
+
+/**
+ * Starts a match through its lobby, as players do (§2): the host clicks Start, every page shows the ready countdown,
+ * then the running timer once control starts; the departure's short protection (test-only, 1 s) runs out.
+ */
+export async function startMatch(host: Page, ...others: Page[]): Promise<void> {
+  const start = host.getByRole("button", { name: "Start match" });
+  await expect(start).toBeEnabled();
+  await start.click();
+  for (const page of [host, ...others]) {
+    await expect(page.getByTestId("match-timer")).toHaveAttribute("data-state", "running", { timeout: 15_000 });
+    await expect(page.getByTestId("lobby")).toBeHidden();
+  }
+  for (const page of [host, ...others]) await expect(page.getByTestId("hud-protection")).toHaveAttribute("data-state", "none", { timeout: 5000 });
+}
+
+/**
+ * A lone player's match needs a second player to start (§2: private matches start with two). A companion joins from
+ * its own browser context and stays at its spawn slot; the host starts. Close the returned context when done.
+ */
+export async function startWithCompanion(browser: Browser, host: Page, code: string): Promise<BrowserContext> {
+  const context = await browser.newContext();
+  const companion = await context.newPage();
+  await joinMatch(companion, code);
+  await expect(host.getByTestId("hud-players")).toHaveText("2");
+  await startMatch(host, companion);
+  return context;
+}
+
+export async function selfId(page: Page): Promise<string> {
+  return (await page.getByTestId("hud-self").textContent())!;
+}
+
+/** Every ship the page's HUD lists, with the latest decoded server state. */
+export async function listed(page: Page): Promise<Readout[]> {
+  return page.evaluate(() =>
+    [...document.querySelectorAll<HTMLElement>('[data-testid="positions"] [data-ship-id]')].map((item) => ({
+      id: item.dataset["shipId"]!,
+      slot: Number(item.dataset["slot"]),
+      x: Number(item.dataset["x"]),
+      y: Number(item.dataset["y"]),
+      heading: Number(item.dataset["heading"]),
+      speed: Number(item.dataset["speed"]),
+      dock: Number(item.dataset["dock"]),
+    })),
+  );
+}
+
+export async function listedIds(page: Page): Promise<string[]> {
+  return (await listed(page)).map((ship) => ship.id).sort();
+}
+
+/** A ship's authoritative state in a page's HUD, or undefined when the page does not list it. */
+export async function readout(page: Page, shipId: string): Promise<Readout | undefined> {
+  return (await listed(page)).find((ship) => ship.id === shipId);
+}
+
+export async function drawnShips(page: Page): Promise<DrawnShip[]> {
+  return JSON.parse((await page.getByTestId("game").getAttribute("data-drawn-ships")) ?? "[]") as DrawnShip[];
+}
+
+export async function drawnIds(page: Page): Promise<string[]> {
+  return (await drawnShips(page)).map((ship) => ship.id).sort();
+}
+
+/**
+ * Test-only placement (the server's PIRATE_SEA_RACE_TEST_PLACEMENT setting, on for these tests): puts a player's
+ * ship at rest on a tile, then waits until the page shows it there.
+ */
+export async function place(request: APIRequestContext, page: Page, code: string, tileX: number, tileY: number, heading: number): Promise<void> {
+  const sessionId = await selfId(page);
+  const response = await request.post(`${SERVER_URL}${TEST_PLACEMENT_PATH}`, { data: { code, sessionId, tileX, tileY, heading } });
+  expect(response.status(), await response.text()).toBe(200);
+  await expect
+    .poll(async () => {
+      const ship = await readout(page, sessionId);
+      return ship === undefined ? undefined : [ship.x, ship.y, ship.speed];
+    })
+    .toEqual([tileX * TILE + TILE / 2, tileY * TILE + TILE / 2, 0]);
+}
+
+/**
+ * Test-only (with the test placement setting, as here): the next match created runs with these timings, in world
+ * ticks, on top of the browser server's own; later matches keep the server's.
+ */
+export async function nextMatchTimings(request: APIRequestContext, timings: TestTimings): Promise<void> {
+  const response = await request.post(`${SERVER_URL}${TEST_NEXT_MATCH_TIMINGS_PATH}`, { data: timings });
+  expect(response.status(), await response.text()).toBe(200);
+}
+
+/** Canvas pixels as RGBA rows, read from a real screenshot of the canvas. */
+async function canvasPixels(page: Page, points: readonly { x: number; y: number }[], radius: number): Promise<[number, number, number][][]> {
+  const png = await page.locator("#game canvas").screenshot();
+  return page.evaluate(
+    async ({ base64, points, radius }) => {
+      const blob = await (await fetch(`data:image/png;base64,${base64}`)).blob();
+      const bitmap = await createImageBitmap(blob);
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const context = canvas.getContext("2d")!;
+      context.drawImage(bitmap, 0, 0);
+      return points.map(({ x, y }) => {
+        const pixels: [number, number, number][] = [];
+        for (let dy = -radius; dy <= radius; dy++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            const px = x + dx;
+            const py = y + dy;
+            if (px < 0 || py < 0 || px >= bitmap.width || py >= bitmap.height) continue;
+            const [r, g, b] = context.getImageData(px, py, 1, 1).data;
+            pixels.push([r!, g!, b!]);
+          }
+        }
+        return pixels;
+      });
+    },
+    { base64: png.toString("base64"), points, radius },
+  );
+}
+
+function near(pixel: [number, number, number], color: string, tolerance = 24): boolean {
+  const want = Number.parseInt(color.slice(1), 16);
+  const [r, g, b] = pixel;
+  return Math.abs(r - ((want >> 16) & 0xff)) <= tolerance && Math.abs(g - ((want >> 8) & 0xff)) <= tolerance && Math.abs(b - (want & 0xff)) <= tolerance;
+}
+
+/**
+ * The ids of ships whose colour is actually on the canvas where the scene says it drew them. Reads a real
+ * screenshot of the canvas, so it checks rendered pixels rather than scene bookkeeping.
+ */
+export async function shipsOnCanvas(page: Page): Promise<string[]> {
+  const drawn = await drawnShips(page);
+  const pixels = await canvasPixels(page, drawn, 0);
+  return drawn.filter((ship, index) => near(pixels[index]![0]!, ship.color)).map((ship) => ship.id).sort();
+}
+
+/** The camera's scroll, in world pixels. */
+export async function camera(page: Page): Promise<{ x: number; y: number }> {
+  const [x, y] = ((await page.getByTestId("game").getAttribute("data-camera")) ?? "0,0").split(",").map(Number);
+  return { x: x!, y: y! };
+}
+
+/**
+ * Whether a ship's colour shows anywhere within a few pixels of where a ship at world position (x, y) sub-units would
+ * be drawn on this page's canvas.
+ */
+export async function colourAt(page: Page, x: number, y: number, color: string): Promise<boolean> {
+  const scroll = await camera(page);
+  const point = { x: Math.round(x * PIXELS_PER_SUB_UNIT - scroll.x), y: Math.round(y * PIXELS_PER_SUB_UNIT - scroll.y) };
+  const [pixels] = await canvasPixels(page, [point], 4);
+  return pixels!.some((pixel) => near(pixel, color));
+}
+
+const hex = (color: number) => `#${color.toString(16).padStart(6, "0")}`;
+
+/**
+ * The share, from 0 to 1, of a tile's pixels on this page's canvas within a few levels of a palette colour: its
+ * interior, one pixel in from each edge, placed through the camera's scroll. Reads a real screenshot of the canvas, so it checks that the tile map
+ * is drawn, not what the scene meant to draw.
+ */
+export async function tileColourShare(page: Page, tileX: number, tileY: number, color: number): Promise<number> {
+  const scroll = await camera(page);
+  const centre = { x: tileX * TILE_PIXELS + TILE_PIXELS / 2 - scroll.x, y: tileY * TILE_PIXELS + TILE_PIXELS / 2 - scroll.y };
+  const [pixels] = await canvasPixels(page, [centre], TILE_PIXELS / 2 - 1);
+  return pixels!.filter((pixel) => near(pixel, hex(color))).length / pixels!.length;
+}
+
+/**
+ * For each tile, whether the minimap pixel over its centre is within a few levels of a palette colour. The scene
+ * reports where it put the minimap (`data-minimap`: left, top, scale); the pixels come from a real screenshot.
+ */
+export async function minimapShows(page: Page, tiles: readonly { tileX: number; tileY: number }[], color: number): Promise<boolean[]> {
+  const [left, top, scale] = ((await page.getByTestId("game").getAttribute("data-minimap")) ?? "").split(",").map(Number);
+  const points = tiles.map(({ tileX, tileY }) => ({ x: Math.floor(left! + (tileX + 0.5) * scale!), y: Math.floor(top! + (tileY + 0.5) * scale!) }));
+  const pixels = await canvasPixels(page, points, 0);
+  return pixels.map(([pixel]) => near(pixel!, hex(color)));
+}
+
+/** How many tiles the page's minimap fog has revealed so far. */
+export async function fogRevealed(page: Page): Promise<number> {
+  return Number((await page.getByTestId("game").getAttribute("data-fog-revealed")) ?? "0");
+}
+
+/** Where the page drew its own ship this frame, in world sub-units, or undefined before it draws it. */
+export async function ownDrawnPosition(page: Page): Promise<{ x: number; y: number } | undefined> {
+  const id = await selfId(page);
+  const own = (await drawnShips(page)).find((ship) => ship.id === id);
+  if (own === undefined) return undefined;
+  const scroll = await camera(page);
+  return { x: (own.x + scroll.x) / PIXELS_PER_SUB_UNIT, y: (own.y + scroll.y) / PIXELS_PER_SUB_UNIT };
+}
+
+/** The colour a page draws its own ship in. */
+export async function ownColour(page: Page): Promise<string> {
+  const id = await selfId(page);
+  await expect.poll(async () => (await drawnShips(page)).some((ship) => ship.id === id)).toBe(true);
+  return (await drawnShips(page)).find((ship) => ship.id === id)!.color;
+}
+
+/**
+ * Where a world position in sub-units falls on this page's canvas, whether that is inside the canvas, and how far it
+ * is from the canvas's centre, in pixels on each axis.
+ */
+export async function onCanvas(page: Page, x: number, y: number): Promise<{ x: number; y: number; inside: boolean; offCentre: number }> {
+  const scroll = await camera(page);
+  const size = await page.locator("#game canvas").evaluate((canvas: HTMLCanvasElement) => ({ width: canvas.width, height: canvas.height }));
+  const point = { x: x * PIXELS_PER_SUB_UNIT - scroll.x, y: y * PIXELS_PER_SUB_UNIT - scroll.y };
+  return {
+    ...point,
+    inside: point.x >= 0 && point.y >= 0 && point.x < size.width && point.y < size.height,
+    offCentre: Math.max(Math.abs(point.x - size.width / 2), Math.abs(point.y - size.height / 2)),
+  };
+}
+
+/** Whether a ship's hull (a square of `hullHalfSize`) at a position in sub-units overlaps only navigable tiles. */
+function hullClear(x: number, y: number): boolean {
+  const half = shipTuning.hullHalfSize;
+  for (let row = Math.floor((y - half) / TILE); row <= Math.floor((y + half) / TILE); row++) {
+    for (let column = Math.floor((x - half) / TILE); column <= Math.floor((x + half) / TILE); column++) {
+      if (!isNavigable(seaMap, column, row)) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether the straight line between two positions, in sub-units, is open sea for the whole width of a hull. `sailTo`
+ * steers straight at its target, so every leg of a test's course must be one. Checked one sub-unit at a time along the
+ * longer axis, as the simulation checks a mooring run, so no tile corner slips between two checks.
+ */
+export function clearCourse(from: { x: number; y: number }, to: { x: number; y: number }): boolean {
+  const steps = Math.max(Math.abs(to.x - from.x), Math.abs(to.y - from.y), 1);
+  for (let index = 0; index <= steps; index++) {
+    const x = from.x + Math.trunc(((to.x - from.x) * index) / steps);
+    const y = from.y + Math.trunc(((to.y - from.y) * index) / steps);
+    if (!hullClear(x, y)) return false;
+  }
+  return true;
+}
+
+export interface SailOptions {
+  /** Stop once the ship has come to rest this close to the target, in sub-units. */
+  readonly within?: number;
+  /** Or once this holds. */
+  readonly until?: () => Promise<boolean>;
+  readonly timeoutMs?: number;
+  /** Called with every readout on the way, for checks along the route. */
+  readonly onReadout?: (ship: Readout) => void;
+}
+
+/** One world step, in milliseconds: while a key is held the ship turns one heading unit, or speeds up once, per step. */
+const STEP_MS = 1000 / WORLD_STEPS_PER_SECOND;
+
+/** The signed number of heading units from one heading to another, the short way round. */
+function headingOff(from: number, to: number): number {
+  return ((((to - from) % HEADING_COUNT) + HEADING_COUNT + HEADING_COUNT / 2) % HEADING_COUNT) - HEADING_COUNT / 2;
+}
+
+/** Reads the page's own ship until two readouts two world steps apart show the same heading: it is not turning. */
+async function steadyReadout(page: Page, id: string): Promise<Readout> {
+  let ship = (await readout(page, id))!;
+  for (;;) {
+    await page.waitForTimeout(2 * STEP_MS);
+    const again = (await readout(page, id))!;
+    if (again.heading === ship.heading) return again;
+    ship = again;
+  }
+}
+
+/**
+ * A page's helm keys held for a number of world steps. A hold carries on for a while after the test lets go (the page
+ * reads its keys on a timer, and a busy machine delays both), so each turn measures how far past its mark it went and
+ * shortens the next holds by that much, or lengthens them when a hold fell short.
+ */
+class TimedHelm {
+  /** How many world steps a hold carries on past its end, as measured so far. */
+  private lag = 2;
+
+  constructor(
+    private readonly page: Page,
+    private readonly id: string,
+  ) {}
+
+  async hold(key: string, steps: number): Promise<void> {
+    await this.page.keyboard.down(key);
+    await this.page.waitForTimeout(Math.max(0, steps - this.lag) * STEP_MS);
+    await this.page.keyboard.up(key);
+  }
+
+  /** Turns `off` heading units (positive to starboard) from `ship` at rest, and returns the ship once steady. */
+  async turn(ship: Readout, off: number): Promise<Readout> {
+    await this.hold(off > 0 ? "ArrowRight" : "ArrowLeft", Math.abs(off));
+    const after = await steadyReadout(this.page, this.id);
+    const turned = headingOff(ship.heading, after.heading) * Math.sign(off);
+    this.lag = Math.min(8, Math.max(0, this.lag + (turned - Math.abs(off)) / 2));
+    return after;
+  }
+}
+
+/**
+ * How far a ship at rest goes, in sub-units, with ahead held for `steps` world steps and then released: it speeds up
+ * by `acceleration` a step to at most `maxSpeed`, then coasts to a stop, losing `drag` a step.
+ */
+export function hopDistance(steps: number): number {
+  let speed = 0;
+  let distance = 0;
+  for (let step = 0; step < steps; step++) distance += speed = Math.min(speed + shipTuning.acceleration, shipTuning.maxSpeed);
+  while (speed > 0) distance += speed = Math.max(speed - shipTuning.drag, 0);
+  return distance;
+}
+
+/**
+ * Sails a page's ship toward a world position with the keyboard only, from the HUD's authoritative readout, in hops:
+ * with the ship at rest it turns to the bearing (left or right, held for as many world steps as it is off course),
+ * then holds ahead for as many world steps as carry it about the rest of the way (from `shipTuning`'s acceleration,
+ * top speed and drag), lets go and waits for it to coast to a stop. Nothing depends on reading the HUD in time: the
+ * readout lags the server, more so on a busy machine, and steering on it continuously carries a ship past its course.
+ * It never brakes, so it never reverses.
+ */
+export async function sailTo(page: Page, target: { x: number; y: number }, options: SailOptions = {}): Promise<Readout> {
+  const id = await selfId(page);
+  const helm = new TimedHelm(page, id);
+  const deadline = Date.now() + (options.timeoutMs ?? 60_000);
+  for (;;) {
+    const ship = await readout(page, id);
+    if (ship === undefined) throw new Error("own ship missing from the HUD");
+    options.onReadout?.(ship);
+    const dx = target.x - ship.x;
+    const dy = target.y - ship.y;
+    const distance = Math.hypot(dx, dy);
+    if (options.until !== undefined && (await options.until())) return ship;
+    if (ship.speed === 0 && options.within !== undefined && distance <= options.within) return ship;
+    if (Date.now() > deadline) throw new Error(`did not reach ${target.x},${target.y} (at ${ship.x},${ship.y})`);
+    if (ship.speed !== 0) {
+      await page.waitForTimeout(2 * STEP_MS);
+      continue;
+    }
+    const bearing = Math.round((Math.atan2(dy, dx) / (2 * Math.PI)) * HEADING_COUNT);
+    const turn = headingOff(ship.heading, bearing);
+    if (Math.abs(turn) > 1) {
+      const turned = await helm.turn(ship, turn);
+      options.onReadout?.(turned);
+      continue;
+    }
+    let steps = 1;
+    while (hopDistance(steps + 1) <= distance) steps++;
+    await helm.hold("ArrowUp", steps);
+    await page.waitForTimeout(2 * STEP_MS);
+  }
+}
+
+/**
+ * Turns a page's ship at rest to one of a few headings with the keyboard, from the HUD's readout: holds left or right
+ * for about as many world steps as it is off (the ship turns a heading unit a step), waits for the readout to show the
+ * heading steady, and tries again until it is one of them.
+ */
+export async function turnTo(page: Page, headings: readonly number[], timeoutMs = 60_000): Promise<Readout> {
+  const id = await selfId(page);
+  const helm = new TimedHelm(page, id);
+  const deadline = Date.now() + timeoutMs;
+  let ship = await steadyReadout(page, id);
+  for (;;) {
+    if (headings.includes(ship.heading)) return ship;
+    if (Date.now() > deadline) throw new Error(`did not turn to heading ${headings.join(" or ")} (at ${ship.heading})`);
+    const [off] = headings.map((heading) => headingOff(ship.heading, heading)).sort((a, b) => Math.abs(a) - Math.abs(b));
+    ship = await helm.turn(ship, off!);
+  }
+}
+
+/**
+ * Records every text the page's dock hint shows from now on, as a player would read it; `dockHintsSeen` returns them.
+ * A MutationObserver catches a hint that is shown only briefly.
+ */
+export async function recordDockHints(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const hint = document.querySelector('[data-testid="hud-dock-hint"]')!;
+    const seen: string[] = [hint.textContent ?? ""];
+    (window as unknown as { __dockHints: string[] }).__dockHints = seen;
+    new MutationObserver(() => seen.push(hint.textContent ?? "")).observe(hint, { childList: true, characterData: true, subtree: true });
+  });
+}
+
+export async function dockHintsSeen(page: Page): Promise<string[]> {
+  return page.evaluate(() => (window as unknown as { __dockHints: string[] }).__dockHints);
+}
+
+/** Attaches the one screenshot a scenario's verifier reads. */
+export async function attachScreenshot(page: Page, testInfo: TestInfo, scenario: string): Promise<void> {
+  const path = testInfo.outputPath(`${scenario}.png`);
+  await page.screenshot({ path });
+  await testInfo.attach(`screenshot:${scenario}`, { path, contentType: "image/png" });
+}

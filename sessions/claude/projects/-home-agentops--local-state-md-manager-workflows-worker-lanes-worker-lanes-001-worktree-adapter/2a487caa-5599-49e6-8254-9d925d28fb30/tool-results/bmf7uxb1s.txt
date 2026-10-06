@@ -1,0 +1,229 @@
+# Workflow CLI cheatsheet
+
+Every command below was taken from the argparse definitions in `workflow/pipeline.py`, `workflow/launch.py` and `workflow/interactive.py` on main after the review-visibility merge. Longer explanations live in [RUNBOOK.md](RUNBOOK.md) and [features/project-workflows/README.md](../features/project-workflows/README.md).
+
+```bash
+PY="$PWD/.venv/bin/python"                                   # controller interpreter, run from the repo root
+RUN="$HOME/.local/state/md-manager-workflows/<feature>/<run-id>"   # run directory, always outside the repo
+```
+
+Two entry points:
+
+| Entry point | Shape | Use |
+| --- | --- | --- |
+| `$PY -m workflow launch <feature> [flags]` | one command | prepare and start a committed feature |
+| `$PY -m workflow <action> "$RUN" [flags]` | one action per call | every other pipeline step, status, recovery |
+
+Nothing launches a Claude session without `--live`. Nothing ever pushes or merges `main`.
+
+## 1. One-command launch
+
+```bash
+$PY -m workflow launch project-workflows --dry-run --automatic          # validate and print the commands, execute nothing
+$PY -m workflow launch project-workflows --live --automatic             # unattended run to a verified feature branch
+$PY -m workflow launch project-workflows --live                         # manual run with operator gates
+```
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `<feature>` | a directory under `features/` listed in `FEATURES` in `workflow/launch.py` | required |
+| `--run-id ID` | opaque run identifier, not a path | `<feature>-001` |
+| `--run-root DIR` | run storage outside the repository | `~/.local/state/md-manager-workflows/<feature>` |
+| `--live` | authorize Claude usage | off |
+| `--automatic` | run-scoped permission bypass for workers, automatic freeze, checks, native reviewer, verified feature branch | off, manual gates |
+| `--worker-timeout-seconds N` | per-worker deadline from launch to completion signal, automatic only | 4 h, max 24 h |
+| `--review-timeout-seconds N` | reviewer deadline from its launch to its completion file, automatic only | 30 min, max 24 h |
+| `--reviewer-transport native\|print` | attachable reviewer session, or headless `claude --print`, automatic only | `native` |
+| `--no-herdr` | omit terminal attachments | attaches |
+| `--dry-run` | validate the feature configuration and print the commands | off |
+
+`launch` refuses an existing run directory. It runs, in order: `preflight`, `git switch -c <branch_prefix>/<run-id>`, `prepare`, `start`, and with `--automatic` also `automatic`.
+
+## 2. Step-by-step pipeline (what `launch` runs for you)
+
+```bash
+$PY -m workflow preflight "$RUN" --repo "$PWD" --policy features/<f>/policy.json --herdr [--automatic]
+$PY -m workflow prepare   "$RUN" --repo "$PWD" --policy features/<f>/policy.json \
+                                 --ui-task features/<f>/ui-task.md --adapter-task features/<f>/adapter-task.md \
+                                 [--automatic --worker-timeout-seconds N --review-timeout-seconds N --reviewer-transport native|print]
+$PY -m workflow start     "$RUN" --live [--herdr]
+```
+
+| Action | Required flags | Optional flags | What it does |
+| --- | --- | --- | --- |
+| `preflight` | `--policy` | `--repo`, `--herdr`, `--automatic` | validates the policy, clean source, installed `git`/`claude`/`node`, the Claude CLI flags the run needs, Claude login; `--herdr` requires a managed Herdr pane (`HERDR_ENV=1`) |
+| `prepare` | `--policy`, `--ui-task`, `--adapter-task` | `--repo`, `--automatic`, the three automatic settings | pins base commit, branch and policy digest into `plan.json`, creates the two worker worktrees, writes the first `run-state.json`; `--automatic` requires a `feature/` branch |
+| `start` | `--live` | `--herdr` | launches both native worker sessions once; refuses an already-started run; with `--herdr` opens the workflow tab |
+
+Manual-mode gates after the workers finish:
+
+```bash
+$PY -m workflow freeze  "$RUN" --ui-handoff ui-handoff.json --adapter-handoff adapter-handoff.json
+$PY -m workflow review  "$RUN" --review-file independent-review.json
+$PY -m workflow approve "$RUN" --bundle-sha256 <hash printed at the approval interrupt>
+```
+
+| Action | Required flags | What it does |
+| --- | --- | --- |
+| `freeze` | `--ui-handoff`, `--adapter-handoff` (each `{"summary": "...", "open_assumptions": []}`) | validates both handoffs, stops the recorded sessions, snapshots, checks each lane, builds and rechecks the candidate |
+| `review` | `--review-file` (the review JSON in RUNBOOK section 5) | imports an independent review bound to the exact bundle hash and candidate commit |
+| `approve` | `--bundle-sha256` | fast-forwards the source branch locally to the reviewed candidate; no push |
+
+## 3. Automatic mode
+
+```bash
+$PY -m workflow automatic      "$RUN" --live     # supervise to a verified feature branch, or resume an interrupted run
+$PY -m workflow automatic-step "$RUN" --live     # one controller step, exit 75 = checkpoint persisted, run again
+```
+
+Resume after Ctrl-C, a closed terminal or a dropped SSH session with the same `automatic --live`; workers and the reviewer keep running meanwhile. Do not repeat `launch` for an existing run. A run stopped by a deadline, a blocked worker, a quota block, a rejected completion file or a blocked review is retained but not resumable: start a new `--run-id`.
+
+## 4. Inspect
+
+```bash
+$PY -m workflow status "$RUN"                        # next nodes, pending interrupts, errors; refreshes report.html
+$PY -m workflow export "$RUN"                        # rebuild run-state.json at the current export version (1.2.0), launches nothing
+$PY -m workflow attach "$RUN"                        # create the run's Herdr tab and panes when start ran without --herdr
+$PY -m workflow.interactive status     "$RUN"        # native session inventory for the run
+$PY -m workflow.interactive attach     "$RUN" [--reuse-observers observers.json]
+$PY -m workflow.interactive attach-one "$RUN" --node ui|adapter|review    # reconnect one session in this terminal
+```
+
+`attach-one` needs an interactive terminal and refuses to restart a missing session. `export` takes the controller lock, constructs no sessions, and refuses a run whose `plan.json`, policy or `review.json` fail validation. Run it on runs recorded before export 1.2.0 so the viewer shows their review and inputs.
+
+## 5. Recovery
+
+```bash
+$PY -m workflow retry     "$RUN" --phase worker    --node adapter   # rerun one failed lane check at the same revision
+$PY -m workflow retry     "$RUN" --phase candidate --node ui        # rerun one failed combined check
+$PY -m workflow retry     "$RUN"                                    # resume failed post-freeze graph steps, never relaunches
+$PY -m workflow reconcile "$RUN"                                    # rebind surviving sessions after an ambiguous launch, never relaunches
+```
+
+| Flag | Values | Default |
+| --- | --- | --- |
+| `--phase` | `worker`, `candidate` | `worker` |
+| `--node` | `ui`, `adapter` | none, meaning resume without selecting a check |
+
+Three verification attempts per lane and phase, including the first. `retry` refuses runs that are waiting at an interrupt and refuses to relaunch failed `launch_*` steps; use `reconcile` for those.
+
+Native session controls, from the run's receipts:
+
+```bash
+claude agents --json                                  # list sessions; the run's are named workflow-<run-id>-ui|adapter|reviewer
+claude stop <background_id>                           # stop one session by its exact id from <node>.interactive.json
+cd "$RUN/review-worktree" && claude --resume <uuid>   # reread or continue the reviewer transcript
+```
+
+## 6. Viewer
+
+```bash
+npm run dev                                              # API on 127.0.0.1:3001 plus Vite on 127.0.0.1:5173
+MD_MANAGER_API_PORT=3010 npm run dev:api                 # API alone on another port
+```
+
+The Projects viewer reads registered run roots from the projects registry file named by `MD_MANAGER_PROJECTS_CONFIG`; `config/projects.example.json` shows the shape. Unset means no projects. Sources come from `MD_MANAGER_CONFIG`. The adapter accepts exports 1.0.0, 1.1.0 and 1.2.0.
+
+## 7. Files in a run directory
+
+| File | Written by | Meaning |
+| --- | --- | --- |
+| `plan.json`, `policy.json` | `prepare` | pinned base commit, branch, tasks, automatic settings, policy |
+| `run-state.json` | every CLI boundary, `export` | versioned export the viewer reads |
+| `<ui\|adapter\|review>.interactive.json` | launch | session receipt with UUID, launch token, status |
+| `<node>.prompt.txt`, `<node>.launch.log` | launch | exact prompt and launch output |
+| `<ui\|adapter>.completion.json` | the worker | automatic mode completion signal |
+| `<ui\|adapter>.handoff.json` | `freeze` or the controller | accepted handoff |
+| `<node>.stop.json` | stop | identity-checked stop marker |
+| `review-bundle.json`, `review.diff`, `review-worktree/` | candidate | what the reviewer sees |
+| `review.completion.json` | the reviewer | bound verdict file |
+| `automatic-review.json`, `review.json` | controller | review status, accepted verdict and findings |
+| `verification/<phase>/<node>/<attempt>/packet.json` | checks | check evidence and screenshots |
+| `report.html`, `events.jsonl`, `terminals.json` | controller | local report, timeline, Herdr pane map |
+| `controller.lock`, `pipeline.sqlite` | controller | lock and LangGraph checkpoint |
+
+## 8. Adding a feature to launch
+
+1. Create `features/<name>/` with `feature.json` (`version`, `name`, `branch_prefix`, `policy`, `ui_task`, `adapter_task`), `policy.json` matching `contracts/workflow/verification.schema.json`, `ui-task.md` and `adapter-task.md`.
+2. Add `<name>` to the `FEATURES` tuple in `workflow/launch.py`.
+3. `$PY -m workflow launch <name> --dry-run --automatic` until it validates, then `--live`.
+workflow/RUNBOOK.md:3:**Entry point: `python -m workflow`.** This is the complete operator-driven path. The older `workflow.demo`, `workflow.live` and `workflow.interactive` entry points remain focused development examples, not the full integration workflow.
+workflow/RUNBOOK.md:22:.venv/bin/python -m workflow launch project-workflows --live --automatic
+workflow/RUNBOOK.md:25:This performs preflight, creates a feature branch (not main), prepares worktrees, starts the two interactive workers with run-scoped permission bypass/Bash access, and supervises them through checks and independent automated review. The command remains running until it stops on a verified feature branch or a blocker. It never pushes or merges main. Use `--dry-run` instead of `--live` to inspect without execution. Omit `--automatic` for the original manual gates. See the feature README for completion signals, recovery and privilege boundaries. The later features `review-result` and `run-inputs` launch the same way (`features/<feature>/README.md`); `--run-id` defaults to `<feature>-001` and the run root to `~/.local/state/md-manager-workflows/<feature>`.
+workflow/RUNBOOK.md:32:- Exact shared starting Git revision is recorded and verified. Frozen ownership is checked against actual captured files, not just agent reports. The fixed graph requires `ui/frontend` and `adapter/backend` policies; relabelling a worker cannot bypass required tests.
+workflow/RUNBOOK.md:64:- `ui`/`frontend` and `adapter`/`backend` owned path prefixes (no globs or overlaps).
+workflow/RUNBOOK.md:82:  --ui-task /path/to/ui-task.txt --adapter-task /path/to/adapter-task.txt
+workflow/RUNBOOK.md:85:Preflight checks policy roles, source cleanliness, CLI flags/authentication and required executables. It does not run the feature's tests or assume future dependencies are already installed. `prepare` creates verified worktrees and pins the policy digest/starting revision/branch. Run configuration is immutable after preparation; change feature requirements by creating a new run.
+workflow/RUNBOOK.md:90:"$PY" -m workflow start "$RUN" --live --herdr
+workflow/RUNBOOK.md:100:"$PY" -m workflow.interactive attach-one "$RUN" --node ui
+workflow/RUNBOOK.md:119:  --ui-handoff /path/to/ui-handoff.json --adapter-handoff /path/to/adapter-handoff.json
+workflow/RUNBOOK.md:143:The runner adds `--reporter=json`, an isolated `--output`, `--workers=1`, and `--retries=0`, and controls `PLAYWRIGHT_JSON_OUTPUT_FILE`. These trusted additions are recorded separately as `effective_commands`; the v1 command field retains the approved policy argv. Use a distinct scenario ID for each viewport/project variant. Failed/skipped/flaky cases do not satisfy required scenarios. No automatic screenshot is substituted for a missing attachment.
+workflow/RUNBOOK.md:188:- **Third pane.** When the run's Herdr tab exists, a `Claude: reviewer` pane is split to the right of the adapter pane and attaches with `attach-one --node review`. You can answer a question the reviewer asks there, exactly as for workers; the transcript is the record, the verdict is only the file. A missing pane never fails the review; `python -m workflow.interactive attach-one "$RUN" --node review` reconnects in any available terminal, and `attach` adds the pane when the reviewer already exists, also to a workflow tab whose worker panes were attached earlier.
+workflow/RUNBOOK.md:192:- **Stop.** After acceptance or a block the controller stops the reviewer with the same identity re-check as for workers (`review.stop.json`); the transcript stays resumable. A stop that cannot be confirmed after acceptance ends the controller with the verdict kept (`automatic-review.json` stays `succeeded`, `review.stop.json` absent or unconfirmed, the reason on the timeline); `python -m workflow automatic "$RUN" --live` retries the stop before continuing and launches nothing.
+workflow/RUNBOOK.md:193:- **Interruption.** Ctrl-C, a closed terminal or a dropped SSH session while the controller waits leaves the reviewer running with `automatic-review.json` at `running`; `python -m workflow automatic "$RUN" --live` resumes waiting for the same session's file. The same holds inside the launch window once `claude --bg` was issued (`review.interactive.json` exists): the receipt is `running`, without `session_id` when the interrupt hit the settle poll, and resume first binds that one session through reconciliation, never a relaunch. An interrupt before the launch was issued leaves `needs_reconciliation`.
+workflow/RUNBOOK.md:218:Status refreshes `report.html`. It is a local snapshot viewer, not a live multi-user HTTP dashboard. Open it where its relative artifact files are accessible, or use your trusted SSH/local file-viewing setup; do not publish the run directory or logs. There are no unauthenticated HTTP execution controls.
+workflow/RUNBOOK.md:224:Export rebuilds `run-state.json` from the run directory under the current export version (1.2.0: the `review` and `inputs` sections the Projects viewer reads, see the feature README's runtime storage seam). It takes the controller lock, reads the persisted checkpoint without invoking any node, constructs no sessions (a copied run whose worktrees are gone still exports), launches nothing, and refuses a run whose `plan.json`, pinned policy or `review.json` fail validation. Unchanged content does not bump `updated_at`. Run it on runs recorded before a newer export version, such as project-workflows-001, so the viewer shows their review and inputs.
+workflow/RUNBOOK.md:226:- **Failed verification:** inspect its packet/log. Attempts default to a hard limit of three per lane/phase; policy v1.1.0 can explicitly set `max_verification_attempts`. For a transient check/environment failure at the same immutable revision, explicitly retry only that lane:
+workflow/RUNBOOK.md:227:  `python -m workflow retry "$RUN" --phase worker --node adapter`.
+workflow/RUNBOOK.md:228:- **Failed combined check:** use `--phase candidate --node ui` (or adapter). Already successful candidate checks are reused after artifact validation.
+features/project-workflows/README.md:8:.venv/bin/python -m workflow launch project-workflows --live --automatic
+features/project-workflows/README.md:26:.venv/bin/python -m workflow automatic "$HOME/.local/state/md-manager-workflows/project-workflows/project-workflows-001" --live
+features/project-workflows/README.md:29:Do not repeat `launch` for an existing run. Uncertain launches still require explicit reconciliation. New files include `ui.completion.json`, `adapter.completion.json`, `ui.prompt.txt`/`adapter.prompt.txt` (the exact prompt each native session received), `automatic-review.json`, `review.diff` and the isolated `review-worktree/`. The native reviewer adds `review.interactive.json` (launch receipt with the reviewer's session UUID), `review.prompt.txt`, `review.launch.log`, `review.completion.json` (the reviewer's bound verdict file) and `review.stop.json` (the identity-checked stop); the print fallback keeps `review.stdout.json` and `review.stderr.log`. The reviewer has Read/Glob/Grep and, natively, Write of its completion file only; no shell or edit tools. Interrupting the controller while it waits for the reviewer leaves the reviewer running and `automatic --live` resumes it; a reviewer that never writes its file blocks the run at `review_timeout_seconds`, and no second reviewer is launched. Synthetic tests of this path are not live Claude validation.
+features/project-workflows/README.md:36:.venv/bin/python -m workflow launch project-workflows --live
+features/project-workflows/README.md:47:## Frozen backend registry seam
+features/project-workflows/README.md:72:The single-node definition above illustrates shape, not the full production DAG. Use the full `GRAPH_NODES` from `workflow/export_state.py` for the pipeline definition. Tests may register a smaller valid graph. Project/workflow IDs are unique within their scope. Paths must be operator-supplied absolute canonical directories; never derive registrations from browser parameters or a run's `plan.repository` value. Reject overlapping/ambiguous run registrations. `repository` may differ from `runs_root` (real pipeline data lives outside the repo).
+features/project-workflows/README.md:78:The controller now writes **`run-state.json` atomically** during preparation and each CLI reporting boundary. The adapter must read this file, not launch Python or decode the checkpoint database. Export version 1.0.0 contains:
+features/project-workflows/README.md:90:**Export version 1.2.0** (`workflow/export_state.py`, `EXPORT_VERSION`) keeps everything above unchanged and adds two keys; the adapter accepts `1.0.0` (neither key), `1.1.0` (`review` only) and `1.2.0` (both). Each is an object or `null`, derived read-only from the run's own files; a missing file is `null` and a malformed optional receipt is `null`, never a guess:
+features/project-workflows/README.md:93:- `inputs` (`null` when `policy.json` is missing): `feature`, `policy_version`, `base_commit`, `source_branch`, `mode` (`automatic` iff `plan.json` has `automatic`), `automatic` (`{finish, permission_mode, worker_timeout_seconds, review_timeout_seconds, reviewer_transport}` or `null`; for plans that predate `reviewer_transport` the export records the transport a recorded review actually used, `native` or `print`, and `null` when no review has happened, never a default), `setup[]` (`{argv, command, timeout_seconds}` with `command = shlex.join(argv)`), `max_verification_attempts`, `failure_drill`, and `workers.<ui|adapter>`: `role`, `task` (the plan's task text verbatim, including the appended ownership/checks JSON), `prompt` (`<worker>.prompt.txt` or `null` when the run did not record it), `owned_paths`, `checks[]` (`{id, kind, argv, command, timeout_seconds, scenarios}`), `launch` (the `<worker>.interactive.json` receipt: `session_id`, `launch_token`, `launch_requested_at` normalised to `Z`, `native_started_at` epoch ms, `observed_state`, `status`, `launcher_invocations`, `background_id`; or `null`), `completion` (`<worker>.completion.json` reduced to `{status, summary, open_assumptions}` or `null`), `handoff` (`{summary, open_assumptions}` or `null`) and `stop` (`{stopped, confirmed_at}` where `confirmed_at` is the stop file's mtime when stopped, else `null`).
+features/project-workflows/README.md:107:API error events/log messages must be sanitized according to the public contract. Native observed states are historical observations, not a guarantee that a process is currently alive. Unsupported older run directories need explicit import support; do not fabricate a successful run or infer a pinned historical graph from the latest definition.
+features/project-workflows/README.md:111:UI worker checks run without the new backend. Their Playwright config must explicitly mock **only** project API success responses when `WORKFLOW_VERIFICATION_PHASE=worker`. Use the committed response schemas/examples for these mocks.
+features/project-workflows/README.md:113:When `WORKFLOW_VERIFICATION_PHASE=candidate`, the same scenarios must exercise the real backend, with no mock project success routes. Seed a disposable configuration in the registry shape above and disposable run folders containing `plan.json`, `run-state.json` and any packet/artifact files needed. Register fixtures for completed, failed and awaiting-approval runs, an empty workflow, and an empty project. Use synthetic UUIDs/revisions and clearly test-only data, not real session paths. Backend tests independently seed the same documented format. The project error scenario may intentionally simulate a network error; other scenarios must use the candidate API.
+features/project-workflows/README.md:115:Both configs must leave existing Pi/Claude browsing usable via temporary skills fixtures. Do not use live skills or reuse a developer's server. The UI owns its dedicated test configuration under `tests/project-workflows/`; the root Playwright config is not shared worker ownership.
+features/project-workflows/README.md:121:This feature uses verification policy v1.1.0. It intentionally blocks the adapter's **first worker-verification attempt**, after executing and preserving the real checks. The packet labels this as an injected gate failure, not a failing implementation test or a failed Claude worker. Genuine check failures remain visible too.
+features/project-workflows/README.md:126:.venv/bin/python -m workflow retry "$HOME/.local/state/md-manager-workflows/project-workflows/project-workflows-001" --phase worker --node adapter
+workflow/README.md:3:**First feature is configured:** [Projects/workflow viewer](../features/project-workflows/README.md). Start it from Herdr with `.venv/bin/python -m workflow launch project-workflows --live --automatic`; use `--dry-run` to inspect without execution. Automatic mode grants run-scoped worker permission bypass and stops at an independently reviewed, verified feature branch—no main merge or push. Omit `--automatic` to retain manual handoff/review/approval gates.
+workflow/README.md:5:**Start with [RUNBOOK.md](RUNBOOK.md).** `python -m workflow` now runs the complete supervised pipeline: two interactive Claude workers in one Herdr tab, explicit freeze, immutable snapshots, isolated checks/screenshots, combined-candidate checks, independent review, approval and local fast-forward integration. `preflight`/`prepare` do not launch agents; `start --live` is explicitly required.
+workflow/README.md:7:`report.html` in each run directory provides a local graph/results viewer. The full pipeline is tested offline with fake workers, real Git/unit/Playwright checks, screenshot artifacts, approval gates and forced-check-failure recovery. No live feature run is needed to run the tests.
+workflow/README.md:9:In automatic mode the independent reviewer is a third native Claude session (`workflow-<run>-reviewer`, read-only tools, its own `Claude: reviewer` pane) that reports its verdict only through a completion file bound to the run, launch token, bundle hash and candidate commit; the controller validates it against `contracts/workflow/reviewCompletion.schema.json`, stops the reviewer with an identity re-check, and never launches a second one. `--reviewer-transport print` keeps the headless fallback. `run-state.json` is exported at version 1.2.0 with `review` and `inputs` sections for the Projects viewer, and `python -m workflow export <run>` re-exports older runs without launching anything. Details: [RUNBOOK.md](RUNBOOK.md) ("Automatic mode: the review step") and [features/project-workflows/README.md](../features/project-workflows/README.md). Later features: [review-result](../features/review-result/README.md) and [run-inputs](../features/run-inputs/README.md).
+workflow/README.md:49:Omit `--fail-adapter-once` for a happy-path run. Runtime files live in ignored `.workflow-state/`, configurable with `--data-dir`. Keep the same data directory and run ID to resume. Only one controller process may operate on a given run at a time; distributed locking is not implemented.
+workflow/README.md:55:- `graph.py`: state, graph wiring, synthetic workers, placeholder verification/review, approval interrupt, durable attempt ledger.
+workflow/README.md:56:- `demo.py`: start/resume/status/approve commands with a persistent thread ID.
+workflow/README.md:57:- `test_graph.py`: failure/recovery across graph recreation, successful sibling reuse, happy path, rejected approval.
+workflow/INTERACTIVE_SESSIONS.md:21:  --ui-task /path/to/ui-task.txt --adapter-task /path/to/adapter-task.txt \
+workflow/INTERACTIVE_SESSIONS.md:24:python -m workflow.interactive run /path/outside-repo/my-run --live --herdr
+workflow/INTERACTIVE_SESSIONS.md:30:`--live` authorizes Claude usage. `--allow-edits` enables Read/Glob/Grep/Edit/Write; omit it for read-only tools. Permission mode is **manual**, so you can answer permission prompts yourself. Shell tools and nested agents remain disabled in this initial slice. No bypass-permissions mode or automatic provider/budget fallback is configured. This is worktree isolation, not an OS sandbox.
+workflow/INTERACTIVE_SESSIONS.md:45:python -m workflow.interactive attach-one /path/outside-repo/my-run --node ui
+workflow/INTERACTIVE_SESSIONS.md:48:This validates the native session ID, worktree, name, live inventory state and PID before `exec`-ing `claude attach`. A terminal is required. Never type this command into a pane already occupied by another program. The programmatic pane adapter also checks that only the pane's shell is in the foreground before submitting a command.
+workflow/INTERACTIVE_SESSIONS.md:56:The recorded `terminals.json` prevents automatically opening duplicate attachments. A failed partial layout is retained for inspection. To deliberately replace the two old, idle log observers, supply `--reuse-observers /old/run/observers.json` to `attach` or to `run --live --herdr`. The adapter checks distinct pane identities, same dedicated tab/current workspace, and shell availability, then records the ownership transfer. It never closes or repurposes an unrelated pane.
+workflow/INTERACTIVE_SESSIONS.md:60:Native `--bg` **ignores `--session-id`** and assigns its own ID. The `session_id` reserved in the common preparation plan is therefore a launch token for interactive mode, not the final Claude identity. The launcher writes intent before calling Claude, retains its stdout/stderr, extracts the ID from that launch receipt, and resolves the exact UUID through `claude agents --json`. It cross-checks the worktree and launch name. Actual IDs live in `*.interactive.json` and `terminals.json`.
+workflow/INTERACTIVE_SESSIONS.md:64:`done` in the native inventory means a finished model turn, not necessarily an exited process. Attachment requires a live native PID in addition to the matching session/worktree identity. A final existence check cannot eliminate every race between checking and native attach; do not concurrently stop/restart sessions while attaching. PIDs are not used as authority to kill processes.
+workflow/INTERACTIVE_SESSIONS.md:80:`workflow.live` / `LIVE_SESSIONS.md` remain the separate headless print-mode/log-viewer path. They are not the interactive terminal path.
+workflow/LIVE_SESSIONS.md:3:This is an initial live-launch slice, separate from the original stub demo. LangGraph launches two independent Claude processes in verified Git worktrees. Herdr runs only observers. No Pi subagent runner is used for execution.
+workflow/LIVE_SESSIONS.md:24:python -m workflow.live prepare /absolute/path/outside-repo/my-run \
+workflow/LIVE_SESSIONS.md:26:  --ui-task /path/to/ui-task.txt --adapter-task /path/to/adapter-task.txt
+workflow/LIVE_SESSIONS.md:29:python -m workflow.live run /absolute/path/outside-repo/my-run --live --herdr
+workflow/LIVE_SESSIONS.md:31:python -m workflow.live status /absolute/path/outside-repo/my-run
+workflow/LIVE_SESSIONS.md:34:`prepare` creates the run directory, resolves the exact commit, journals both worktree allocations, verifies their clean HEADs and allocates separate Claude UUIDs. Partial allocations are retained on error, never destructively cleaned up. The run plan, prompts and logs live in a private mode-0700 directory. Use unique run directory names.
+workflow/LIVE_SESSIONS.md:38:This is not an OS sandbox: Git worktrees isolate tracked edits, not arbitrary filesystem access. Task ownership is currently a prompt boundary, not enforced path-level authorization. Keep live edit mode for trusted tasks until ownership enforcement and evidence gates are implemented. There is no arbitrary extra-arguments escape hatch or bypass-permissions flag.
+workflow/LIVE_SESSIONS.md:51:python -m workflow.live observe /absolute/path/outside-repo/my-run
+workflow/LIVE_SESSIONS.md:66:- The graph stops at `verification_required` after both sessions finish. Repeating `run --live` there does not launch new workers. There is intentionally no approve/merge command yet.
+workflow/LIVE_SESSIONS.md:68:Still to implement: contract-complete worker results and immutable artifacts; required shell/browser checks in isolated validation environments; fresh Pi review and approved integration; safe operator reconciliation/retry; runtime UI/event API. The existing stub failure demo remains useful for checking LangGraph selective branch recovery, but is not evidence of live Claude retry behavior.
+workflow/LIVE_SESSIONS.md:76:Tests use a fake executable for deterministic process lifecycle coverage. A live smoke test additionally exercised two authenticated, read-only Claude sessions from LangGraph and real Herdr observers. Both read the shared contract heading, exited successfully with distinct UUIDs, left worktrees clean, and reached the verification interrupt. Re-invoking the run did not relaunch them. No implementation/browser checks or merge were claimed by this smoke test.
+workflow/VALIDATION.md:3:The complete pipeline is ready for a **supervised local run** with an operator-approved feature policy. No live feature graph or new Claude implementation workers were launched during this readiness pass.
+workflow/VALIDATION.md:23:3. Required build, backend unit tests, Playwright assertions and screenshot attachments execute in fresh verification worktrees.
+workflow/VALIDATION.md:28:8. An injected backend check failure reruns only that failed verification attempt after reopening checkpoints. Worker starts remain one each and the successful UI check packet stays byte-for-byte unchanged.
+workflow/VALIDATION.md:29:9. Tampered evidence, stale review, missing screenshots/checks, zero-test runs, ownership violations and incorrect role mappings block.
+workflow/VALIDATION.md:30:10. Native stop behavior is separately tested with mocked CLI/registry responses: successful stops, repeated calls, completed-stop-intent recovery, nonzero exits and lingering live workers. Missing handoffs do not stop workers.
+workflow/VALIDATION.md:32:Unit-test fixtures and their temporary screenshots are cleaned up by the test runner; no synthetic packet is represented as a real agent review or live feature result. Earlier interactive-launch validation did use real native Claude terminals and Herdr attachments; those two demo sessions were stopped before this pass.
+workflow/VALIDATION.md:38:- P1: incorrect role mapping could bypass browser/backend test categories.
+workflow/VALIDATION.md:41:Both were fixed and regression-tested. Focused follow-up run `6618fab6-31a9-4e44-8162-c78d8de8abd9` found no remaining issues in that fix scope and returned **Merge verdict: OK**. The reviewer inspected source/tests, not live sessions or command execution; executed-check evidence above is the parent's.
+workflow/VALIDATION.md:53:No real Claude workers or reviewer were launched for this validation. Actual live `--bg` permission-bypass behavior and model completion-protocol compliance still require the first owner-started live run. Worktrees are not security sandboxes. Automatic verification retries do not repair immutable source, and process deadlines require the controller to remain alive. No merge to main or push was performed for this implementation.
+workflow/VERIFICATION.md:27:Each worker declares its role, node ID, exact owned path prefixes, and required checks. A check has a unique ID, kind, argv array, timeout and (for browser checks only) named scenarios. There are no ownership globs; `src/workflow` owns itself and descendants, not `src/workflow-other`. Worker ownership cannot overlap.
+workflow/VERIFICATION.md:29:All listed checks are required. Frontend policies cannot omit build or browser checks; backend policies cannot omit unit tests. Browser scenarios cannot be an empty list. For responsive work, name desktop/mobile cases explicitly and implement the corresponding viewport assertions and screenshot capture in the browser test.
+workflow/VERIFICATION.md:35:The sidecar binds the policy SHA-256, run ID, worker ID, attempt and output commit. Canonical policy JSON uses sorted keys, no whitespace separators and literal Unicode encoded as UTF-8. Each check ID points to one index in `WorkerResult.checks`; command text must equal Python `shlex.join(argv)`. The executed working directory must match the backend-owned verification worktree.
+workflow/VERIFICATION.md:39:All artifact paths are resolved through a **backend-owned registry**, constrained to its root and hash-checked. Agent-provided URI strings are not fetched or treated as arbitrary paths. PNG header checks are format sanity only, not image decoding or proof that an image came from a browser.
+workflow/VERIFICATION.md:43:This slice evaluates evidence; it does **not** run commands, launch a browser, take screenshots, launch Claude, or advance the live graph. Its tests use clearly synthetic local fixtures.
+workflow/VERIFICATION.md:45:Before wiring it into the live graph:
+workflow/VERIFICATION.md:49:3. Supply backend-owned expected run/node/attempt/base/output identity and verification cwd to `evaluate_worker`.
+workflow/VERIFICATION.md:53:`evaluate_worker` always returns `integration_allowed: false`, with independent review and approval listed as pending gates—even if technical evidence passes. Unresolved worker assumptions are retained for that review. The live graph remains paused at its existing handoff until these remaining pieces are implemented.
+workflow/VERIFICATION.md:55:Run local tests without any live agent launches:

@@ -1,0 +1,700 @@
+import { rulesPresets, seaPathCosts, type RulesPresetId, type SeaMapDefinition } from "@pirate-sea-race/content";
+import { sourceId } from "@pirate-sea-race/content/objectives";
+import {
+  cacheRubbings,
+  createLedger,
+  createLedgerFromAssignment,
+  heldTypes,
+  RUBBING_TYPES,
+  unlockSource,
+  type LedgerCache,
+  type LedgerState,
+  type ObjectiveRules,
+  type RubbingType,
+  type SourceAssignment,
+  type SourceSite,
+} from "@pirate-sea-race/simulation/objectives";
+/**
+ * The room's side of the objective ledger (`docs/objectives.md`): where the sources stand on the sea, what interact
+ * (E) targets at a dock, and where a leaver's recovery cache goes. The ledger itself decides every move of a rubbing
+ * or of gold; nothing here writes one.
+ */
+/** Private matches play the slice preset (§18 stage 2): two types, eight rubbings, two sources on each of four islands. */
+export const MATCH_PRESET: RulesPresetId = "slice";
+/** The centre of a dock's tile, in sub-units: where a moored ship lies, a source stands and a cache is placed. */
+export function dockCentre(map: SeaMapDefinition, dockId: number): { x: number; y: number } {
+  const dock = map.docks[dockId];
+  if (dock === undefined) throw new RangeError(`no dock ${dockId}`);
+  const half = Math.floor(map.subUnitsPerTile / 2);
+  return { x: dock.tileX * map.subUnitsPerTile + half, y: dock.tileY * map.subUnitsPerTile + half };
+}
+/** An island's docks, in id order. */
+export function islandDocks(map: SeaMapDefinition, island: number): number[] {
+  return map.docks.filter((dock) => dock.island === island).map((dock) => dock.id);
+}
+/**
+ * The ledger's source sites: `sourcesPerIsland` on each regular island, at that island's docks taken in id order (a
+ * dock is reused when the island has fewer docks than sources). Site `j` of island `i` becomes source `source-i-j`.
+ */
+export function sourceSites(map: SeaMapDefinition, presetId: RulesPresetId = MATCH_PRESET): SourceSite[] {
+  const preset = rulesPresets[presetId];
+  const sites: SourceSite[] = [];
+  for (let island = 0; island < preset.islands; island++) {
+    const docks = islandDocks(map, island);
+    if (docks.length === 0) throw new Error(`${map.name}: island ${island} has no dock for its sources`);
+    for (let slot = 0; slot < preset.sourcesPerIsland; slot++) sites.push({ island, ...dockCentre(map, docks[slot % docks.length]!) });
+  }
+  return sites;
+}
+/**
+ * A fixed assignment for the test-only source layout (`TEST_SOURCES_ENV`): island `i`'s sources get the types of
+ * group `i`, in order, each the next unused copy of that type. The ledger validates the result like any assignment,
+ * so a layout that does not seal every rubbing once is refused.
+ */
+export function layoutAssignment(sites: readonly SourceSite[], layout: readonly (readonly string[])[], presetId: RulesPresetId = MATCH_PRESET): SourceAssignment {
+  const copies = new Map<string, number>();
+  const slots = new Map<number, number>();
+  const sources = sites.map((site) => {
+    const slot = slots.get(site.island) ?? 0;
+    slots.set(site.island, slot + 1);
+    const type = layout[site.island]?.[slot];
+    if (type === undefined || !(RUBBING_TYPES as readonly string[]).includes(type)) {
+      throw new Error(`test source layout: island ${site.island} source ${slot} has no valid type`);
+    }
+    const copy = (copies.get(type) ?? 0) + 1;
+    copies.set(type, copy);
+    return { id: sourceId(site.island, slot), island: site.island, x: site.x, y: site.y, type: type as RubbingType, rubbingId: `${type}-${copy}` };
+  });
+  return { preset: presetId, seed: 0, sources };
+}
+export interface MatchLedgerOptions {
+  readonly map: SeaMapDefinition;
+  /** The room's own private randomness, never the public match code (§3, §16). */
+  readonly seed: number;
+  readonly rules: ObjectiveRules;
+  /** Test-only: deal the sources in this layout instead of shuffling them. */
+  readonly layout?: readonly (readonly string[])[];
+}
+/**
+ * A new match's ledger. Until the ruins are wired (`objectives-endgame`, which will lock sources behind the puzzles),
+ * every source is unlocked at the start of the match.
+ */
+export function createMatchLedger(options: MatchLedgerOptions): LedgerState {
+  const sites = sourceSites(options.map);
+  let ledger =
+    options.layout === undefined
+      ? createLedger({ preset: MATCH_PRESET, seed: options.seed, sites, rules: options.rules })
+      : createLedgerFromAssignment(layoutAssignment(sites, options.layout), options.seed >>> 0, options.rules);
+  for (const source of ledger.sources) ledger = unlockSource(ledger, { sourceId: source.id, tick: 0 }).state;
+  return ledger;
+}
+const typeOrder = (type: RubbingType) => RUBBING_TYPES.indexOf(type);
+/** The types still sealed at an island's sources, one per source, in type order: what a moored player may see there. */
+export function sealedTypesAt(ledger: LedgerState, island: number): RubbingType[] {
+  return ledger.sources
+    .filter((source) => source.island === island && sealedAt(ledger, source.id, source.rubbingId))
+    .map((source) => source.type)
+    .sort((a, b) => typeOrder(a) - typeOrder(b));
+}
+function sealedAt(ledger: LedgerState, sourceIdentifier: string, rubbingId: string): boolean {
+  const rubbing = ledger.rubbings.find((each) => each.id === rubbingId);
+  return rubbing?.location.kind === "source" && rubbing.location.sourceId === sourceIdentifier;
+}
+/** The dock a cache stands at (caches are only ever placed at dock centres), or -1. */
+export function cacheDock(map: SeaMapDefinition, cache: Pick<LedgerCache, "x" | "y">): number {
+  for (const dock of map.docks) {
+    const centre = dockCentre(map, dock.id);
+    if (centre.x === cache.x && centre.y === cache.y) return dock.id;
+  }
+  return -1;
+}
+/** The caches at a dock, in creation order. */
+export function cachesAtDock(ledger: LedgerState, map: SeaMapDefinition, dockId: number): LedgerCache[] {
+  return ledger.caches.filter((cache) => cacheDock(map, cache) === dockId);
+}
+/** The types held in the caches at a dock, one per rubbing, in type order: what a player moored there may see. */
+export function cachedTypesAt(ledger: LedgerState, map: SeaMapDefinition, dockId: number): RubbingType[] {
+  return cachesAtDock(ledger, map, dockId)
+    .flatMap((cache) => cacheRubbings(ledger, cache.id).map((rubbing) => rubbing.type))
+    .sort((a, b) => typeOrder(a) - typeOrder(b));
+}
+/** What holding E at a dock works on: an island source to collect, or one cached rubbing to claim. */
+export type InteractTarget =
+  | { readonly kind: "collect"; readonly sourceId: string; readonly type: RubbingType }
+  | { readonly kind: "claim"; readonly cacheId: string; readonly rubbingId: string; readonly type: RubbingType };
+/**
+ * E's target for a player moored at a dock: first the island's unlocked sealed source of a type the player lacks,
+ * then a rubbing of a type they lack in a cache at this dock, each in the fixed type order (ties to the lower source
+ * id, the older cache, the lower rubbing id). None when the player lacks nothing on offer.
+ */
+export function interactTarget(ledger: LedgerState, map: SeaMapDefinition, playerId: string, dockId: number): InteractTarget | undefined {
+  const island = map.docks[dockId]?.island;
+  if (island === undefined || island < 0) return undefined;
+  const held = new Set(heldTypes(ledger, playerId));
+  const source = ledger.sources
+    .filter((each) => each.island === island && each.unlocked && !held.has(each.type) && sealedAt(ledger, each.id, each.rubbingId))
+    .sort((a, b) => typeOrder(a.type) - typeOrder(b.type) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
+  if (source !== undefined) return { kind: "collect", sourceId: source.id, type: source.type };
+  for (const type of ledger.types) {
+    if (held.has(type)) continue;
+    for (const cache of cachesAtDock(ledger, map, dockId)) {
+      const rubbing = cacheRubbings(ledger, cache.id)
+        .filter((each) => each.type === type)
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
+      if (rubbing !== undefined) return { kind: "claim", cacheId: cache.id, rubbingId: rubbing.id, type };
+    }
+  }
+  return undefined;
+}
+/**
+ * The dock nearest a position by sea (§12: a quitter's cache goes to the nearest reachable dock): the shortest
+ * eight-way path over navigable tiles, ties to the lower dock id. A position whose tile reaches no dock falls back to
+ * the nearest dock in a straight line.
+ */
+export function nearestDockBySea(map: SeaMapDefinition, x: number, y: number): number {
+  const tileX = Math.floor(x / map.subUnitsPerTile);
+  const tileY = Math.floor(y / map.subUnitsPerTile);
+  const costs = seaPathCosts(map, tileX, tileY);
+  let best = -1;
+  let bestCost = Number.POSITIVE_INFINITY;
+  for (const dock of map.docks) {
+    const cost = costs[dock.tileY * map.widthTiles + dock.tileX]!;
+    if (cost < bestCost) {
+      best = dock.id;
+      bestCost = cost;
+    }
+  }
+  if (best >= 0 && bestCost < Number.MAX_SAFE_INTEGER) return best;
+  let nearest = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const dock of map.docks) {
+    const centre = dockCentre(map, dock.id);
+    const distance = (centre.x - x) ** 2 + (centre.y - y) ** 2;
+    if (distance < nearestDistance) {
+      nearest = dock.id;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}
+import { describe, expect, it } from "vitest";
+import {
+  createDuelOptionsSchema,
+  DUEL_CODE_REQUIRED_MESSAGE,
+  DUEL_INPUT_BITS_MAX,
+  DUEL_INPUT_MESSAGES_PER_SECOND,
+  DUEL_UNAVAILABLE_MESSAGE,
+  duelFrameBundleSchema,
+  duelFullMessage,
+  duelPracticeMessageSchema,
+  DuelMessageType,
+  duelProbeReplySchema,
+  duelReadyMessageSchema,
+  encodedSize,
+  firstInputFrame,
+  MAX_DUEL_INPUTS_PER_MESSAGE,
+  MAX_INPUT_LEAD_FRAMES,
+  MAX_INPUT_MESSAGE_BYTES,
+  MAX_INPUT_MESSAGES_PER_SECOND,
+  MAX_SEQUENCE,
+  NO_SUCH_DUEL_MESSAGE,
+  validateDuelInputMessage,
+  type InputContext,
+} from "./index.js";
+const context: InputContext = { lastAcceptedSeq: 9, serverFrame: 600 };
+const valid = { seq: 10, frame: 605, inputs: [0, 16, 48, 48] };
+describe("duel input messages", () => {
+  it("accept a batch of up to four frames, the newest last", () => {
+    expect(validateDuelInputMessage(valid, context)).toEqual({ ok: true, input: valid });
+    expect(firstInputFrame(valid)).toBe(602);
+    expect(validateDuelInputMessage({ ...valid, inputs: [DUEL_INPUT_BITS_MAX] }, context).ok).toBe(true);
+  });
+  it("fit the world input's 128-byte cap even with the largest numbers", () => {
+    const largest = { seq: MAX_SEQUENCE, frame: MAX_SEQUENCE, inputs: Array.from({ length: MAX_DUEL_INPUTS_PER_MESSAGE }, () => DUEL_INPUT_BITS_MAX) };
+    expect(encodedSize(largest)).toBeLessThanOrEqual(MAX_INPUT_MESSAGE_BYTES);
+  });
+  it("are sent at half the gate's rate cap, so redundancy never meets it", () => {
+    expect(DUEL_INPUT_MESSAGES_PER_SECOND * 2).toBe(MAX_INPUT_MESSAGES_PER_SECOND);
+  });
+  it.each([
+    ["no inputs", { ...valid, inputs: [] }],
+    ["five inputs", { ...valid, inputs: [0, 0, 0, 0, 0] }],
+    ["an unknown bit", { ...valid, inputs: [DUEL_INPUT_BITS_MAX + 1] }],
+    ["a negative input", { ...valid, inputs: [-1] }],
+    ["a fractional input", { ...valid, inputs: [1.5] }],
+    ["frame zero", { ...valid, frame: 0 }],
+    ["an extra field", { ...valid, buttons: 0 }],
+    ["a missing sequence", { frame: 605, inputs: [0] }],
+  ])("refuse %s as malformed", (_label, message) => {
+    expect(validateDuelInputMessage(message, context)).toEqual({ ok: false, reason: "malformed" });
+  });
+  it("apply the world input's size, sequence and future-frame limits", () => {
+    expect(validateDuelInputMessage({ ...valid, pad: "x".repeat(MAX_INPUT_MESSAGE_BYTES) }, context)).toEqual({ ok: false, reason: "oversized" });
+    expect(validateDuelInputMessage({ ...valid, seq: 9 }, context)).toEqual({ ok: false, reason: "stale-sequence" });
+    const limit = context.serverFrame + MAX_INPUT_LEAD_FRAMES;
+    expect(validateDuelInputMessage({ ...valid, frame: limit }, context).ok).toBe(true);
+    expect(validateDuelInputMessage({ ...valid, frame: limit + 1 }, context)).toEqual({ ok: false, reason: "future-frame" });
+  });
+  it("measure the lead from a negative server frame during the countdown", () => {
+    const countdown: InputContext = { lastAcceptedSeq: 0, serverFrame: -20 };
+    expect(validateDuelInputMessage({ seq: 1, frame: 10, inputs: [0] }, countdown).ok).toBe(true);
+    expect(validateDuelInputMessage({ seq: 1, frame: 11, inputs: [0] }, countdown)).toEqual({ ok: false, reason: "future-frame" });
+  });
+});
+describe("duel frame bundles", () => {
+  it("carry applied input pairs with either a hash or a snapshot", () => {
+    expect(duelFrameBundleSchema.safeParse({ frame: 9, inputs: [[0, 0], [16, 0], [16, 1]], substituted: 0b100000, hash: "0123456789abcdef" }).success).toBe(true);
+    expect(duelFrameBundleSchema.safeParse({ frame: 0, inputs: [], substituted: 0, snapshot: { any: "thing" } }).success).toBe(true);
+    expect(duelFrameBundleSchema.safeParse({ frame: 9, inputs: [[0, 512]], substituted: 0 }).success).toBe(false);
+    expect(duelFrameBundleSchema.safeParse({ frame: 9, inputs: [[0, 0]], substituted: 0, hash: "XYZ" }).success).toBe(false);
+  });
+});
+describe("other duel messages", () => {
+  it("validate the ready report of a duel at sea: an empty object", () => {
+    expect(duelReadyMessageSchema.safeParse({}).success).toBe(true);
+    expect(duelReadyMessageSchema.safeParse({ duelId: "duel:1:1:a:b" }).success).toBe(false);
+    expect(duelReadyMessageSchema.safeParse(null).success).toBe(false);
+    expect(DuelMessageType.Ready).toBe("duel-ready");
+  });
+  it("validate probe replies, the practice dummy and duel create options", () => {
+    expect(duelProbeReplySchema.safeParse({ id: 3 }).success).toBe(true);
+    expect(duelProbeReplySchema.safeParse({ id: 0 }).success).toBe(false);
+    expect(duelPracticeMessageSchema.safeParse({ dummy: "guard" }).success).toBe(true);
+    expect(duelPracticeMessageSchema.safeParse({ dummy: "attack" }).success).toBe(false);
+    const token = "0123456789abcdef0123456789abcdef";
+    expect(createDuelOptionsSchema.safeParse({ protocolVersion: 5, createToken: token, practice: true }).success).toBe(true);
+    expect(createDuelOptionsSchema.safeParse({ protocolVersion: 5, createToken: token, practice: "yes" }).success).toBe(false);
+  });
+  it("keep refusal messages under 100 bytes", () => {
+    for (const message of [NO_SUCH_DUEL_MESSAGE, DUEL_CODE_REQUIRED_MESSAGE, DUEL_UNAVAILABLE_MESSAGE, duelFullMessage()]) {
+      expect(encodedSize(message)! - 2).toBeLessThan(100);
+    }
+  });
+});
+import { z } from "zod";
+import { createTokenSchema, matchCodeSchema } from "./join.js";
+import { encodedSize, MAX_INPUT_LEAD_FRAMES, MAX_INPUT_MESSAGE_BYTES, MAX_SEQUENCE, type InputContext, type InputRejection } from "./input.js";
+/** The Colyseus room name of a standalone duel (the combat spike, §18 stage 1). */
+export const DUEL_ROOM = "duel";
+export const DuelMessageType = {
+  /** Client → server: batched, redundant frame-tagged duel inputs (`DuelInputMessage`). */
+  Input: "duel-input",
+  /** Server → client: the inputs the server applied since the last bundle, with a snapshot or a hash (`DuelFrameBundle`). */
+  Frames: "duel-frames",
+  /** Both ways: a round-trip probe from the server (`DuelProbe`) and the client's echo (`DuelProbeReply`). */
+  Probe: "duel-probe",
+  /** Client → server, practice rooms only: the dummy's behaviour (`DuelPracticeMessage`). */
+  Practice: "duel-practice",
+  /**
+   * Client → server, duels at sea only (protocol v5): this fighter's arena is loaded (`DuelReadyMessage`). The fight
+   * starts once the countdown is over and both fighters are ready (§6).
+   */
+  Ready: "duel-ready",
+} as const;
+/**
+ * The highest duel input: every bit of `DUEL_INPUT` (content's `DUEL_INPUT_MASK`, which the protocol does not depend
+ * on). A server unit test keeps the two equal.
+ */
+export const DUEL_INPUT_BITS_MAX = 0x1ff;
+/** Inputs one message carries at most: the newest frame and the three before it. */
+export const MAX_DUEL_INPUTS_PER_MESSAGE = 4;
+/** Clients send input messages at most this often (every second frame), half the gate's cap. */
+export const DUEL_INPUT_MESSAGES_PER_SECOND = 30;
+/** The server sends one frame bundle every this many frames (20 a second)... */
+export const DUEL_BUNDLE_FRAMES = 3;
+/** ...and a full snapshot in every this many bundles (every 6 frames); the others carry the state hash. */
+export const DUEL_SNAPSHOT_EVERY_BUNDLES = 2;
+/** The countdown before the fight, in frames (§6: three seconds). */
+export const DUEL_COUNTDOWN_FRAMES = 180;
+/** A player absent this long forfeits (§12); they may rejoin the same duel until then. */
+export const DUEL_RECONNECT_SECONDS = 10;
+/**
+ * One client's duel input message (§15, batched and redundant): `inputs` holds the input bits (`DUEL_INPUT`) of
+ * consecutive frames, oldest first, ending with frame `frame`; so `inputs[k]` is for frame
+ * `frame - inputs.length + 1 + k`. A client repeats each frame in two messages, so one lost message loses no input.
+ * The server takes each frame's input from the first message that carries it and ignores frames it has already
+ * stepped. It is checked like world input: size, strictly increasing `seq`, and `frame` no more than
+ * MAX_INPUT_LEAD_FRAMES ahead of the server.
+ */
+export const duelInputMessageSchema = z.strictObject({
+  seq: z.int().min(1).max(MAX_SEQUENCE),
+  frame: z.int().min(1).max(MAX_SEQUENCE),
+  inputs: z.array(z.int().min(0).max(DUEL_INPUT_BITS_MAX)).min(1).max(MAX_DUEL_INPUTS_PER_MESSAGE),
+});
+export type DuelInputMessage = z.infer<typeof duelInputMessageSchema>;
+export type DuelInputValidation = { ok: true; input: DuelInputMessage } | { ok: false; reason: InputRejection };
+/** The first frame a duel input message carries. */
+export function firstInputFrame(message: Pick<DuelInputMessage, "frame" | "inputs">): number {
+  return message.frame - message.inputs.length + 1;
+}
+/**
+ * Validates an untrusted duel input message with the world input's limits: MAX_INPUT_MESSAGE_BYTES, the schema, a
+ * sequence number above the last accepted one, and a newest frame at most MAX_INPUT_LEAD_FRAMES past the server's.
+ * The server's frame is negative during the countdown (frames left until the fight's frame 0).
+ */
+export function validateDuelInputMessage(message: unknown, context: InputContext): DuelInputValidation {
+  const size = encodedSize(message);
+  if (size === undefined) return { ok: false, reason: "malformed" };
+  if (size > MAX_INPUT_MESSAGE_BYTES) return { ok: false, reason: "oversized" };
+  const parsed = duelInputMessageSchema.safeParse(message);
+  if (!parsed.success) return { ok: false, reason: "malformed" };
+  const input = parsed.data;
+  if (input.seq <= context.lastAcceptedSeq) return { ok: false, reason: "stale-sequence" };
+  if (input.frame > context.serverFrame + MAX_INPUT_LEAD_FRAMES) return { ok: false, reason: "future-frame" };
+  return { ok: true, input };
+}
+/**
+ * Server → client, one per DUEL_BUNDLE_FRAMES: the inputs the server applied to both players, substitutions included,
+ * for each frame since the last bundle, ending with frame `frame`. `inputs[k]` is `[player one, player two]` for frame
+ * `frame - inputs.length + 1 + k`. `substituted` has bit `2k + p` set when player `p`'s input for that frame was not
+ * received in time (the held input repeated, or neutral). Every DUEL_SNAPSHOT_EVERY_BUNDLES-th bundle carries the full
+ * state after `frame` as `snapshot` (a `DuelSnapshot`, checked by `restoreDuel`); the others carry its `hashState` as
+ * `hash`. A bundle with no inputs and a snapshot is a resync point (the fight's frame 0, or a rejoin).
+ */
+export const duelFrameBundleSchema = z.strictObject({
+  frame: z.int().min(0).max(MAX_SEQUENCE),
+  inputs: z.array(z.tuple([z.int().min(0).max(DUEL_INPUT_BITS_MAX), z.int().min(0).max(DUEL_INPUT_BITS_MAX)])),
+  substituted: z.int().min(0),
+  snapshot: z.unknown().optional(),
+  hash: z.string().regex(/^[0-9a-f]{16}$/).optional(),
+});
+export type DuelFrameBundle = z.infer<typeof duelFrameBundleSchema>;
+/**
+ * Server → client round-trip probe: `id` to echo, the server's duel `frame` when it was sent (negative during the
+ * countdown), and `rtt`, the server's latest round-trip measurement for this client in milliseconds (0 before any).
+ */
+export const duelProbeSchema = z.strictObject({
+  id: z.int().min(1).max(MAX_SEQUENCE),
+  frame: z.int(),
+  rtt: z.number().min(0),
+});
+export type DuelProbe = z.infer<typeof duelProbeSchema>;
+/** Client → server: the echo of a probe, sent as soon as it arrives. */
+export const duelProbeReplySchema = z.strictObject({ id: z.int().min(1).max(MAX_SEQUENCE) });
+export type DuelProbeReply = z.infer<typeof duelProbeReplySchema>;
+/** A practice dummy either stands idle or holds back to guard (§13's idle or defensive opponent). */
+export const DUMMY_BEHAVIOURS = ["idle", "guard"] as const;
+export type DummyBehaviour = (typeof DUMMY_BEHAVIOURS)[number];
+export const duelPracticeMessageSchema = z.strictObject({ dummy: z.enum(DUMMY_BEHAVIOURS) });
+export type DuelPracticeMessage = z.infer<typeof duelPracticeMessageSchema>;
+/** A fighter's ready report at sea: empty, since the server knows which duel the sender is in. */
+export const duelReadyMessageSchema = z.strictObject({});
+export type DuelReadyMessage = z.infer<typeof duelReadyMessageSchema>;
+/** Creating a duel: like a match, with a one-time token; `practice` makes a one-player room against the dummy. */
+export const createDuelOptionsSchema = z.object({
+  protocolVersion: z.int(),
+  createToken: createTokenSchema,
+  practice: z.boolean().optional(),
+});
+/** Joining a duel by its code. */
+export const joinDuelOptionsSchema = z.object({
+  protocolVersion: z.int(),
+  code: matchCodeSchema,
+});
+export type CreateDuelOptions = z.infer<typeof createDuelOptionsSchema>;
+export type JoinDuelOptions = z.infer<typeof joinDuelOptionsSchema>;
+/**
+ * A duel's phases: waiting (a standalone duel's second player, or at sea a fighter still loading once the countdown is
+ * over), the countdown, the fight, and its result.
+ */
+export const DUEL_PHASES = ["waiting", "countdown", "fighting", "over"] as const;
+export type DuelRoomPhase = (typeof DUEL_PHASES)[number];
+/**
+ * Why a duel ended: the step's own result, a player absent past DUEL_RECONNECT_SECONDS (or quitting), or at sea a
+ * duel cancelled because neither fighter was ready in time (§6).
+ */
+export type DuelEndReason = "ko" | "double-ko" | "timeout" | "overtime" | "forfeit" | "cancelled";
+/** At sea: a fighter not ready this long after the grapple landed forfeits; both not ready cancels the duel (§6). */
+export const DUEL_READY_TIMEOUT_SECONDS = 10;
+export const NO_SUCH_DUEL_MESSAGE = "No duel with that code";
+export const DUEL_CODE_REQUIRED_MESSAGE = "Joining this duel needs its code";
+export const DUEL_UNAVAILABLE_MESSAGE = "That duel is full or no longer exists";
+export function duelFullMessage(): string {
+  return "That duel already has two players";
+}
+export * from "./version.js";
+export * from "./join.js";
+export * from "./input.js";
+export * from "./testPlacement.js";
+export * from "./duel.js";
+export * from "./rubbings.js";
+import { z } from "zod";
+export const MessageType = {
+  /** Client → server: the player's held intent. */
+  Input: "input",
+} as const;
+/** Largest input message accepted, measured as its JSON encoding. A valid one is well under 100 bytes. */
+export const MAX_INPUT_MESSAGE_BYTES = 128;
+/** How far ahead of the server's current frame an input's frame tag may be (§15: reject future-frame spam). */
+export const MAX_INPUT_LEAD_FRAMES = 30;
+/** Input messages a client may send per second of match time before the server drops the rest. */
+export const MAX_INPUT_MESSAGES_PER_SECOND = 60;
+/** The server repeats a held input for at most this many frames (250 ms) without a fresh one, then goes neutral. */
+export const INPUT_HOLD_FRAMES = 15;
+export const MAX_SEQUENCE = 2 ** 31 - 1;
+/**
+ * Button bits (§8). Interact (E) docks a ship near a dock; grapple (J, protocol v5) asks the encounter rules to start a
+ * grapple (§6), whose target the server chooses. The other bits are reserved for world actions.
+ */
+export const Buttons = {
+  Interact: 1 << 0,
+  Grapple: 1 << 1,
+} as const;
+/**
+ * One frame-tagged input (§16): a strictly increasing sequence number, the client's estimate of the server frame,
+ * a button bit field and movement axes bounded to [-1, 1]. Axes outside the range are rejected, not clamped.
+ *
+ * At sea (protocol v3) the axes steer a ship: `moveX` turns (positive clockwise, to starboard) and `moveY` is the
+ * throttle, negative ahead (up on a keyboard) and positive to brake, then reverse slowly from a stop.
+ */
+export const inputMessageSchema = z.strictObject({
+  seq: z.int().min(1).max(MAX_SEQUENCE),
+  frame: z.int().min(0).max(MAX_SEQUENCE),
+  buttons: z.int().min(0).max(0xffff),
+  moveX: z.number().min(-1).max(1),
+  moveY: z.number().min(-1).max(1),
+});
+export type InputMessage = z.infer<typeof inputMessageSchema>;
+export type InputRejection = "oversized" | "malformed" | "stale-sequence" | "future-frame";
+export type InputValidation = { ok: true; input: InputMessage } | { ok: false; reason: InputRejection };
+/** What the server knows when a message arrives: the last sequence it accepted from this client, and its frame. */
+export interface InputContext {
+  readonly lastAcceptedSeq: number;
+  readonly serverFrame: number;
+}
+/** Size of a decoded message as JSON, or undefined when it cannot be encoded (cycles, BigInt). */
+export function encodedSize(message: unknown): number | undefined {
+  try {
+    const json = JSON.stringify(message);
+    return json === undefined ? undefined : utf8Length(json);
+  } catch {
+    return undefined;
+  }
+}
+function utf8Length(text: string): number {
+  let bytes = 0;
+  for (const char of text) {
+    const code = char.codePointAt(0)!;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+/** Validates an untrusted input message against its schema and the sender's sequence and the server clock. */
+export function validateInputMessage(message: unknown, context: InputContext): InputValidation {
+  const size = encodedSize(message);
+  if (size === undefined) return { ok: false, reason: "malformed" };
+  if (size > MAX_INPUT_MESSAGE_BYTES) return { ok: false, reason: "oversized" };
+  const parsed = inputMessageSchema.safeParse(message);
+  if (!parsed.success) return { ok: false, reason: "malformed" };
+  const input = parsed.data;
+  if (input.seq <= context.lastAcceptedSeq) return { ok: false, reason: "stale-sequence" };
+  if (input.frame > context.serverFrame + MAX_INPUT_LEAD_FRAMES) return { ok: false, reason: "future-frame" };
+  return { ok: true, input };
+}
+import { z } from "zod";
+import { PROTOCOL_VERSION } from "./version.js";
+export const MATCH_CODE_LENGTH = 6;
+export const MATCH_CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+/** A private match code: six uppercase letters or digits, for example `K7Q2MX`. */
+export const matchCodeSchema = z.string().regex(/^[A-Z0-9]{6}$/);
+/** Players type codes in any case; the wire carries the canonical uppercase form. */
+export function normalizeMatchCode(input: string): string {
+  return input.trim().toUpperCase();
+}
+/**
+ * A one-time secret the creator of a match sends with its `create` request: 128 random bits as 32 lowercase hex
+ * digits, generated by the caller with the platform's crypto API. The room admits exactly one seat carrying it (the
+ * creator's) and never lists it, so a request carrying a token can only ever create a new match.
+ */
+export const CREATE_TOKEN_BYTES = 16;
+export const createTokenSchema = z.string().regex(/^[0-9a-f]{32}$/);
+/** Hex-encodes random bytes from the platform's crypto API into a create token. */
+export function formatCreateToken(bytes: Uint8Array): string {
+  let token = "";
+  for (const byte of bytes) token += byte.toString(16).padStart(2, "0");
+  return token;
+}
+/** Options for creating a private match. The server generates the code. */
+export const createMatchOptionsSchema = z.object({
+  protocolVersion: z.int(),
+  createToken: createTokenSchema,
+});
+/** Options for joining a private match by code. */
+export const joinMatchOptionsSchema = z.object({
+  protocolVersion: z.int(),
+  code: matchCodeSchema,
+});
+export type CreateMatchOptions = z.infer<typeof createMatchOptionsSchema>;
+export type JoinMatchOptions = z.infer<typeof joinMatchOptionsSchema>;
+/** Why the server refused a create or join. Colyseus answers matchmaking over HTTP, so these are HTTP statuses. */
+export const JoinRefusal = {
+  BadRequest: 400,
+  CodeRequired: 403,
+  NoSuchMatch: 404,
+  MatchFull: 409,
+  ProtocolMismatch: 426,
+} as const;
+export type JoinRefusalCode = (typeof JoinRefusal)[keyof typeof JoinRefusal];
+/**
+ * Refusal messages stay under 100 bytes: a refusal from the room itself can travel as a WebSocket close reason, which
+ * is capped at 123 bytes. The client's version is echoed only when it is an integer, so the caller cannot lengthen it.
+ */
+export function protocolMismatchMessage(clientVersion: unknown): string {
+  const client = Number.isSafeInteger(clientVersion) ? String(clientVersion) : "?";
+  return `Protocol version mismatch: client v${client}, server v${PROTOCOL_VERSION}. Reload the page to update.`;
+}
+/** A request must carry either a match code (join) or a create token (create), and not both. */
+export const MALFORMED_MATCH_REQUEST_MESSAGE = "Malformed match request";
+export const NO_SUCH_MATCH_MESSAGE = "No match with that code";
+/** The room refuses a seat whose request carries neither this match's code nor its creator's token. */
+export const MATCH_CODE_REQUIRED_MESSAGE = "Joining this match needs its code";
+/**
+ * What the client shows when Colyseus's matchmaker finds no open listing after the server admitted the request: the
+ * match filled up or closed in the meantime (for example, two players racing for the last seat).
+ */
+export const MATCH_UNAVAILABLE_MESSAGE = "That match is full or no longer exists";
+export function matchFullMessage(maxPlayers: number): string {
+  return `That match is full (${maxPlayers} players)`;
+}
+import { describe, expect, it } from "vitest";
+import {
+  CREATE_TOKEN_BYTES,
+  createMatchOptionsSchema,
+  createTokenSchema,
+  encodedSize,
+  formatCreateToken,
+  MALFORMED_MATCH_REQUEST_MESSAGE,
+  MATCH_CODE_REQUIRED_MESSAGE,
+  MATCH_UNAVAILABLE_MESSAGE,
+  matchFullMessage,
+  NO_SUCH_MATCH_MESSAGE,
+  protocolMismatchMessage,
+  MAX_INPUT_LEAD_FRAMES,
+  MAX_INPUT_MESSAGE_BYTES,
+  PROTOCOL_VERSION,
+  parseTestSourceLayout,
+  RUBBING_TYPE_NAMES,
+  RubbingMessageType,
+  TEST_SOURCES_ENV,
+  validateChooseTheftMessage,
+  joinMatchOptionsSchema,
+  normalizeMatchCode,
+  PLACEMENT_HEADING_COUNT,
+  createTestPlacementSchema,
+  validateInputMessage,
+  Buttons,
+  type InputContext,
+} from "./index.js";
+const context: InputContext = { lastAcceptedSeq: 4, serverFrame: 300 };
+const valid = { seq: 5, frame: 301, buttons: 0, moveX: 1, moveY: -0.5 };
+describe("input validation", () => {
+  it("accepts a valid input", () => {
+    expect(validateInputMessage(valid, context)).toEqual({ ok: true, input: valid });
+  });
+  it.each([
+    ["undefined", undefined],
+    ["a string", "left"],
+    ["an array", [5, 301, 0, 1, 0]],
+    ["a missing field", { seq: 5, frame: 301, buttons: 0, moveX: 1 }],
+    ["an extra field", { ...valid, x: 100 }],
+    ["a fractional sequence", { ...valid, seq: 5.5 }],
+    ["a negative frame", { ...valid, frame: -1 }],
+    ["a string axis", { ...valid, moveX: "1" }],
+    ["a NaN axis", { ...valid, moveX: Number.NaN }],
+    ["buttons out of range", { ...valid, buttons: 0x10000 }],
+    ["a BigInt field", { ...valid, seq: 5n }],
+  ])("rejects a malformed input: %s", (_label, message) => {
+    expect(validateInputMessage(message, context)).toEqual({ ok: false, reason: "malformed" });
+  });
+  it("rejects an oversized input before parsing it", () => {
+    const padded = { ...valid, padding: "x".repeat(MAX_INPUT_MESSAGE_BYTES) };
+    expect(validateInputMessage(padded, context)).toEqual({ ok: false, reason: "oversized" });
+    expect(validateInputMessage({ ...valid, note: "é".repeat(70) }, context)).toEqual({ ok: false, reason: "oversized" });
+  });
+  it("rejects a future-frame input", () => {
+    const limit = context.serverFrame + MAX_INPUT_LEAD_FRAMES;
+    expect(validateInputMessage({ ...valid, frame: limit }, context).ok).toBe(true);
+    expect(validateInputMessage({ ...valid, frame: limit + 1 }, context)).toEqual({ ok: false, reason: "future-frame" });
+  });
+  it("rejects a repeated or older sequence number", () => {
+    expect(validateInputMessage({ ...valid, seq: 4 }, context)).toEqual({ ok: false, reason: "stale-sequence" });
+    expect(validateInputMessage({ ...valid, seq: 1 }, context)).toEqual({ ok: false, reason: "stale-sequence" });
+  });
+  it("rejects movement axes outside [-1, 1] rather than clamping them", () => {
+    for (const axis of [1.0001, -1.5, 2, Number.POSITIVE_INFINITY]) {
+      expect(validateInputMessage({ ...valid, moveX: axis }, context)).toEqual({ ok: false, reason: "malformed" });
+      expect(validateInputMessage({ ...valid, moveY: axis }, context)).toEqual({ ok: false, reason: "malformed" });
+    }
+    expect(validateInputMessage({ ...valid, moveX: -1, moveY: 1 }, context).ok).toBe(true);
+  });
+});
+describe("join options", () => {
+  it("normalises typed codes to the canonical form", () => {
+    expect(normalizeMatchCode("  k7q2mx ")).toBe("K7Q2MX");
+  });
+  it("accepts a canonical code and refuses anything else", () => {
+    expect(joinMatchOptionsSchema.safeParse({ protocolVersion: PROTOCOL_VERSION, code: "K7Q2MX" }).success).toBe(true);
+    for (const code of ["k7q2mx", "K7Q2M", "K7Q2MXX", "K7-2MX", ""]) {
+      expect(joinMatchOptionsSchema.safeParse({ protocolVersion: PROTOCOL_VERSION, code }).success).toBe(false);
+    }
+  });
+});
+describe("create tokens", () => {
+  it("formats 128 random bits as 32 lowercase hex digits", () => {
+    expect(CREATE_TOKEN_BYTES * 8).toBeGreaterThanOrEqual(128);
+    const token = formatCreateToken(Uint8Array.from({ length: CREATE_TOKEN_BYTES }, (_, index) => index * 17));
+    expect(token).toBe("00112233445566778899aabbccddeeff");
+    expect(createTokenSchema.safeParse(token).success).toBe(true);
+  });
+  it("refuses anything but a well-formed token in a create request", () => {
+    const token = "0123456789abcdef0123456789abcdef";
+    expect(createMatchOptionsSchema.safeParse({ protocolVersion: PROTOCOL_VERSION, createToken: token }).success).toBe(true);
+    for (const createToken of [undefined, "", token.toUpperCase(), token.slice(1), `${token}0`, 42]) {
+      expect(createMatchOptionsSchema.safeParse({ protocolVersion: PROTOCOL_VERSION, createToken }).success).toBe(false);
+    }
+  });
+});
+describe("refusal messages", () => {
+  it("stay under 100 bytes, whatever version the client claims", () => {
+    const messages = [
+      MALFORMED_MATCH_REQUEST_MESSAGE,
+      NO_SUCH_MATCH_MESSAGE,
+      MATCH_CODE_REQUIRED_MESSAGE,
+      MATCH_UNAVAILABLE_MESSAGE,
+      matchFullMessage(8),
+      ...[PROTOCOL_VERSION - 1, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, "x".repeat(500), undefined, 1.5].map(
+        protocolMismatchMessage,
+      ),
+    ];
+    for (const message of messages) expect(encodedSize(message)! - 2).toBeLessThan(100);
+  });
+  it("names both protocol versions", () => {
+    expect(protocolMismatchMessage(1)).toBe(
+      `Protocol version mismatch: client v1, server v${PROTOCOL_VERSION}. Reload the page to update.`,
+    );
+    expect(protocolMismatchMessage("1; drop")).toContain("client v?,");
+  });
+});
+describe("protocol v6 (rubbings: the theft choice)", () => {
+  const choice = { duel: "d1", type: "moon" };
+  it("is version 6 and accepts a theft choice naming a duel lobby and a rubbing type", () => {
+    expect(PROTOCOL_VERSION).toBe(6);
+    expect(RubbingMessageType.ChooseTheft).toBe("choose-theft");
+    expect(validateChooseTheftMessage(choice)).toEqual(choice);
+    for (const type of RUBBING_TYPE_NAMES) expect(validateChooseTheftMessage({ ...choice, type })).toEqual({ ...choice, type });
+  });
+  it.each([
+    ["an unknown type", { ...choice, type: "gold" }],
+    ["no duel", { type: "sun" }],
+    ["an empty duel", { ...choice, duel: "" }],
+    ["a long duel key", { ...choice, duel: "d".repeat(17) }],
+    ["an extra field", { ...choice, rubbingId: "moon-1" }],
+    ["an oversized message", { ...choice, duel: "d1", pad: "x".repeat(100) }],
+    ["a string", "moon"],
+    ["null", null],
+  ])("refuses %s", (_label, candidate) => {
+    expect(validateChooseTheftMessage(candidate)).toBeUndefined();
+  });
+  it("parses the test-only source layout, one group of types per island", () => {
+    expect(TEST_SOURCES_ENV).toBe("PIRATE_SEA_RACE_TEST_SOURCES");
+    expect(parseTestSourceLayout("sun,sun|moon,moon")).toEqual([["sun", "sun"], ["moon", "moon"]]);

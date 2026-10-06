@@ -1,0 +1,1548 @@
+diff --git a/workflow/test_automatic.py b/workflow/test_automatic.py
+index ed88858..b67f1f9 100644
+--- a/workflow/test_automatic.py
++++ b/workflow/test_automatic.py
+@@ -3,6 +3,7 @@ import json
+ import subprocess
+ import sys
+ import tempfile
++import time
+ import unittest
+ from pathlib import Path
+ from types import SimpleNamespace
+@@ -10,7 +11,7 @@ from unittest.mock import patch
+ 
+ from langgraph.checkpoint.sqlite import SqliteSaver
+ 
+-from .automatic import DEFAULTS, automatic_settings, drive, read_completion, validate_automatic, wait_handoffs, supervise
++from .automatic import DEFAULTS, automatic_settings, drive, read_completion, review_candidate, validate_automatic, wait_handoffs, supervise
+ from .pipeline import build_pipeline
+ from .sessions import git, read_json, save_json
+ from .verification import policy_digest
+@@ -145,6 +146,29 @@ class CompletionTests(unittest.TestCase):
+         self.assertTrue(advance_failed_checks(runtime, state))
+         self.assertEqual(bumped, [("worker", "adapter")])
+ 
++    def test_reviewer_transport_defaults_to_native_and_legacy_plans_still_validate(self):
++        from .automatic import reviewer_transport
++        self.assertEqual(automatic_settings()["reviewer_transport"], "native")
++        self.assertEqual(automatic_settings(reviewer_transport="print")["reviewer_transport"], "print")
++        with self.assertRaisesRegex(ValueError, "reviewer transport"):
++            automatic_settings(reviewer_transport="stdio")
++        # Plans pinned before this slice have no reviewer_transport and mean native.
++        legacy = {"run_id": "test", "source_branch": "feature/test",
++                  "automatic": {key: value for key, value in DEFAULTS.items() if key != "reviewer_transport"}}
++        validate_automatic(legacy)
++        self.assertEqual(reviewer_transport(legacy), "native")
++        self.assertEqual(reviewer_transport(self.plan), "native")
++        self.plan["automatic"]["reviewer_transport"] = "print"
++        validate_automatic(self.plan)
++        self.assertEqual(reviewer_transport(self.plan), "print")
++        for bad in ("stdio", None, 1):
++            self.plan["automatic"]["reviewer_transport"] = bad
++            with self.assertRaises(ValueError):
++                validate_automatic(self.plan)
++        self.plan["automatic"] = dict(DEFAULTS, extra=True)
++        with self.assertRaises(ValueError):
++            validate_automatic(self.plan)
++
+     def test_main_and_unbounded_authority_rejected(self):
+         self.plan["source_branch"] = "main"
+         with self.assertRaises(ValueError):
+@@ -155,7 +179,111 @@ class CompletionTests(unittest.TestCase):
+             validate_automatic(self.plan)
+ 
+ 
+-class AutomaticGraphTests(unittest.TestCase):
++class ReviewCompletionTests(unittest.TestCase):
++    """Unit-level acceptance of the reviewer's completion file and of the wait loop."""
++
++    TOKEN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.bundle = {"run_id": "test", "candidate_commit": "c" * 40, "snapshots": {"ui": {"session_id": "ui-session"}, "adapter": {"session_id": "adapter-session"}}}
++        self.digest = "b" * 64
++        plan = {"run_id": "test", "source_branch": "feature/test", "automatic": dict(DEFAULTS)}
++        self.rows = [{"sessionId": "33333333-3333-4333-8333-333333333333", "state": "idle"}]
++        sessions = SimpleNamespace(inventory=lambda: list(self.rows), locate=lambda node, rows: rows[0] if rows else None)
++        self.events = []
++        self.runtime = SimpleNamespace(directory=self.root, plan=plan, sessions=sessions, validate_bundle=lambda: (self.bundle, self.digest),
++                                       event=lambda node, status, message: self.events.append((node, status, message)))
++        save_json(self.root / "automatic-review.json", {"transport": "native", "launch_token": self.TOKEN, "bundle_sha256": self.digest,
++                                                         "candidate_commit": "c" * 40, "status": "running"})
++        save_json(self.root / "review.interactive.json", {"launch_requested_at": "1970-01-01T00:00:00+00:00"})
++
++    def completion(self, **updates):
++        item = {"version": "1.0.0", "run_id": "test", "node_id": "review", "launch_token": self.TOKEN, "bundle_sha256": self.digest,
++                "candidate_commit": "c" * 40, "verdict": "approved",
++                "findings": [{"severity": "P2", "message": "Finding", "disposition": "open", "worker": "ui", "requirement": "Read UI"}]}
++        item.update(updates)
++        return item
++
++    def test_completion_prompt_spells_out_every_enum_the_schema_enforces(self):
++        # Seen live: a reviewer given only an example invented severity "P3" and its whole file was
++        # rejected; the prompt must name every allowed value rather than rely on one example.
++        from .automatic import completion_protocol_prompt
++        prompt = completion_protocol_prompt(self.runtime, self.TOKEN, self.digest, "c" * 40)
++        for value in ("P0, P1 or P2", "no P3", "open, resolved or accepted", "ui, adapter, both or none", "approved or blocked", "no other keys"):
++            self.assertIn(value, prompt)
++        self.assertIn(self.TOKEN, prompt)
++        self.assertIn(self.digest, prompt)
++
++    def test_valid_completion_is_reduced_to_the_decision(self):
++        from .automatic import read_review_completion
++        save_json(self.root / "review.completion.json", self.completion())
++        self.assertEqual(read_review_completion(self.runtime), {"verdict": "approved", "findings": self.completion()["findings"]})
++
++    def test_stale_foreign_or_malformed_completions_fail_closed(self):
++        from .automatic import read_review_completion
++        cases = {"wrong bundle": {"bundle_sha256": "0" * 64}, "wrong token": {"launch_token": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
++                 "wrong candidate": {"candidate_commit": "d" * 40}, "wrong run": {"run_id": "other"}, "wrong node": {"node_id": "ui"},
++                 "wrong version": {"version": "2.0.0"}, "extra key": {"extra": True}, "bad verdict": {"verdict": "maybe"},
++                 "bad worker": {"findings": [{"severity": "P2", "message": "x", "disposition": "open", "worker": "reviewer", "requirement": None}]},
++                 "missing finding link": {"findings": [{"severity": "P2", "message": "x", "disposition": "open"}]},
++                 "empty requirement": {"findings": [{"severity": "P2", "message": "x", "disposition": "open", "worker": "ui", "requirement": ""}]}}
++        for name, updates in cases.items():
++            with self.subTest(name):
++                save_json(self.root / "review.completion.json", self.completion(**updates))
++                with self.assertRaises(RuntimeError):
++                    read_review_completion(self.runtime)
++        item = self.completion()
++        del item["findings"]
++        save_json(self.root / "review.completion.json", item)
++        with self.assertRaises(RuntimeError):
++            read_review_completion(self.runtime)
++        (self.root / "review.completion.json").write_text("{not json")
++        with self.assertRaises(RuntimeError):
++            read_review_completion(self.runtime)
++        (self.root / "review.completion.json").unlink()
++        (self.root / "review.completion.json").symlink_to(self.root / "automatic-review.json")
++        with self.assertRaises(RuntimeError):
++            read_review_completion(self.runtime)
++
++    def test_wait_accepts_only_an_idle_reviewer_with_a_file_and_never_relaunches(self):
++        from .automatic import wait_review
++        ticks = iter([1, 1, 1, DEFAULTS["review_timeout_seconds"] + 1])
++        with self.assertRaisesRegex(RuntimeError, "deadline exhausted; no second reviewer"):
++            wait_review(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
++        save_json(self.root / "review.completion.json", self.completion())
++        self.rows[0]["state"] = "working"
++        ticks = iter([1, 1, DEFAULTS["review_timeout_seconds"] + 1])
++        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
++            wait_review(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
++        # `blocked` means the session needs a human (a question in its pane): the wait continues
++        # until the deadline, recorded once, and never treated as a verdict or a failure.
++        self.rows[0]["state"] = "blocked"
++        ticks = iter([1, 1, 1, DEFAULTS["review_timeout_seconds"] + 1])
++        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
++            wait_review(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
++        self.assertEqual([event[1] for event in self.events], ["interactive"])
++        self.assertIn("needs attention", self.events[0][2])
++        # Answered in the pane, the reviewer finishes: the file is accepted once the session is idle.
++        states = iter(["blocked", "blocked", "idle"])
++        self.rows[0]["state"] = "blocked"
++        def settle(_seconds):
++            self.rows[0]["state"] = next(states)
++        self.assertEqual(wait_review(self.runtime, clock=lambda: 1, sleep=settle)["verdict"], "approved")
++        self.rows[0]["state"] = "done"
++        self.assertEqual(wait_review(self.runtime, clock=lambda: 1, sleep=lambda _: self.fail("Unexpected wait"))["verdict"], "approved")
++        self.rows.clear()
++        with self.assertRaisesRegex(RuntimeError, "missing; reconciliation"):
++            wait_review(self.runtime, clock=lambda: 1, sleep=lambda _: None)
++
++
++class GraphFixture(unittest.TestCase):
++    """Automatic graph over the offline pipeline fixture; subclasses pick the reviewer transport."""
++
++    transport = "native"
++
+     def setUp(self):
+         self.fixture = fixtures.PipelineTests()
+         self.fixture.setUp()
+@@ -165,13 +293,16 @@ class AutomaticGraphTests(unittest.TestCase):
+         git(f.repo, "switch", "-c", "feature/automatic-test")
+         f.policy.update(version="1.1.0", max_verification_attempts=3,
+                         failure_drill={"node_id": "adapter", "phase": "worker", "attempt": 1})
+-        f.plan.update(source_branch="feature/automatic-test", automatic=dict(DEFAULTS), policy_sha256=policy_digest(f.policy))
++        f.plan.update(source_branch="feature/automatic-test", automatic=automatic_settings(reviewer_transport=self.transport),
++                      policy_sha256=policy_digest(f.policy))
+         save_json(f.directory / "plan.json", f.plan)
+         save_json(f.directory / "policy.json", f.policy)
+         f.runtime = fixtures.OfflinePipeline(f.directory, f.sessions)
+         self.counter = f.root / "review-count"
+         self.verdict = f.root / "review-verdict"
+         self.verdict.write_text("approved")
++        self.findings = f.root / "review-findings.json"  # Optional: the findings the fake print reviewer reports.
++        f.sessions.reviewer_verdict_file = self.verdict
+         executable = f.root / "fake-reviewer"
+         executable.write_text(f'''#!/usr/bin/env python3
+ import json, sys
+@@ -179,11 +310,14 @@ from pathlib import Path
+ args = sys.argv
+ assert args[args.index('--tools') + 1] == 'Read,Glob,Grep'
+ assert '--dangerously-skip-permissions' not in args
++assert '--bg' not in args
+ counter = Path({str(self.counter)!r})
+ counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')
+ verdict = Path({str(self.verdict)!r}).read_text()
++findings_file = Path({str(self.findings)!r})
++findings = json.loads(findings_file.read_text()) if findings_file.exists() else []
+ print(json.dumps({{"session_id": args[args.index('--session-id') + 1], "is_error": False, "subtype": "success",
+-                  "structured_output": {{"verdict": verdict, "findings": []}}}}))
++                  "structured_output": {{"verdict": verdict, "findings": findings}}}}))
+ ''')
+         executable.chmod(0o700)
+         f.sessions.executable = str(executable)
+@@ -192,6 +326,22 @@ print(json.dumps({{"session_id": args[args.index('--session-id') + 1], "is_error
+             first = graph.invoke({"run_id": "run"}, f.config)
+             self.assertEqual(first["__interrupt__"][0].value["kind"], "worker_handoff")
+ 
++    def reviewer_launches(self) -> int:
++        if self.transport == "print":
++            return int(self.counter.read_text()) if self.counter.exists() else 0
++        log = self.fixture.directory / "fake-launches.log"
++        return log.read_text().split().count("review") if log.exists() else 0
++
++    def expected_starts(self) -> list:
++        return sorted(["ui", "adapter"] + (["review"] if self.transport == "native" else []))
++
++    def events(self) -> list:
++        return [json.loads(line) for line in (self.fixture.directory / "events.jsonl").read_text().splitlines()]
++
++
++class SharedGraphTests:
++    """Behaviour that must hold for both reviewer transports."""
++
+     def test_automatic_drill_review_and_feature_only_finish(self):
+         f = self.fixture
+         # Completion protocol has separate tests; FakeSessions already supplied handoffs.
+@@ -200,11 +350,15 @@ print(json.dumps({{"session_id": args[args.index('--session-id') + 1], "is_error
+         self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+         self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
+         self.assertEqual(git(f.repo, "symbolic-ref", "--short", "HEAD"), "feature/automatic-test")
+-        self.assertEqual(sorted(f.sessions.starts), ["adapter", "ui"])
+-        self.assertEqual(self.counter.read_text(), "1")
++        self.assertEqual(sorted(f.sessions.starts), self.expected_starts())
++        self.assertEqual(self.reviewer_launches(), 1)
+         self.assertEqual(read_json(f.directory / "failure-report.json")["verification_attempts"], {"ui": [1], "adapter": [1, 2]})
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["transport"], receipt["status"]), (self.transport, "succeeded"))
++        self.assertIn("accepted_at", receipt)
++        self.assertEqual(read_json(f.directory / "review.json")["reviewer"], receipt["session_id"])
+         self.assertEqual(drive(f.runtime), commit)
+-        self.assertEqual(self.counter.read_text(), "1")
++        self.assertEqual(self.reviewer_launches(), 1)
+         self.assertFalse(git(f.repo, "remote"))
+ 
+     def test_recovery_in_actual_new_controller_processes(self):
+@@ -220,7 +374,7 @@ sessions.executable = sys.argv[2]
+ runtime = OfflinePipeline(directory, sessions)
+ automatic.wait_handoffs = lambda runtime: None
+ commit = automatic.drive(runtime, single_step=True)
+-assert not sessions.starts, 'Restart launched workers again'
++assert not [node for node in sessions.starts if node != 'review'], 'Restart launched workers again'
+ sys.exit(0 if commit else 75)
+ '''
+         codes = []
+@@ -232,11 +386,10 @@ sys.exit(0 if commit else 75)
+             if result.returncode == 0:
+                 break
+         self.assertEqual(codes, [75, 75, 0])
+-        events = [json.loads(line) for line in (f.directory / "events.jsonl").read_text().splitlines()]
+-        self.assertEqual(len({event["message"] for event in events if event["node"] == "controller"}), 3)
++        self.assertEqual(len({event["message"] for event in self.events() if event["node"] == "controller"}), 3)
+         self.assertEqual(read_json(f.directory / "failure-report.json")["verification_attempts"], {"ui": [1], "adapter": [1, 2]})
+         self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
+-        self.assertEqual(self.counter.read_text(), "1")
++        self.assertEqual(self.reviewer_launches(), 1)
+ 
+     def test_interrupt_during_worker_wait_keeps_workers_and_resumes(self):
+         f = self.fixture
+@@ -244,14 +397,13 @@ sys.exit(0 if commit else 75)
+             with self.assertRaises(KeyboardInterrupt):
+                 drive(f.runtime)
+         stop.assert_not_called()
+-        events = [json.loads(line) for line in (f.directory / "events.jsonl").read_text().splitlines()]
+-        self.assertTrue(any(event["status"] == "interrupted" and "resume with" in event["message"] for event in events))
++        self.assertTrue(any(event["status"] == "interrupted" and "resume with" in event["message"] for event in self.events()))
+         self.assertFalse((f.directory / "ui.stop.json").exists())
+         # The same run resumes from the persisted checkpoint without relaunching anything.
+         with patch("workflow.automatic.wait_handoffs"):
+             commit = drive(f.runtime)
+         self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+-        self.assertEqual(sorted(f.sessions.starts), ["adapter", "ui"])
++        self.assertEqual(sorted(f.sessions.starts), self.expected_starts())
+ 
+     def test_deadline_or_blocked_worker_stops_workers(self):
+         f = self.fixture
+@@ -260,6 +412,7 @@ sys.exit(0 if commit else 75)
+             with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+                 drive(f.runtime)
+         stop.assert_called_once()
++        self.assertEqual(self.reviewer_launches(), 0)
+ 
+     def test_reviewer_block_preserves_branch_and_does_not_relaunch(self):
+         f = self.fixture
+@@ -267,10 +420,386 @@ sys.exit(0 if commit else 75)
+         with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+             drive(f.runtime)
+         self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+-        self.assertEqual(read_json(f.directory / "automatic-review.json")["status"], "blocked")
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual(receipt["status"], "blocked")
++        self.assertIn("blocked the candidate", receipt["error"])
++        review = read_json(f.directory / "review.json")
++        self.assertEqual((review["verdict"], review["reviewer"]), ("blocked", receipt["session_id"]))
+         with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+             drive(f.runtime)
+-        self.assertEqual(self.counter.read_text(), "1")
++        self.assertEqual(self.reviewer_launches(), 1)
++
++
++class AutomaticGraphTests(SharedGraphTests, GraphFixture):
++    transport = "native"
++
++
++class PrintReviewerGraphTests(SharedGraphTests, GraphFixture):
++    transport = "print"
++
++    def test_print_mode_never_starts_a_native_reviewer(self):
++        f = self.fixture
++        with patch("workflow.automatic.wait_handoffs"):
++            drive(f.runtime)
++        self.assertFalse((f.directory / "review.interactive.json").exists())
++        self.assertFalse((f.directory / "review.completion.json").exists())
++        self.assertTrue((f.directory / "review.stdout.json").exists())
++        self.assertEqual(f.sessions.starts.count("review"), 0)
++
++    def test_print_findings_carry_worker_and_requirement_into_review_and_export(self):
++        f = self.fixture
++        findings = [{"severity": "P2", "message": "Table lacks a disposition column", "disposition": "open", "worker": "ui", "requirement": "UI"},
++                    {"severity": "P1", "message": "Fixed during review", "disposition": "resolved", "worker": "adapter", "requirement": None},
++                    {"severity": "P2", "message": "Policy scoping", "disposition": "accepted", "worker": "none", "requirement": None}]
++        self.findings.write_text(json.dumps(findings))
++        with patch("workflow.automatic.wait_handoffs"):
++            commit = drive(f.runtime)
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
++        review = read_json(f.directory / "review.json")
++        self.assertEqual((review["verdict"], review["findings"]), ("approved", findings))
++        self.assertEqual([(item["worker"], item["requirement"]) for item in review["findings"]], [("ui", "UI"), ("adapter", None), ("none", None)])
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["transport"], receipt["status"], receipt["decision"]["findings"]), ("print", "succeeded", findings))
++        exported = read_json(f.directory / "run-state.json")
++        self.assertEqual(exported["review"]["transport"], "print")
++        self.assertEqual(exported["review"]["findings"], findings)
++        self.assertEqual(exported["inputs"]["automatic"]["reviewer_transport"], "print")
++        self.assertEqual(self.reviewer_launches(), 1)
++
++    def test_print_finding_without_worker_is_rejected_by_the_schema_without_relaunch(self):
++        f = self.fixture
++        self.findings.write_text(json.dumps([{"severity": "P2", "message": "Legacy finding shape", "disposition": "open"}]))
++        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++            drive(f.runtime)
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["transport"], receipt["status"]), ("print", "blocked"))
++        self.assertIn("'worker' is a required property", receipt["error"])
++        self.assertNotIn("decision", receipt)
++        self.assertFalse((f.directory / "review.json").exists())
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
++        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++            drive(f.runtime)
++        self.assertEqual(self.reviewer_launches(), 1)
++        self.assertEqual(f.sessions.starts.count("review"), 0)
++
++
++class NativeReviewerGraphTests(GraphFixture):
++    transport = "native"
++
++    def test_native_reviewer_session_findings_and_stop_are_recorded(self):
++        f = self.fixture
++        f.sessions.reviewer_findings = [
++            {"severity": "P2", "message": "Table lacks a disposition column", "disposition": "open", "worker": "ui", "requirement": "UI"},
++            {"severity": "P1", "message": "Fixed during review", "disposition": "resolved", "worker": "adapter", "requirement": None},
++            {"severity": "P2", "message": "Policy scoping", "disposition": "accepted", "worker": "none", "requirement": None}]
++        with patch("workflow.automatic.wait_handoffs"):
++            commit = drive(f.runtime)
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
++        receipt = read_json(f.directory / "review.interactive.json")
++        self.assertEqual((receipt["node_id"], receipt["session_id"]), ("review", fixtures.FakeSessions.REVIEWER_UUID))
++        completion = read_json(f.directory / "review.completion.json")
++        self.assertEqual(completion["launch_token"], receipt["launch_token"])
++        review = read_json(f.directory / "review.json")
++        self.assertEqual(review["reviewer"], fixtures.FakeSessions.REVIEWER_UUID)
++        self.assertEqual(review["verdict"], "approved")
++        self.assertEqual([(item["worker"], item["requirement"]) for item in review["findings"]], [("ui", "UI"), ("adapter", None), ("none", None)])
++        self.assertEqual(review["findings"], f.sessions.reviewer_findings)
++        automatic_receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((automatic_receipt["transport"], automatic_receipt["status"], automatic_receipt["session_id"], automatic_receipt["launch_token"]),
++                         ("native", "succeeded", fixtures.FakeSessions.REVIEWER_UUID, receipt["launch_token"]))
++        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
++        prompt = (f.directory / "review.prompt.txt").read_text()
++        for expected in (str(f.directory / "review.completion.json"), receipt["launch_token"], completion["bundle_sha256"],
++                         completion["candidate_commit"], '"worker"', '"requirement"', "nodes.<worker>.task", "human"):
++            self.assertIn(expected, prompt)
++        review_events = [event for event in self.events() if event["node"] == "review"]
++        self.assertTrue(any(fixtures.FakeSessions.REVIEWER_UUID in event["message"] and event["status"] == "interactive" for event in review_events))
++        self.assertEqual([event["status"] for event in review_events][-2:], ["stopped", "approved"])
++        exported = read_json(f.directory / "run-state.json")
++        self.assertEqual((exported["review"]["transport"], exported["review"]["reviewer_session_id"], exported["review"]["reviewed_at"]),
++                         ("native", fixtures.FakeSessions.REVIEWER_UUID, automatic_receipt["accepted_at"]))
++        self.assertEqual(exported["inputs"]["automatic"]["reviewer_transport"], "native")
++
++    def test_interrupted_reviewer_wait_keeps_the_reviewer_and_resumes_in_a_new_process(self):
++        f = self.fixture
++        marker = f.root / "interrupt-once"
++        marker.touch()
++        script = '''import sys
++from pathlib import Path
++from workflow import automatic
++from workflow.sessions import read_json
++from workflow.test_pipeline import OfflinePipeline, FakeSessions
++directory, marker = Path(sys.argv[1]), Path(sys.argv[2])
++sessions = FakeSessions(directory, read_json(directory / 'plan.json'))
++runtime = OfflinePipeline(directory, sessions)
++automatic.wait_handoffs = lambda runtime: None
++real_wait = automatic.wait_review
++def interrupted_once(runtime, **kwargs):
++    if marker.exists():
++        marker.unlink()
++        raise KeyboardInterrupt
++    return real_wait(runtime, **kwargs)
++automatic.wait_review = interrupted_once
++try:
++    commit = automatic.drive(runtime, single_step=True)
++except KeyboardInterrupt:
++    sys.exit(130)
++assert not [node for node in sessions.starts if node != 'review'], 'Restart launched workers again'
++sys.exit(0 if commit else 75)
++'''
++        codes = []
++        for _ in range(5):
++            result = subprocess.run([sys.executable, "-c", script, str(f.directory), str(marker)],
++                                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=90)
++            codes.append(result.returncode)
++            self.assertIn(result.returncode, (0, 75, 130), result.stderr)
++            if result.returncode == 130:
++                # The interrupted controller left the reviewer running: receipt still running, no stop, no error.
++                receipt = read_json(f.directory / "automatic-review.json")
++                self.assertEqual((receipt["transport"], receipt["status"]), ("native", "running"))
++                self.assertNotIn("error", receipt)
++                self.assertFalse((f.directory / "review.stop.json").exists())
++                self.assertFalse((f.directory / "review.json").exists())
++                self.assertTrue(any(event["node"] == "review" and event["status"] == "interrupted" and "NOT stopped" in event["message"] for event in self.events()))
++                self.assertTrue(f.runtime.sessions.locate("review", f.runtime.sessions.inventory()))
++            if result.returncode == 0:
++                break
++        self.assertEqual(codes, [75, 130, 75, 0])
++        self.assertEqual(self.reviewer_launches(), 1)
++        self.assertEqual(read_json(f.directory / "review.json")["verdict"], "approved")
++        self.assertEqual(read_json(f.directory / "automatic-review.json")["status"], "succeeded")
++        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
++        self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
++
++    def assert_rejected(self, mutate, error):
++        f = self.fixture
++        f.sessions.reviewer_mutate = mutate
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "stop_reviewer", wraps=f.runtime.stop_reviewer) as stop:
++            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++                drive(f.runtime)
++            stop.assert_called_once()
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual(receipt["status"], "blocked")
++        self.assertIn(error, receipt["error"])
++        self.assertTrue((f.directory / "review.stop.json").exists())
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
++        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++            drive(f.runtime)
++        self.assertEqual(self.reviewer_launches(), 1)
++
++    def test_completion_with_wrong_bundle_hash_fails_closed(self):
++        self.assert_rejected(lambda item: {**item, "bundle_sha256": "0" * 64}, "Stale or foreign")
++        self.assertFalse((self.fixture.directory / "review.json").exists())
++
++    def test_completion_with_wrong_launch_token_fails_closed(self):
++        self.assert_rejected(lambda item: {**item, "launch_token": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}, "Stale or foreign")
++
++    def test_completion_with_wrong_candidate_fails_closed(self):
++        self.assert_rejected(lambda item: {**item, "candidate_commit": "d" * 40}, "Stale or foreign")
++
++    def test_completion_with_unknown_or_missing_keys_fails_closed(self):
++        self.assert_rejected(lambda item: {**item, "surprise": 1}, "schema")
++
++    def test_blocked_verdict_ends_the_run_with_review_recorded(self):
++        self.assert_rejected(lambda item: {**item, "verdict": "blocked"}, "blocked the candidate")
++        self.assertEqual(read_json(self.fixture.directory / "review.json")["verdict"], "blocked")
++
++    def test_unresolved_p1_blocks_even_when_the_reviewer_says_approved(self):
++        finding = {"severity": "P1", "message": "Unresolved defect", "disposition": "open", "worker": "adapter", "requirement": None}
++        self.assert_rejected(lambda item: {**item, "findings": [finding]}, "blocked the candidate")
++        review = read_json(self.fixture.directory / "review.json")
++        self.assertEqual((review["verdict"], review["findings"]), ("blocked", [finding]))
++        self.assertEqual(read_json(self.fixture.directory / "automatic-review.json")["decision"]["verdict"], "approved")
++
++    # ---- Launch window and post-acceptance stop -----------------------------------------------------
++
++    def assert_launch_window_interrupt_resumes(self, bound):
++        """Ctrl-C after `claude --bg` returned: the reviewer exists and keeps running; resume accepts its file."""
++        f = self.fixture
++        uuid, background = fixtures.FakeSessions.REVIEWER_UUID, fixtures.FakeSessions.REVIEWER_UUID[:8]
++        real_launch = f.runtime.launch_reviewer
++        def launch_then_interrupt(prompt, launch_token, candidate_commit):
++            real_launch(prompt, launch_token, candidate_commit)  # The launch command returned: the session exists.
++            if not bound:
++                # Ctrl-C inside the settle poll: the launcher journaled its intent but never bound the row.
++                receipt = read_json(f.directory / "review.interactive.json")
++                receipt.update(session_id=None, background_id=None, status="needs_reconciliation", error="")
++                save_json(f.directory / "review.interactive.json", receipt)
++            raise KeyboardInterrupt  # Ctrl-C in the settle poll or the pane attach.
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "launch_reviewer", side_effect=launch_then_interrupt), \
++                patch.object(f.runtime, "stop_reviewer") as stop:
++            with self.assertRaises(KeyboardInterrupt):
++                drive(f.runtime)
++        stop.assert_not_called()
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["transport"], receipt["status"]), ("native", "running"))
++        self.assertNotIn("error", receipt)
++        if bound:
++            self.assertEqual((receipt["session_id"], receipt["background_id"]), (uuid, background))
++        else:
++            self.assertNotIn("session_id", receipt)
++            self.assertNotIn("background_id", receipt)
++        self.assertFalse((f.directory / "review.stop.json").exists())
++        self.assertFalse((f.directory / "review.json").exists())
++        self.assertTrue(any(event["node"] == "review" and event["status"] == "interrupted" and "NOT stopped" in event["message"]
++                            and "resume with" in event["message"] for event in self.events()))
++        self.assertEqual(self.reviewer_launches(), 1)
++        # Resume: the same session's file is accepted; nothing is launched again.
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
++            commit = drive(f.runtime)
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
++        self.assertEqual(self.reviewer_launches(), 1)
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["status"], receipt["session_id"], receipt["background_id"]), ("succeeded", uuid, background))
++        interactive = read_json(f.directory / "review.interactive.json")
++        self.assertEqual((interactive["status"], interactive["session_id"], interactive["background_id"]), ("attached_session_available", uuid, background))
++        self.assertNotIn("error", interactive)
++        self.assertEqual(read_json(f.directory / "review.json")["reviewer"], uuid)
++        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
++        reconciled = [event for event in self.events() if event["node"] == "review" and "reconcil" in event["message"]]
++        self.assertEqual(bool(reconciled), not bound)
++        if reconciled:
++            self.assertIn(uuid, reconciled[-1]["message"])
++
++    def test_interrupt_after_launch_with_a_bound_session_resumes_the_same_reviewer(self):
++        self.assert_launch_window_interrupt_resumes(bound=True)
++
++    def test_interrupt_inside_the_settle_poll_reconciles_the_reviewer_then_resumes(self):
++        self.assert_launch_window_interrupt_resumes(bound=False)
++
++    def test_interrupt_before_the_launch_was_issued_needs_reconciliation(self):
++        f = self.fixture
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=KeyboardInterrupt), \
++                patch.object(f.runtime, "stop_reviewer") as stop:
++            with self.assertRaises(KeyboardInterrupt):
++                drive(f.runtime)
++        stop.assert_not_called()
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["transport"], receipt["status"]), ("native", "needs_reconciliation"))
++        self.assertFalse((f.directory / "review.interactive.json").exists())
++        self.assertFalse(any(event["status"] == "interrupted" for event in self.events()))
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
++            with self.assertRaisesRegex(RuntimeError, "needs reconciliation; no automatic relaunch"):
++                review_candidate(f.runtime)
++        self.assertEqual(self.reviewer_launches(), 0)
++
++    def test_failed_reviewer_launch_needs_reconciliation_and_never_relaunches(self):
++        f = self.fixture
++        error = "Claude background launch exited 1; inspect launch log"
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=RuntimeError(error)), \
++                patch.object(f.runtime, "stop_reviewer") as stop:
++            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++                drive(f.runtime)
++        stop.assert_not_called()
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["transport"], receipt["status"], receipt["error"]), ("native", "needs_reconciliation", error))
++        self.assertNotIn("session_id", receipt)
++        self.assertEqual(receipt["patch_sha256"], fixtures.digest_file(f.directory / "review.diff"))
++        self.assertTrue(any(event["node"] == "review" and event["status"] == "blocked" and event["message"] == error for event in self.events()))
++        self.assertFalse((f.directory / "review.interactive.json").exists())
++        self.assertFalse((f.directory / "review.stop.json").exists())
++        self.assertFalse((f.directory / "review.json").exists())
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
++            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++                drive(f.runtime)
++            with self.assertRaisesRegex(RuntimeError, "needs reconciliation; no automatic relaunch"):
++                review_candidate(f.runtime)
++        self.assertEqual(self.reviewer_launches(), 0)
++
++    def test_unconfirmed_stop_after_acceptance_keeps_the_verdict_and_is_retried_on_resume(self):
++        f = self.fixture
++        real_stop = f.runtime.stop_reviewer
++        attempts = []
++        def stop_failing_once():
++            attempts.append(1)
++            if len(attempts) == 1:
++                raise RuntimeError("Stop failed for review; inspect native session before retrying")
++            real_stop()
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "stop_reviewer", side_effect=stop_failing_once):
++            with self.assertRaisesRegex(RuntimeError, "Reviewer stop not confirmed.*resume"):
++                drive(f.runtime)
++        self.assertEqual(len(attempts), 1)
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual((receipt["transport"], receipt["status"], receipt["session_id"]), ("native", "succeeded", fixtures.FakeSessions.REVIEWER_UUID))
++        self.assertNotIn("error", receipt)
++        self.assertFalse((f.directory / "review.stop.json").exists())
++        self.assertEqual(read_json(f.directory / "review.json")["verdict"], "approved")
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
++        last = [event for event in self.events() if event["node"] == "review"][-1]
++        self.assertEqual(last["status"], "running")
++        self.assertIn("Could not confirm reviewer stop: Stop failed for review", last["message"])
++        self.assertIn("resume retries the stop", last["message"])
++        # Resume: the accepted verdict is reused, the stop is retried and confirmed, nothing is relaunched.
++        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "stop_reviewer", side_effect=stop_failing_once), \
++                patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
++            commit = drive(f.runtime)
++        self.assertEqual(len(attempts), 2)
++        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
++        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
++        self.assertEqual(read_json(f.directory / "automatic-review.json")["status"], "succeeded")
++        self.assertEqual(self.reviewer_launches(), 1)
++        self.assertEqual([event["status"] for event in self.events() if event["node"] == "review"][-2:], ["stopped", "approved"])
++
++    # ---- Re-checks between the accepted file and the verdict --------------------------------------
++
++    def assert_refused_after_wait(self, error):
++        """The file was accepted by the wait; the re-check refuses it: blocked, stopped once, no verdict, no relaunch."""
++        self.assert_rejected(None, error)
++        self.assertFalse((self.fixture.directory / "review.json").exists())
++        self.assertNotIn("decision", read_json(self.fixture.directory / "automatic-review.json"))
++
++    def test_reviewer_identity_changed_after_the_file_is_refused(self):
++        self.fixture.sessions.reviewer_row_after_file = {"sessionId": "44444444-4444-4444-8444-444444444444"}
++        self.assert_refused_after_wait("Reviewer identity changed or is not independent")
++
++    def test_reviewer_that_is_a_worker_session_is_not_independent(self):
++        f = self.fixture
++        f.sessions.reviewer_session_id = f.plan["nodes"]["ui"]["session_id"]  # The bundle snapshots carry the workers' UUIDs.
++        self.assert_refused_after_wait("Reviewer identity changed or is not independent")
++
++    def test_reviewer_missing_after_the_file_is_refused(self):
++        from . import automatic
++        f = self.fixture
++        real_wait = automatic.wait_review
++        def wait_then_vanish(runtime, **kwargs):
++            decision = real_wait(runtime, **kwargs)
++            f.sessions.reviewer_row_after_file = "missing"  # The session exits right after the wait accepted its file.
++            return decision
++        with patch("workflow.automatic.wait_review", side_effect=wait_then_vanish):
++            self.assert_refused_after_wait("Reviewer identity changed or is not independent")
++
++    def test_reviewer_worktree_change_is_refused(self):
++        f = self.fixture
++        f.sessions.reviewer_after_file = lambda: (f.directory / "review-worktree" / "ui.txt").write_text("edited during review")
++        self.assert_refused_after_wait("Reviewer worktree changed")
++
++    def test_evidence_change_during_review_is_refused(self):
++        f = self.fixture
++        f.sessions.reviewer_after_file = lambda: (f.directory / "review.diff").write_text("rewritten during review\n")
++        self.assert_refused_after_wait("Evidence changed during review")
++
++    def test_reviewer_deadline_without_a_file_stops_the_reviewer_and_launches_no_second(self):
++        f = self.fixture
++        f.sessions.reviewer_writes_file = False
++        clock = SimpleNamespace(value=time.time())  # The deadline counts from the reviewer's real launch time.
++        def tick():
++            clock.value += DEFAULTS["review_timeout_seconds"] / 2 + 1
++            return clock.value
++        with patch("workflow.automatic.wait_handoffs"), patch("workflow.automatic.time") as fake_time, \
++                patch.object(f.runtime, "stop_reviewer", wraps=f.runtime.stop_reviewer) as stop:
++            fake_time.time.side_effect = tick
++            fake_time.sleep.return_value = None
++            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++                drive(f.runtime)
++            stop.assert_called_once()
++        receipt = read_json(f.directory / "automatic-review.json")
++        self.assertEqual(receipt["status"], "blocked")
++        self.assertIn("deadline exhausted; no second reviewer", receipt["error"])
++        self.assertFalse((f.directory / "review.json").exists())
++        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
++            drive(f.runtime)
++        self.assertEqual(self.reviewer_launches(), 1)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/workflow/test_export.py b/workflow/test_export.py
+new file mode 100644
+index 0000000..f82d347
+--- /dev/null
++++ b/workflow/test_export.py
+@@ -0,0 +1,279 @@
++"""Export version 1.2.0: review/inputs sections from a run directory, stability, and the export CLI."""
++import contextlib
++import io
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import unittest
++from datetime import datetime, timezone
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from .export_state import EXPORT_VERSION, export_state, inputs_section, review_section
++from .pipeline import ExportRuntime, digest_file, export_run
++from .sessions import read_json, save_json
++from .verification import policy_digest
++
++REPO = Path(__file__).resolve().parents[1]
++REVIEWER = "dd7bdcd1-adec-4efe-bcd4-bbadc3525d95"
++
++
++def legacy_run(root: Path, *, with_policy: bool = True, automatic: bool = True) -> Path:
++    """A finished run directory shaped like the first live 1.0.0 run, whose worktrees no longer exist."""
++    directory = root / "legacy-001"
++    directory.mkdir()
++    policy = read_json(REPO / "features/project-workflows/policy.json")
++    plan = {"run_id": "legacy-001", "repository": str(root / "gone-repo"), "base_commit": "c" * 40, "allow_edits": True,
++            "nodes": {node: {"worktree": str(directory / f"worktree-{node}"), "task": f"# {node} task\n\nDo the {node} work.\n\nApproved ownership and checks:\n{{}}",
++                             "session_id": f"{node[0] * 8}-0000-4000-8000-000000000000", "observed_start_commit": "c" * 40} for node in ("ui", "adapter")},
++            "mode": "interactive", "policy_sha256": policy_digest(policy), "created_at": "2026-09-21T14:33:23.528543Z",
++            "source_branch": "feature/project-workflows/legacy-001"}
++    if automatic:
++        # Pinned before reviewer_transport existed: four keys only.
++        plan["automatic"] = {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions",
++                             "worker_timeout_seconds": 3600, "review_timeout_seconds": 1800}
++    save_json(directory / "plan.json", plan)
++    if with_policy:
++        save_json(directory / "policy.json", policy)
++    for node in ("ui", "adapter"):
++        save_json(directory / f"{node}.interactive.json", {
++            "node_id": node, "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111", "launch_token": plan["nodes"][node]["session_id"],
++            "plan_digest": "x" * 64, "worktree": plan["nodes"][node]["worktree"], "base_commit": "c" * 40, "status": "attached_session_available",
++            "attempt": 1, "launcher_invocations": 1, "launch_requested_at": "2026-09-21T14:33:25.331982+00:00",
++            "background_id": node[0] * 8, "observed_state": "working", "native_started_at": 1790001207771})
++        save_json(directory / f"{node}.completion.json", {"version": "1.0.0", "run_id": "legacy-001", "node_id": node,
++                                                          "launch_token": plan["nodes"][node]["session_id"], "status": "completed",
++                                                          "summary": f"{node} implemented", "open_assumptions": ["assumed"]})
++        save_json(directory / f"{node}.handoff.json", {"summary": f"{node} implemented", "open_assumptions": ["assumed"]})
++        save_json(directory / f"{node}.stop.json", {"background_id": node[0] * 8, "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111", "pid": 1, "stopped": True})
++    bundle = {"run_id": "legacy-001", "base_commit": "c" * 40, "candidate_commit": "d" * 40, "policy_sha256": policy_digest(policy),
++              "snapshots": {node: {"commit": "d" * 40, "changed_files": [], "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111"} for node in ("ui", "adapter")},
++              "packets": []}
++    save_json(directory / "review-bundle.json", bundle)
++    review = {"run_id": "legacy-001", "bundle_sha256": digest_file(directory / "review-bundle.json"), "candidate_commit": "d" * 40,
++              "reviewer": REVIEWER, "independent": True, "verdict": "approved",
++              "findings": [{"severity": "P2", "message": "Stale task error overrides verified success", "disposition": "open"},
++                           {"severity": "P2", "message": "Root Playwright suite is not in the policy", "disposition": "accepted"}]}
++    save_json(directory / "review.json", review)
++    save_json(directory / "automatic-review.json", {"session_id": REVIEWER, "bundle_sha256": review["bundle_sha256"], "candidate_commit": "d" * 40,
++                                                    "status": "succeeded", "patch_sha256": "0" * 64, "pid": 1, "review": review})
++    (directory / "review.diff").write_text("diff --git a/ui.txt b/ui.txt\n--- a/ui.txt\n+++ b/ui.txt\n@@ -1 +1 @@\n-before\n+after\n")
++    events = [{"sequence": 1, "time": "2026-09-21T14:33:25.000000Z", "node": "ui", "status": "running", "message": "Launching"},
++              {"sequence": 2, "time": "2026-09-21T15:42:27.848828Z", "node": "review", "status": "approved", "message": REVIEWER},
++              {"sequence": 3, "time": "2026-09-21T15:52:04.611348Z", "node": "controller", "status": "running", "message": "PID 1"}]
++    (directory / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
++    old = {"version": "1.0.0", "run_id": "legacy-001", "base_commit": "c" * 40, "created_at": plan["created_at"],
++           "definition": {"name": "Feature implementation", "nodes": []}, "values": {"run_id": "legacy-001", "review": review},
++           "next": [], "tasks": [], "events": events, "verification_packets": [], "updated_at": "2026-09-21T15:52:04.675731Z"}
++    save_json(directory / "run-state.json", old)
++    return directory
++
++
++class ExportSectionTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++
++    def test_review_section_derives_transport_time_and_diff_from_files(self):
++        directory = legacy_run(self.root)
++        section = review_section(directory)
++        self.assertEqual((section["attempt"], section["transport"], section["reviewer_session_id"], section["independent"]), (1, "print", REVIEWER, True))
++        self.assertEqual((section["verdict"], section["candidate_commit"]), ("approved", "d" * 40))
++        self.assertEqual(section["reviewed_at"], "2026-09-21T15:42:27.848828Z")  # Last review event; the old receipt has no accepted_at.
++        self.assertEqual(section["diff"], {"path": "review.diff", "sha256": digest_file(directory / "review.diff"), "bytes": (directory / "review.diff").stat().st_size})
++        self.assertEqual([(finding["worker"], finding["requirement"]) for finding in section["findings"]], [(None, None), (None, None)])
++        self.assertEqual(section["findings"][0]["message"], "Stale task error overrides verified success")
++        # Native receipts win over print receipts; accepted_at wins over events; no diff → null.
++        save_json(directory / "review.interactive.json", {"node_id": "review"})
++        receipt = read_json(directory / "automatic-review.json")
++        receipt["accepted_at"] = "2026-09-21T16:00:00.000000Z"
++        save_json(directory / "automatic-review.json", receipt)
++        (directory / "review.diff").unlink()
++        section = review_section(directory)
++        self.assertEqual((section["transport"], section["reviewed_at"], section["diff"]), ("native", "2026-09-21T16:00:00.000000Z", None))
++        # Manual reviews: no receipts at all, time from the review file itself when no event exists.
++        (directory / "review.interactive.json").unlink()
++        (directory / "automatic-review.json").unlink()
++        (directory / "events.jsonl").unlink()
++        section = review_section(directory)
++        expected = datetime.fromtimestamp((directory / "review.json").stat().st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
++        self.assertEqual((section["transport"], section["reviewed_at"]), ("manual", expected))
++        (directory / "review.json").unlink()
++        self.assertIsNone(review_section(directory))
++
++    def test_inputs_section_pins_plan_policy_and_receipts(self):
++        directory = legacy_run(self.root)
++        plan, policy = read_json(directory / "plan.json"), read_json(directory / "policy.json")
++        (directory / "ui.prompt.txt").write_text("You are a workflow worker.\n\n# ui task")
++        section = inputs_section(directory, plan, policy)
++        self.assertEqual((section["feature"], section["policy_version"], section["base_commit"], section["source_branch"], section["mode"]),
++                         (policy["feature"], "1.1.0", "c" * 40, "feature/project-workflows/legacy-001", "automatic"))
++        # Pinned before reviewer_transport existed: the export reports the transport the run recorded (a print receipt), never a default.
++        self.assertEqual(section["automatic"], {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions",
++                                                "worker_timeout_seconds": 3600, "review_timeout_seconds": 1800, "reviewer_transport": "print"})
++        self.assertEqual(section["setup"], [{"argv": ["npm", "ci"], "command": "npm ci", "timeout_seconds": 600}])
++        self.assertEqual((section["max_verification_attempts"], section["failure_drill"]), (3, {"node_id": "adapter", "phase": "worker", "attempt": 1}))
++        self.assertEqual(list(section["workers"]), ["ui", "adapter"])
++        ui = section["workers"]["ui"]
++        self.assertEqual((ui["role"], ui["task"], ui["prompt"]), ("frontend", plan["nodes"]["ui"]["task"], "You are a workflow worker.\n\n# ui task"))
++        self.assertIsNone(section["workers"]["adapter"]["prompt"])
++        self.assertEqual(ui["owned_paths"], policy["workers"][0]["owned_paths"])
++        browser = next(check for check in ui["checks"] if check["kind"] == "browser")
++        self.assertEqual(browser["command"], "npx --no-install playwright test --config=tests/project-workflows/playwright.config.ts")
++        self.assertEqual(len(browser["scenarios"]), 6)
++        self.assertEqual(ui["launch"], {"session_id": "uuuuuuuu-1111-4111-8111-111111111111", "launch_token": plan["nodes"]["ui"]["session_id"],
++                                        "launch_requested_at": "2026-09-21T14:33:25.331982Z", "native_started_at": 1790001207771,
++                                        "observed_state": "working", "status": "attached_session_available", "launcher_invocations": 1, "background_id": "uuuuuuuu"})
++        self.assertEqual(ui["completion"], {"status": "completed", "summary": "ui implemented", "open_assumptions": ["assumed"]})
++        self.assertEqual(ui["handoff"], {"summary": "ui implemented", "open_assumptions": ["assumed"]})
++        stop = directory / "ui.stop.json"
++        self.assertEqual(ui["stop"], {"stopped": True, "confirmed_at": datetime.fromtimestamp(stop.stat().st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")})
++        # Absent or malformed receipts are null, a manual plan has no automatic block, an unconfirmed stop has no time.
++        (directory / "adapter.completion.json").write_text("{not json")
++        (directory / "adapter.handoff.json").unlink()
++        (directory / "adapter.interactive.json").unlink()
++        save_json(directory / "adapter.stop.json", {"stopped": False})
++        del plan["automatic"]
++        section = inputs_section(directory, plan, policy)
++        adapter = section["workers"]["adapter"]
++        self.assertEqual((section["mode"], section["automatic"]), ("manual", None))
++        self.assertEqual((adapter["completion"], adapter["handoff"], adapter["launch"], adapter["stop"]), (None, None, None, {"stopped": False, "confirmed_at": None}))
++        plan["automatic"] = {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions", "worker_timeout_seconds": 1,
++                             "review_timeout_seconds": 1, "reviewer_transport": "print"}
++        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "print")
++
++    def test_legacy_plan_reports_the_recorded_reviewer_transport_or_null(self):
++        directory = legacy_run(self.root)
++        plan, policy = read_json(directory / "plan.json"), read_json(directory / "policy.json")
++        self.assertNotIn("reviewer_transport", plan["automatic"])
++        # A print receipt without a native receipt: the run reviewed headlessly.
++        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "print")
++        # A native receipt wins, exactly as the review section derives it.
++        save_json(directory / "review.interactive.json", {"node_id": "review"})
++        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "native")
++        self.assertEqual(review_section(directory)["transport"], "native")
++        # No reviewer receipt at all (the run has not reviewed yet): null, never a guessed default.
++        (directory / "review.interactive.json").unlink()
++        (directory / "automatic-review.json").unlink()
++        (directory / "review.json").unlink()
++        self.assertIsNone(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"])
++        # A plan that pins the key reports the key regardless of receipts.
++        plan["automatic"]["reviewer_transport"] = "native"
++        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "native")
++        save_json(directory / "automatic-review.json", {"status": "running"})
++        plan["automatic"]["reviewer_transport"] = "print"
++        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "print")
++        # The full export of a legacy run carries the recorded transport in both sections.
++        (directory / "automatic-review.json").unlink()
++        del plan["automatic"]["reviewer_transport"]
++        save_json(directory / "plan.json", plan)
++        exported = export_run(ExportRuntime(directory))
++        self.assertIsNone(exported["review"])
++        self.assertIsNone(exported["inputs"]["automatic"]["reviewer_transport"])
++
++
++class ExportRunTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++
++    def test_legacy_run_directory_re_exports_to_current_version_and_stays_stable(self):
++        directory = legacy_run(self.root)
++        # The checkpoint of a finished run: no pending work, integrated commit recorded.
++        from langgraph.checkpoint.sqlite import SqliteSaver
++        from .pipeline import build_pipeline
++        runtime = ExportRuntime(directory)
++        self.assertFalse(Path(runtime.plan["repository"]).exists())  # Worktrees and repository are gone.
++        with SqliteSaver.from_conn_string(str(directory / "pipeline.sqlite")) as saver:
++            graph = build_pipeline(saver, runtime)
++            graph.update_state({"configurable": {"thread_id": "legacy-001"}}, {"run_id": "legacy-001", "integrated_commit": "d" * 40}, as_node="integrate")
++        before = read_json(directory / "run-state.json")
++        exported = export_run(runtime)
++        self.assertEqual(exported["version"], EXPORT_VERSION)
++        self.assertEqual(exported["version"], "1.2.0")
++        self.assertNotEqual(exported["updated_at"], before["updated_at"])
++        self.assertEqual(exported["created_at"], before["created_at"])
++        self.assertEqual(exported["values"]["integrated_commit"], "d" * 40)
++        self.assertEqual(exported["next"], [])
++        self.assertEqual((exported["review"]["transport"], exported["review"]["reviewer_session_id"], exported["review"]["verdict"]), ("print", REVIEWER, "approved"))
++        self.assertEqual(exported["inputs"]["mode"], "automatic")
++        self.assertEqual(exported["inputs"]["workers"]["ui"]["launch"]["launch_requested_at"], "2026-09-21T14:33:25.331982Z")
++        self.assertEqual(len(exported["definition"]["nodes"]), 9)
++        written = (directory / "run-state.json").read_bytes()
++        self.assertEqual(export_run(ExportRuntime(directory)), exported)
++        self.assertEqual((directory / "run-state.json").read_bytes(), written)  # Unchanged content does not bump updated_at.
++        self.assertFalse((directory / "review-worktree").exists())
++        self.assertFalse(any(path.name.endswith(".launch.log") for path in directory.iterdir()))
++
++    def test_prepared_run_without_checkpoint_exports_the_prepare_shape(self):
++        directory = legacy_run(self.root)
++        (directory / "run-state.json").unlink()
++        exported = export_run(ExportRuntime(directory))
++        self.assertEqual((exported["values"], exported["next"], exported["tasks"]), ({}, ["launch_ui", "launch_adapter"], []))
++        self.assertFalse((directory / "pipeline.sqlite").exists())
++
++    def test_run_without_policy_exports_null_inputs(self):
++        directory = legacy_run(self.root, with_policy=False)
++        exported = export_run(ExportRuntime(directory))
++        self.assertIsNone(exported["inputs"])
++        self.assertIsNotNone(exported["review"])
++
++    def test_malformed_or_contradictory_runs_are_refused(self):
++        directory = legacy_run(self.root)
++        review = read_json(directory / "review.json")
++        review["findings"][0]["worker"] = "reviewer"
++        save_json(directory / "review.json", review)
++        with self.assertRaisesRegex(ValueError, "finding"):
++            ExportRuntime(directory)
++        review["findings"][0]["worker"] = "ui"
++        review["findings"][0]["requirement"] = "Do the ui work."
++        review["verdict"] = "blocked"
++        save_json(directory / "review.json", review)
++        exported = export_run(ExportRuntime(directory))  # A blocked review exports; only approval is not required.
++        self.assertEqual(exported["review"]["verdict"], "blocked")
++        self.assertEqual(exported["review"]["findings"][0]["requirement"], "Do the ui work.")
++        review["candidate_commit"] = "e" * 40
++        save_json(directory / "review.json", review)
++        with self.assertRaisesRegex(ValueError, "exact run"):
++            ExportRuntime(directory)
++        (directory / "review-bundle.json").unlink()
++        with self.assertRaisesRegex(ValueError, "contradictory"):
++            ExportRuntime(directory)
++        (directory / "review.json").unlink()
++        policy = read_json(directory / "policy.json")
++        policy["feature"] = "edited after pinning"
++        save_json(directory / "policy.json", policy)
++        with self.assertRaisesRegex(ValueError, "policy changed"):
++            ExportRuntime(directory)
++        plan = read_json(directory / "plan.json")
++        plan["automatic"]["reviewer_transport"] = "stdio"
++        save_json(directory / "plan.json", plan)
++        with self.assertRaisesRegex(ValueError, "reviewer transport"):
++            ExportRuntime(directory)
++
++    def test_export_cli_takes_the_lock_and_launches_nothing(self):
++        directory = legacy_run(self.root)
++        result = subprocess.run([sys.executable, "-m", "workflow", "export", str(directory)], cwd=REPO, capture_output=True, text=True, timeout=60)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertIn("version 1.2.0", result.stdout)
++        self.assertIn("No agents launched", result.stdout)
++        exported = read_json(directory / "run-state.json")
++        self.assertEqual((exported["version"], exported["review"]["reviewer_session_id"]), ("1.2.0", REVIEWER))
++        self.assertTrue((directory / "controller.lock").exists())
++        self.assertFalse((directory / "review.interactive.json").exists())
++        review = read_json(directory / "review.json")
++        review["reviewer"] = "uuuuuuuu-1111-4111-8111-111111111111"  # A worker reviewing itself is not independent.
++        save_json(directory / "review.json", review)
++        result = subprocess.run([sys.executable, "-m", "workflow", "export", str(directory)], cwd=REPO, capture_output=True, text=True, timeout=60)
++        self.assertEqual(result.returncode, 1)
++        self.assertIn("Independent reviewer identity required", result.stderr)
++        self.assertEqual(read_json(directory / "run-state.json"), exported)  # A refused export leaves the previous file untouched.
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/workflow/test_feature_launch.py b/workflow/test_feature_launch.py
+index cc33332..3083017 100644
+--- a/workflow/test_feature_launch.py
++++ b/workflow/test_feature_launch.py
+@@ -1,5 +1,6 @@
+ import contextlib
+ import io
++import json
+ import tempfile
+ import unittest
+ from pathlib import Path
+@@ -47,11 +48,54 @@ class FeatureLaunchTests(unittest.TestCase):
+         with self.assertRaisesRegex(ValueError, "automatic runs only"):
+             launch_commands(REPO, "project-workflows", "auto-test", Path("/tmp/workflow-launch-tests"), worker_timeout_seconds=7200)
+ 
++    def test_reviewer_transport_is_pinned_into_prepare(self):
++        _, commands = launch_commands(REPO, "project-workflows", "auto-test", Path("/tmp/workflow-launch-tests"), automatic=True)
++        prepare = commands[2]
++        self.assertEqual(prepare[prepare.index("--reviewer-transport") + 1], "native")
++        _, commands = launch_commands(REPO, "project-workflows", "auto-test", Path("/tmp/workflow-launch-tests"), automatic=True,
++                                      reviewer_transport="print")
++        prepare = commands[2]
++        self.assertEqual(prepare[prepare.index("--reviewer-transport") + 1], "print")
++        with self.assertRaisesRegex(ValueError, "reviewer transport"):
++            launch_commands(REPO, "project-workflows", "auto-test", Path("/tmp/workflow-launch-tests"), automatic=True, reviewer_transport="stdio")
++        with self.assertRaisesRegex(ValueError, "automatic runs only"):
++            launch_commands(REPO, "project-workflows", "auto-test", Path("/tmp/workflow-launch-tests"), reviewer_transport="print")
++        with patch("workflow.launch.subprocess.run") as command, contextlib.redirect_stdout(io.StringIO()) as output:
++            main(["project-workflows", "--dry-run", "--automatic", "--reviewer-transport", "print"])
++        command.assert_not_called()
++        printed = json.loads(output.getvalue())
++        self.assertIn("print", printed["commands"][2])
++
+     def test_dry_run_does_not_execute_anything(self):
+         with patch("workflow.launch.subprocess.run") as command, contextlib.redirect_stdout(io.StringIO()):
+             main(["project-workflows", "--dry-run"])
+         command.assert_not_called()
+ 
++    def test_review_result_and_run_inputs_features_validate_and_plan(self):
++        from .sessions import read_json
++        base_scenarios = {scenario["id"] for check in read_json(REPO / "features/project-workflows/policy.json")["workers"][0]["checks"]
++                          for scenario in check["scenarios"]}
++        expected = {"review-result": base_scenarios | {"review-verdict", "review-blocked", "review-legacy", "paths-redacted"}}
++        expected["run-inputs"] = expected["review-result"] | {"run-assignment", "worker-inputs", "finding-to-task", "inputs-legacy", "inputs-paths-redacted"}
++        for feature, scenarios in expected.items():
++            with self.subTest(feature):
++                run, commands = launch_commands(REPO, feature, f"{feature}-001", Path("/tmp/workflow-launch-tests"), automatic=True)
++                self.assertEqual(run.name, f"{feature}-001")
++                self.assertEqual(commands[1], ["git", "switch", "-c", f"feature/{feature}/{feature}-001"])
++                self.assertIn(str(REPO / "features" / feature / "policy.json"), commands[2])
++                policy = read_json(REPO / "features" / feature / "policy.json")
++                self.assertEqual((policy["version"], policy["max_verification_attempts"], policy.get("failure_drill")), ("1.1.0", 3, None))
++                self.assertEqual(policy["setup"], [{"argv": ["npm", "ci"], "timeout_seconds": 600}])
++                browser = next(check for check in policy["workers"][0]["checks"] if check["kind"] == "browser")
++                self.assertEqual({scenario["id"] for scenario in browser["scenarios"]}, scenarios)
++                with patch("workflow.launch.subprocess.run") as command, contextlib.redirect_stdout(io.StringIO()) as output:
++                    main([feature, "--dry-run", "--automatic"])
++                command.assert_not_called()
++                printed = json.loads(output.getvalue())
++                self.assertTrue(printed["run_directory"].endswith(f"md-manager-workflows/{feature}/{feature}-001"))
++                self.assertFalse(printed["executes"])
++                self.assertEqual(printed["commands"][-1][3], "automatic")
++
+     def test_missing_live_consent_never_runs_commands(self):
+         with patch("workflow.launch.subprocess.run") as command, contextlib.redirect_stderr(io.StringIO()):
+             with self.assertRaises(SystemExit):
+diff --git a/workflow/test_interactive.py b/workflow/test_interactive.py
+index d813243..1e69877 100644
+--- a/workflow/test_interactive.py
++++ b/workflow/test_interactive.py
+@@ -1,6 +1,7 @@
+ import os
+ import subprocess
+ import unittest
++from pathlib import Path
+ from unittest.mock import patch
+ 
+ from langgraph.checkpoint.sqlite import SqliteSaver
+@@ -163,25 +164,31 @@ class InteractiveTests(unittest.TestCase):
+                 graph.invoke(None, config)
+                 self.assertEqual(launch.call_count, 2)
+ 
+-    def test_panels_attach_to_native_sessions_in_one_new_tab(self):
+-        from .sessions import plan_digest
+-        for node in ("ui", "adapter"):
+-            save_json(self.directory / f"{node}.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row(node)["id"], "session_id": self.row(node)["sessionId"]})
+-        calls = []
+-        def fake_herdr(*args):
++    def fake_herdr(self, calls):
++        splits = iter(["w1:p3", "w1:p4"])
++        def herdr(*args):
+             calls.append(args)
+             if args[:2] == ("pane", "current"):
+                 return {"result": {"pane": {"workspace_id": "w1", "tab_id": "w1:t1"}}}
+             if args[:2] == ("tab", "create"):
+                 return {"result": {"tab": {"tab_id": "w1:t2"}, "root_pane": {"pane_id": "w1:p2"}}}
+             if args[:2] == ("pane", "split"):
+-                return {"result": {"pane": {"pane_id": "w1:p3"}}}
++                return {"result": {"pane": {"pane_id": next(splits)}}}
+             if args[:2] == ("pane", "process-info"):
+                 return {"result": {"process_info": {"shell_pid": 1, "foreground_processes": [{"pid": 1}]}}}
+             return {}
+-        with patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter")]), patch("workflow.interactive.herdr", side_effect=fake_herdr):
++        return herdr
++
++    def test_panels_attach_to_native_sessions_in_one_new_tab(self):
++        from .sessions import plan_digest
++        for node in ("ui", "adapter"):
++            save_json(self.directory / f"{node}.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row(node)["id"], "session_id": self.row(node)["sessionId"]})
++        calls = []
++        with patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter")]), patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)):
+             mapping = attach_panels(self.sessions)
++        self.assertEqual(set(mapping), {"ui", "adapter"})
+         self.assertEqual({entry["tab_id"] for entry in mapping.values()}, {"w1:t2"})
++        self.assertEqual(len([call for call in calls if call[:2] == ("pane", "split")]), 1)
+         for call in calls:
+             if call[:2] == ("pane", "run"):
+                 self.assertIn("workflow.interactive attach-one", call[3])
+@@ -189,6 +196,226 @@ class InteractiveTests(unittest.TestCase):
+             if call[:2] in (("tab", "create"), ("pane", "split")):
+                 self.assertIn("--no-focus", call)
+ 
++    # ---- Native reviewer session -------------------------------------------------------------------
++
++    REVIEWER_UUID = "33333333-3333-4333-8333-333333333333"
++    TOKEN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
++
++    def reviewer_row(self, **updates):
++        return {"sessionId": self.REVIEWER_UUID, "id": self.REVIEWER_UUID[:8], "name": self.sessions.launch_name("review"),
++                "kind": "background", "cwd": str(self.directory / "review-worktree"), "state": "idle", "pid": os.getpid(), **updates}
++
++    def reviewer_receipt(self):
++        from .sessions import plan_digest
++        save_json(self.directory / "review.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.reviewer_row()["id"],
++                                                               "session_id": self.REVIEWER_UUID, "node_id": "review"})
++
++    def started(self, *args, **kwargs):
++        kwargs["stdout"].write(f"claude attach {self.reviewer_row()['id']}    open in this terminal\n")
++        return subprocess.CompletedProcess([], 0)
++
++    def test_reviewer_launch_is_read_only_except_its_completion_file(self):
++        (self.directory / "review-worktree").mkdir()
++        candidate = self.plan["base_commit"]
++        with patch.object(self.sessions, "inventory", side_effect=[[], [self.reviewer_row()], [self.reviewer_row()]]), \
++                patch("workflow.interactive.git", side_effect=[candidate, ""]), \
++                patch("workflow.interactive.subprocess.run", side_effect=self.started) as launch:
++            receipt = self.sessions.run_reviewer("Review this candidate.", self.TOKEN, candidate)
++            # A second call reconciles the same session and never launches again.
++            self.assertEqual(self.sessions.run_reviewer("Review this candidate.", self.TOKEN, candidate)["status"], "attached_session_available")
++        self.assertEqual(launch.call_count, 1)
++        self.assertEqual(self.sessions.launch_name("review"), f"workflow-{self.plan['run_id']}-reviewer")
++        self.assertEqual((receipt["node_id"], receipt["session_id"], receipt["launch_token"], receipt["candidate_commit"]),
++                         ("review", self.REVIEWER_UUID, self.TOKEN, candidate))
++        self.assertEqual((receipt["worktree"], receipt["base_commit"], receipt["attempt"], receipt["launcher_invocations"]),
++                         (str(self.directory / "review-worktree"), self.plan["base_commit"], 1, 1))
++        self.assertEqual(receipt["background_id"], self.reviewer_row()["id"])
++        self.assertIn("launch_requested_at", receipt)
++        command = launch.call_args.args[0]
++        self.assertEqual(command[command.index("--name") + 1], f"workflow-{self.plan['run_id']}-reviewer")
++        self.assertIn("--bg", command)
++        self.assertEqual(command[command.index("--tools") + 1], "Read,Glob,Grep,Write")
++        self.assertEqual(command[command.index("--permission-mode") + 1], "dontAsk")
++        self.assertEqual(command[command.index("--allowedTools") + 1], f"Edit(//{str(self.directory / 'review.completion.json').lstrip('/')})")
++        self.assertEqual(command[command.index("--add-dir") + 1], str(self.directory))
++        self.assertEqual(command[command.index("--mcp-config") + 1], '{"mcpServers":{}}')
++        for forbidden in ("--dangerously-skip-permissions", "--print", "bypassPermissions", "Bash", "Edit"):
++            self.assertNotIn(forbidden, command)
++        self.assertEqual(command[-1], "Review this candidate.")
++        # --tools, --allowedTools and --add-dir are variadic: the prompt must directly follow a
++        # single-value option, or the CLI swallows it and the session starts idle (seen live).
++        self.assertEqual(command[-3:-1], ["--permission-mode", "dontAsk"])
++        for option in ("--tools", "--allowedTools", "--add-dir"):
++            self.assertLess(command.index(option), command.index("--permission-mode"))
++        self.assertEqual(launch.call_args.kwargs["cwd"], self.directory / "review-worktree")
++        self.assertFalse(any(key.startswith("HERDR_") for key in launch.call_args.kwargs["env"]))
++        prompt = self.directory / "review.prompt.txt"
++        self.assertEqual(prompt.read_text(), "Review this candidate.")
++        self.assertEqual(prompt.stat().st_mode & 0o777, 0o600)
++        self.assertIn("claude attach", (self.directory / "review.launch.log").read_text())
++
++    def test_reviewer_launch_waits_for_native_pid_then_gives_up_without_relaunch(self):
++        (self.directory / "review-worktree").mkdir()
++        candidate = self.plan["base_commit"]
++        unregistered = {key: value for key, value in self.reviewer_row().items() if key != "pid"}
++        inventories = [[], [], [unregistered], [unregistered], [self.reviewer_row()]]
++        with patch.object(self.sessions, "inventory", side_effect=inventories) as inventory, \
++                patch("workflow.interactive.git", side_effect=[candidate, ""]), \
++                patch("workflow.interactive.subprocess.run", side_effect=self.started) as launch, \
++                patch("workflow.interactive.time.sleep") as sleep:
++            result = self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
++        self.assertEqual((result["status"], result["background_id"]), ("attached_session_available", self.reviewer_row()["id"]))
++        self.assertEqual((launch.call_count, inventory.call_count, sleep.call_count), (1, 5, 3))
++        # A reviewer whose PID never registers is left for reconciliation, never relaunched.
++        (self.directory / "review.interactive.json").unlink()
++        self.sessions.settle_seconds = 0
++        with patch.object(self.sessions, "inventory", side_effect=[[], [unregistered]]), \
++                patch("workflow.interactive.git", side_effect=[candidate, ""]), \
++                patch("workflow.interactive.subprocess.run", side_effect=self.started) as launch:
++            with self.assertRaisesRegex(RuntimeError, "No live native PID"):
++                self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
++        self.assertEqual(launch.call_count, 1)
++        receipt = read_json(self.directory / "review.interactive.json")
++        self.assertEqual(receipt["status"], "needs_reconciliation")
++        with patch.object(self.sessions, "inventory", return_value=[]), patch("workflow.interactive.subprocess.run") as launch:
++            with self.assertRaisesRegex(RuntimeError, "reconcile|relaunch"):
++                self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
++            launch.assert_not_called()
++
++    def test_reviewer_launch_requires_the_clean_candidate_worktree(self):
++        candidate = self.plan["base_commit"]
++        with patch("workflow.interactive.subprocess.run") as launch:
++            with self.assertRaisesRegex(RuntimeError, "worktree"):
++                self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
++            (self.directory / "review-worktree").mkdir()
++            with patch("workflow.interactive.git", side_effect=["0" * 40, ""]):
++                with self.assertRaisesRegex(RuntimeError, "candidate"):
++                    self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
++            with patch("workflow.interactive.git", side_effect=[candidate, " M file"]):
++                with self.assertRaisesRegex(RuntimeError, "candidate"):
++                    self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
++            with patch("workflow.interactive.git", side_effect=[candidate, ""]), \
++                    patch.object(self.sessions, "inventory", return_value=[self.reviewer_row()]):
++                with self.assertRaisesRegex(RuntimeError, "launch name"):
++                    self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
++            launch.assert_not_called()
++        self.assertFalse((self.directory / "review.interactive.json").exists())
++
++    def test_locate_reviewer_binds_the_review_worktree(self):
++        self.reviewer_receipt()
++        self.assertEqual(self.sessions.node_worktree("review"), self.directory / "review-worktree")
++        self.assertEqual(self.sessions.node_worktree("ui"), Path(self.plan["nodes"]["ui"]["worktree"]))
++        self.assertEqual(self.sessions.locate("review", [self.reviewer_row(), self.row()])["sessionId"], self.REVIEWER_UUID)
++        for row in [self.reviewer_row(cwd=self.plan["nodes"]["ui"]["worktree"]), self.reviewer_row(name=self.sessions.launch_name("ui")),
++                    self.reviewer_row(state="exited"), self.reviewer_row(pid=None)]:
++            with self.assertRaises(RuntimeError):
++                self.sessions.locate("review", [row])
++        self.assertIsNone(self.sessions.locate("review", [self.row()]))
++        with self.assertRaisesRegex(RuntimeError, "UUID changed"):
++            self.sessions.locate("review", [self.reviewer_row(sessionId="44444444-4444-4444-8444-444444444444")])
++
++    def test_worker_launch_records_the_exact_prompt(self):
++        def started(*args, **kwargs):
++            kwargs["stdout"].write(f"claude attach {self.row()['id']}    open in this terminal\n")
++            return subprocess.CompletedProcess([], 0)
++        with patch.object(self.sessions, "inventory", side_effect=[[], [self.row()]]), patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), \
++                patch("workflow.interactive.subprocess.run", side_effect=started) as launch:
++            self.sessions.run("ui")
++        prompt = self.directory / "ui.prompt.txt"
++        self.assertEqual(prompt.read_text(), launch.call_args.args[0][-1])
++        self.assertIn(self.plan["nodes"]["ui"]["task"], prompt.read_text())
++        self.assertEqual(prompt.stat().st_mode & 0o777, 0o600)
++
++    def test_panels_attach_reviewer_as_third_pane_when_its_receipt_exists(self):
++        from .sessions import plan_digest
++        for node in ("ui", "adapter"):
++            save_json(self.directory / f"{node}.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row(node)["id"], "session_id": self.row(node)["sessionId"]})
++        self.reviewer_receipt()
++        calls = []
++        with patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter"), self.reviewer_row()]), \
++                patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)):
++            mapping = attach_panels(self.sessions)
++        self.assertEqual(list(mapping), ["ui", "adapter", "review"])
++        self.assertEqual(mapping["review"], {"pane_id": "w1:p4", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.REVIEWER_UUID})
++        splits = [call for call in calls if call[:2] == ("pane", "split")]
++        self.assertEqual(len(splits), 2)
++        self.assertEqual((splits[1][splits[1].index("--pane") + 1], splits[1][splits[1].index("--direction") + 1]), ("w1:p3", "right"))
++        self.assertIn(("pane", "rename", "w1:p4", "Claude: reviewer"), calls)
++        runs = [call for call in calls if call[:2] == ("pane", "run") and call[2] == "w1:p4"]
++        self.assertEqual(len(runs), 1)
++        self.assertIn("attach-one", runs[0][3])
++        self.assertIn("--node review", runs[0][3])
++        self.assertEqual(read_json(self.directory / "terminals.json"), mapping)
++
++    def test_attach_reviewer_panel_extends_existing_mapping_and_refuses_duplicates(self):
++        from .interactive import attach_reviewer_panel
++        calls = []
++        with patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)), \
++                patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter"), self.reviewer_row()]):
++            with self.assertRaisesRegex(RuntimeError, "terminal"):
++                attach_reviewer_panel(self.sessions)  # No worker panes yet.
++            mapping = {"ui": {"pane_id": "w1:p2", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row()["sessionId"]},
++                       "adapter": {"pane_id": "w1:p3", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row("adapter")["sessionId"]}}
++            save_json(self.directory / "terminals.json", mapping)
++            with self.assertRaisesRegex(RuntimeError, "reviewer"):
++                attach_reviewer_panel(self.sessions)  # No reviewer receipt yet.
++            self.reviewer_receipt()
++            result = attach_reviewer_panel(self.sessions)
++            self.assertEqual(result["review"], {"pane_id": "w1:p3", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.REVIEWER_UUID})
++            self.assertEqual(result["ui"], mapping["ui"])
++            self.assertEqual(read_json(self.directory / "terminals.json"), result)
++            with self.assertRaisesRegex(RuntimeError, "already"):
++                attach_reviewer_panel(self.sessions)
++        splits = [call for call in calls if call[:2] == ("pane", "split")]
++        self.assertEqual(len(splits), 1)
++        self.assertEqual(splits[0][splits[0].index("--pane") + 1], "w1:p3")
++        self.assertIn(("pane", "rename", "w1:p3", "Claude: reviewer"), calls)
++        self.assertEqual(len([call for call in calls if call[:2] == ("pane", "run")]), 1)
++
++    def test_attach_adds_the_reviewer_pane_to_the_existing_workflow_tab(self):
++        # `attach` after the review node started: the workers' tab exists, the reviewer does not have a pane yet.
++        from .sessions import plan_digest
++        for node in ("ui", "adapter"):
++            save_json(self.directory / f"{node}.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row(node)["id"], "session_id": self.row(node)["sessionId"]})
++        existing = {"ui": {"pane_id": "w1:p5", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row()["sessionId"]},
++                    "adapter": {"pane_id": "w1:p6", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row("adapter")["sessionId"]}}
++        save_json(self.directory / "terminals.json", existing)
++        calls = []
++        with patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter"), self.reviewer_row()]), \
++                patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)):
++            with self.assertRaisesRegex(RuntimeError, "already exist"):
++                attach_panels(self.sessions)  # No reviewer yet: the existing refusal stands.
++            self.reviewer_receipt()
++            mapping = attach_panels(self.sessions)
++            with self.assertRaisesRegex(RuntimeError, "already exist"):
++                attach_panels(self.sessions)  # The reviewer pane exists now: refuse again rather than duplicate it.
++        self.assertEqual(list(mapping), ["ui", "adapter", "review"])
++        self.assertEqual((mapping["ui"], mapping["adapter"]), (existing["ui"], existing["adapter"]))
++        self.assertEqual(mapping["review"], {"pane_id": "w1:p3", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.REVIEWER_UUID})
++        self.assertEqual(read_json(self.directory / "terminals.json"), mapping)
++        self.assertFalse(any(call[:2] == ("tab", "create") for call in calls))
++        splits = [call for call in calls if call[:2] == ("pane", "split")]
++        self.assertEqual(len(splits), 1)
++        self.assertEqual((splits[0][splits[0].index("--pane") + 1], splits[0][splits[0].index("--direction") + 1]), ("w1:p6", "right"))
++        self.assertIn(("pane", "rename", "w1:p3", "Claude: reviewer"), calls)
++        runs = [call for call in calls if call[:2] == ("pane", "run")]
++        self.assertEqual(len(runs), 1)
++        self.assertEqual(runs[0][2], "w1:p3")
++        self.assertIn("workflow.interactive attach-one", runs[0][3])
++        self.assertIn("--node review", runs[0][3])
++
++    def test_attach_one_reconnects_the_reviewer_in_its_worktree(self):
++        from .interactive import main
++        self.reviewer_receipt()
++        with patch("workflow.interactive.sys.argv", ["interactive", "attach-one", str(self.directory), "--node", "review"]), \
++                patch("workflow.interactive.sys.stdin") as stdin, patch.object(InteractiveSessions, "inventory", return_value=[self.reviewer_row()]), \
++                patch("workflow.interactive.os.chdir") as chdir, patch("workflow.interactive.os.execvp", side_effect=SystemExit(0)) as execvp:
++            stdin.isatty.return_value = True
++            with self.assertRaises(SystemExit):
++                main()  # A real execvp replaces the process; the mock ends it the same way.
++        chdir.assert_called_once_with(self.directory / "review-worktree")
++        execvp.assert_called_once_with("claude", ["claude", "attach", self.reviewer_row()["id"]])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/workflow/test_pipeline.py b/workflow/test_pipeline.py
+index 51e8b1c..6fcedd3 100644
+--- a/workflow/test_pipeline.py
++++ b/workflow/test_pipeline.py
+@@ -13,31 +13,106 @@ from unittest.mock import patch
+ from langgraph.checkpoint.sqlite import SqliteSaver
+ from langgraph.types import Command
+ 
+-from .checks import execute
+-from .pipeline import Pipeline, build_pipeline, digest_file, report, validate_pipeline_policy
++from .checks import execute, now
++from .pipeline import Pipeline, build_pipeline, check_review, digest_file, report, validate_pipeline_policy
+ from .sessions import git, prepare, read_json, save_json
+ from .verification import CONTRACTS, policy_digest
+ 
+ 
+ class FakeSessions:
++    """Offline stand-in for InteractiveSessions. Receipts on disk are its only cross-process state."""
++
++    REVIEWER_UUID = "33333333-3333-4333-8333-333333333333"
++
+     def __init__(self, directory, plan):
+         self.directory, self.plan = directory, plan
+         self.starts = []
++        self.reviewer_verdict_file = None  # A file whose text is the fake reviewer's verdict (default approved).
++        self.reviewer_findings = []        # Findings the fake reviewer reports.
++        self.reviewer_mutate = None        # Callable applied to the completion payload before it is written.
++        self.reviewer_writes_file = True   # False: the reviewer idles without ever writing a completion file.
++        self.reviewer_session_id = self.REVIEWER_UUID  # The native UUID the reviewer session reports (a worker's: not independent).
++        self.reviewer_after_file = None    # Callable run right after the completion file is written (dirty the worktree, rewrite the diff).
++        self.reviewer_row_after_file = None  # Once the completion file exists: a dict merged into the located reviewer row, or "missing" for None.
+ 
+-    def run(self, node):
++    def native_id(self, node):
++        """The UUID the native registry reports for a session; receipts record it, they do not define it."""
++        return self.reviewer_session_id if node == "review" else self.plan["nodes"][node]["session_id"]
++
++    def background_id(self, node):
++        return self.REVIEWER_UUID[:8] if node == "review" else f"fake-{node}"
++
++    def record(self, node):
+         self.starts.append(node)
++        with (self.directory / "fake-launches.log").open("a") as log:
++            log.write(node + "\n")
++
++    def run(self, node):
++        self.record(node)
+         cwd = Path(self.plan["nodes"][node]["worktree"])
+         (cwd / ("ui.txt" if node == "ui" else "backend.py")).write_text("after" if node == "ui" else "VALUE = 2\n")
+-        receipt = {"session_id": self.plan["nodes"][node]["session_id"], "status": "fake-worker-completed"}
++        receipt = {"node_id": node, "session_id": self.native_id(node), "launch_token": self.plan["nodes"][node]["session_id"],
++                   "background_id": self.background_id(node), "status": "fake-worker-completed", "attempt": 1, "launcher_invocations": 1,
++                   "launch_requested_at": now(), "observed_state": "idle", "native_started_at": None}
+         save_json(self.directory / f"{node}.interactive.json", receipt)
+         save_json(self.directory / f"{node}.handoff.json", {"summary": "Synthetic implementation for offline test", "open_assumptions": []})
+         return receipt
+ 
++    def run_reviewer(self, prompt, launch_token, candidate_commit):
++        self.record("review")
++        receipt = {"node_id": "review", "session_id": self.native_id("review"), "launch_token": launch_token, "background_id": self.background_id("review"),
++                   "worktree": str(self.directory / "review-worktree"), "candidate_commit": candidate_commit,
++                   "status": "attached_session_available", "attempt": 1, "launcher_invocations": 1,
++                   "launch_requested_at": now(), "observed_state": "idle", "native_started_at": None}
++        save_json(self.directory / "review.interactive.json", receipt)
++        (self.directory / "review.prompt.txt").write_text(prompt)
++        if self.reviewer_writes_file:
++            verdict = Path(self.reviewer_verdict_file).read_text().strip() if self.reviewer_verdict_file else "approved"
++            completion = {"version": "1.0.0", "run_id": self.plan["run_id"], "node_id": "review", "launch_token": launch_token,
++                          "bundle_sha256": digest_file(self.directory / "review-bundle.json"), "candidate_commit": candidate_commit,
++                          "verdict": verdict, "findings": copy.deepcopy(self.reviewer_findings)}
++            if self.reviewer_mutate:
++                completion = self.reviewer_mutate(completion)
++            save_json(self.directory / "review.completion.json", completion)
++            if self.reviewer_after_file:
++                self.reviewer_after_file()
++        return receipt
++
++    def reconcile(self, node, path, receipt):
++        """Mirror of InteractiveSessions.reconcile: bind the one surviving session; never launch."""
++        row = self.locate(node, self.inventory())
++        if row is None:
++            raise RuntimeError("Existing launch cannot be reconciled; no automatic relaunch")
++        receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"])
++        receipt.pop("error", None)
++        save_json(path, receipt)
++        return receipt
++
++    def inventory(self):
++        """The native registry: one row per session this fake launched, whatever its receipt recorded so far."""
++        return [{"id": self.background_id(node), "sessionId": self.native_id(node), "state": "idle", "pid": os.getpid(), "kind": "background"}
++                for node in ("ui", "adapter", "review") if (self.directory / f"{node}.interactive.json").exists()]
++
++    def locate(self, node, rows):
++        if not (self.directory / f"{node}.interactive.json").exists():
++            return None
++        row = next((row for row in rows if row["id"] == self.background_id(node)), None)
++        if node == "review" and row is not None and self.reviewer_row_after_file is not None and (self.directory / "review.completion.json").exists():
++            return None if self.reviewer_row_after_file == "missing" else {**row, **self.reviewer_row_after_file}
++        return row
++
+ 
+ class OfflinePipeline(Pipeline):
+     def stop_workers(self):
+         self.event("freeze", "stopped", "Fake workers have no background processes")
+ 
++    def stop_reviewer(self):
++        # Fake sessions have no process to stop; record the intent the real path would persist.
++        receipt = read_json(self.directory / "review.interactive.json")
++        save_json(self.directory / "review.stop.json", {"background_id": receipt["background_id"], "session_id": receipt["session_id"],
++                                                        "pid": None, "stopped": True, "synthetic": True})
++        self.event("review", "stopped", "Fake reviewer has no background process")
++
+ 
+ class PipelineTests(unittest.TestCase):
+     def setUp(self):
+@@ -144,7 +219,12 @@ test('[scenario:ready] shows the worker change', async ({{page}}, testInfo) => {
+ '''
+             code, _, _ = execute(["node", "-e", script], self.directory, self.directory / "report-browser.log", 30, dict(os.environ))
+             self.assertEqual(code, 0, (self.directory / "report-browser.log").read_text())
+-            self.assertEqual(sorted(self.sessions.starts), ["adapter", "ui"])
++            self.assertEqual(sorted(self.sessions.starts), ["adapter", "ui"])  # Manual review: no reviewer session.
++            exported = read_json(self.directory / "run-state.json")
++            self.assertEqual(exported["version"], "1.2.0")
++            self.assertEqual((exported["review"]["transport"], exported["review"]["reviewer_session_id"]), ("manual", "synthetic-test-reviewer"))
++            self.assertEqual(exported["inputs"]["mode"], "manual")
++            self.assertEqual(exported["inputs"]["workers"]["ui"]["launch"]["session_id"], self.plan["nodes"]["ui"]["session_id"])
+             screenshots = list((self.directory / "verification").glob("**/screenshot-*"))
+             self.assertGreaterEqual(len(screenshots), 2)  # Worker + combined candidate.
+             self.assertTrue(all(path.read_bytes().startswith(b"\x89PNG") for path in screenshots))
+@@ -230,9 +310,37 @@ test('[scenario:ready] shows the worker change', async ({{page}}, testInfo) => {
+             with self.assertRaisesRegex(ValueError, "ui/frontend"):
+                 validate_pipeline_policy(policy)
+ 
++    def test_check_review_accepts_finding_links_and_blocked_verdicts_only_when_asked(self):
++        bundle = {"run_id": "run", "candidate_commit": "c" * 40, "snapshots": {"ui": {"session_id": "ui-session"}, "adapter": {"session_id": "adapter-session"}}}
++        digest = "b" * 64
++        base = {"run_id": "run", "bundle_sha256": digest, "candidate_commit": "c" * 40, "reviewer": "reviewer-session", "independent": True}
++        plain = {"severity": "P2", "message": "Legacy finding", "disposition": "open"}
++        linked = {"severity": "P2", "message": "Linked finding", "disposition": "accepted", "worker": "ui", "requirement": "Show every finding"}
++        unlinked = {"severity": "P1", "message": "Cross-cutting", "disposition": "resolved", "worker": "none", "requirement": None}
++        check_review({**base, "verdict": "approved", "findings": [plain, linked, unlinked]}, bundle, digest)
++        for bad in ({**linked, "worker": "reviewer"}, {**linked, "requirement": ""}, {**linked, "requirement": 3}, {**linked, "extra": True},
++                    {**linked, "worker": None}, {**plain, "severity": "P3"}, {**plain, "message": " "}):
++            with self.assertRaisesRegex(ValueError, "finding"):
++                check_review({**base, "verdict": "approved", "findings": [bad]}, bundle, digest)
++        open_p1 = {**unlinked, "disposition": "open"}
++        with self.assertRaisesRegex(ValueError, "Unresolved blocking"):
++            check_review({**base, "verdict": "approved", "findings": [open_p1]}, bundle, digest)
++        with self.assertRaisesRegex(ValueError, "not approved"):
++            check_review({**base, "verdict": "blocked", "findings": [open_p1]}, bundle, digest)
++        check_review({**base, "verdict": "blocked", "findings": [open_p1]}, bundle, digest, require_approved=False)
++        # Export-time validation still enforces identity, shape and the approved/blocking rule.
++        with self.assertRaisesRegex(ValueError, "Unresolved blocking"):
++            check_review({**base, "verdict": "approved", "findings": [open_p1]}, bundle, digest, require_approved=False)
++        with self.assertRaisesRegex(ValueError, "Independent"):
++            check_review({**base, "reviewer": "ui-session", "verdict": "blocked", "findings": []}, bundle, digest, require_approved=False)
++        with self.assertRaisesRegex(ValueError, "verdict"):
++            check_review({**base, "verdict": "maybe", "findings": []}, bundle, digest, require_approved=False)
++        with self.assertRaisesRegex(ValueError, "exact run"):
++            check_review({**base, "candidate_commit": "d" * 40, "verdict": "blocked", "findings": []}, bundle, digest, require_approved=False)
++
+     def native_rows(self):
+         return {node: {"id": f"id-{node}", "sessionId": f"session-{node}", "pid": 90000 + index}
+-                for index, node in enumerate(("ui", "adapter"))}
++                for index, node in enumerate(("ui", "adapter", "review"))}
+ 
+     def set_native(self, live):
+         self.runtime.sessions = SimpleNamespace(executable="claude", inventory=lambda: list(live.values()),
+@@ -260,6 +368,72 @@ test('[scenario:ready] shows the worker change', async ({{page}}, testInfo) => {
+             Pipeline.stop_workers(self.runtime)
+             command.assert_not_called()
+ 
++    def test_native_reviewer_stop_rechecks_identity_and_records_intent(self):
++        live = self.native_rows()
++        self.set_native(live)
++        def stop(argv, **_kwargs):
++            live.pop(argv[-1].removeprefix("id-"))
++            return subprocess.CompletedProcess(argv, 0)
++        with patch("workflow.pipeline.subprocess.run", side_effect=stop) as command, patch("workflow.pipeline.pid_alive", return_value=False):
++            Pipeline.stop_reviewer(self.runtime)
++            self.assertEqual(command.call_args.args[0], ["claude", "stop", "id-review"])
++            Pipeline.stop_reviewer(self.runtime)  # Completed intent: no second stop command.
++            self.assertEqual(command.call_count, 1)
++        intent = read_json(self.directory / "review.stop.json")
++        self.assertEqual((intent["session_id"], intent["stopped"]), ("session-review", True))
++        self.assertTrue(all(row["sessionId"] != "session-review" for row in live.values()))
++        self.assertFalse((self.directory / "ui.stop.json").exists())
++        events = [json.loads(line) for line in (self.directory / "events.jsonl").read_text().splitlines()]
++        self.assertEqual([event["status"] for event in events if event["node"] == "review"], ["stopped", "stopped"])
++        # A reviewer whose identity changed after the stop intent is never signalled.
++        (self.directory / "review.stop.json").unlink()
++        live["review"] = self.native_rows()["review"]
++        save_json(self.directory / "review.stop.json", {"background_id": "id-review", "session_id": "session-review", "pid": 1, "stopped": False})
++        with patch("workflow.pipeline.subprocess.run") as command:
++            with self.assertRaisesRegex(RuntimeError, "identity changed"):
++                Pipeline.stop_reviewer(self.runtime)
++            command.assert_not_called()
++
++    def test_launch_reviewer_pane_is_best_effort_and_launch_failure_is_recorded(self):
++        receipt = {"session_id": "33333333-3333-4333-8333-333333333333", "background_id": "33333333", "status": "attached_session_available"}
++        launches = []
++        def run_reviewer(prompt, launch_token, candidate_commit):
++            launches.append((prompt, launch_token, candidate_commit))
++            return dict(receipt)
++        self.runtime.sessions = SimpleNamespace(run_reviewer=run_reviewer)
++        def review_events():
++            return [(event["status"], event["message"]) for event in
++                    (json.loads(line) for line in (self.directory / "events.jsonl").read_text().splitlines()) if event["node"] == "review"]
++        # No terminals.json: nothing to attach to, no attach attempted.
++        with patch.dict(os.environ, {"HERDR_ENV": "1"}), patch("workflow.pipeline.attach_reviewer_panel") as attach:
++            self.assertEqual(self.runtime.launch_reviewer("prompt", "token", "c" * 40), receipt)
++        attach.assert_not_called()
++        self.assertEqual([status for status, _ in review_events()], ["running", "interactive"])
++        self.assertIn("33333333-3333-4333-8333-333333333333", review_events()[-1][1])
++        # The tab exists but the pane cannot be attached: the launch still succeeds, the reason is on the timeline.
++        save_json(self.directory / "terminals.json", {"ui": {"pane_id": "w1:p2"}, "adapter": {"pane_id": "w1:p3"}})
++        with patch.dict(os.environ, {"HERDR_ENV": "1"}), patch("workflow.pipeline.attach_reviewer_panel", side_effect=RuntimeError("Pane w1:p3 is occupied")) as attach:
++            self.assertEqual(self.runtime.launch_reviewer("prompt", "token", "c" * 40), receipt)
++        attach.assert_called_once_with(self.runtime.sessions)
++        self.assertIn(("running", "Reviewer pane not attached: Pane w1:p3 is occupied"), review_events())
++        # Ctrl-C during the attach: the session was launched; the interruption is recorded and propagated as such.
++        with patch.dict(os.environ, {"HERDR_ENV": "1"}), patch("workflow.pipeline.attach_reviewer_panel", side_effect=KeyboardInterrupt):
++            with self.assertRaises(KeyboardInterrupt):
++                self.runtime.launch_reviewer("prompt", "token", "c" * 40)
++        self.assertIn(("running", "Reviewer pane not attached: KeyboardInterrupt"), review_events())
++        # Outside a managed Herdr pane no attach is attempted even with the tab mapping present.
++        with patch.dict(os.environ, {"HERDR_ENV": "0"}), patch("workflow.pipeline.attach_reviewer_panel") as attach:
++            self.runtime.launch_reviewer("prompt", "token", "c" * 40)
++        attach.assert_not_called()
++        self.assertEqual(len(launches), 4)
++        # A launch that fails is a blocked review event; the pane is never touched.
++        self.runtime.sessions = SimpleNamespace(run_reviewer=lambda *args: (_ for _ in ()).throw(RuntimeError("Claude background launch exited 1; inspect launch log")))
++        with patch.dict(os.environ, {"HERDR_ENV": "1"}), patch("workflow.pipeline.attach_reviewer_panel") as attach:
++            with self.assertRaisesRegex(RuntimeError, "exited 1"):
++                self.runtime.launch_reviewer("prompt", "token", "c" * 40)
++        attach.assert_not_called()
++        self.assertEqual(review_events()[-1], ("blocked", "Claude background launch exited 1; inspect launch log"))
++
+     def test_failed_stop_and_lingering_pid_block_freeze(self):
+         live = self.native_rows()
+         self.set_native(live)

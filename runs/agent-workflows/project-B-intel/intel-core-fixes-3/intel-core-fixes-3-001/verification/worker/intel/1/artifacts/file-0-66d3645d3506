@@ -1,0 +1,114 @@
+# Match information (intel)
+
+The pure rules behind §2's timed reveals, §3's rumors and journal, §5's final-island announcement and §11's comeback leads. `@pirate-sea-race/simulation/intel` has the config, the state, `stepIntel`, `targetedRumorAvailability`, `replayIntel` and the three lead phases (`gatherLeads`, `decideLeads`, `answerRequests`). `@pirate-sea-race/content/intel` has the constants and the zod validator `validateIntelRules`. The module doesn't import the ledger. It is integer data with no clocks and no `Math.random`, and time is the world tick (20 per second). `objectives-endgame` wires it into `MatchRoom`; nothing calls it yet.
+
+## Constants (`intelRules`)
+
+| Rule | Value |
+| --- | --- |
+| Sector grid | 3 × 3, named row by row from "North-West Reach" to "South-East Reach" |
+| Sighting delay | 600 ticks (30 s), equal to the carrier interval |
+| Carrier interval | 600 ticks (30 s) |
+| Sector reveal | 24,000 ticks (minute 20) after control start |
+| Carrier reveal | 33,600 ticks (minute 28) after control start |
+| Targeted rumor price | 25 gold (the caller charges it) |
+
+The validator refuses a zero interval, reveals out of order, a carrier reveal that isn't a multiple of the interval, a delay that differs from the interval, and names that are missing or repeated. Because the carrier reveal is a multiple of the interval, every broadcast falls on a snapshot boundary, so pending and new sightings can't split across messages.
+
+## Sectors
+
+`sectorOfTile` cuts the map's columns and rows into three bands each by integer division (`floor(tile × 3 / width)`). Every tile is in exactly one sector, and bands differ by at most one tile. On the 224 × 208 slice sea, the columns start at tiles 0, 75 and 150 and the rows at 0, 70 and 139. `sectorOf(position)` is the sector of the position's tile. A position off the map counts in the nearest edge sector. The config computes all of this from the map size, so the same code serves the slice and the 12-island alpha.
+
+## Leads
+
+A rumor names a missing type and a target: an **island**, where a source of that type is still sealed, or a **sector**, where a recovery cache holds one. It never names a rubbing, a player or a position. It picks among the eligible targets, sorted, with the seeded generator (`random.ts`) keyed by (seed, tick, player, type), so the same seed gives the same rumor and no other decision changes it. It tries three tiers in order:
+
+1. the islands with a sealed source of the type;
+2. the sectors with a cached copy;
+3. a **carrier sighting**, and only when every copy of the type is carried by someone else.
+
+Targets already active in the player's journal are skipped, so a player is never given the same lead twice.
+
+Leads are made on four occasions:
+
+- a **start** rumor for each player at control start, or when a player is first seen after it. It only ever names a source or a cache, of any type the player lacks. When every copy of every missing type is carried (a late joiner, say), there is no starting rumor, only a `no-lead`: a start never becomes a carrier sighting;
+- a free **fresh** rumor for each type a player lost (§11);
+- a **targeted** rumor, bought on request;
+- a **replacement**, when a journal rumor goes stale.
+
+Losses and completions come from diffing each player's held types between ticks. A rubbing reserved in a duel still counts as held, so entering a duel is never a loss; only a settled theft is.
+
+**Journal rumors** (island or sector) are the only leads tracked:
+
+- A rumor goes **stale** when its target no longer holds its type: the source was collected or the cache claimed by someone else. The player gets `rumor-stale` with the tick and then a replacement.
+- A rumor whose type the holder obtains, by any means, is **resolved** quietly. It gets no replacement.
+
+**Carrier sightings** are one-shot messages, never tracked, so they can never go stale and can't be used to follow a carrier. At every carrier boundary (control start plus a multiple of 30 s, counted when crossed), the state takes one snapshot of the carried copies: the sector, the type and the internal holder of each. It keeps the latest two. A sighting reads the **older** of the two, so it is 30–60 s old and never the current position. It also skips the requester's own former entries.
+
+Only three triggers ask for a sighting: a loss (`fresh`), a journal replacement and a targeted request. The sighting's reason type (`CarrierSightingReason`) has only these three, so a start can't produce one. A `carrier-sighting` message may list several types: one entry per type (the type, the trigger's reason and a sector), all from the same older snapshot. Before minute 28, a player gets at most **one sighting message per snapshot**, and at any time at most **one per step**.
+
+**Three phases per step.** Every step builds its lead decisions the same way, whatever order the triggers, the requests or the view's arrays come in:
+
+1. **Gather.** Every trigger joins a set keyed by **(player, type)**: a type lost, a stale rumor's replacement, a pending type at a boundary (the pending set is decided again there), a targeted request. An entry keeps one free trigger (the earliest, then `fresh` before `replacement`) and its request ids, sorted.
+2. **Decide.** Per player by id: a starting rumor first (a source or a cache, never a sighting), then each entry in type order. An entry gets a journal rumor, a `no-lead` (free triggers only), or its type joins the player's one sighting decision. Uncapped (no sighting yet in this snapshot, or minute 28 on), one message lists every such type the older snapshot shows another player carrying; capped, nothing is sent and the free types join the one pending set (a paid type is never queued). A free type the snapshot can't answer yet also waits. Each draw uses a generator keyed by (seed, tick, player, type), and a sighting's sector by (seed, snapshot tick, player, type) among the sorted candidate sectors, so no decision depends on another.
+3. **Answer.** Each (player, type)'s requests, by request id (`answerRequests`):
+   - `covered` (not charged) when a free trigger or the start already gave the player that type in this step, as a rumor or in the sighting message;
+   - otherwise `rumor` or `sighting` for the first request, and `covered` for the rest;
+   - when nothing is delivered for that (player, type), every request gets the same `capped` or `none`.
+
+A type goes out with its free trigger's reason if it has one, otherwise `targeted`. So a player who loses two types on one tick, or at a boundary with a type already pending, or loses one while buying another, learns about all of them in one message, and a purchase is never charged for what the step gives for free. Skipped ticks change nothing: two losses seen in one batched view make one message. Two players' requests never affect each other.
+
+**Targeted requests** are `{ requestId, playerId, type }`, and each gets exactly one outcome, whatever the order of the batch:
+
+- `rumor` or `sighting`: something was delivered. Charge the 25 gold only for these two.
+- `covered`: this step already gives the player that type, for free or to a request of the same type lower by id. Not charged.
+- `capped`: the player already got a sighting in this snapshot (before this step).
+- `none`: nothing to sell. The player holds the type, or the player is unknown, or it is before control start, or no untracked target exists.
+- `duplicate`: the request id was seen before, or is listed twice in one batch (only its lowest (player, type) is taken). The step answers it without changing the state or drawing from the generator.
+
+`targetedRumorAvailability(config, state, view, playerId, type)` gives the same answer without drawing, so the UI can show whether buying would yield anything. A later step can differ only if it crosses a snapshot boundary first, or answer `covered` when a free trigger of that player and type in the same step gives the type anyway.
+
+## Reveals (§2, §5)
+
+All reveals fire when their tick is crossed since the last processed tick, so a skipped tick never loses one. Nothing is sent before control start.
+
+- **First full set:** the first player to hold every type of the preset triggers `final-sector` (the final island's sector) to everyone. Each holder of a full set gets `final-route` with the exact point: the first completer, later completers, and anyone who restores a broken set (with `restored: true`). A player who loses a type gets `final-route-inactive`.
+- **Minute 20:** `sector-reveal` to everyone, listing the sectors with sealed sources and the sectors with caches.
+- **Minute 28, then every 30 s:** `carrier-report` to everyone, listing the (sector, type) pairs of the newest snapshot. Skipping several beats sends one report.
+- **Minute 35** belongs to the claim code.
+
+## Messages and hidden information (§16)
+
+`stepIntel(config, state, view, requests) → { state, messages, outcomes }` never writes into its input. Each message is `{ to, body }`, where `to` is `{ kind: "player", playerId }`, `{ kind: "players", playerIds }` or `{ kind: "everyone" }`. Broadcasts are `final-sector`, `sector-reveal` and `carrier-report`; every other kind goes to one player.
+
+Bodies carry sectors, island indexes and names, types, ticks and journal entry numbers. They never carry a player id, a rubbing id, or a source's, cache's or ship's position. The one exact position ever sent is the final island's, in a `final-route` to a full-set holder. The property tests check every message of every run against these rules:
+
+- six seeded runs with compressed reveal times;
+- one slice run with the real constants for 36,660 ticks;
+- one alpha run with the real constants that skips ticks.
+
+The same runs also check, after every step, that each player got at most one sighting message in it, that every free trigger needing a sighting (a loss, or a stale rumor's replacement) is either in that step's message or in the pending set, and that it waits only if the player's sighting was already spent in this snapshot or the older snapshot shows no other carrier of it. They also check that each player has at most one pending sighting message and that every deferred type goes out at the first boundary after it was capped (or is dropped only when the checker finds it ineligible, or kept only when the previous snapshot shows no other carrier of it). Every rumor is checked against the preference: a cache lead only when no sealed source of the type is left outside the player's journal, a carrier sighting only when no source or cache of the type exists. Every sighting's reason is checked to be `fresh`, `targeted` or `replacement`. Per step and (player, type), at most one request is charged, only for a lead of that type sent with the reason `targeted`, and a `covered` request always has a lead of its type in that step. A black-box check replays the compressed runs, with extra purchases added, against the same script with each step's requests and view arrays shuffled, and compares the messages, the outcomes sorted by request id and `hashState`. Their `EXERCISED` check asserts that every message kind, outcome and lead path occurred, including a deferred delivery, a free trigger sighted in its own step and a message with several types.
+
+## Building the world view from the ledger
+
+On each processed tick, the caller passes `{ tick, players, rubbings }`:
+
+- **`players`:** each player still in the match (`status` not `left`), with the ship's position in sub-units.
+- **`rubbings`:** each ledger rubbing with its `type` and its `location` resolved to a place:
+  - `source` becomes `{ kind: "source", island, x, y }` from its `LedgerSource`;
+  - `cache` becomes `{ kind: "cache", x, y }` from its `LedgerCache`;
+  - `player` becomes `{ kind: "carried", playerId }`;
+  - `duel` becomes `{ kind: "duel", playerId }`.
+
+Held types and claimed-out islands (islands with no sealed source left) follow from the rubbings, so they can't disagree with them. The ledger's sticky `freshRumors` flag isn't read. The config comes from `createIntelConfig({ preset, finalIsland, controlStartTick, map })`. The state comes from `createIntelState(config, seed)`, which starts before control start.
+
+## Decisions taken here
+
+- Held types and claimed-out islands are derived from the view's rubbings rather than passed separately.
+- A pending sighting is one message per player holding a set of types, so two types that need a sighting at once are delivered together at the next boundary, not one interval apart, and the cap stays one sighting message per 30 s before minute 28.
+- Every trigger of a step joins the step's set of (player, type) entries, with one sighting decision per player, so "learns about both at once" holds on every path: several losses, a loss with a replacement or a purchase, a batched view, and the boundary tick.
+- A start points only at sources and caches. Sightings come only from a loss, a targeted rumor or a journal replacement.
+- A free trigger that finds every copy carried but no snapshot entry to read yet waits like a capped one.
+- A targeted request whose type a free trigger (or the start) of the same step gives the player is `covered` and not charged; the type goes out with the free reason. Of two requests for one (player, type) in one step, the first by id is charged and the other `covered`. Before, both were charged.
+- Leads are decided in three phases (gather by (player, type), decide with keyed draws, answer grouped by (player, type)), so order independence holds by construction, and one player's purchase never changes another's result or draw.
+- The state's `rng` is the seed of the keyed draws and no longer advances.

@@ -1,0 +1,267 @@
+import { Client } from "@colyseus/sdk";
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  DUEL_CODE_REQUIRED_MESSAGE,
+  DUEL_COUNTDOWN_FRAMES,
+  DUEL_ROOM,
+  duelFullMessage,
+  DuelMessageType,
+  INPUT_HOLD_FRAMES,
+  MALFORMED_MATCH_REQUEST_MESSAGE,
+  NO_SUCH_DUEL_MESSAGE,
+  PROTOCOL_VERSION,
+  type DuelFrameBundle,
+} from "@pirate-sea-race/protocol";
+import { DuelRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { duelInput, hashState } from "@pirate-sea-race/simulation/duel";
+import { MAX_INPUT_DELAY, MIN_INPUT_DELAY } from "@pirate-sea-race/simulation/netcode";
+import { HeadlessDuelClient, ImpairmentProxy, newCreateToken, replayRecordedDuel, sleep } from "@pirate-sea-race/test-tools";
+
+let server: RunningGameServer;
+let endpoint: string;
+const clients: HeadlessDuelClient[] = [];
+const proxies: ImpairmentProxy[] = [];
+
+const R = duelInput("right");
+const J = duelInput("light");
+const K = duelInput("heavy");
+
+async function track(client: Promise<HeadlessDuelClient>): Promise<HeadlessDuelClient> {
+  const joined = await client;
+  clients.push(joined);
+  return joined;
+}
+
+function roomOf(client: HeadlessDuelClient): DuelRoom {
+  return matchMaker.getLocalRoomById(client.room.roomId) as unknown as DuelRoom;
+}
+
+/** The refusal a request ends with; fails the test if the request succeeds. */
+async function refusal(attempt: Promise<unknown>): Promise<{ code: unknown; message: string }> {
+  const error: unknown = await attempt.then(
+    () => expect.fail("the request was admitted"),
+    (reason: unknown) => reason,
+  );
+  return { code: (error as { code?: unknown }).code, message: (error as Error).message };
+}
+
+/** The pairs the server applied, by frame, from the bundles a client received. */
+function appliedPairs(bundles: readonly DuelFrameBundle[]): Map<number, { pair: readonly [number, number]; substituted: [boolean, boolean] }> {
+  const pairs = new Map<number, { pair: readonly [number, number]; substituted: [boolean, boolean] }>();
+  for (const bundle of bundles) {
+    const first = bundle.frame - bundle.inputs.length + 1;
+    bundle.inputs.forEach((pair, index) => {
+      pairs.set(first + index, { pair, substituted: [((bundle.substituted >> (2 * index)) & 1) === 1, ((bundle.substituted >> (2 * index + 1)) & 1) === 1] });
+    });
+  }
+  return pairs;
+}
+
+/** The newest frame the server has confirmed to this client. */
+const latestFrame = (client: HeadlessDuelClient) => client.bundles.at(-1)?.frame ?? -1;
+
+/**
+ * Plays a frame-exact timeline of inputs, `inputs[k]` for frame `start + k`, as raw input messages of four frames
+ * each, sent 6 to 25 frames ahead of the server (the session's own sending is off). This is how the tests press
+ * keys a precise number of frames apart; the browser and the session send the same messages.
+ */
+async function playTimeline(client: HeadlessDuelClient, start: number, inputs: readonly number[]): Promise<void> {
+  let seq = 1000;
+  for (let offset = 0; offset < inputs.length; offset += 4) {
+    const first = start + offset;
+    const chunk = inputs.slice(offset, offset + 4);
+    await client.waitFor(() => latestFrame(client) >= first + chunk.length - 1 - 25);
+    if (latestFrame(client) > first - 6) throw new Error(`the timeline fell behind the server at frame ${first}`);
+    client.sendRaw(DuelMessageType.Input, { seq: ++seq, frame: first + chunk.length - 1, inputs: chunk });
+  }
+}
+
+const hold = (frames: number, bits = 0) => Array.from({ length: frames }, () => bits);
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((client) => client.leave()));
+  await Promise.all(proxies.splice(0).map((proxy) => proxy.close()));
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+describe("duel admission", { timeout: 30_000 }, () => {
+  it("admits the creator by token and the second player by code, and nobody else", async () => {
+    const host = await track(HeadlessDuelClient.create(endpoint));
+    expect(host.code).toMatch(/^[A-Z0-9]{6}$/);
+    expect(host.slot).toBe(0);
+    expect(host.phase).toBe("waiting");
+    const version = { protocolVersion: PROTOCOL_VERSION };
+    expect(await refusal(new Client(endpoint).join(DUEL_ROOM, { ...version, code: host.code === "ZZZZZ9" ? "ZZZZZ8" : "ZZZZZ9" }))).toEqual({
+      code: 404,
+      message: NO_SUCH_DUEL_MESSAGE,
+    });
+    expect(await refusal(new Client(endpoint).join(DUEL_ROOM, version))).toEqual({ code: 400, message: MALFORMED_MATCH_REQUEST_MESSAGE });
+    expect(await refusal(new Client(endpoint).joinById(host.room.roomId, { ...version, createToken: newCreateToken() }))).toEqual({
+      code: 403,
+      message: DUEL_CODE_REQUIRED_MESSAGE,
+    });
+    expect(await refusal(new Client(endpoint).join(DUEL_ROOM, { protocolVersion: PROTOCOL_VERSION - 1, code: host.code }))).toMatchObject({ code: 426 });
+
+    const guest = await track(HeadlessDuelClient.join(endpoint, host.code.toLowerCase()));
+    expect(guest.room.roomId).toBe(host.room.roomId);
+    expect(guest.slot).toBe(1);
+    expect(await refusal(new Client(endpoint).join(DUEL_ROOM, { ...version, code: host.code }))).toEqual({ code: 409, message: duelFullMessage() });
+    expect(await refusal(new Client(endpoint).joinById(host.room.roomId, { ...version, code: host.code }))).toMatchObject({ code: expect.anything() });
+    expect(roomOf(host).clients.length).toBe(2);
+  });
+
+  it("holds one player in a practice duel", async () => {
+    const player = await track(HeadlessDuelClient.create(endpoint, { practice: true }));
+    expect(player.room.state.practice).toBe(true);
+    expect(player.room.state.dummy).toBe("idle");
+    expect(await refusal(new Client(endpoint).join(DUEL_ROOM, { protocolVersion: PROTOCOL_VERSION, code: player.code }))).toMatchObject({ code: 409 });
+  });
+});
+
+describe("duel room", { timeout: 30_000 }, () => {
+  it("counts down three seconds once both are connected, then fights with a shared input delay of 3 to 8 frames", async () => {
+    const host = await track(HeadlessDuelClient.create(endpoint));
+    await sleep(300);
+    expect(host.phase).toBe("waiting");
+    expect(host.room.state.countdown).toBe(DUEL_COUNTDOWN_FRAMES);
+    const guest = await track(HeadlessDuelClient.join(endpoint, host.code));
+    const countdownAt = Date.now();
+    await host.waitFor(() => host.phase === "countdown");
+    await host.waitFor(() => host.phase === "fighting", 5000);
+    expect(Date.now() - countdownAt).toBeGreaterThanOrEqual(2700);
+    const delay = host.room.state.inputDelay;
+    expect(delay).toBeGreaterThanOrEqual(MIN_INPUT_DELAY);
+    expect(delay).toBeLessThanOrEqual(MAX_INPUT_DELAY);
+    expect(guest.room.state.inputDelay).toBe(delay);
+    // Locally the round trip is well under a frame, so the delay is the minimum.
+    expect(delay).toBe(MIN_INPUT_DELAY);
+    expect(roomOf(host).diagnostics().rttSamples["0"]!.length).toBeGreaterThanOrEqual(20);
+    await guest.waitForConfirmed(60);
+    await host.waitForConfirmed(60);
+    // The first bundle is the frame-0 snapshot; every bundle since then was checked against each client's own state.
+    for (const client of [host, guest]) {
+      expect(client.bundles[0]).toMatchObject({ frame: 0, inputs: [] });
+      expect(client.stats).toMatchObject({ desyncs: 0 });
+      expect(client.stats!.hashChecks).toBeGreaterThanOrEqual(20);
+    }
+  });
+
+  it("lands a jab and a throw pressed J then K one or two frames apart, and a jab when K comes three frames late", async () => {
+    const chord = async (gap: number) => {
+      const player = await track(HeadlessDuelClient.create(endpoint, { practice: true, tickMs: 1_000_000 }));
+      await player.waitFor(() => player.phase === "fighting", 5000);
+      await player.waitFor(() => latestFrame(player) >= 0);
+      const start = 40;
+      // Walk 50 frames towards the dummy (150 px of the 192), tap J, wait out the jab and the dummy's hitstun, then
+      // press J and, `gap` frames later, K too, holding both for a few frames.
+      const timeline = [...hold(50, R), ...hold(10), J, ...hold(45), ...hold(gap, J), ...hold(4, J | K), ...hold(60)];
+      await playTimeline(player, start, timeline);
+      await player.waitFor(() => latestFrame(player) >= start + timeline.length + 3);
+      const room = roomOf(player);
+      expect(room.diagnostics().authority.late[0]).toBe(0);
+      return room.duelState.fighters[1].health;
+    };
+    // Three practice duels at once, one per gap.
+    expect(await Promise.all([1, 2, 3].map(chord))).toEqual([1000 - 45 - 120, 1000 - 45 - 120, 1000 - 45 - 45]);
+  }, 45_000);
+
+  it("never lets late input rewrite a stepped frame, and repeats a missing input for 250 ms before neutral", async () => {
+    const player = await track(HeadlessDuelClient.create(endpoint, { practice: true, tickMs: 1_000_000 }));
+    await player.waitFor(() => player.phase === "fighting", 5000);
+    await player.waitFor(() => latestFrame(player) >= 30);
+    // Walk right for frames 60 to 63, then nothing: the server repeats R for 15 frames and then substitutes neutral.
+    await playTimeline(player, 60, hold(4, R));
+    await player.waitFor(() => latestFrame(player) >= 100);
+    // A jab for frame 70, long stepped, arrives now and is ignored.
+    player.sendRaw(DuelMessageType.Input, { seq: 5000, frame: 70, inputs: [J] });
+    await player.waitFor(() => latestFrame(player) >= 110);
+    const pairs = appliedPairs(player.bundles);
+    expect(pairs.get(63)).toEqual({ pair: [R, 0], substituted: [false, false] });
+    expect(pairs.get(63 + INPUT_HOLD_FRAMES)).toEqual({ pair: [R, 0], substituted: [true, false] });
+    expect(pairs.get(64 + INPUT_HOLD_FRAMES)).toEqual({ pair: [0, 0], substituted: [true, false] });
+    expect(pairs.get(70)!.pair).toEqual([R, 0]);
+    expect(roomOf(player).diagnostics().authority.late[0]).toBe(1);
+    expect(roomOf(player).duelState.fighters[0].moveId).toBeNull();
+  });
+
+  it("switches the practice dummy to guarding, so the same jab is blocked", async () => {
+    const player = await track(HeadlessDuelClient.create(endpoint, { practice: true, tickMs: 1_000_000 }));
+    player.setDummy("guard");
+    await player.waitFor(() => player.room.state.dummy === "guard");
+    await player.waitFor(() => player.phase === "fighting", 5000);
+    await player.waitFor(() => latestFrame(player) >= 0);
+    await playTimeline(player, 40, [...hold(50, R), ...hold(10), J, ...hold(40)]);
+    await player.waitFor(() => latestFrame(player) >= 145);
+    const events = player.bundles.length;
+    expect(events).toBeGreaterThan(0);
+    expect(roomOf(player).duelState.fighters[1].health).toBe(1000);
+    expect(roomOf(player).duelState.fighters[1].stamina).toBeLessThan(100);
+  });
+});
+
+describe("duel reconnection (§12)", () => {
+  async function startDuel(dropperThroughProxy: boolean): Promise<{ host: HeadlessDuelClient; guest: HeadlessDuelClient; proxy: ImpairmentProxy }> {
+    const proxy = await ImpairmentProxy.start(server.port);
+    proxies.push(proxy);
+    const host = await track(HeadlessDuelClient.create(endpoint));
+    const guest = await track(HeadlessDuelClient.join(dropperThroughProxy ? proxy.endpoint : endpoint, host.code));
+    // The guest walks towards the host all the time, so its held input is left.
+    guest.play(() => duelInput("left"));
+    await host.waitFor(() => host.phase === "fighting", 5000);
+    // The SDK reconnects only a room joined at least five seconds ago.
+    await host.waitForConfirmed(180);
+    return { host, guest, proxy };
+  }
+
+  it("gives a dropped player neutral input after the held-input timeout, and lets them rejoin and continue", async () => {
+    const { host, guest, proxy } = await startDuel(true);
+    const room = roomOf(host);
+    const dropFrame = room.duelState.frame;
+    // The network drops and stays down for about a second.
+    proxy.sever({ refuse: true });
+    await host.waitFor(() => !room.state.seats.find((seat) => seat.slot === 1)!.connected, 5000);
+    // While the guest is away the server substitutes: its held input (left) for 15 frames, then neutral.
+    await host.waitFor(() => latestFrame(host) >= dropFrame + 50);
+    const during = [...appliedPairs(host.bundles).entries()].filter(([frame]) => frame > dropFrame && frame <= dropFrame + 50);
+    const substituted = during.filter(([, entry]) => entry.substituted[1]).map(([, entry]) => entry.pair[1]);
+    expect(substituted.slice(0, INPUT_HOLD_FRAMES)).toEqual(hold(INPUT_HOLD_FRAMES, duelInput("left")));
+    expect(substituted.slice(INPUT_HOLD_FRAMES).length).toBeGreaterThan(0);
+    expect(substituted.slice(INPUT_HOLD_FRAMES).every((bits) => bits === 0)).toBe(true);
+    await sleep(500);
+    proxy.restore();
+    // The SDK reconnects on its own through the same address, within the ten seconds.
+    await guest.waitFor(() => guest.connected && room.state.seats.find((seat) => seat.slot === 1)!.connected, 9000);
+    const back = room.duelState.frame;
+    await guest.waitForConfirmed(back + 60);
+    expect(room.state.phase).toBe("fighting");
+    // The rejoined client restarted from the server's snapshot and follows the server again, without a desync.
+    expect(guest.stats!.snapshotRestores).toBeGreaterThanOrEqual(1);
+    expect(guest.stats!.desyncs).toBe(0);
+    const frame = guest.duel!.rollback.confirmedFrame;
+    const replayed = await replayRecordedDuel({ ...room.inputLog(), inputs: room.inputLog().inputs.slice(0, frame) }, { seed: room.state.seed });
+    expect(hashState(guest.duel!.confirmedState)).toBe(replayed.hash);
+    const guestPairs = appliedPairs(host.bundles);
+    expect([...guestPairs.entries()].some(([f, entry]) => f > back + 10 && !entry.substituted[1] && entry.pair[1] === duelInput("left"))).toBe(true);
+  }, 30_000);
+
+  it("forfeits a player absent for ten seconds", async () => {
+    const { host, proxy } = await startDuel(true);
+    const room = roomOf(host);
+    proxy.sever({ refuse: true });
+    const droppedAt = Date.now();
+    await host.waitFor(() => host.phase === "over", 15_000);
+    expect(Date.now() - droppedAt).toBeGreaterThanOrEqual(9500);
+    expect(host.room.state.winner).toBe(0);
+    expect(host.room.state.reason).toBe("forfeit");
+    expect(room.state.phase).toBe("over");
+  }, 30_000);
+});

@@ -1,0 +1,689 @@
+    (a, b) => a.distance - b.distance || compareIds(a.attempt.attackerId, b.attempt.attackerId) || compareIds(a.attempt.defenderId, b.attempt.defenderId),
+  );
+  for (const { attempt, attacker, defender } of hits) {
+    const { attackerId, defenderId } = attempt;
+    if (inDuel.has(attackerId) || inDuel.has(defenderId)) {
+      events.push({ kind: "attempt-preempted", tick, attackerId, defenderId, reason: "conflict" });
+    } else if (duels.size >= config.maxDuels) {
+      events.push({ kind: "attempt-preempted", tick, attackerId, defenderId, reason: "duel-cap" });
+    } else {
+      const id = duelIdFor(tick, attackerId, defenderId);
+      const x = Math.floor((attacker.x + defender.x) / 2);
+      const y = Math.floor((attacker.y + defender.y) / 2);
+      duels.set(id, {
+        id,
+        mode: attempt.mode,
+        players: [attackerId, defenderId],
+        positions: [
+          { x: attacker.x, y: attacker.y },
+          { x: defender.x, y: defender.y },
+        ],
+        x,
+        y,
+        reservedTick: tick,
+        phase: "transition",
+        startTick: null,
+        end: null,
+      });
+      inDuel.add(attackerId);
+      inDuel.add(defenderId);
+      events.push({ kind: "duel-reserved", tick, duelId: id, mode: attempt.mode, players: [attackerId, defenderId], x, y });
+    }
+  }
+  attempts = attempts.filter((attempt) => {
+    if (attempt.landTick === tick) return false;
+    // A player just reserved as a defender loses their own attempt.
+    if (!inDuel.has(attempt.attackerId)) return true;
+    cancel(attempt, "attacker-ineligible");
+    return false;
+  });
+
+  // 6. Presses. Every target is chosen from the state before any of this tick's starts, so a protected player who
+  // attacks on this tick is still not a target on it, whatever order the presses arrive in.
+  const attacking = new Set(attempts.map((attempt) => attempt.attackerId));
+  const started: EncounterAttempt[] = [];
+  const protectedBefore = new Set([...records.values()].filter((player) => player.protection !== null).map((player) => player.id));
+  if (duels.size < config.maxDuels) {
+    const players = [...snapshot.values()].sort((a, b) => compareIds(a.id, b.id));
+    for (const attacker of players) {
+      if (!attacker.attack || !attacker.connected || attacking.has(attacker.id) || !free(attacker.id, attacker.mode)) continue;
+      if (tick < record(attacker.id).cooldownEndTick) continue;
+      const mode = config.modes[attacker.mode];
+      let target: { player: EncounterPlayerInput; distance: number } | null = null;
+      for (const defender of players) {
+        if (defender.id === attacker.id || !free(defender.id, attacker.mode) || protectedBefore.has(defender.id)) continue;
+        if (!withinRange(attacker, defender, mode.range) || !withinCone(attacker, defender, attacker.heading, mode.targetConeHeadings)) continue;
+        if (!mode.rules.lineOfSight(attacker, defender)) continue;
+        // Players are in id order, so a strictly nearer one replaces the choice and an equal one never does.
+        const distance = distanceSquared(attacker, defender);
+        if (target === null || distance < target.distance) target = { player: defender, distance };
+      }
+      if (target === null) continue;
+      if (protectedBefore.has(attacker.id)) {
+        update(attacker.id, { protection: null });
+        events.push({ kind: "protection-ended", tick, playerId: attacker.id, reason: "attack" });
+      }
+      const aim = bearing(attacker, target.player) ?? attacker.heading;
+      const attempt: EncounterAttempt = {
+        attackerId: attacker.id,
+        defenderId: target.player.id,
+        mode: attacker.mode,
+        aim,
+        startTick: tick,
+        landTick: tick + mode.windupTicks,
+      };
+      started.push(attempt);
+      events.push({ kind: "attempt-started", tick, attackerId: attacker.id, defenderId: target.player.id, mode: attacker.mode, aim, landTick: attempt.landTick });
+    }
+  }
+
+  // Records with nothing left to remember are dropped, so equal situations hash equally.
+  const players = sortedIds()
+    .map(record)
+    .filter((player) => player.protection !== null || player.cooldownEndTick > tick || player.respawn !== null)
+    .map((player) => (player.cooldownEndTick > tick ? player : { ...player, cooldownEndTick: 0 }));
+  return {
+    state: {
+      tick,
+      closed: false,
+      players,
+      attempts: [...attempts, ...started].sort(byAttacker),
+      duels: [...duels.values()].sort(compareDuels),
+    },
+    events,
+  };
+}
+
+/** §6's return at settlement: the winner stays with 8 s, the loser waits to respawn, a draw separates both. */
+function settle(
+  config: EncounterConfig,
+  duel: EncounterDuel,
+  end: NonNullable<EncounterDuel["end"]>,
+  settledTick: number,
+  tick: number,
+  events: EncounterEvent[],
+  update: (id: string, change: Partial<Omit<EncounterPlayer, "id">>) => void,
+): void {
+  const guard = (protection: Protection) => (protection.endTick > tick ? protection : null);
+  const returned = (playerId: string, point: EncounterPoint, protection: Protection) => {
+    update(playerId, { protection: guard(protection) });
+    events.push({ kind: "player-returned", tick, duelId: duel.id, playerId, x: point.x, y: point.y, protection });
+  };
+  if (end.outcome === "win") {
+    const winner = end.winner!;
+    const loser = end.loser!;
+    const own = duel.positions[duel.players.indexOf(winner)]!;
+    returned(winner, own, { source: "win", endTick: settledTick + config.winProtectionTicks });
+    // The respawn counts from the fight's end, not the settlement, so the theft choice does not lengthen it.
+    const respawnTick = Math.max(end.tick + config.respawnDelayTicks, tick);
+    const loserOwn = duel.positions[duel.players.indexOf(loser)]!;
+    update(loser, {
+      protection: null,
+      respawn: { duelId: duel.id, respawnTick, x: duel.x, y: duel.y, ownX: loserOwn.x, ownY: loserOwn.y, mode: duel.mode },
+    });
+    events.push({ kind: "player-respawning", tick, duelId: duel.id, playerId: loser, respawnTick });
+    return;
+  }
+  const points = config.modes[duel.mode].rules.separateReturn({
+    encounter: { x: duel.x, y: duel.y },
+    players: duel.positions,
+    minSeparation: config.drawReturnMinSeparation,
+    maxDistance: config.drawReturnMaxDistance,
+  });
+  const protection: Protection = { source: "draw", endTick: settledTick + config.drawProtectionTicks };
+  returned(duel.players[0], points[0], protection);
+  returned(duel.players[1], points[1], protection);
+}
+
+export interface EncounterReplay {
+  readonly state: EncounterState;
+  readonly events: readonly EncounterEvent[];
+  readonly hash: string;
+}
+
+/** Steps a sequence of ticks from a state, collecting every event; `hash` is the final state's `hashState`. */
+export function replayEncounters(config: EncounterConfig, state: EncounterState, inputs: readonly EncounterTickInput[]): EncounterReplay {
+  let current = state;
+  const events: EncounterEvent[] = [];
+  for (const input of inputs) {
+    const stepped = stepEncounters(config, current, input);
+    current = stepped.state;
+    events.push(...stepped.events);
+  }
+  return { state: current, events, hash: hashState(current) };
+}
+import { compassHeading, isNavigable } from "@pirate-sea-race/content";
+import type { SimulationConfig } from "./config.js";
+import { normalizeHeading } from "./heading.js";
+import { nextInt } from "./random.js";
+
+/** 60 fixed steps per second: the one match clock (§15). */
+export const STEPS_PER_SECOND = 60;
+/** World logic runs on every third step, 20 times a second (§15). */
+export const WORLD_STEP_INTERVAL = 3;
+
+/** `dock` of a ship at sea. */
+export const NOT_DOCKED = -1;
+
+/** A ship on the sea. Every number is an integer; positions are in sub-units. */
+export interface ShipState {
+  readonly id: string;
+  readonly slot: number;
+  readonly x: number;
+  readonly y: number;
+  /** One of HEADING_COUNT directions: 0 is east, counting clockwise because y grows down. */
+  readonly heading: number;
+  /** Sub-units per world step along the heading; negative when reversing. */
+  readonly speed: number;
+  /** The id of the dock the ship is moored at, or NOT_DOCKED. */
+  readonly dock: number;
+  /**
+   * The throttle direction (-1, 0 or 1) held when the ship moored. It does not cast off until it is released, so a
+   * player who drives into a dock with ahead held stays moored. Always 0 at sea.
+   */
+  readonly mooredThrottle: number;
+}
+
+/** The complete match state: plain, serializable data that `hashState` covers entirely. */
+export interface MatchState {
+  /** Steps completed on the 60 Hz match clock. */
+  readonly frame: number;
+  /** World steps completed (every third frame). */
+  readonly worldTick: number;
+  /** The seeded generator's state. */
+  readonly rng: number;
+  /** In join order. */
+  readonly ships: readonly ShipState[];
+}
+
+export function createMatchState(seed: number): MatchState {
+  if (!Number.isInteger(seed)) throw new RangeError(`seed must be an integer, got ${seed}`);
+  return { frame: 0, worldTick: 0, rng: seed >>> 0, ships: [] };
+}
+
+/** The centre of a tile, in sub-units. */
+export function tileCentre(config: SimulationConfig, tileX: number, tileY: number): { x: number; y: number } {
+  const size = config.map.subUnitsPerTile;
+  const half = Math.floor(size / 2);
+  return { x: tileX * size + half, y: tileY * size + half };
+}
+
+/** Adds a ship at rest on a random free spawn slot, facing the slot's heading. Two ships never share a slot. */
+export function addShip(config: SimulationConfig, state: MatchState, id: string): MatchState {
+  if (state.ships.some((ship) => ship.id === id)) throw new Error(`ship ${id} already exists`);
+  const taken = new Set(state.ships.map((ship) => ship.slot));
+  const free = config.spawnSlots.map((_, index) => index).filter((index) => !taken.has(index));
+  if (free.length === 0) throw new Error("no free spawn slot");
+  const drawn = nextInt(state.rng, free.length);
+  const slot = free[drawn.value]!;
+  const spawn = config.spawnSlots[slot]!;
+  const ship: ShipState = {
+    id,
+    slot,
+    ...tileCentre(config, spawn.tileX, spawn.tileY),
+    heading: compassHeading(spawn.facing),
+    speed: 0,
+    dock: NOT_DOCKED,
+    mooredThrottle: 0,
+  };
+  return { ...state, rng: drawn.state, ships: [...state.ships, ship] };
+}
+
+export function removeShip(state: MatchState, id: string): MatchState {
+  return { ...state, ships: state.ships.filter((ship) => ship.id !== id) };
+}
+
+export interface Placement {
+  readonly tileX: number;
+  readonly tileY: number;
+  readonly heading: number;
+}
+
+/**
+ * Moves a ship to rest at the centre of a navigable tile. Only the server's test-placement setting calls this (tests
+ * put ships where a scenario needs them); matches never do.
+ */
+export function placeShip(config: SimulationConfig, state: MatchState, id: string, placement: Placement): MatchState {
+  const { tileX, tileY, heading } = placement;
+  if (![tileX, tileY, heading].every(Number.isInteger)) throw new RangeError("a placement needs integer tiles and heading");
+  if (!isNavigable(config.map, tileX, tileY)) throw new RangeError(`tile ${tileX},${tileY} is not navigable`);
+  if (!state.ships.some((ship) => ship.id === id)) throw new Error(`no ship ${id}`);
+  const placed = { ...tileCentre(config, tileX, tileY), heading: normalizeHeading(heading), speed: 0, dock: NOT_DOCKED, mooredThrottle: 0 };
+  return { ...state, ships: state.ships.map((ship) => (ship.id === id ? { ...ship, ...placed } : ship)) };
+}
+
+/** A position as the tile it lies on plus the sub-unit offset inside that tile. */
+export function toTilePosition(config: SimulationConfig, x: number, y: number) {
+  const size = config.map.subUnitsPerTile;
+  return {
+    tileX: Math.floor(x / size),
+    tileY: Math.floor(y / size),
+    offsetX: x % size,
+    offsetY: y % size,
+  };
+}
+import { isNavigable, type Dock, type ShipTuning } from "@pirate-sea-race/content";
+import type { SimulationConfig } from "./config.js";
+import { divTrunc } from "./fixed.js";
+import { HEADING_DX, HEADING_DY, HEADING_SCALE, normalizeHeading } from "./heading.js";
+import { AXIS_SCALE, INTERACT_BUTTON, sanitizeInput, type PlayerInput } from "./input.js";
+import { NOT_DOCKED, tileCentre, WORLD_STEP_INTERVAL, type MatchState, type ShipState } from "./state.js";
+
+/**
+ * Held inputs by ship id. A ship without an entry sails as neutral input, except that a moored ship keeps the throttle
+ * it moored with (`mooredThrottle`): a missing entry is no input at all (the server leaves it out when a player's input
+ * lapsed), so it cannot release that throttle, and the player's unchanged held keys do not cast off when they resume.
+ */
+export type StepInputs = Readonly<Record<string, PlayerInput>>;
+
+export function isWorldStep(frame: number): boolean {
+  return frame % WORLD_STEP_INTERVAL === 0;
+}
+
+/**
+ * Advances the match clock by one 60 Hz step and returns the new state. World logic (sailing) runs only when the new
+ * frame is a multiple of WORLD_STEP_INTERVAL. The input state is never mutated.
+ */
+export function step(config: SimulationConfig, state: MatchState, inputs: StepInputs): MatchState {
+  const frame = state.frame + 1;
+  if (!isWorldStep(frame)) return { ...state, frame };
+  return {
+    ...state,
+    frame,
+    worldTick: state.worldTick + 1,
+    ships: state.ships.map((ship) => {
+      const input = inputs[ship.id];
+      return input === undefined && ship.dock !== NOT_DOCKED ? ship : sail(config, ship, sanitizeInput(input));
+    }),
+  };
+}
+
+/**
+ * One world step of one ship (§3). The throttle (`-moveY`) accelerates, brakes or reverses; `moveX` turns the
+ * heading; the ship then moves along its heading and stops or slides against land, shoals and the map edge.
+ *
+ * Docking: interact near a dock moors the ship there (at the dock tile's centre, speed 0) at any speed, when its hull
+ * is on or beside the berth tile or could sail straight there from within reach (`dockInReach`). Neither speed nor
+ * throttle matters, so a ship driven at its dock with ahead and interact held moors on the first step it starts beside
+ * the berth or within reach, from any angle. A moored ship stays put while interact is held,
+ * without throttle, or while the throttle it moored with is still held; releasing that throttle and then any throttle
+ * (or the other direction) casts off and sails in the same step.
+ */
+export function sail(config: SimulationConfig, ship: ShipState, input: PlayerInput): ShipState {
+  const tuning = config.ship;
+  const throttle = -input.moveY;
+  const interact = (input.buttons & INTERACT_BUTTON) !== 0;
+  const direction = Math.sign(throttle);
+  let dock = ship.dock;
+  if (dock !== NOT_DOCKED) {
+    if (direction === 0 || interact || direction === ship.mooredThrottle) {
+      const mooredThrottle = direction === 0 ? 0 : ship.mooredThrottle;
+      return ship.speed === 0 && ship.mooredThrottle === mooredThrottle ? ship : { ...ship, speed: 0, mooredThrottle };
+    }
+    dock = NOT_DOCKED;
+  } else if (interact) {
+    const berth = dockInReach(config, ship.x, ship.y);
+    if (berth !== undefined) {
+      return { ...ship, ...tileCentre(config, berth.tileX, berth.tileY), speed: 0, dock: berth.id, mooredThrottle: direction };
+    }
+  }
+
+  const heading = normalizeHeading(ship.heading + Math.sign(input.moveX) * tuning.turnRate);
+  const speed = nextSpeed(tuning, ship.speed, throttle);
+  const dx = divTrunc(speed * HEADING_DX[heading]!, HEADING_SCALE);
+  const dy = divTrunc(speed * HEADING_DY[heading]!, HEADING_SCALE);
+  const x = sweepX(config, ship.x, ship.y, dx);
+  const y = sweepY(config, x, ship.y, dy);
+  // Blocked on every axis it tried to move along: the ship has run aground and stops. Blocked on one axis only, it
+  // slides along the obstacle on the other.
+  const aground = (dx !== 0 || dy !== 0) && x === ship.x && y === ship.y;
+  return { ...ship, x, y, heading, speed: aground ? 0 : speed, dock, mooredThrottle: 0 };
+}
+
+/** The speed after one world step of throttle in [-AXIS_SCALE, AXIS_SCALE] (positive forward). */
+export function nextSpeed(tuning: ShipTuning, speed: number, throttle: number): number {
+  if (throttle > 0) {
+    if (speed < 0) return Math.min(speed + tuning.braking, 0);
+    const target = divTrunc(tuning.maxSpeed * throttle, AXIS_SCALE);
+    return speed < target ? Math.min(speed + tuning.acceleration, target) : Math.max(speed - tuning.drag, target);
+  }
+  if (throttle < 0) {
+    // Down brakes a ship under way, and reverses slowly from a stop.
+    if (speed > 0) return Math.max(speed - tuning.braking, 0);
+    const target = -divTrunc(tuning.maxReverseSpeed * -throttle, AXIS_SCALE);
+    return speed > target ? Math.max(speed - tuning.reverseAcceleration, target) : Math.min(speed + tuning.drag, target);
+  }
+  return speed > 0 ? Math.max(speed - tuning.drag, 0) : Math.min(speed + tuning.drag, 0);
+}
+
+/**
+ * The nearest dock the ship at a position can moor at, or undefined: one whose tile the hull is on or beside, or whose
+ * centre is within the dock radius with a clear straight run for the hull. Beside means any tile the hull overlaps is
+ * one of the berth tile's eight neighbours; a diagonal one counts only if one of the two tiles it shares with the
+ * berth is navigable, so a ship cannot moor through a pinch of land or shoal. Mooring moves the ship to the berth
+ * centre, so without these checks it could cut through land that sailing would have stopped it at.
+ */
+export function dockInReach(config: SimulationConfig, x: number, y: number): Dock | undefined {
+  const reach = config.ship.dockRadius * config.ship.dockRadius;
+  let best: Dock | undefined;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const dock of config.map.docks) {
+    const centre = tileCentre(config, dock.tileX, dock.tileY);
+    const distance = (centre.x - x) * (centre.x - x) + (centre.y - y) * (centre.y - y);
+    if (distance >= bestDistance) continue;
+    if (hullIsBesideBerth(config, dock, x, y) || (distance <= reach && hullPathIsClear(config, x, y, centre.x, centre.y))) {
+      best = dock;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+/** Whether a tile the hull at (x, y) overlaps is the dock's tile or an unpinched neighbour of it (see `dockInReach`). */
+function hullIsBesideBerth(config: SimulationConfig, dock: Dock, x: number, y: number): boolean {
+  const size = config.map.subUnitsPerTile;
+  const half = config.ship.hullHalfSize;
+  for (let row = Math.floor((y - half) / size); row <= Math.floor((y + half) / size); row++) {
+    for (let column = Math.floor((x - half) / size); column <= Math.floor((x + half) / size); column++) {
+      const dx = column - dock.tileX;
+      const dy = row - dock.tileY;
+      if (Math.abs(dx) > 1 || Math.abs(dy) > 1) continue;
+      if (dx === 0 || dy === 0) return true;
+      if (isNavigable(config.map, dock.tileX + dx, dock.tileY) || isNavigable(config.map, dock.tileX, dock.tileY + dy)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The hull is a square of `hullHalfSize` around the position. It never overlaps a blocked tile, so a move only needs
+ * to check the tile columns (or rows) its leading edge enters, in order: the first blocked one stops the hull flush
+ * against it. However fast the ship, it cannot pass through a tile, so it never tunnels.
+ */
+function sweepX(config: SimulationConfig, x: number, y: number, dx: number): number {
+  if (dx === 0) return x;
+  const size = config.map.subUnitsPerTile;
+  const half = config.ship.hullHalfSize;
+  const top = Math.floor((y - half) / size);
+  const bottom = Math.floor((y + half) / size);
+  const blocked = (column: number) => {
+    for (let row = top; row <= bottom; row++) if (!isNavigable(config.map, column, row)) return true;
+    return false;
+  };
+  if (dx > 0) {
+    const last = Math.floor((x + half + dx) / size);
+    for (let column = Math.floor((x + half) / size) + 1; column <= last; column++) {
+      if (blocked(column)) return column * size - 1 - half;
+    }
+  } else {
+    const last = Math.floor((x - half + dx) / size);
+    for (let column = Math.floor((x - half) / size) - 1; column >= last; column--) {
+      if (blocked(column)) return (column + 1) * size + half;
+    }
+  }
+  return x + dx;
+}
+
+function sweepY(config: SimulationConfig, x: number, y: number, dy: number): number {
+  if (dy === 0) return y;
+  const size = config.map.subUnitsPerTile;
+  const half = config.ship.hullHalfSize;
+  const left = Math.floor((x - half) / size);
+  const right = Math.floor((x + half) / size);
+  const blocked = (row: number) => {
+    for (let column = left; column <= right; column++) if (!isNavigable(config.map, column, row)) return true;
+    return false;
+  };
+  if (dy > 0) {
+    const last = Math.floor((y + half + dy) / size);
+    for (let row = Math.floor((y + half) / size) + 1; row <= last; row++) {
+      if (blocked(row)) return row * size - 1 - half;
+    }
+  } else {
+    const last = Math.floor((y - half + dy) / size);
+    for (let row = Math.floor((y - half) / size) - 1; row >= last; row--) {
+      if (blocked(row)) return (row + 1) * size + half;
+    }
+  }
+  return y + dy;
+}
+
+/**
+ * Whether the hull stays clear along the straight segment between two positions. It checks every position one
+ * sub-unit apart along the longer axis, so between two checks the hull moves at most one sub-unit on either axis and
+ * no tile corner can slip between them.
+ */
+export function hullPathIsClear(config: SimulationConfig, fromX: number, fromY: number, toX: number, toY: number): boolean {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy));
+  if (steps === 0) return hullIsClear(config, fromX, fromY);
+  for (let index = 0; index <= steps; index++) {
+    if (!hullIsClear(config, fromX + divTrunc(dx * index, steps), fromY + divTrunc(dy * index, steps))) return false;
+  }
+  return true;
+}
+
+/** Whether a ship's hull at (x, y) overlaps only navigable tiles. Tests use it to check the collision invariant. */
+export function hullIsClear(config: SimulationConfig, x: number, y: number): boolean {
+  const size = config.map.subUnitsPerTile;
+  const half = config.ship.hullHalfSize;
+  for (let row = Math.floor((y - half) / size); row <= Math.floor((y + half) / size); row++) {
+    for (let column = Math.floor((x - half) / size); column <= Math.floor((x + half) / size); column++) {
+      if (!isNavigable(config.map, column, row)) return false;
+    }
+  }
+  return true;
+}
+/** Movement axes enter the simulation as integers in [-AXIS_SCALE, AXIS_SCALE]. */
+export const AXIS_SCALE = 1000;
+
+/** The interact button's bit (§8: E), the same bit as the protocol's `Buttons.Interact`. */
+export const INTERACT_BUTTON = 1 << 0;
+
+/**
+ * One player's held intent for a step. `buttons` is a bit field. At sea the axes are the device's movement axes:
+ * `moveX` turns (positive clockwise, to starboard) and `moveY` is the throttle, negative forward (up on a keyboard)
+ * and positive to brake, then reverse slowly from a stop.
+ */
+export interface PlayerInput {
+  readonly buttons: number;
+  readonly moveX: number;
+  readonly moveY: number;
+}
+
+export const NEUTRAL_INPUT: PlayerInput = { buttons: 0, moveX: 0, moveY: 0 };
+
+/** Turns a protocol axis in [-1, 1] into simulation units. Out-of-range values clamp; anything non-finite is 0. */
+export function quantizeAxis(axis: number): number {
+  if (!Number.isFinite(axis)) return 0;
+  const clamped = axis < -1 ? -1 : axis > 1 ? 1 : axis;
+  return Math.round(clamped * AXIS_SCALE);
+}
+
+/** Keeps a simulation input inside its integer bounds whatever the caller passed. */
+export function sanitizeInput(input: PlayerInput | undefined): PlayerInput {
+  if (input === undefined) return NEUTRAL_INPUT;
+  const axis = (value: number) =>
+    Number.isInteger(value) ? Math.max(-AXIS_SCALE, Math.min(AXIS_SCALE, value)) : 0;
+  return {
+    buttons: Number.isInteger(input.buttons) ? input.buttons >>> 0 : 0,
+    moveX: axis(input.moveX),
+    moveY: axis(input.moveY),
+  };
+}
+import type { SimulationConfig } from "./config.js";
+import type { MatchState, ShipState } from "./state.js";
+
+/** Whether `viewer` sees `target`: within the sight radius, centre to centre, compared in integer squares (§3). */
+export function canSee(config: SimulationConfig, viewer: ShipState, target: ShipState): boolean {
+  if (viewer.id === target.id) return true;
+  const dx = target.x - viewer.x;
+  const dy = target.y - viewer.y;
+  return dx * dx + dy * dy <= config.sightRadius * config.sightRadius;
+}
+
+/**
+ * The ids of the ships a player is entitled to see (§16): their own, and every other ship inside their sight radius.
+ * The server sends a client these ships and no others.
+ */
+export function visibleShipIds(config: SimulationConfig, state: MatchState, viewerId: string): Set<string> {
+  const viewer = state.ships.find((ship) => ship.id === viewerId);
+  const visible = new Set<string>();
+  if (viewer === undefined) return visible;
+  for (const ship of state.ships) if (canSee(config, viewer, ship)) visible.add(ship.id);
+  return visible;
+}
+import {
+  seaMap,
+  shipTuning,
+  SIGHT_RADIUS_TILES,
+  spawnSlots,
+  type SeaMapDefinition,
+  type ShipTuning,
+  type SpawnSlot,
+} from "@pirate-sea-race/content";
+
+/** Static match data the step reads; it comes from `packages/content` and never changes during a match. */
+export interface SimulationConfig {
+  readonly map: SeaMapDefinition;
+  readonly ship: ShipTuning;
+  readonly spawnSlots: readonly SpawnSlot[];
+  /** How far a ship sees other ships, in sub-units (§3). */
+  readonly sightRadius: number;
+}
+
+export const defaultSimulationConfig: SimulationConfig = {
+  map: seaMap,
+  ship: shipTuning,
+  spawnSlots,
+  sightRadius: SIGHT_RADIUS_TILES * seaMap.subUnitsPerTile,
+};
+
+/** The playable area in sub-units: positions run from 0 to these bounds inclusive, so every one lies on a tile. */
+export function mapBounds(config: SimulationConfig): { maxX: number; maxY: number } {
+  return {
+    maxX: config.map.widthTiles * config.map.subUnitsPerTile - 1,
+    maxY: config.map.heightTiles * config.map.subUnitsPerTile - 1,
+  };
+}
+export * from "./config.js";
+export * from "./fixed.js";
+export * from "./hash.js";
+export * from "./heading.js";
+export * from "./input.js";
+export * from "./random.js";
+export * from "./state.js";
+export * from "./step.js";
+export * from "./visibility.js";
+{
+  "name": "@pirate-sea-race/simulation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The pure fixed-step match simulation shared by client and server (§15)",
+  "exports": {
+    ".": {
+      "@pirate-sea-race/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./duel": {
+      "@pirate-sea-race/source": "./src/duel/index.ts",
+      "types": "./dist/duel/index.d.ts",
+      "default": "./dist/duel/index.js"
+    },
+    "./claim": {
+      "@pirate-sea-race/source": "./src/claim/index.ts",
+      "types": "./dist/claim/index.d.ts",
+      "default": "./dist/claim/index.js"
+    },
+    "./objectives": {
+      "@pirate-sea-race/source": "./src/objectives/index.ts",
+      "types": "./dist/objectives/index.d.ts",
+      "default": "./dist/objectives/index.js"
+    },
+    "./ruins": {
+      "@pirate-sea-race/source": "./src/ruins/index.ts",
+      "types": "./dist/ruins/index.d.ts",
+      "default": "./dist/ruins/index.js"
+    },
+    "./netcode": {
+      "@pirate-sea-race/source": "./src/netcode/index.ts",
+      "types": "./dist/netcode/index.d.ts",
+      "default": "./dist/netcode/index.js"
+    },
+    "./encounters": {
+      "@pirate-sea-race/source": "./src/encounters/index.ts",
+      "types": "./dist/encounters/index.d.ts",
+      "default": "./dist/encounters/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "postbuild": "node --input-type=module -e \"for(const [s,main] of [['@pirate-sea-race/simulation/duel','stepDuel'],['@pirate-sea-race/simulation/netcode','DuelRollback']]){const sub=s.split('/').pop();const p=new URL(import.meta.resolve(s)).pathname;if(!p.endsWith('/dist/'+sub+'/index.js'))throw new Error(s+' resolves to '+p+', not to its dist/');const m=await import(s);if(Object.keys(m).length===0||!(main in m))throw new Error(s+' ('+p+') exports nothing or misses its main export');console.log(s+' loads from '+p)}\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@pirate-sea-race/content": "0.0.0"
+  }
+}
+/** Ship speeds are per world step, and the world steps 20 times a second (§15). */
+export const WORLD_STEPS_PER_SECOND = 20;
+
+/**
+ * Sailing (§3): acceleration, braking and turning, tuned for generous handling. Speeds are sub-units per 20 Hz world
+ * step; accelerations are the change in speed per world step. The sea is compact (§3's travel times at three tiles a
+ * second) and drawn at 24 px a tile, so on screen a ship handles as it did at five tiles a second and 16 px: about
+ * as fast in pixels, as quick to full speed and to a stop, and turning in about as wide a circle.
+ */
+export interface ShipTuning {
+  /** Full throttle: 39 sub-units per world step is 780 a second, 3.05 tiles a second. */
+  readonly maxSpeed: number;
+  /** Reverse is slow, from a stop only. */
+  readonly maxReverseSpeed: number;
+  readonly acceleration: number;
+  readonly reverseAcceleration: number;
+  readonly braking: number;
+  /** Deceleration with no throttle. */
+  readonly drag: number;
+  /** Heading units per world step; HEADING_COUNT units make a full circle. */
+  readonly turnRate: number;
+  /** Ships collide as a square of this half-size around their position; it must fit inside one tile. */
+  readonly hullHalfSize: number;
+  /** A ship docks with interact, at any speed, when its centre is this close to a dock tile's centre. */
+  readonly dockRadius: number;
+  /** A slow approach to a dock (the old mooring speed limit, kept at its share of full speed). Mooring ignores it. */
+  readonly dockMaxSpeed: number;
+}
+
+export const shipTuning: ShipTuning = {
+  maxSpeed: 39,
+  maxReverseSpeed: 10,
+  acceleration: 3,
+  reverseAcceleration: 1,
+  braking: 3,
+  drag: 1,
+  turnRate: 1,
+  hullHalfSize: 80,
+  dockRadius: 384,
+  dockMaxSpeed: 15,
+};
+
+/** Other ships are visible within this many tiles of a ship's centre (§3); the server enforces it (§16). */
+export const SIGHT_RADIUS_TILES = 10;
+
+/** The distance at which two ships could engage (grapple, §6). Used here only to validate spawn slots (§2). */
+export const ENGAGEMENT_RANGE_TILES = 6;
+
+/** §3's travel-time targets at full speed on the shortest sea path, and §2's first useful stop, in seconds. */
+export const travelTargets = {
+  neighbourIslandMinSeconds: 20,
+  neighbourIslandMaxSeconds: 40,
+  longestCrossingMaxSeconds: 90,
+  firstDockMaxSeconds: 40,
+} as const;

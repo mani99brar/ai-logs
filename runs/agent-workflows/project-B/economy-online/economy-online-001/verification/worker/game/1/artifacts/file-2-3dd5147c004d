@@ -1,0 +1,134 @@
+import { describe, expect, it } from "vitest";
+import { Buttons, INPUT_HOLD_FRAMES, MAX_INPUT_MESSAGES_PER_SECOND, WORLD_HOLD_GRACE_FRAMES } from "@pirate-sea-race/protocol";
+import { AXIS_SCALE, INTERACT_BUTTON, NEUTRAL_INPUT } from "@pirate-sea-race/simulation";
+import { InputGate } from "./inputGate.js";
+import { generateMatchCode } from "./matchCode.js";
+
+const input = (seq: number, frame: number, moveX = 1, moveY = 0) => ({ seq, frame, buttons: 0, moveX, moveY });
+
+describe("InputGate", () => {
+  it("holds the latest accepted input in integer simulation units", () => {
+    const gate = new InputGate();
+    expect(gate.receive(input(1, 10, 1, -0.5), 10)).toBeUndefined();
+    expect(gate.inputAt(11)).toEqual({ buttons: 0, moveX: AXIS_SCALE, moveY: -AXIS_SCALE / 2 });
+  });
+
+  it("passes the interact button through as the simulation's interact bit", () => {
+    expect(Buttons.Interact).toBe(INTERACT_BUTTON);
+    const gate = new InputGate();
+    gate.receive({ seq: 1, frame: 10, buttons: Buttons.Interact, moveX: 0, moveY: 0 }, 10);
+    expect(gate.inputAt(11)).toEqual({ buttons: INTERACT_BUTTON, moveX: 0, moveY: 0 });
+  });
+
+  it("latches a button tapped between two world steps until the next world step reads it", () => {
+    const gate = new InputGate();
+    // Interact pressed and released on frames 10 and 11, before the world step on frame 12.
+    gate.receive({ seq: 1, frame: 10, buttons: Buttons.Interact, moveX: 0, moveY: 0 }, 10);
+    gate.receive({ seq: 2, frame: 11, buttons: 0, moveX: 0, moveY: 0 }, 11);
+    expect(gate.inputAt(12).buttons).toBe(INTERACT_BUTTON);
+    gate.worldStepTaken(12);
+    expect(gate.inputAt(13)).toEqual(NEUTRAL_INPUT);
+    // A button still held after the world step keeps coming from the held input.
+    gate.receive({ seq: 3, frame: 14, buttons: Buttons.Interact, moveX: 0, moveY: 0 }, 14);
+    gate.worldStepTaken(15);
+    expect(gate.inputAt(15).buttons).toBe(INTERACT_BUTTON);
+  });
+
+  it("lets a held input lapse to neutral without a fresh one", () => {
+    const gate = new InputGate();
+    gate.receive(input(1, 10), 10);
+    expect(gate.inputAt(10 + INPUT_HOLD_FRAMES)).not.toEqual(NEUTRAL_INPUT);
+    expect(gate.inputAt(10 + INPUT_HOLD_FRAMES + 1)).toEqual(NEUTRAL_INPUT);
+  });
+
+  it("reports a lapse only when the held input has expired and no button is latched", () => {
+    const gate = new InputGate();
+    gate.receive({ ...input(1, 10), buttons: Buttons.Interact }, 10);
+    expect(gate.lapsedAt(10 + INPUT_HOLD_FRAMES)).toBe(false);
+    // A button pressed in the last message is latched until the world step reads it, so that frame is not a lapse.
+    expect(gate.lapsedAt(10 + INPUT_HOLD_FRAMES + 1)).toBe(false);
+    gate.worldStepTaken(10 + INPUT_HOLD_FRAMES + 1);
+    expect(gate.lapsedAt(10 + INPUT_HOLD_FRAMES + 1)).toBe(true);
+    gate.receive(input(2, 40), 40);
+    expect(gate.lapsedAt(41)).toBe(false);
+  });
+
+  it("keeps a held world hold button through a gap of up to 750 ms for the room's hold reads only, never for the simulation", () => {
+    expect(WORLD_HOLD_GRACE_FRAMES).toBe(45);
+    const gate = new InputGate();
+    const held = Buttons.Interact | Buttons.Fruit | Buttons.Grapple;
+    gate.receive({ seq: 1, frame: 10, buttons: held, moveX: 0, moveY: -1 }, 10);
+    gate.worldStepTaken(12);
+    // Past the input's own lapse the simulation gets nothing: no throttle, no button, a lapsed gate.
+    expect(gate.lapsedAt(10 + INPUT_HOLD_FRAMES + 1)).toBe(true);
+    expect(gate.inputAt(10 + INPUT_HOLD_FRAMES + 1)).toEqual(NEUTRAL_INPUT);
+    // The hold reads keep interact and fruit (never the grapple) to the end of the grace window, then drop them.
+    expect(gate.holdButtonsAt(10 + INPUT_HOLD_FRAMES + 1)).toBe(Buttons.Interact | Buttons.Fruit);
+    expect(gate.holdButtonsAt(10 + WORLD_HOLD_GRACE_FRAMES)).toBe(Buttons.Interact | Buttons.Fruit);
+    expect(gate.holdButtonsAt(10 + WORLD_HOLD_GRACE_FRAMES + 1)).toBe(0);
+  });
+
+  it("ends a hold at once on an accepted message without the button, and reads a latched tap as held until the world step", () => {
+    const gate = new InputGate();
+    gate.receive({ seq: 1, frame: 10, buttons: Buttons.Interact, moveX: 0, moveY: 0 }, 10);
+    gate.worldStepTaken(12);
+    gate.receive({ seq: 2, frame: 13, buttons: 0, moveX: 0, moveY: 0 }, 13);
+    gate.worldStepTaken(15);
+    expect(gate.holdButtonsAt(16)).toBe(0);
+    // A tap between two world steps still counts once, like the simulation's latch.
+    gate.receive({ seq: 3, frame: 16, buttons: Buttons.Fruit, moveX: 0, moveY: 0 }, 16);
+    gate.receive({ seq: 4, frame: 17, buttons: 0, moveX: 0, moveY: 0 }, 17);
+    expect(gate.holdButtonsAt(18)).toBe(Buttons.Fruit);
+    gate.worldStepTaken(18);
+    expect(gate.holdButtonsAt(19)).toBe(0);
+  });
+
+  it("counts the gaps a hold survived and the holds that lapsed after the grace window, and reports a lapse once", () => {
+    const gate = new InputGate();
+    const hold = (seq: number, frame: number) => gate.receive({ seq, frame, buttons: Buttons.Interact, moveX: 0, moveY: 0 }, frame);
+    hold(1, 0);
+    // A 400 ms stall: bridged, counted when the next message arrives.
+    for (let frame = 3; frame <= 24; frame += 3) expect(gate.worldStepTaken(frame)).toBeUndefined();
+    expect(gate.holdDiagnostics).toEqual({ gapsBridged: 0, holdsLapsed: 0 });
+    hold(2, 24);
+    expect(gate.holdDiagnostics).toEqual({ gapsBridged: 1, holdsLapsed: 0 });
+    // A short gap inside the input's own lapse is no bridge.
+    gate.worldStepTaken(33);
+    hold(3, 33);
+    expect(gate.holdDiagnostics.gapsBridged).toBe(1);
+    // A 1.2 s stall: the hold lapses once, on the first world step past the grace window, and is not a bridge.
+    const lapses: (number | undefined)[] = [];
+    for (let frame = 36; frame <= 33 + 72; frame += 3) lapses.push(gate.worldStepTaken(frame));
+    expect(lapses.filter((gap) => gap !== undefined)).toEqual([WORLD_HOLD_GRACE_FRAMES + 3]);
+    hold(4, 33 + 72);
+    expect(gate.holdDiagnostics).toEqual({ gapsBridged: 1, holdsLapsed: 1 });
+    // Nothing held: a gap is neither.
+    gate.receive({ seq: 5, frame: 110, buttons: 0, moveX: 1, moveY: 0 }, 110);
+    for (let frame = 111; frame <= 200; frame += 3) expect(gate.worldStepTaken(frame)).toBeUndefined();
+    expect(gate.holdDiagnostics).toEqual({ gapsBridged: 1, holdsLapsed: 1 });
+  });
+
+  it("drops out-of-sequence input and keeps the accepted one", () => {
+    const gate = new InputGate();
+    gate.receive(input(5, 10, 1), 10);
+    expect(gate.receive(input(5, 11, -1), 11)).toBe("stale-sequence");
+    expect(gate.receive(input(3, 11, -1), 11)).toBe("stale-sequence");
+    expect(gate.inputAt(12).moveX).toBe(AXIS_SCALE);
+    expect(gate.dropped["stale-sequence"]).toBe(2);
+  });
+
+  it("drops messages beyond the rate cap within one second of match time", () => {
+    const gate = new InputGate();
+    for (let seq = 1; seq <= MAX_INPUT_MESSAGES_PER_SECOND; seq++) expect(gate.receive(input(seq, 100), 100)).toBeUndefined();
+    expect(gate.receive(input(1000, 100), 100)).toBe("rate-limited");
+    // A second later the window resets.
+    expect(gate.receive(input(1001, 160), 160)).toBeUndefined();
+  });
+});
+
+describe("generateMatchCode", () => {
+  it("makes six uppercase letters or digits", () => {
+    for (let index = 0; index < 50; index++) expect(generateMatchCode()).toMatch(/^[A-Z0-9]{6}$/);
+    expect(generateMatchCode(() => 0)).toBe("AAAAAA");
+  });
+});

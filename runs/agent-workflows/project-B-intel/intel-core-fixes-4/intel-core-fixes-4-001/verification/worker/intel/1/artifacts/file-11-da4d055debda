@@ -1,0 +1,725 @@
+import { rubbingTypeOrder, type RubbingType } from "@pirate-sea-race/content/objectives";
+import { fnv1a64, hashState } from "../hash.js";
+import { nextInt } from "../random.js";
+import {
+  requireId,
+  requireInteger,
+  sectorName,
+  sectorOf,
+  type CarrierSighting,
+  type CarrierSnapshot,
+  type CarrierSnapshotEntry,
+  type IntelConfig,
+  type IntelLeadReason,
+  type IntelLeadTarget,
+  type IntelMessage,
+  type IntelMessageBody,
+  type IntelPlayerState,
+  type IntelPlayerView,
+  type IntelState,
+  type IntelStepResult,
+  type IntelWorldView,
+  type JournalRumor,
+  type PendingSighting,
+  type PendingSightingType,
+  type SectorRef,
+  type TargetedRumorOutcome,
+  type TargetedRumorRequest,
+  type TargetedRumorResult,
+} from "./state.js";
+
+/** Lowest id by UTF-16 code units, independent of locale. */
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function byTypeOrder(a: RubbingType, b: RubbingType): number {
+  return rubbingTypeOrder(a) - rubbingTypeOrder(b);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Reading the world view.
+
+interface WorldIndex {
+  readonly tick: number;
+  readonly players: ReadonlyMap<string, IntelPlayerView>;
+  /** Each player's held types (carried or reserved in a duel), in type order. */
+  readonly held: ReadonlyMap<string, readonly RubbingType[]>;
+  readonly sources: readonly { readonly type: RubbingType; readonly island: number; readonly sector: number }[];
+  readonly caches: readonly { readonly type: RubbingType; readonly sector: number }[];
+  readonly carriers: readonly CarrierSnapshotEntry[];
+}
+
+/** Refuses a malformed view: a tick not after `after`, duplicate ids, unknown types, islands or carriers, a doubled type. */
+function readView(config: IntelConfig, view: IntelWorldView, after: number): WorldIndex {
+  requireInteger(view.tick, "tick");
+  if (view.tick <= after) throw new RangeError(`expected a tick after ${after}, got ${view.tick}`);
+  const players = new Map<string, IntelPlayerView>();
+  for (const player of view.players) {
+    requireId(player.id, "player id");
+    if (players.has(player.id)) throw new RangeError(`player ${player.id} appears twice`);
+    requireInteger(player.x, `${player.id}.x`);
+    requireInteger(player.y, `${player.id}.y`);
+    players.set(player.id, player);
+  }
+  const ids = new Set<string>();
+  const held = new Map<string, RubbingType[]>([...players.keys()].map((id) => [id, []]));
+  const sources: { type: RubbingType; island: number; sector: number }[] = [];
+  const caches: { type: RubbingType; sector: number }[] = [];
+  const carriers: CarrierSnapshotEntry[] = [];
+  for (const rubbing of view.rubbings) {
+    requireId(rubbing.id, "rubbing id");
+    if (ids.has(rubbing.id)) throw new RangeError(`rubbing ${rubbing.id} appears twice`);
+    ids.add(rubbing.id);
+    if (!config.types.includes(rubbing.type)) throw new RangeError(`rubbing ${rubbing.id} has a type outside the preset: ${String(rubbing.type)}`);
+    const place = rubbing.place;
+    switch (place.kind) {
+      case "source":
+        requireInteger(place.island, `${rubbing.id} island`);
+        if (place.island < 0 || place.island >= config.islandNames.length) throw new RangeError(`rubbing ${rubbing.id} names an unknown island ${place.island}`);
+        requireInteger(place.x, `${rubbing.id}.x`);
+        requireInteger(place.y, `${rubbing.id}.y`);
+        sources.push({ type: rubbing.type, island: place.island, sector: sectorOf(config, place) });
+        break;
+      case "cache":
+        requireInteger(place.x, `${rubbing.id}.x`);
+        requireInteger(place.y, `${rubbing.id}.y`);
+        caches.push({ type: rubbing.type, sector: sectorOf(config, place) });
+        break;
+      case "carried":
+      case "duel": {
+        const holder = players.get(place.playerId);
+        if (holder === undefined) throw new RangeError(`rubbing ${rubbing.id} is with ${String(place.playerId)}, who is not in the view`);
+        const types = held.get(holder.id)!;
+        if (types.includes(rubbing.type)) throw new RangeError(`player ${holder.id} holds two ${rubbing.type} rubbings`);
+        types.push(rubbing.type);
+        carriers.push({ sector: sectorOf(config, holder), type: rubbing.type, holder: holder.id });
+        break;
+      }
+      default:
+        throw new RangeError(`rubbing ${rubbing.id} has an unknown place`);
+    }
+  }
+  for (const types of held.values()) types.sort(byTypeOrder);
+  carriers.sort((a, b) => a.sector - b.sector || byTypeOrder(a.type, b.type) || compareIds(a.holder, b.holder));
+  return { tick: view.tick, players, held, sources, caches, carriers };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Planning a lead: sealed sources first, then caches, then a carrier sighting when every other copy is carried.
+
+type LeadPlan =
+  | { readonly kind: "journal"; readonly options: readonly { readonly type: RubbingType; readonly target: IntelLeadTarget }[] }
+  | {
+      readonly kind: "carrier";
+      /** The wanted types whose every copy is carried by someone else. */
+      readonly types: readonly RubbingType[];
+      /** Before the carrier reveal, one sighting message per player per snapshot. */
+      readonly capped: boolean;
+      /** Distinct (type, sector) pairs from the previous snapshot, the player's own entries left out. */
+      readonly options: readonly { readonly type: RubbingType; readonly sector: number }[];
+      readonly seenTick: number;
+    }
+  | { readonly kind: "none" };
+
+interface LeadHolder {
+  readonly id: string;
+  readonly journal: readonly JournalRumor[];
+  readonly lastSightingBoundary: number;
+}
+
+function sameTarget(a: IntelLeadTarget, b: IntelLeadTarget): boolean {
+  return a.kind === "island" ? b.kind === "island" && a.island === b.island : b.kind === "sector" && a.sector === b.sector;
+}
+
+function uniqueSorted(values: readonly number[]): number[] {
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
+function planLead(
+  config: IntelConfig,
+  world: WorldIndex,
+  snapshots: readonly CarrierSnapshot[],
+  player: LeadHolder,
+  types: readonly RubbingType[],
+): LeadPlan {
+  const held = world.held.get(player.id) ?? [];
+  const wanted = config.types.filter((type) => types.includes(type) && !held.includes(type));
+  const active = player.journal.filter((rumor) => rumor.status === "active");
+  const fresh = (type: RubbingType, target: IntelLeadTarget) => !active.some((rumor) => rumor.type === type && sameTarget(rumor.target, target));
+
+  const islands = wanted.flatMap((type) =>
+    uniqueSorted(world.sources.filter((source) => source.type === type).map((source) => source.island))
+      .map((island) => ({ type, target: { kind: "island", island } as const }))
+      .filter((option) => fresh(option.type, option.target)),
+  );
+  if (islands.length > 0) return { kind: "journal", options: islands };
+  const sectors = wanted.flatMap((type) =>
+    uniqueSorted(world.caches.filter((cache) => cache.type === type).map((cache) => cache.sector))
+      .map((sector) => ({ type, target: { kind: "sector", sector } as const }))
+      .filter((option) => fresh(option.type, option.target)),
+  );
+  if (sectors.length > 0) return { kind: "journal", options: sectors };
+
+  const carried = wanted.filter(
+    (type) =>
+      !world.sources.some((source) => source.type === type) &&
+      !world.caches.some((cache) => cache.type === type) &&
+      world.carriers.some((carrier) => carrier.type === type && carrier.holder !== player.id),
+  );
+  if (carried.length === 0) return { kind: "none" };
+  const newest = snapshots.at(-1);
+  const older = snapshots.length === 2 ? snapshots[0]! : undefined;
+  const capped = world.tick < config.carrierRevealTick && newest !== undefined && player.lastSightingBoundary === newest.boundary;
+  const options: { type: RubbingType; sector: number }[] = [];
+  for (const entry of older?.entries ?? []) {
+    if (entry.holder === player.id || !carried.includes(entry.type)) continue;
+    if (!options.some((option) => option.type === entry.type && option.sector === entry.sector)) options.push({ type: entry.type, sector: entry.sector });
+  }
+  options.sort((a, b) => byTypeOrder(a.type, b.type) || a.sector - b.sector);
+  return { kind: "carrier", types: carried, capped, options, seenTick: older?.tick ?? -1 };
+}
+
+interface CoverageHolder extends LeadHolder {
+  readonly pending: PendingSighting | null;
+}
+
+/**
+ * Free coverage: whether a purchase of `type` would only buy what the player gets for free anyway. Only a type whose
+ * sole eligible target is a carrier qualifies, by `planLead`, the eligibility rumor generation uses (sources, then
+ * caches, then carriers), and then when either holds:
+ * (a) the minute-28 reveal has happened: the free 30 s broadcast is fresher than a paid sighting of the older snapshot;
+ * (b) the type is in the player's pending set after the gather phase: the next boundary delivers it free.
+ */
+function coveredFree(config: IntelConfig, world: WorldIndex, snapshots: readonly CarrierSnapshot[], holder: CoverageHolder, type: RubbingType): boolean {
+  if (planLead(config, world, snapshots, holder, [type]).kind !== "carrier") return false;
+  return world.tick >= config.carrierRevealTick || (holder.pending?.types.some((waiting) => waiting.type === type) ?? false);
+}
+
+/**
+ * The one free-coverage predicate of the step (`covered` answers in phase 3) and of the UI
+ * (`targetedRumorAvailability`), read from the state after its last step and the world view of that tick or a later one:
+ * `covered` when a purchase of `type` by `playerId` would be free coverage (`coveredFree`), otherwise null.
+ */
+export function freeCoverage(config: IntelConfig, state: IntelState, view: IntelWorldView, playerId: string, type: RubbingType): "covered" | null {
+  const world = readView(config, view, state.tick - 1);
+  if (!state.started || !world.players.has(playerId) || !config.types.includes(type)) return null;
+  const player = state.players.find((candidate) => candidate.id === playerId) ?? { id: playerId, journal: [], lastSightingBoundary: -1, pending: null };
+  return coveredFree(config, world, state.snapshots, player, type) ? "covered" : null;
+}
+
+/**
+ * What buying a targeted rumor for `type` would yield for `playerId` now, from the state after its last step and the
+ * world view of that tick or a later one, without drawing: `covered` by `freeCoverage`, otherwise the lead it would
+ * buy. A step on a later tick can differ only if it first crosses a snapshot boundary. A free trigger of the same
+ * player and type in that step makes the purchase `covered` instead.
+ */
+export function targetedRumorAvailability(
+  config: IntelConfig,
+  state: IntelState,
+  view: IntelWorldView,
+  playerId: string,
+  type: RubbingType,
+): Exclude<TargetedRumorResult, "duplicate"> {
+  const world = readView(config, view, state.tick - 1);
+  if (!state.started || !world.players.has(playerId) || !config.types.includes(type)) return "none";
+  if (freeCoverage(config, state, view, playerId, type) !== null) return "covered";
+  const player = state.players.find((candidate) => candidate.id === playerId) ?? { id: playerId, journal: [], lastSightingBoundary: -1 };
+  return targetedResult(planLead(config, world, state.snapshots, player, [type]));
+}
+
+function targetedResult(plan: LeadPlan): Exclude<TargetedRumorResult, "duplicate" | "covered"> {
+  if (plan.kind === "journal") return "rumor";
+  if (plan.kind === "none") return "none";
+  if (plan.capped) return "capped";
+  return plan.options.length > 0 ? "sighting" : "none";
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The three lead phases of a step: gather every trigger by (player, type), decide each entry, answer the requests.
+
+/** A trigger for a lead: a free one (a loss, a journal replacement, a pending type at a boundary) or a paid request. */
+export type LeadTrigger =
+  | { readonly playerId: string; readonly type: RubbingType; readonly free: PendingSightingType }
+  | { readonly playerId: string; readonly type: RubbingType; readonly requestId: string };
+
+/** One (player, type) of a step: the free trigger it keeps, if any, and the ids of its requests, sorted. */
+export interface LeadEntry {
+  readonly playerId: string;
+  readonly type: RubbingType;
+  readonly free: PendingSightingType | null;
+  readonly requestIds: readonly string[];
+}
+
+/** The earliest free trigger wins, then `fresh` before `replacement`, so the arrival order never picks the reason. */
+function compareFree(a: PendingSightingType, b: PendingSightingType): number {
+  return a.tick - b.tick || (a.reason === b.reason ? 0 : a.reason === "fresh" ? -1 : 1);
+}
+
+function compareEntries(a: { playerId: string; type: RubbingType }, b: { playerId: string; type: RubbingType }): number {
+  return compareIds(a.playerId, b.playerId) || byTypeOrder(a.type, b.type);
+}
+
+/** Phase 1: the step's triggers as a set keyed by (player, type), sorted by player id then type order. */
+export function gatherLeads(triggers: readonly LeadTrigger[]): LeadEntry[] {
+  const entries = new Map<string, { playerId: string; type: RubbingType; free: PendingSightingType | null; requestIds: Set<string> }>();
+  for (const trigger of triggers) {
+    const key = `${trigger.playerId}\u0000${trigger.type}`;
+    let entry = entries.get(key);
+    if (entry === undefined) entries.set(key, (entry = { playerId: trigger.playerId, type: trigger.type, free: null, requestIds: new Set() }));
+    if ("free" in trigger) {
+      if (entry.free === null || compareFree(trigger.free, entry.free) < 0) entry.free = trigger.free;
+    } else entry.requestIds.add(trigger.requestId);
+  }
+  return [...entries.values()]
+    .map(({ playerId, type, free, requestIds }) => ({ playerId, type, free, requestIds: [...requestIds].sort(compareIds) }))
+    .sort(compareEntries);
+}
+
+/**
+ * What one (player, type) entry got: `free` when a free trigger's (or the start's) rumor or sighting gave the player
+ * that type, `covered` when only its requests asked and free coverage (`freeCoverage`) holds, so nothing is sent,
+ * `rumor` or `sighting` when only its requests asked, otherwise `capped` or `none`.
+ */
+export type LeadDelivery = "free" | "covered" | "rumor" | "sighting" | "capped" | "none";
+
+/** One decided lead message, in decision order: per player by id, the start first, then its entries in type order. */
+export type DecidedLead =
+  | { readonly kind: "rumor"; readonly playerId: string; readonly type: RubbingType; readonly target: IntelLeadTarget; readonly reason: IntelLeadReason }
+  | { readonly kind: "no-lead"; readonly playerId: string; readonly type: RubbingType; readonly reason: IntelLeadReason };
+
+export interface LeadDecisions {
+  readonly leads: readonly DecidedLead[];
+  /** At most one sighting message per player, by player id, its types in type order. */
+  readonly sightings: readonly { readonly playerId: string; readonly seenTick: number; readonly sightings: readonly CarrierSighting[] }[];
+  readonly deliveries: readonly (LeadEntry & { readonly delivery: LeadDelivery })[];
+  /** The pending sighting of each player with an entry, after the step. */
+  readonly pending: ReadonlyMap<string, PendingSighting | null>;
+}
+
+type DecisionHolder = CoverageHolder;
+
+/** An integer in [0, bound) from a generator keyed by the seed and a decision's key, not by any other decision. */
+function keyedDraw(seed: number, key: string, bound: number): number {
+  return nextInt(Number.parseInt(fnv1a64(`${seed >>> 0}\u0000${key}`).slice(8), 16) >>> 0, bound).value;
+}
+
+/**
+ * Phase 2: decides each entry from the world view and the older snapshot. A starting player's start rumor comes first.
+ * Each draw is keyed by (seed, tick, player, type), or by the older snapshot's tick for a sighting's sector among the
+ * sorted candidates, so neither the order of the entries nor any other player's entries change a decision.
+ */
+function decide(
+  config: IntelConfig,
+  world: WorldIndex,
+  snapshots: readonly CarrierSnapshot[],
+  seed: number,
+  holders: ReadonlyMap<string, DecisionHolder>,
+  entries: readonly LeadEntry[],
+  starting: ReadonlySet<string>,
+): LeadDecisions {
+  const tick = world.tick;
+  const leads: DecidedLead[] = [];
+  const sightings: { playerId: string; seenTick: number; sightings: CarrierSighting[] }[] = [];
+  const deliveries: (LeadEntry & { delivery: LeadDelivery })[] = [];
+  const pending = new Map<string, PendingSighting | null>();
+  const sorted = [...entries].sort(compareEntries);
+  const playerIds = [...new Set([...starting, ...sorted.map((entry) => entry.playerId)])].sort(compareIds);
+  for (const playerId of playerIds) {
+    const known = holders.get(playerId);
+    const journal: JournalRumor[] = [...(known?.journal ?? [])];
+    const holder: LeadHolder = { id: playerId, journal, lastSightingBoundary: known?.lastSightingBoundary ?? -1 };
+    const held = world.held.get(playerId) ?? [];
+    const rumor = (plan: Extract<LeadPlan, { kind: "journal" }>, key: string, reason: IntelLeadReason): RubbingType => {
+      const { type, target } = plan.options[keyedDraw(seed, `${tick}\u0000${playerId}\u0000${key}`, plan.options.length)]!;
+      journal.push({ entry: journal.length + 1, type, target, reason, tick, status: "active", closedTick: null });
+      leads.push({ kind: "rumor", playerId, type, target, reason });
+      return type;
+    };
+    // A starting rumor points at a source or a cache of any missing type, never at a carrier; otherwise a no-lead.
+    let startType: RubbingType | null = null;
+    if (starting.has(playerId)) {
+      const plan = planLead(config, world, snapshots, holder, config.types);
+      if (plan.kind === "journal") startType = rumor(plan, "start", "start");
+      else {
+        const lacking = config.types.filter((type) => !held.includes(type));
+        if (lacking.length > 0) leads.push({ kind: "no-lead", playerId, type: lacking[0]!, reason: "start" });
+      }
+    }
+    const mine = sorted.filter((entry) => entry.playerId === playerId);
+    const carried: LeadEntry[] = [];
+    for (const entry of mine) {
+      if (entry.type === startType) {
+        deliveries.push({ ...entry, delivery: "free" });
+        continue;
+      }
+      // A purchase of what the broadcast or the pending set gives for free is covered: nothing sent, nothing charged.
+      if (entry.free === null && coveredFree(config, world, snapshots, { ...holder, pending: known?.pending ?? null }, entry.type)) {
+        deliveries.push({ ...entry, delivery: "covered" });
+        continue;
+      }
+      const plan = planLead(config, world, snapshots, holder, [entry.type]);
+      if (plan.kind === "journal") {
+        rumor(plan, entry.type, entry.free?.reason ?? "targeted");
+        deliveries.push({ ...entry, delivery: entry.free !== null ? "free" : "rumor" });
+      } else if (plan.kind === "carrier") carried.push(entry);
+      else {
+        if (entry.free !== null && !held.includes(entry.type)) leads.push({ kind: "no-lead", playerId, type: entry.type, reason: entry.free.reason });
+        deliveries.push({ ...entry, delivery: "none" });
+      }
+    }
+    if (mine.length === 0) continue;
+    // One sighting decision for the player: uncapped, one message lists every type the older snapshot can answer.
+    let sent: RubbingType[] = [];
+    let capped = false;
+    if (carried.length > 0) {
+      const plan = planLead(config, world, snapshots, holder, carried.map((entry) => entry.type));
+      if (plan.kind !== "carrier") throw new Error(`the sighting types of ${playerId} no longer need a sighting`);
+      capped = plan.capped;
+      if (!capped) sent = carried.map((entry) => entry.type).filter((type) => plan.options.some((option) => option.type === type));
+      if (sent.length > 0) {
+        sightings.push({
+          playerId,
+          seenTick: plan.seenTick,
+          sightings: sent.map((type) => {
+            const entry = carried.find((candidate) => candidate.type === type)!;
+            const sectors = plan.options.filter((option) => option.type === type).map((option) => option.sector);
+            const sector = sectors[keyedDraw(seed, `${plan.seenTick}\u0000${playerId}\u0000${type}`, sectors.length)]!;
+            return { type, reason: entry.free?.reason ?? "targeted", sector, name: sectorName(config, sector) };
+          }),
+        });
+      }
+    }
+    for (const entry of carried) {
+      deliveries.push({ ...entry, delivery: sent.includes(entry.type) ? (entry.free !== null ? "free" : "sighting") : capped ? "capped" : "none" });
+    }
+    // The free types not sent keep waiting in the one pending set; a paid type is never queued.
+    const kept = (known?.pending?.types ?? []).filter((waiting) => !sent.includes(waiting.type));
+    for (const entry of carried) {
+      if (entry.free !== null && !sent.includes(entry.type) && !kept.some((waiting) => waiting.type === entry.type)) kept.push(entry.free);
+    }
+    kept.sort((a, b) => byTypeOrder(a.type, b.type));
+    pending.set(playerId, kept.length > 0 ? { types: kept } : null);
+  }
+  deliveries.sort(compareEntries);
+  return { leads, sightings, deliveries, pending };
+}
+
+/**
+ * Phase 2 from outside a step: decides `entries` against a state whose snapshots are current (as after a step) and the
+ * world view of that tick or a later one. `starting` lists the players whose start rumor is decided too.
+ */
+export function decideLeads(
+  config: IntelConfig,
+  state: IntelState,
+  view: IntelWorldView,
+  entries: readonly LeadEntry[],
+  starting: readonly string[] = [],
+): LeadDecisions {
+  const world = readView(config, view, state.tick - 1);
+  return decide(config, world, state.snapshots, state.rng, new Map(state.players.map((player) => [player.id, player])), entries, new Set(starting));
+}
+
+/**
+ * Phase 3: the requests of each (player, type), by request id. A free delivery or free coverage covers them all; a
+ * paid one goes to the first and covers the rest; with nothing delivered, all get the same `capped` or `none`. Only
+ * `rumor` and `sighting` are charged, and one player's requests never change another's.
+ */
+export function answerRequests(deliveries: readonly { readonly requestIds: readonly string[]; readonly delivery: LeadDelivery }[]): Map<string, TargetedRumorResult> {
+  const results = new Map<string, TargetedRumorResult>();
+  for (const { requestIds, delivery } of deliveries) {
+    [...requestIds].sort(compareIds).forEach((requestId, index) => {
+      results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : "covered") : delivery);
+    });
+  }
+  return results;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The step.
+
+interface WorkingPlayer {
+  id: string;
+  held: readonly RubbingType[];
+  journal: JournalRumor[];
+  routeActive: boolean;
+  routeEver: boolean;
+  lastSightingBoundary: number;
+  pending: PendingSighting | null;
+}
+
+function working(player: IntelPlayerState): WorkingPlayer {
+  return { ...player, journal: [...player.journal] };
+}
+
+function frozen(player: WorkingPlayer): IntelPlayerState {
+  return {
+    id: player.id,
+    held: [...player.held],
+    journal: player.journal,
+    routeActive: player.routeActive,
+    routeEver: player.routeEver,
+    lastSightingBoundary: player.lastSightingBoundary,
+    pending: player.pending,
+  };
+}
+
+function sectorRef(config: IntelConfig, sector: number): SectorRef {
+  return { sector, name: sectorName(config, sector) };
+}
+
+/** The latest boundary `origin + k × interval` at or before `tick`, or -1 before `origin`. */
+function boundaryIndex(tick: number, origin: number, interval: number): number {
+  return tick < origin ? -1 : Math.floor((tick - origin) / interval);
+}
+
+/**
+ * One world tick of the information rules, in a fixed order:
+ *
+ * 1. Crossing a carrier boundary (every interval from control start) takes a snapshot of the carried copies; the
+ *    latest two are kept.
+ * 2. Per player, by id: the diff of held types resolves rumors for types gained; rumors whose target was emptied go
+ *    stale; a completed or broken full set announces the final sector and sends or suspends the route.
+ * 3. The leads, in three phases. Gather: every trigger joins a set keyed by (player, type): a type lost, a stale
+ *    rumor's replacement, a pending type at a boundary, a targeted request. Decide: per player by id, a starting
+ *    rumor first (never a sighting), then each entry in type order: a journal rumor, a no-lead, or its type joins the
+ *    player's one sighting decision (one message listing every type the older snapshot can answer, or, capped, the free
+ *    types wait as the one pending set); a purchase that `freeCoverage` covers sends nothing. Answer: each (player,
+ *    type)'s requests by request id (`answerRequests`).
+ * 4. The minute-20 sector reveal and the minute-28 carrier broadcasts, when their boundary was crossed.
+ *
+ * Every draw is keyed by (seed, tick, player, type), so no decision depends on the order of the triggers, requests or
+ * view arrays. Boundaries fire when crossed since the last processed tick, so a skipped tick never loses one. Before
+ * control start only the held types are tracked, and no message is sent. The input state is never mutated.
+ */
+export function stepIntel(
+  config: IntelConfig,
+  state: IntelState,
+  view: IntelWorldView,
+  requests: readonly TargetedRumorRequest[] = [],
+): IntelStepResult {
+  const world = readView(config, view, state.tick);
+  for (const request of requests) {
+    requireId(request.requestId, "request id");
+    requireId(request.playerId, "request player id");
+    if (typeof request.type !== "string") throw new RangeError(`request ${request.requestId} has no type`);
+  }
+  const tick = world.tick;
+  const messages: IntelMessage[] = [];
+  const toPlayer = (playerId: string, body: IntelMessageBody) => messages.push({ to: { kind: "player", playerId }, body });
+  const toEveryone = (body: IntelMessageBody) => messages.push({ to: { kind: "everyone" }, body });
+
+  const previous = new Map(state.players.map((player) => [player.id, player]));
+  const players: WorkingPlayer[] = [...world.players.keys()].sort(compareIds).map((id) => {
+    const known = previous.get(id);
+    return known
+      ? working(known)
+      : { id, held: [], journal: [], routeActive: false, routeEver: false, lastSightingBoundary: -1, pending: null };
+  });
+
+  // Requests: an id seen before is a duplicate and touches nothing. A new id listed twice in one batch is recorded
+  // once, for its lowest (player, type), so the listing order never picks it; the others are duplicates.
+  const seen = new Set(state.requestIds);
+  const chosen = new Map<string, number>();
+  requests.forEach((request, index) => {
+    if (seen.has(request.requestId)) return;
+    const other = chosen.get(request.requestId);
+    if (other === undefined || compareEntries(request, requests[other]!) < 0) chosen.set(request.requestId, index);
+  });
+  const outcomes = new Map<number, TargetedRumorResult>();
+  const accepted: { index: number; request: TargetedRumorRequest }[] = [];
+  requests.forEach((request, index) => {
+    if (chosen.get(request.requestId) === index) accepted.push({ index, request });
+    else outcomes.set(index, "duplicate");
+  });
+  const requestIds = chosen.size === 0 ? state.requestIds : [...state.requestIds, ...chosen.keys()].sort(compareIds);
+  const answer = (): TargetedRumorOutcome[] => requests.map((request, index) => ({ requestId: request.requestId, result: outcomes.get(index)! }));
+
+  if (tick < config.controlStartTick) {
+    for (const { index } of accepted) outcomes.set(index, "none");
+    for (const player of players) player.held = world.held.get(player.id)!;
+    return { state: { ...state, tick, players: players.map(frozen), requestIds }, messages, outcomes: answer() };
+  }
+
+  // 1. Carrier snapshots.
+  let snapshots = state.snapshots;
+  const boundary = boundaryIndex(tick, config.controlStartTick, config.carrierIntervalTicks);
+  const crossedBoundary = boundary > (snapshots.at(-1)?.boundary ?? -1);
+  if (crossedBoundary) snapshots = [...snapshots, { boundary, tick, entries: world.carriers }].slice(-2);
+
+  // 2. Players; their free triggers are gathered for step 3.
+  const triggers: LeadTrigger[] = [];
+  const starting = new Set<string>();
+  const startCrossed = !state.started;
+  let finalAnnounced = state.finalSectorAnnounced;
+  for (const player of players) {
+    const held = world.held.get(player.id)!;
+    if (startCrossed || !previous.has(player.id)) {
+      player.held = held;
+      starting.add(player.id);
+    } else {
+      const gained = held.filter((type) => !player.held.includes(type));
+      const lost = player.held.filter((type) => !held.includes(type));
+      player.held = held;
+      // Types obtained retire their rumors quietly and cancel their deferred sightings.
+      player.journal = player.journal.map((rumor) => {
+        if (rumor.status !== "active" || !gained.includes(rumor.type)) return rumor;
+        toPlayer(player.id, { kind: "rumor-resolved", tick, entry: rumor.entry, type: rumor.type });
+        return { ...rumor, status: "resolved", closedTick: tick };
+      });
+      const stillWanted = player.pending?.types.filter((pending) => !held.includes(pending.type)) ?? [];
+      player.pending = stillWanted.length > 0 ? { types: stillWanted } : null;
+      // At a boundary the pending types are decided again with this step's other triggers. A type the player has
+      // bought a live rumor for since is dropped quietly: no sighting and no no-lead.
+      if (crossedBoundary) {
+        player.pending = null;
+        for (const pending of stillWanted) {
+          if (player.journal.some((rumor) => rumor.status === "active" && rumor.type === pending.type)) continue;
+          triggers.push({ playerId: player.id, type: pending.type, free: pending });
+        }
+      }
+      // §11: a free fresh rumor for each type lost. Entering a duel is no loss: reserved copies still count as held.
+      for (const type of lost) triggers.push({ playerId: player.id, type, free: { type, reason: "fresh", tick } });
+    }
+
+    // Journal rumors whose island or cache sector no longer holds the type go stale, then get a replacement.
+    player.journal = player.journal.map((rumor) => {
+      if (rumor.status !== "active") return rumor;
+      const { target } = rumor;
+      const holds =
+        target.kind === "island"
+          ? world.sources.some((source) => source.type === rumor.type && source.island === target.island)
+          : world.caches.some((cache) => cache.type === rumor.type && cache.sector === target.sector);
+      if (holds) return rumor;
+      toPlayer(player.id, { kind: "rumor-stale", tick, entry: rumor.entry, type: rumor.type });
+      triggers.push({ playerId: player.id, type: rumor.type, free: { type: rumor.type, reason: "replacement", tick } });
+      return { ...rumor, status: "stale", closedTick: tick };
+    });
+
+    // §5: the first full set announces the final sector to everyone; each holder gets the route while the set is whole.
+    const complete = config.types.every((type) => held.includes(type));
+    if (complete && !player.routeActive) {
+      if (!finalAnnounced) {
+        finalAnnounced = true;
+        const sector = sectorOf(config, config.finalIsland);
+        toEveryone({ kind: "final-sector", tick, sector, name: sectorName(config, sector) });
+      }
+      toPlayer(player.id, { kind: "final-route", tick, x: config.finalIsland.x, y: config.finalIsland.y, restored: player.routeEver });
+      player.routeActive = true;
+      player.routeEver = true;
+    } else if (!complete && player.routeActive) {
+      toPlayer(player.id, { kind: "final-route-inactive", tick });
+      player.routeActive = false;
+    }
+  }
+
+  // 3. Leads. Gather: targeted requests (§11) join the free triggers by (player, type).
+  const byId = new Map(players.map((player) => [player.id, player]));
+  const requestIndex = new Map<string, number>();
+  for (const { index, request } of accepted) {
+    if (!byId.has(request.playerId) || !config.types.includes(request.type)) outcomes.set(index, "none");
+    else {
+      requestIndex.set(request.requestId, index);
+      triggers.push({ playerId: request.playerId, type: request.type, requestId: request.requestId });
+    }
+  }
+  const entries = gatherLeads(triggers);
+  // Decide.
+  const decided = decide(config, world, snapshots, state.rng, byId, entries, starting);
+  for (const lead of decided.leads) {
+    const player = byId.get(lead.playerId)!;
+    if (lead.kind === "no-lead") {
+      toPlayer(player.id, { kind: "no-lead", tick, type: lead.type, reason: lead.reason });
+      continue;
+    }
+    const { type, target, reason } = lead;
+    const entry = player.journal.length + 1;
+    player.journal.push({ entry, type, target, reason, tick, status: "active", closedTick: null });
+    toPlayer(player.id, {
+      kind: "rumor",
+      tick,
+      entry,
+      type,
+      reason,
+      target:
+        target.kind === "island"
+          ? { kind: "island", island: target.island, name: config.islandNames[target.island]! }
+          : { kind: "sector", sector: target.sector, name: sectorName(config, target.sector) },
+    });
+  }
+  // A sighting message spends the player's sighting for this snapshot.
+  for (const { playerId, seenTick, sightings } of decided.sightings) {
+    byId.get(playerId)!.lastSightingBoundary = snapshots.at(-1)!.boundary;
+    toPlayer(playerId, { kind: "carrier-sighting", tick, seenTick, sightings });
+  }
+  for (const [playerId, pending] of decided.pending) byId.get(playerId)!.pending = pending;
+  // Answer.
+  for (const [requestId, result] of answerRequests(decided.deliveries)) outcomes.set(requestIndex.get(requestId)!, result);
+
+  // 4. Timed reveals (§2).
+  let sectorRevealed = state.sectorRevealed;
+  if (!sectorRevealed && tick >= config.sectorRevealTick) {
+    sectorRevealed = true;
+    toEveryone({
+      kind: "sector-reveal",
+      tick,
+      sources: uniqueSorted(world.sources.map((source) => source.sector)).map((sector) => sectorRef(config, sector)),
+      caches: uniqueSorted(world.caches.map((cache) => cache.sector)).map((sector) => sectorRef(config, sector)),
+    });
+  }
+  let lastCarrierBroadcast = state.lastCarrierBroadcast;
+  const broadcast = boundaryIndex(tick, config.carrierRevealTick, config.carrierIntervalTicks);
+  if (broadcast > lastCarrierBroadcast) {
+    lastCarrierBroadcast = broadcast;
+    const newest = snapshots.at(-1)!;
+    const carriers: (SectorRef & { type: RubbingType })[] = [];
+    for (const entry of newest.entries) {
+      if (!carriers.some((carrier) => carrier.sector === entry.sector && carrier.type === entry.type)) {
+        carriers.push({ ...sectorRef(config, entry.sector), type: entry.type });
+      }
+    }
+    toEveryone({ kind: "carrier-report", tick, seenTick: newest.tick, carriers });
+  }
+
+  return {
+    state: {
+      tick,
+      rng: state.rng,
+      started: true,
+      players: players.map(frozen),
+      snapshots,
+      finalSectorAnnounced: finalAnnounced,
+      sectorRevealed,
+      lastCarrierBroadcast,
+      requestIds,
+    },
+    messages,
+    outcomes: answer(),
+  };
+}
+
+export interface IntelReplayTick {
+  readonly view: IntelWorldView;
+  readonly requests?: readonly TargetedRumorRequest[];
+}
+
+export interface IntelReplay {
+  readonly state: IntelState;
+  readonly messages: readonly IntelMessage[];
+  readonly outcomes: readonly TargetedRumorOutcome[];
+  readonly hash: string;
+}
+
+/** Steps a sequence of views from a state, collecting every message and outcome; `hash` is the final `hashState`. */
+export function replayIntel(config: IntelConfig, state: IntelState, ticks: readonly IntelReplayTick[]): IntelReplay {
+  let current = state;
+  const messages: IntelMessage[] = [];
+  const outcomes: TargetedRumorOutcome[] = [];
+  for (const { view, requests } of ticks) {
+    const stepped = stepIntel(config, current, view, requests ?? []);
+    current = stepped.state;
+    messages.push(...stepped.messages);
+    outcomes.push(...stepped.outcomes);
+  }
+  return { state: current, messages, outcomes, hash: hashState(current) };
+}

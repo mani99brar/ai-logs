@@ -1,0 +1,143 @@
+import { expect, test, type Page } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/sea.js";
+import { PROTOCOL_VERSION } from "../../packages/protocol/src/version.js";
+
+const SUB_UNITS_PER_TILE = seaMap.subUnitsPerTile;
+const MAP_CENTRE_X = (seaMap.widthTiles * seaMap.subUnitsPerTile) / 2;
+
+interface DrawnShip {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly color: string;
+}
+
+async function createMatch(page: Page): Promise<string> {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Create match" }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+  const code = page.getByTestId("hud-code");
+  await expect(code).toHaveText(/^[A-Z0-9]{6}$/);
+  return (await code.textContent())!;
+}
+
+async function joinMatch(page: Page, code: string): Promise<void> {
+  await page.goto("/");
+  await page.getByLabel("Match code").fill(code);
+  await page.getByRole("button", { name: "Join" }).click();
+}
+
+/** The authoritative position of a ship in a page's HUD readout. */
+async function readout(page: Page, shipId: string): Promise<{ x: number; y: number }> {
+  const item = page.locator(`[data-ship-id="${shipId}"]`);
+  return { x: Number(await item.getAttribute("data-x")), y: Number(await item.getAttribute("data-y")) };
+}
+
+/**
+ * The ids of ships whose colour is actually on the canvas where the scene says it drew them. Reads a real
+ * screenshot of the canvas, so it checks rendered pixels rather than scene bookkeeping.
+ */
+async function shipsOnCanvas(page: Page): Promise<string[]> {
+  const drawn = JSON.parse((await page.getByTestId("game").getAttribute("data-drawn-ships")) ?? "[]") as DrawnShip[];
+  const png = await page.locator("#game canvas").screenshot();
+  const visible = await page.evaluate(
+    async ({ base64, ships }) => {
+      const blob = await (await fetch(`data:image/png;base64,${base64}`)).blob();
+      const bitmap = await createImageBitmap(blob);
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const context = canvas.getContext("2d")!;
+      context.drawImage(bitmap, 0, 0);
+      return ships
+        .filter((ship) => {
+          const [r, g, b] = context.getImageData(ship.x, ship.y, 1, 1).data;
+          const want = Number.parseInt(ship.color.slice(1), 16);
+          const near = (actual: number, expected: number) => Math.abs(actual - expected) <= 24;
+          return near(r!, (want >> 16) & 0xff) && near(g!, (want >> 8) & 0xff) && near(b!, want & 0xff);
+        })
+        .map((ship) => ship.id);
+    },
+    { base64: png.toString("base64"), ships: drawn },
+  );
+  return visible.sort();
+}
+
+test("create a private match from the landing page and see it in the HUD [scenario:join-private-match]", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Pirate Sea Race" })).toBeVisible();
+
+  // An unknown code is refused on the landing page.
+  await page.getByLabel("Match code").fill("zzzzz9");
+  await page.getByRole("button", { name: "Join" }).click();
+  await expect(page.getByTestId("join-error")).toHaveText("No match with that code");
+
+  await page.getByRole("button", { name: "Create match" }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+  await expect(page.getByTestId("hud-code")).toHaveText(/^[A-Z0-9]{6}$/);
+  await expect(page.getByTestId("hud-protocol")).toHaveText(`v${PROTOCOL_VERSION}`);
+  await expect(page.getByTestId("hud-players")).toHaveText("1");
+  await expect(page.getByTestId("hud-mode")).toHaveText("custom");
+  await expect(page.getByRole("button", { name: "Create match" })).toBeHidden();
+
+  const self = (await page.getByTestId("hud-self").textContent())!;
+  await expect.poll(() => shipsOnCanvas(page)).toEqual([self]);
+
+  const screenshot = testInfo.outputPath("join-private-match.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("screenshot:join-private-match", { path: screenshot, contentType: "image/png" });
+});
+
+test("a ship moved in one browser moves in the other [scenario:two-ships-sync]", async ({ browser }, testInfo) => {
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+
+    const code = await createMatch(host);
+    await joinMatch(guest, code.toLowerCase());
+    await expect(guest.getByTestId("hud-status")).toHaveText("connected");
+    await expect(guest.getByTestId("hud-code")).toHaveText(code);
+    await expect(host.getByTestId("hud-players")).toHaveText("2");
+    await expect(guest.getByTestId("hud-players")).toHaveText("2");
+
+    const hostId = (await host.getByTestId("hud-self").textContent())!;
+    const guestId = (await guest.getByTestId("hud-self").textContent())!;
+    const start = await readout(guest, hostId);
+    const guestStart = await readout(guest, guestId);
+
+    // Sail the host's ship a tile or more toward the middle of the sea with the keyboard; the guest's readout
+    // follows the server.
+    const direction = start.x < MAP_CENTRE_X ? 1 : -1;
+    const key = direction > 0 ? "ArrowRight" : "ArrowLeft";
+    await host.keyboard.down(key);
+    await expect
+      .poll(async () => ((await readout(guest, hostId)).x - start.x) * direction, { timeout: 10_000 })
+      .toBeGreaterThan(SUB_UNITS_PER_TILE);
+    await host.keyboard.up(key);
+
+    // Once the ship stops, both browsers show the same authoritative position.
+    await expect
+      .poll(async () => {
+        const [inHost, inGuest] = await Promise.all([readout(host, hostId), readout(guest, hostId)]);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const [laterHost, laterGuest] = await Promise.all([readout(host, hostId), readout(guest, hostId)]);
+        return inHost.x === inGuest.x && laterHost.x === inHost.x && laterGuest.x === inGuest.x ? inGuest : undefined;
+      })
+      .toBeDefined();
+    const settled = await readout(guest, hostId);
+    expect((settled.x - start.x) * direction).toBeGreaterThan(SUB_UNITS_PER_TILE);
+    expect(settled.y).toBe(start.y);
+    expect(await readout(host, hostId)).toEqual(settled);
+    expect(await readout(guest, guestId)).toEqual(guestStart);
+
+    // Both ships are drawn on the guest's canvas.
+    await expect.poll(() => shipsOnCanvas(guest)).toEqual([hostId, guestId].sort());
+
+    const screenshot = testInfo.outputPath("two-ships-sync.png");
+    await guest.screenshot({ path: screenshot });
+    await testInfo.attach("screenshot:two-ships-sync", { path: screenshot, contentType: "image/png" });
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

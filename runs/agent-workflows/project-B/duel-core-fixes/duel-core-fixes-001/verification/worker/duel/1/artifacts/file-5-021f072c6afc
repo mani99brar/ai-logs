@@ -1,0 +1,287 @@
+import { z } from "zod";
+import { baselineFrameBudgets, moveTimingSchema, type MoveTiming } from "../frameBudgets.js";
+import { formatIssues, type ValidationResult } from "../rules.js";
+
+/**
+ * An axis-aligned box in integer sub-pixels, relative to a fighter's origin (the middle of its feet) for a fighter
+ * facing right; y grows upwards from the floor. The box covers the half-open ranges [x, x + w) × [y, y + h), so it
+ * needs a positive width and height to cover anything.
+ */
+export const boxSchema = z.strictObject({
+  x: z.int(),
+  y: z.int(),
+  w: z.int().positive(),
+  h: z.int().positive(),
+});
+
+export type Box = z.infer<typeof boxSchema>;
+
+const count = z.int().nonnegative();
+const positive = z.int().positive();
+
+/**
+ * §8's move timing, restricted to what a fighter's own move can be: numeric active frames, blockable or not. The
+ * rows go through §8's own schema, so its rules (positive startup and active frames, block advantage within
+ * active + recovery) are checked in one place.
+ */
+export const duelMoveTimingSchema = moveTimingSchema.transform((timing, ctx) => {
+  const { active, onBlock } = timing;
+  if (active === "projectile-life") {
+    ctx.issues.push({ code: "custom", input: active, path: ["active"], message: "a fighter's move needs a number of active frames" });
+    return z.NEVER;
+  }
+  if (onBlock.kind === "spacing-dependent") {
+    ctx.issues.push({ code: "custom", input: onBlock, path: ["onBlock"], message: "a fighter's move is blockable with a frame advantage, or unguardable" });
+    return z.NEVER;
+  }
+  return { ...timing, active, onBlock };
+});
+
+export type DuelMoveTiming = z.infer<typeof duelMoveTimingSchema>;
+
+export const guardLevelSchema = z.enum(["high", "mid", "low", "unguardable"]);
+export type GuardLevel = z.infer<typeof guardLevelSchema>;
+
+export const moveCategorySchema = z.enum(["light", "heavy", "special", "throw"]);
+export type MoveCategory = z.infer<typeof moveCategorySchema>;
+
+/**
+ * One move. Frame counts are 60 Hz frames: `startup` frames come before the first active frame, then `active`, then
+ * `recovery`. Distances and velocities are sub-pixels (per frame).
+ */
+export const duelMoveSchema = z
+  .strictObject({
+    timing: duelMoveTimingSchema,
+    kind: z.enum(["strike", "throw"]),
+    /** Decides what blocking it costs (§7) and which rules apply. */
+    category: moveCategorySchema,
+    /** The hurtbox the attacker uses while performing the move. */
+    stance: z.enum(["standing", "crouching"]),
+    guard: guardLevelSchema,
+    /** One box for the whole active phase. */
+    hitbox: boxSchema,
+    /** Before combo scaling. */
+    damage: positive,
+    /** Frames the defender cannot act after a hit, counting the contact frame; for a throw, the knockdown after it. */
+    hitstun: positive,
+    /** Frames the defender cannot act after blocking, counting the contact frame; 0 for a throw. */
+    blockstun: count,
+    hitPushback: count,
+    blockPushback: count,
+    /** Upward velocity given to the defender on hit (sub-pixels per frame); 0 leaves a grounded defender grounded. */
+    launch: count,
+    /** Forward velocity of the attacker during startup and active frames. */
+    advance: count,
+    /** Frames from the move's first frame during which strikes pass through the attacker. */
+    strikeInvulnerable: count,
+    /** Stamina the defender spends to block it. */
+    guardStaminaCost: count,
+  })
+  .superRefine((move, ctx) => {
+    const { timing } = move;
+    const isThrow = move.kind === "throw";
+    if (isThrow !== (move.category === "throw") || isThrow !== (move.guard === "unguardable")) {
+      ctx.addIssue({ code: "custom", path: ["kind"], message: "a throw, and only a throw, has the throw category and is unguardable" });
+    }
+    if (isThrow) {
+      if (timing.onBlock.kind !== "unguardable") ctx.addIssue({ code: "custom", path: ["timing", "onBlock"], message: "a throw is unguardable" });
+      if (move.blockstun !== 0) ctx.addIssue({ code: "custom", path: ["blockstun"], message: "a throw cannot be blocked" });
+    } else if (timing.onBlock.kind !== "frames") {
+      ctx.addIssue({ code: "custom", path: ["timing", "onBlock"], message: "a strike needs a frame advantage on block" });
+    } else if (move.blockstun !== timing.active + timing.recovery + timing.onBlock.advantage) {
+      // Contact on the first active frame, which is also the defender's first blockstun frame.
+      ctx.addIssue({
+        code: "custom",
+        path: ["blockstun"],
+        message: `blockstun ${move.blockstun} does not give ${timing.onBlock.advantage} on block (needs ${timing.active + timing.recovery + timing.onBlock.advantage})`,
+      });
+    }
+    if (move.strikeInvulnerable > timing.startup) {
+      ctx.addIssue({ code: "custom", path: ["strikeInvulnerable"], message: "strike invulnerability cannot outlast startup" });
+    }
+  });
+
+export type DuelMove = z.infer<typeof duelMoveSchema>;
+
+const hurtboxesSchema = z.strictObject({ standing: boxSchema, crouching: boxSchema, airborne: boxSchema });
+
+/** A fighter's body and movement. Distances are sub-pixels, speeds sub-pixels per frame, durations frames. */
+export const duelFighterSchema = z.strictObject({
+  hurtboxes: hurtboxesSchema,
+  /** Two fighters' pushboxes never overlap: centred on the origin, `halfWidth` either side, `height` tall. */
+  pushbox: z.strictObject({ halfWidth: positive, height: positive }),
+  walkForwardSpeed: positive,
+  walkBackSpeed: positive,
+  jumpVelocity: positive,
+  jumpSpeedX: count,
+  /** Subtracted from the vertical velocity every airborne frame. */
+  gravity: positive,
+  dashFrames: positive,
+  dashSpeed: positive,
+  backdashFrames: positive,
+  backdashSpeed: positive,
+  /** Recovery of both fighters after a throw escape or two throws breaking each other. */
+  throwBreakFrames: positive,
+  /** How far each fighter is pushed away from the other when a throw breaks. */
+  throwBreakPushback: count,
+});
+
+export type DuelFighter = z.infer<typeof duelFighterSchema>;
+
+/** The single-plane arena: a floor between two walls. */
+export const duelArenaSchema = z.strictObject({
+  subPixelsPerPixel: positive,
+  /** Wall to wall, in sub-pixels. Fighters' origins stay a pushbox half-width inside the walls. */
+  width: positive,
+  /** Distance between the two fighters' origins at the start, placed symmetrically about the centre. */
+  startGap: positive,
+});
+
+export type DuelArena = z.infer<typeof duelArenaSchema>;
+
+/** §7's round, stamina and combo rules as numbers. */
+export const duelRulesSchema = z.strictObject({
+  roundFrames: positive,
+  overtimeFrames: positive,
+  maxHealth: positive,
+  maxStamina: positive,
+  dashStaminaCost: count,
+  guardStaminaCost: z.strictObject({ light: count, heavy: count, special: count }),
+  /** Frames without spending or blocking before stamina regenerates. */
+  staminaRegenDelayFrames: count,
+  /** After the delay, one stamina point every this many frames (3 frames is 20 a second). */
+  staminaRegenIntervalFrames: positive,
+  guardBreakStaggerFrames: positive,
+  /** Added to the stamina a guard break leaves, up to `maxStamina`. */
+  guardBreakStaminaRestore: count,
+  /** Percent of base damage for the first, second, ... damaging hit of a combo. */
+  comboScaling: z.array(z.int().min(1).max(100)).min(1).readonly(),
+  /** The damaging hit that forces the non-juggleable recovery. */
+  comboCap: positive,
+  forcedRecoveryFrames: positive,
+  throwEscapeFrames: positive,
+  inputBufferFrames: positive,
+  /**
+   * The throw chord window: a light or heavy move that a free fighter started becomes the throw when the other button
+   * is pressed up to this many frames later, before the move's first active frame (keyboard rollover, §8).
+   */
+  throwChordFrames: count,
+});
+
+export type DuelRules = z.infer<typeof duelRulesSchema>;
+
+/** Which move each input starts (§8): down + heavy is the low sweep, forward + heavy the launcher, down + light the anti-air. */
+export const duelCommandsSchema = z.strictObject({
+  light: z.string(),
+  downLight: z.string(),
+  heavy: z.string(),
+  downHeavy: z.string(),
+  forwardHeavy: z.string(),
+  special1: z.string(),
+  special2: z.string(),
+  throw: z.string(),
+});
+
+export type DuelCommands = z.infer<typeof duelCommandsSchema>;
+
+/**
+ * The commands a light or heavy press starts, each with the button that still turns it into the throw inside the
+ * throw chord window.
+ */
+export const THROW_CHORD_PARTNER = {
+  light: "heavy",
+  downLight: "heavy",
+  heavy: "light",
+  downHeavy: "light",
+  forwardHeavy: "light",
+} as const satisfies Partial<Record<keyof DuelCommands, "light" | "heavy">>;
+
+/** Everything the duel step reads. `movesetVersion` identifies it all, and a duel state records that version. */
+export const duelMovesetSchema = z
+  .strictObject({
+    rules: duelRulesSchema,
+    arena: duelArenaSchema,
+    fighter: duelFighterSchema,
+    moves: z.array(duelMoveSchema).min(1).readonly(),
+    commands: duelCommandsSchema,
+  })
+  .superRefine((moveset, ctx) => {
+    const { rules, arena, fighter } = moveset;
+    const byId = new Map<string, DuelMove>();
+    moveset.moves.forEach((move, index) => {
+      const id = move.timing.id;
+      if (byId.has(id)) ctx.addIssue({ code: "custom", path: ["moves", index, "timing", "id"], message: `${id}: duplicate move id` });
+      byId.set(id, move);
+      // A move named like a §8 baseline row must use that row's timing exactly.
+      const baseline = baselineFrameBudgets.find((row) => row.id === id);
+      if (baseline !== undefined && !sameTiming(move.timing, baseline)) {
+        ctx.addIssue({ code: "custom", path: ["moves", index, "timing"], message: `${id}: timing differs from §8's baseline row` });
+      }
+      const cost = move.category === "throw" ? 0 : rules.guardStaminaCost[move.category];
+      if (move.guardStaminaCost !== cost) {
+        ctx.addIssue({ code: "custom", path: ["moves", index, "guardStaminaCost"], message: `${id}: blocking a ${move.category} costs ${cost}` });
+      }
+    });
+    for (const [command, id] of Object.entries(moveset.commands)) {
+      const move = byId.get(id);
+      if (move === undefined) {
+        ctx.addIssue({ code: "custom", path: ["commands", command], message: `unknown move "${id}"` });
+      } else if ((command === "throw") !== (move.kind === "throw")) {
+        ctx.addIssue({ code: "custom", path: ["commands", command], message: `"${id}" is the wrong kind of move for ${command}` });
+      }
+    }
+    // The chord window closes before a light or heavy move could strike, so a throw never replaces an active hitbox.
+    for (const command of Object.keys(THROW_CHORD_PARTNER) as (keyof typeof THROW_CHORD_PARTNER)[]) {
+      const move = byId.get(moveset.commands[command]);
+      if (move !== undefined && rules.throwChordFrames >= move.timing.startup) {
+        ctx.addIssue({ code: "custom", path: ["rules", "throwChordFrames"], message: `the throw chord window outlasts ${move.timing.id}'s startup` });
+      }
+    }
+    if (rules.comboCap > rules.comboScaling.length) {
+      ctx.addIssue({ code: "custom", path: ["rules", "comboCap"], message: "every hit up to the cap needs a scaling step" });
+    }
+    if (rules.dashStaminaCost > rules.maxStamina) {
+      ctx.addIssue({ code: "custom", path: ["rules", "dashStaminaCost"], message: "a dash would cost more than full stamina" });
+    }
+    // Symmetric start positions need even distances, and both fighters must start inside the walls and out of reach
+    // of every move, including the distance an advancing move travels through its startup and active frames (§6: no
+    // free opening hit).
+    if (arena.width % 2 !== 0 || arena.startGap % 2 !== 0) {
+      ctx.addIssue({ code: "custom", path: ["arena"], message: "arena width and start gap must be even" });
+    }
+    if (arena.startGap > arena.width - 2 * fighter.pushbox.halfWidth) {
+      ctx.addIssue({ code: "custom", path: ["arena", "startGap"], message: "the start positions lie outside the walls" });
+    }
+    const hurtReach = Math.max(...Object.values(fighter.hurtboxes).map((box) => Math.max(box.x + box.w, -box.x)));
+    const hitReach = Math.max(
+      ...moveset.moves.map((move) => move.hitbox.x + move.hitbox.w + move.advance * (move.timing.startup + move.timing.active)),
+    );
+    if (arena.startGap < hitReach + hurtReach) {
+      ctx.addIssue({ code: "custom", path: ["arena", "startGap"], message: "fighters would start within reach of a move" });
+    }
+  });
+
+export type DuelMoveset = z.infer<typeof duelMovesetSchema>;
+
+function sameTiming(a: DuelMoveTiming, b: MoveTiming): boolean {
+  const advantage = (timing: MoveTiming | DuelMoveTiming) => (timing.onBlock.kind === "frames" ? timing.onBlock.advantage : null);
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.startup === b.startup &&
+    a.active === b.active &&
+    a.recovery === b.recovery &&
+    a.onBlock.kind === b.onBlock.kind &&
+    advantage(a) === advantage(b)
+  );
+}
+
+export function validateDuelMove(candidate: unknown): ValidationResult<DuelMove> {
+  const parsed = duelMoveSchema.safeParse(candidate);
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, issues: formatIssues(parsed.error) };
+}
+
+export function validateDuelMoveset(candidate: unknown): ValidationResult<DuelMoveset> {
+  const parsed = duelMovesetSchema.safeParse(candidate);
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, issues: formatIssues(parsed.error) };
+}

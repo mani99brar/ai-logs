@@ -1,0 +1,201 @@
+import { describe, expect, it } from "vitest";
+import { canonicalize } from "../hash.js";
+import { nextInt } from "../random.js";
+import {
+  answerRuin,
+  clueFor,
+  createRuins,
+  hashState,
+  openRuin,
+  reportPresence,
+  ruinIslands,
+  RUIN_MOVES,
+  RUIN_SYMBOLS,
+  type Ruin,
+  type RuinAttempt,
+  type RuinEvent,
+  type RuinsState,
+} from "./index.js";
+
+const ISLANDS = [0, 1, 2, 3].map((island) => ({ island, sourceIds: [`source-${island}-0`, `source-${island}-1`] }));
+const PLAYERS = ["p1", "p10", "p2", "Crew"];
+
+type Draw = (bound: number) => number;
+
+function generator(seed: number): Draw {
+  let rng = seed;
+  return (bound) => {
+    const drawn = nextInt(rng, bound);
+    rng = drawn.state;
+    return drawn.value;
+  };
+}
+
+function frozen<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const item of Object.values(value)) frozen(item);
+  }
+  return value;
+}
+
+/** A right answer from the secret puzzle: the sequence, or a minimum route found by breadth-first search. */
+function rightAnswer(ruin: Ruin): RuinAttempt {
+  const puzzle = ruin.puzzle;
+  if (puzzle.kind === "sequence") return { kind: "sequence", symbols: [...puzzle.answer] };
+  const blocked = new Set(puzzle.blocked.map(({ x, y }) => `${x},${y}`));
+  const routes = new Map<string, RuinAttempt & { kind: "navigation" }>([[`${puzzle.start.x},${puzzle.start.y}`, { kind: "navigation", moves: [] }]]);
+  const queue = [puzzle.start];
+  const delta = { N: [0, -1], E: [1, 0], S: [0, 1], W: [-1, 0] } as const;
+  for (let head = 0; head < queue.length; head++) {
+    const { x, y } = queue[head]!;
+    const route = routes.get(`${x},${y}`)!;
+    if (x === puzzle.goal.x && y === puzzle.goal.y) return route;
+    for (const move of RUIN_MOVES) {
+      const next = { x: x + delta[move][0], y: y + delta[move][1] };
+      const key = `${next.x},${next.y}`;
+      if (next.x < 0 || next.y < 0 || next.x >= puzzle.size || next.y >= puzzle.size || blocked.has(key) || routes.has(key)) continue;
+      routes.set(key, { kind: "navigation", moves: [...route.moves, move] });
+      queue.push(next);
+    }
+  }
+  throw new Error("no route");
+}
+
+function randomAttempt(ruin: Ruin, draw: Draw): RuinAttempt {
+  if (ruin.puzzle.kind === "sequence") {
+    const pool = [...RUIN_SYMBOLS];
+    return { kind: "sequence", symbols: [0, 1, 2].map(() => pool.splice(draw(pool.length), 1)[0]!) };
+  }
+  return { kind: "navigation", moves: Array.from({ length: 1 + draw(7) }, () => RUIN_MOVES[draw(4)]!) };
+}
+
+interface Run {
+  /** Every step's result, serialised. */
+  readonly results: string[];
+  /** `hashState` every 20 steps and at the end (hashing every step is slow). */
+  readonly hashes: string[];
+  readonly events: RuinEvent[];
+  readonly final: RuinsState;
+}
+
+/**
+ * A seeded session: players moor at islands and cast off, enter and leave duels, open ruins, answer right and wrong
+ * (sometimes during a lockout or after solving), and repeat or send stale requests.
+ */
+function runSession(seed: number): Run {
+  const draw = generator(seed);
+  let state = frozen(createRuins({ seed, islands: ISLANDS }));
+  const islands = ruinIslands(state);
+  const results: string[] = [];
+  const hashes = [hashState(state)];
+  const events: RuinEvent[] = [];
+  let tick = 0;
+  for (let step = 0; step < 200; step++) {
+    tick += draw(4) === 0 ? 0 : 1 + draw(40);
+    const playerId = PLAYERS[draw(PLAYERS.length)]!;
+    const island = islands[draw(islands.length)]!;
+    const ruin = state.ruins[String(island)]!;
+    const roll = draw(12);
+    const requestTick = draw(20) === 0 ? Math.max(0, tick - 5) : tick;
+    let next: RuinsState;
+    if (roll < 3) {
+      const where = draw(3) === 0 ? null : island;
+      const reported = reportPresence(state, { playerId, island: where, inDuel: draw(6) === 0, tick: requestTick });
+      results.push(JSON.stringify(reported.result));
+      next = reported.state;
+    } else if (roll < 6) {
+      const opened = openRuin(state, { playerId, island, tick: requestTick });
+      results.push(JSON.stringify(opened.result));
+      next = opened.state;
+    } else {
+      const attempt = roll < 9 ? rightAnswer(ruin) : randomAttempt(ruin, draw);
+      const answered = answerRuin(state, { playerId, island, tick: requestTick, attempt });
+      results.push(JSON.stringify(answered.result));
+      events.push(...answered.result.events);
+      next = answered.state;
+    }
+    state = frozen(next);
+    if (step % 20 === 19) hashes.push(hashState(state));
+  }
+  hashes.push(hashState(state));
+  return { results, hashes, events, final: state };
+}
+
+function integersOnly(value: unknown): boolean {
+  if (typeof value === "number") return Number.isSafeInteger(value);
+  if (Array.isArray(value)) return value.every(integersOnly);
+  if (typeof value === "object" && value !== null) return Object.values(value).every(integersOnly);
+  return true;
+}
+
+describe("ruin determinism (§15, §16)", () => {
+  it("keeps the state plain integer data that hashState covers", () => {
+    const state = createRuins({ seed: 5, islands: ISLANDS });
+    expect(() => canonicalize(state)).not.toThrow();
+    expect(integersOnly(state)).toBe(true);
+    // Every part of the state is in the hash: changing any secret or record changes it.
+    const ruin = state.ruins["0"]!;
+    const variants: RuinsState[] = [
+      { ...state, tick: 1 },
+      { ...state, rules: { ...state.rules, lockoutTicks: 61 } },
+      { ...state, presence: [{ playerId: "p1", island: 0, inDuel: false }] },
+      { ...state, ruins: { ...state.ruins, "0": { ...ruin, unlocked: true } } },
+      { ...state, ruins: { ...state.ruins, "0": { ...ruin, lockouts: [{ playerId: "p1", until: 60 }] } } },
+      { ...state, ruins: { ...state.ruins, "0": { ...ruin, sessions: [{ playerId: "p1", openedTick: 0 }] } } },
+      { ...state, ruins: { ...state.ruins, "0": { ...ruin, solvedBy: [{ playerId: "p1", tick: 0 }] } } },
+      { ...state, ruins: { ...state.ruins, "0": { ...ruin, sourceIds: ["source-0-0"] } } },
+      {
+        ...state,
+        ruins: {
+          ...state.ruins,
+          "0": {
+            ...ruin,
+            puzzle: ruin.puzzle.kind === "sequence" ? { ...ruin.puzzle, answer: [...ruin.puzzle.answer].reverse() } : { ...ruin.puzzle, minMoves: ruin.puzzle.minMoves + 1 },
+          },
+        },
+      },
+    ];
+    const hashes = new Set([hashState(state), ...variants.map((variant) => hashState(variant))]);
+    expect(hashes.size).toBe(variants.length + 1);
+  });
+
+  it("replays a seeded random session to the same results and hashes, over 40 seeds", () => {
+    const seen = new Map<string, number>();
+    for (let seed = 0; seed < 40; seed++) {
+      const first = runSession(seed);
+      const second = runSession(seed);
+      expect(second.results).toEqual(first.results);
+      expect(second.hashes).toEqual(first.hashes);
+      expect(second.events).toEqual(first.events);
+      expect(integersOnly(first.final)).toBe(true);
+
+      // The rules held throughout: one unlock per ruin, one payment per player and ruin, sessions only where present.
+      const unlocks = first.events.filter((event) => event.kind === "sources-unlocked");
+      const gold = first.events.filter((event) => event.kind === "gold-awarded");
+      expect(new Set(unlocks.map((event) => event.island)).size).toBe(unlocks.length);
+      expect(new Set(gold.map((event) => `${event.island}/${event.playerId}`)).size).toBe(gold.length);
+      for (const island of ruinIslands(first.final)) {
+        const ruin = first.final.ruins[String(island)]!;
+        expect(ruin.unlocked).toBe(ruin.solvedBy.length > 0);
+        expect(ruin.unlocked).toBe(unlocks.some((event) => event.island === island));
+        expect(ruin.solvedBy.map((solve) => solve.playerId).sort()).toEqual(gold.filter((event) => event.island === island).map((event) => event.playerId).sort());
+        for (const session of ruin.sessions) {
+          expect(first.final.presence.find((entry) => entry.playerId === session.playerId)).toEqual({ playerId: session.playerId, island, inDuel: false });
+        }
+        expect(JSON.stringify(clueFor(ruin))).not.toContain("answer");
+      }
+      for (const text of first.results) {
+        const result = JSON.parse(text) as { outcome?: string | null; rejection: string | null };
+        const label = result.outcome ?? result.rejection ?? "ok";
+        seen.set(label, (seen.get(label) ?? 0) + 1);
+      }
+    }
+    // The sessions exercised both outcomes and every kind of refusal they can meet.
+    expect(seen.get("solved")).toBeGreaterThan(40);
+    expect(seen.get("wrong")).toBeGreaterThan(40);
+    for (const label of ["locked-out", "already-solved", "no-session", "not-at-ruin", "in-duel", "duplicate", "stale-tick"]) {
+      expect(seen.get(label), label).toBeGreaterThan(0);
+    }
+  });
+});

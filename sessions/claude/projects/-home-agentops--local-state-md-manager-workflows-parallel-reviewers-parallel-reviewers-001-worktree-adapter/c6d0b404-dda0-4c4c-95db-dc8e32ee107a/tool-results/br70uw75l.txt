@@ -1,0 +1,600 @@
+# Workflow CLI cheatsheet
+
+Every command below was taken from the argparse definitions in `workflow/pipeline.py`, `workflow/launch.py` and `workflow/interactive.py` after the worker-lanes slice (PRD_WORKER_LANES). Longer explanations live in [RUNBOOK.md](RUNBOOK.md) and [features/project-workflows/README.md](../features/project-workflows/README.md).
+
+Worker lanes come from the feature's configuration: `features/<f>/feature.json` (2.0.0) declares every lane with its task file, `features/<f>/policy.json` (1.2.0) gives each lane its role label, owned paths, checks and `required_check_kinds`. A run launches every declared lane or the subset named with `--workers`; `<lane>` below is any selected lane id.
+
+```bash
+PY="$PWD/.venv/bin/python"                                   # controller interpreter, run from the repo root
+RUN="$HOME/.local/state/md-manager-workflows/<feature>/<run-id>"   # run directory, always outside the repo
+```
+
+Two entry points:
+
+| Entry point | Shape | Use |
+| --- | --- | --- |
+| `$PY -m workflow launch <feature> [flags]` | one command | prepare and start a committed feature |
+| `$PY -m workflow <action> "$RUN" [flags]` | one action per call | every other pipeline step, status, recovery |
+
+Nothing launches a Claude session without `--live`. Nothing ever pushes or merges `main`.
+
+## 1. One-command launch
+
+```bash
+$PY -m workflow launch project-workflows --dry-run --automatic          # validate and print the commands, execute nothing
+$PY -m workflow launch project-workflows --live --automatic             # unattended run to a verified feature branch
+$PY -m workflow launch project-workflows --live                         # manual run with operator gates
+$PY -m workflow launch project-workflows --live --automatic --workers adapter   # only the named lanes; the rest stay off-limits
+```
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `<feature>` | a directory under `features/` listed in `FEATURES` in `workflow/launch.py` | required |
+| `--run-id ID` | opaque run identifier, not a path | `<feature>-001` |
+| `--run-root DIR` | run storage outside the repository | `~/.local/state/md-manager-workflows/<feature>` |
+| `--workers a,b` | launch only these declared lanes (unknown ids, duplicates and an empty list are refused before any Git action); the selection is pinned in `plan.json` | every declared lane |
+| `--live` | authorize Claude usage | off |
+| `--automatic` | run-scoped permission bypass for workers, automatic freeze, checks, native reviewer, verified feature branch | off, manual gates |
+| `--worker-timeout-seconds N` | per-worker deadline from launch to completion signal, automatic only | 4 h, max 24 h |
+| `--review-timeout-seconds N` | reviewer deadline from its launch to its completion file, automatic only | 30 min, max 24 h |
+| `--reviewer-transport native\|print` | attachable reviewer session, or headless `claude --print`, automatic only | `native` |
+| `--no-herdr` | omit terminal attachments | attaches |
+| `--dry-run` | validate the feature configuration and print the commands | off |
+
+`launch` refuses an existing run directory. It runs, in order: `preflight`, `git switch -c <branch_prefix>/<run-id>`, `prepare`, `start`, and with `--automatic` also `automatic`. A `feature.json` still at version 1.0.0 (`ui_task`/`adapter_task`) is translated to the 2.0.0 shape and a deprecation line is printed; `--dry-run` lists it under `notes`. A policy `failure_drill` that names a lane the selection leaves out is skipped, with a note and a timeline event.
+
+## 2. Step-by-step pipeline (what `launch` runs for you)
+
+```bash
+$PY -m workflow preflight "$RUN" --repo "$PWD" --policy features/<f>/policy.json --herdr [--automatic]
+$PY -m workflow prepare   "$RUN" --repo "$PWD" --policy features/<f>/policy.json \
+                                 [--workers ui,docs] --task ui=features/<f>/ui-task.md --task docs=features/<f>/docs-task.md \
+                                 [--automatic --worker-timeout-seconds N --review-timeout-seconds N --reviewer-transport native|print]
+$PY -m workflow start     "$RUN" --live [--herdr]
+```
+
+| Action | Required flags | Optional flags | What it does |
+| --- | --- | --- | --- |
+| `preflight` | `--policy` | `--repo`, `--herdr`, `--automatic` | validates the policy, clean source, installed `git`/`claude`/`node`, the Claude CLI flags the run needs, Claude login; `--herdr` requires a managed Herdr pane (`HERDR_ENV=1`) |
+| `prepare` | `--policy`, `--task <lane>=<path>` once per selected lane | `--workers a,b`, `--repo`, `--automatic`, the three automatic settings | pins base commit, branch, policy digest, `workers` (selected lanes in declared order) and `excluded_workers` into `plan.json`, creates one worktree per selected lane, writes the first `run-state.json`; `--automatic` requires a `feature/` branch |
+| `start` | `--live` | `--herdr` | launches every selected lane's native session once; refuses an already-started run; with `--herdr` opens the workflow tab (one pane per lane, in declared order) |
+
+Manual-mode gates after the workers finish:
+
+```bash
+$PY -m workflow freeze  "$RUN" --handoff ui=ui-handoff.json --handoff docs=docs-handoff.json   # one --handoff per selected lane
+$PY -m workflow review  "$RUN" --review-file independent-review.json
+$PY -m workflow approve "$RUN" --bundle-sha256 <hash printed at the approval interrupt>
+```
+
+| Action | Required flags | What it does |
+| --- | --- | --- |
+| `freeze` | `--handoff <lane>=<path>` for every selected lane (each `{"summary": "...", "open_assumptions": []}`) | validates every handoff, stops the recorded sessions, snapshots (an edit under an excluded lane's owned paths is an ownership violation naming both lanes), checks each lane, builds the candidate from the selected lanes in declared order and rechecks it |
+| `review` | `--review-file` (the review JSON in RUNBOOK section 5) | imports an independent review bound to the exact bundle hash and candidate commit |
+| `approve` | `--bundle-sha256` | fast-forwards the source branch locally to the reviewed candidate; no push |
+
+## 3. Automatic mode
+
+```bash
+$PY -m workflow automatic      "$RUN" --live     # supervise to a verified feature branch, or resume an interrupted run
+$PY -m workflow automatic-step "$RUN" --live     # one controller step, exit 75 = checkpoint persisted, run again
+```
+
+Resume after Ctrl-C, a closed terminal or a dropped SSH session with the same `automatic --live`; workers and the reviewer keep running meanwhile. Do not repeat `launch` for an existing run. A run stopped by a deadline, a blocked worker, a quota block, a rejected completion file or a blocked review is retained but not resumable: start a new `--run-id`.
+
+## 4. Inspect
+
+```bash
+$PY -m workflow status "$RUN"                        # next nodes, pending interrupts, errors; refreshes report.html
+$PY -m workflow export "$RUN"                        # rebuild run-state.json at the current export version (1.3.0), launches nothing
+$PY -m workflow attach "$RUN"                        # create the run's Herdr tab and panes when start ran without --herdr
+$PY -m workflow.interactive status     "$RUN"        # native session inventory for the run
+$PY -m workflow.interactive attach     "$RUN" [--reuse-observers observers.json]
+$PY -m workflow.interactive attach-one "$RUN" --node <lane>|review    # reconnect one session in this terminal
+```
+
+`status` prints the run's `workers` and `excluded_workers` with the pending nodes. `attach-one` needs an interactive terminal, accepts any lane of the run or `review`, and refuses to restart a missing session. `export` takes the controller lock, constructs no sessions, and refuses a run whose `plan.json`, policy or `review.json` fail validation. Run it on runs recorded before export 1.3.0 so the viewer shows their review and inputs; an old run keeps its stored graph labels and reports both legacy lanes as selected.
+
+## 5. Recovery
+
+```bash
+$PY -m workflow retry     "$RUN" --phase worker    --node docs      # rerun one failed lane check at the same revision
+$PY -m workflow retry     "$RUN" --phase candidate --node ui        # rerun one failed combined check
+$PY -m workflow retry     "$RUN"                                    # resume failed post-freeze graph steps, never relaunches
+$PY -m workflow reconcile "$RUN"                                    # rebind surviving sessions after an ambiguous launch, never relaunches
+```
+
+| Flag | Values | Default |
+| --- | --- | --- |
+| `--phase` | `worker`, `candidate` | `worker` |
+| `--node` | any lane of the run (`workers` in `plan.json`) | none, meaning resume without selecting a check |
+
+Three verification attempts per lane and phase, including the first. `retry` refuses runs that are waiting at an interrupt and refuses to relaunch failed `launch_*` steps; use `reconcile` for those.
+
+Native session controls, from the run's receipts:
+
+```bash
+claude agents --json                                  # list sessions; the run's are named workflow-<run-id>-<lane> and workflow-<run-id>-reviewer
+claude stop <background_id>                           # stop one session by its exact id from <node>.interactive.json
+cd "$RUN/review-worktree" && claude --resume <uuid>   # reread or continue the reviewer transcript
+```
+
+## 6. Viewer
+
+```bash
+npm run dev                                              # API on 127.0.0.1:3001 plus Vite on 127.0.0.1:5173
+MD_MANAGER_API_PORT=3010 npm run dev:api                 # API alone on another port
+```
+
+The Projects viewer reads registered run roots from the projects registry file named by `MD_MANAGER_PROJECTS_CONFIG`; `config/projects.example.json` shows the shape. Unset means no projects. Sources come from `MD_MANAGER_CONFIG`. The adapter accepts exports 1.0.0 to 1.3.0 and derives the run's lanes from `inputs.workers` (the fixed `ui`/`adapter` pair for exports without `inputs`).
+
+## 7. Files in a run directory
+
+| File | Written by | Meaning |
+| --- | --- | --- |
+| `plan.json`, `policy.json` | `prepare` | pinned base commit, branch, `workers`, `excluded_workers`, `failure_drill`, tasks, automatic settings, policy |
+| `run-state.json` | every CLI boundary, `export` | versioned export the viewer reads |
+| `worktree-<lane>/` | `prepare` | one worktree per selected lane |
+| `<lane\|review>.interactive.json` | launch | session receipt with UUID, launch token, status |
+| `<node>.prompt.txt`, `<node>.launch.log` | launch | exact prompt and launch output |
+| `<lane>.completion.json` | the worker | automatic mode completion signal |
+| `<lane>.handoff.json` | `freeze` or the controller | accepted handoff |
+| `<node>.stop.json` | stop | identity-checked stop marker |
+| `review-bundle.json`, `review.diff`, `review-worktree/` | candidate | what the reviewer sees |
+| `review.completion.json` | the reviewer | bound verdict file |
+| `automatic-review.json`, `review.json` | controller | review status, accepted verdict and findings |
+| `verification/<phase>/<node>/<attempt>/packet.json` | checks | check evidence and screenshots |
+| `report.html`, `events.jsonl`, `terminals.json` | controller | local report, timeline, Herdr pane map |
+| `controller.lock`, `pipeline.sqlite` | controller | lock and LangGraph checkpoint |
+
+## 8. Adding a feature to launch
+
+1. Create `features/<name>/` with `feature.json` matching `contracts/workflow/feature.schema.json` (`version` 2.0.0, `name`, `branch_prefix`, `policy`, `workers: [{node_id, task}]`, one entry per lane), `policy.json` matching `contracts/workflow/verification.schema.json` (1.2.0: the same lane ids, a free `role` label, `owned_paths`, `checks` and `required_check_kinds` per lane; lane ids match `^[a-z][a-z0-9-]{0,31}$` and avoid `review`, `candidate`, `handoff`, `approval`, `integrate`, `multiple`, `none`, `both` and the `launch_`/`verify_`/`candidate_`/`review-` prefixes), and one task file per lane.
+2. Add `<name>` to the `FEATURES` tuple in `workflow/launch.py`.
+3. `$PY -m workflow launch <name> --dry-run --automatic` until it validates, then `--live`.
+12:                                                            independent review (interrupt)
+27:This performs preflight, creates a feature branch (not main), prepares one worktree per selected lane, starts the interactive workers with run-scoped permission bypass/Bash access, and supervises them through checks and independent automated review. Add `--workers ui` (or any comma-separated subset of the declared lanes) to run only those lanes: the others are not launched, their owned paths stay off-limits to every running lane, and the candidate is built from the selected lanes only. The command remains running until it stops on a verified feature branch or a blocker. It never pushes or merges main. Use `--dry-run` instead of `--live` to inspect without execution. Omit `--automatic` for the original manual gates. See the feature README for completion signals, recovery and privilege boundaries. The later features `review-result` and `run-inputs` launch the same way (`features/<feature>/README.md`); `--run-id` defaults to `<feature>-001` and the run root to `~/.local/state/md-manager-workflows/<feature>`.
+29:The profile includes a deliberate first adapter-verification gate failure and a hard limit of three verification attempts per lane/phase. Read the feature README for the exact retry and evidence procedure. Automatic mode adds persisted per-worker deadlines (default 4 hours, `--worker-timeout-seconds`) enforced by the running supervisor and a reviewer deadline (default 30 minutes, `--review-timeout-seconds`, counted from the reviewer's launch). Interrupting the supervisor leaves the workers running and the run resumable; only deadline expiry or a blocked worker stops them. It does not impose token caps or automatically repair code. Manual mode retains operator-controlled worker lifetimes. The independent review runs as a third native session by default; `--reviewer-transport print` keeps the headless `claude --print` reviewer for environments without Herdr (see "Automatic mode: the review step").
+33:- One implementation worker per selected lane, as many lanes as the feature declares; each is a native interactive Claude background terminal in its own worktree. A dedicated Herdr tab attaches every terminal with keyboard input enabled: the first lane takes the root pane, each following lane splits right of the previous one, the reviewer splits right of the last lane.
+34:- Exact shared starting Git revision is recorded and verified. Frozen ownership is checked against actual captured files, not just agent reports, against the full declared policy: a selected lane that edits a path owned by an excluded lane is an ownership violation naming both lanes. Lane ids follow `^[a-z][a-z0-9-]{0,31}$` and never take a reserved graph name (`review`, `candidate`, `handoff`, `approval`, `integrate`, `multiple`, `none`, `both`, or a `launch_`/`verify_`/`candidate_`/`review-` prefix). `role` is a free label; each lane's `required_check_kinds` decide which check kinds it must pass (policies before 1.2.0 derive them from the role: `frontend` needs `build` and `browser`, `backend` needs `unit`), so relabelling a lane cannot bypass required tests.
+39:- Review is performed by Pi/a fresh reviewer or a human against the exact bundle and candidate. The CLI imports that review; it does not spawn an unconfigured Pi model or fabricate independent review. Review identity is an operator attestation, not a cryptographic identity service.
+41:- This is a trusted local development tool, not a sandbox or multi-tenant service. Tests/configuration are executable code. Review policy commands and task ownership before approving a run. CLI/manual terminal input is trusted operator authority.
+57:The tests use fake workers, a fake reviewer session and mocked native lifecycle controls. `workflow.test_lanes` covers lanes from configuration: a three-lane run, a one-lane run, a pinned subset, excluded-lane ownership, refused selections, required check kinds, reserved ids, retrying any lane, a skipped drill, finding attribution per lane, the deprecated 1.0.0 feature file and the export of a run recorded before configured lanes. The end-to-end test uses real temporary Git worktrees, Python unit tests, headless Chromium, screenshot files, review/approval interrupts and a fast-forward of a **temporary test repository**. It makes no Claude model calls. A second test injects a check failure, reopens checkpoints and verifies that only the failed verification attempt reruns. The automatic tests run once with the native reviewer protocol and once with the print-mode fallback, including a controller interrupted while waiting for the reviewer and every rejected completion file.
+149:Python unittest and Node TAP/spec summaries are supported for non-browser test counts. Unsupported/custom test reporters produce missing test evidence and block rather than infer success. Browser assertions/reporting and screenshot inspection remain the reviewer's responsibility; PNG headers/hashes do not prove visual quality.
+151:## 5. Review the exact candidate
+153:Successful verification interrupts at `independent_review` and produces:
+155:- `review-bundle.json`: frozen revisions, policy digest and packet hashes.
+163:Ask Pi to assign an independent read-only reviewer against these exact artifacts. If the reviewer needs to run commands, give it another isolated worktree; do not let it mutate the captured candidate/check worktrees. The review JSON is:
+168:  "bundle_sha256": "<SHA-256 of review-bundle.json>",
+170:  "reviewer": "<independent Pi review run ID or human identity>",
+177:Findings, if present, contain `severity` (`P0`, `P1`, `P2`), `message`, and `disposition` (`open`, `resolved`, `accepted`), optionally `worker` (one of the run's lane ids, `multiple` for several lanes, or `none` for cross-cutting findings; the legacy `both` is refused for new runs) and `requirement` (a verbatim quote from that worker's task text in `plan.json`, or null) so the viewer can link a finding to the task it concerns. P0/P1 must be resolved. Do not relabel a rejected review as approved. Code changes require new snapshots, verification and review—start a revised run rather than mutate an approved bundle.
+180:"$PY" -m workflow review "$RUN" --review-file /path/to/independent-review.json
+183:Review does not integrate. The graph then waits at a separate approval interrupt.
+185:### Automatic mode: the review step
+187:In an automatic run the review node launches the reviewer itself, once per bundle, and waits for its verdict exactly as it waits for worker completion signals:
+189:- **Native reviewer session (default).** `claude --bg --name workflow-<run>-reviewer` starts in `$RUN/review-worktree/` (a detached checkout of the candidate commit) with tools Read, Glob, Grep and Write, permission mode `dontAsk`, no MCP servers, the run directory added as a readable path, and a single allowed write: `$RUN/review.completion.json`. The receipt is `review.interactive.json` (same keys as a worker receipt plus `candidate_commit`), the prompt is kept in `review.prompt.txt`, the launch output in `review.launch.log`. Its session UUID is recorded in the timeline (`Reviewer session <uuid> launched; awaiting review.completion.json`) and must differ from both worker UUIDs.
+190:- **Reviewer pane.** When the run's Herdr tab exists, a `Claude: reviewer` pane is split to the right of the last lane's pane and attaches with `attach-one --node review`. You can answer a question the reviewer asks there, exactly as for workers; the transcript is the record, the verdict is only the file. A missing pane never fails the review; `python -m workflow.interactive attach-one "$RUN" --node review` reconnects in any available terminal, and `attach` adds the pane when the reviewer already exists, also to a workflow tab whose worker panes were attached earlier.
+191:- **Completion protocol.** The reviewer writes `review.completion.json` once, as its last action, then ends its turn. The controller accepts the file only when it validates against `contracts/workflow/reviewCompletion.schema.json`, its `run_id`, `node_id: "review"`, `launch_token`, `bundle_sha256` and `candidate_commit` match the run, the session is `idle` or `done`, the reviewer identity is unchanged and independent, and the review worktree, bundle and `review.diff` hashes are unchanged. Findings carry `worker` (a selected lane id, `multiple` or `none`; the prompt spells out this run's vocabulary, and the print fallback's structured-output schema is generated from it) and `requirement`. Any rejected file, including one naming a lane the run did not select, blocks the run with the reason in `automatic-review.json`; nothing is relaunched.
+192:- **Verdict.** `review.json` is written for every verdict. `approved` with no unresolved P0/P1 finding continues to the verified feature branch; `blocked`, or an approval that still carries an unresolved P0/P1 (recorded as `verdict: "blocked"` with the reviewer's raw decision kept in `automatic-review.json`), ends the run. Fixing findings means a new run with a new bundle.
+193:- **Deadline.** `review_timeout_seconds` counts from the reviewer's launch (`launch_requested_at`) and survives controller restarts. A reviewer that idles without a file until the deadline blocks the run; **no second reviewer is ever launched**.
+194:- **Stop.** After acceptance or a block the controller stops the reviewer with the same identity re-check as for workers (`review.stop.json`); the transcript stays resumable. A stop that cannot be confirmed after acceptance ends the controller with the verdict kept (`automatic-review.json` stays `succeeded`, `review.stop.json` absent or unconfirmed, the reason on the timeline); `python -m workflow automatic "$RUN" --live` retries the stop before continuing and launches nothing.
+195:- **Interruption.** Ctrl-C, a closed terminal or a dropped SSH session while the controller waits leaves the reviewer running with `automatic-review.json` at `running`; `python -m workflow automatic "$RUN" --live` resumes waiting for the same session's file. The same holds inside the launch window once `claude --bg` was issued (`review.interactive.json` exists): the receipt is `running`, without `session_id` when the interrupt hit the settle poll, and resume first binds that one session through reconciliation, never a relaunch. An interrupt before the launch was issued leaves `needs_reconciliation`.
+196:- **Print fallback.** `--reviewer-transport print` (at `launch` or `prepare`, pinned into `plan.automatic`) keeps the headless `claude --print --json-schema` reviewer: no pane, no human input, `review.stdout.json`/`review.stderr.log`, the same bundle binding and verdict rules. Plans pinned before the setting existed validate as `native` (they never launch a new reviewer); their exported inputs report the transport their recorded review used, or null.
+198:To read or continue a reviewer's transcript after the run:
+201:cd "$RUN/review-worktree" && claude --resume <reviewer-uuid>
+204:The UUID is `session_id` in `$RUN/review.interactive.json` (or `reviewer` in `review.json`). Claude keeps transcripts under `~/.claude/projects/<encoded worktree path>/<uuid>.jsonl`, keyed by the worktree the session ran in, which is why the resume must start from `review-worktree`.
+209:"$PY" -m workflow approve "$RUN" --bundle-sha256 <exact-reviewed-bundle-hash>
+212:This explicitly authorizes a fast-forward of the original source branch. It checks review, packet/artifact hashes, source branch identity, clean source state and unchanged starting HEAD again. No push occurs. Do not allow another writer in the source checkout during this operation.
+226:Export rebuilds `run-state.json` from the run directory under the current export version (1.3.0: the `review` and `inputs` sections the Projects viewer reads plus the lane list, see the feature README's runtime storage seam). A run recorded before configured lanes keeps its stored graph definition (same node ids, same labels), reports `ui` and `adapter` as its selected lanes and carries its launch receipts and packet paths under `values.lanes` and `values.packets`. It takes the controller lock, reads the persisted checkpoint without invoking any node, constructs no sessions (a copied run whose worktrees are gone still exports), launches nothing, and refuses a run whose `plan.json`, pinned policy or `review.json` fail validation. Unchanged content does not bump `updated_at`. Run it on runs recorded before a newer export version, such as project-workflows-001, so the viewer shows their review and inputs.
+236:- **Stopping an unfinished run:** use the exact native IDs from its receipts (`<lane>.interactive.json` for every selected lane and, in automatic mode, `review.interactive.json`) with Claude's `stop` command after verifying identity. Closing Herdr alone is not a stop. All run artifacts/worktrees are retained; cleanup is a separate operator decision.
+237:- **Reviewer needs reconciliation:** `automatic-review.json` at `needs_reconciliation` or `blocked` never relaunches a reviewer. Inspect `review.interactive.json`, `review.launch.log` and `claude agents --json`, stop a stray reviewer by its exact ID, and start a new run for a fresh review.
+# Ready-to-launch feature: project workflows and run viewer
+
+This directory is the committed assignment for the feature's worker lanes, **not** an implementation of the Projects feature. The API contract is `contracts/projects/README.md`.
+
+`feature.json` (version 2.0.0, `contracts/workflow/feature.schema.json`) declares the lanes and their task files: `ui` (`ui-task.md`) and `adapter` (`adapter-task.md`). `policy.json` (version 1.2.0) gives each lane its role label, owned paths, checks and `required_check_kinds` (`ui`: `build` and `browser`; `adapter`: `unit`). `launch project-workflows --workers ui` or `--workers adapter` runs one lane alone; the other lane's owned paths stay off-limits and the candidate is built from the selected lane only. The `failure_drill` names `adapter`, so a run that leaves `adapter` out records the drill as skipped.
+
+## Automatic mode: stop at a verified feature branch
+
+```bash
+.venv/bin/python -m workflow launch project-workflows --live --automatic
+```
+
+This is the user-approved unattended path. Keep the command running in Herdr. Both implementation workers retain their interactive terminals, but have **run-scoped permission bypass and Bash access**. Global Claude settings are untouched. Worktrees are not OS sandboxes: these workers have the account's shell privileges, so only use this mode in a trusted environment.
+
+Workers emit an explicit run/node/token-bound completion file. Idle alone is insufficient. The controller freezes completed work, executes the real isolated and combined checks, and launches a fresh read-only Claude reviewer from the LangGraph review node: by default a third native session (`workflow-<run>-reviewer` in `review-worktree/`, tools Read/Glob/Grep plus a single allowed write of `review.completion.json`) with its own `Claude: reviewer` pane in the run's tab, or a headless `claude --print` job with `--reviewer-transport print`. The reviewer reports its verdict only through a completion file bound to the run, launch token, bundle hash and candidate commit, validated against `contracts/workflow/reviewCompletion.schema.json`; the review is bound to the exact candidate and evidence hash. Only a passing review permits fast-forwarding the newly created `feature/…` branch. **No merge to main and no push.**
+
+The automatic supervisor restarts the controller in a new Python process after a persisted step. The intentional first adapter verification failure is retried using the same SQLite thread; successful sibling work is reused. Controller PIDs are recorded in the event timeline. This is the existing LangGraph pipeline—not Pi subagent orchestration.
+
+Bounds: per-worker deadlines measured from launch to completion signal (default 4 hours, `--worker-timeout-seconds`, at most 24 hours; persisted launch times survive restart and are enforced only while the supervisor is running), a reviewer process timeout (default 30 minutes, `--review-timeout-seconds`), existing per-check timeouts, three check attempts per lane/phase and at most 45 controller-step processes per supervisor invocation. There is no token cap or billing/provider fallback. Ambiguous launches, missing completion signals, quota blocks, reviewer rejection, ownership violations and exhausted retries stop with retained evidence. Review/worker processes are not blindly relaunched. A stopped/crashed controller cannot enforce process deadlines while it is offline.
+
+These retries rerun verification of immutable code; they are **not** an automatic source-repair loop. Persistent code failures or review findings require intervention. Fully automatic means no routine approval prompts on the successful path, not a guarantee that every run succeeds.
+
+Interrupting the supervisor (Ctrl-C, a closed terminal, a dropped SSH session) does **not** stop the workers: they keep running in their native terminals, the timeline records `interrupted`, and the deadline keeps counting from launch. Resume the same run with the command below. Deadline expiry, a worker reporting `blocked`, a native quota block or an invalid completion file **do** stop both workers; those runs are retained for inspection but cannot be resumed, so start a new `--run-id`.
+
+To resume an already-started automatic run after an interruption or after fixing a post-freeze blocker:
+
+```bash
+.venv/bin/python -m workflow automatic "$HOME/.local/state/md-manager-workflows/project-workflows/project-workflows-001" --live
+```
+
+Do not repeat `launch` for an existing run. Uncertain launches still require explicit reconciliation. New files include `<lane>.completion.json` and `<lane>.prompt.txt` for every selected lane (the exact prompt each native session received), `automatic-review.json`, `review.diff` and the isolated `review-worktree/`. The native reviewer adds `review.interactive.json` (launch receipt with the reviewer's session UUID), `review.prompt.txt`, `review.launch.log`, `review.completion.json` (the reviewer's bound verdict file) and `review.stop.json` (the identity-checked stop); the print fallback keeps `review.stdout.json` and `review.stderr.log`. The reviewer has Read/Glob/Grep and, natively, Write of its completion file only; no shell or edit tools. Interrupting the controller while it waits for the reviewer leaves the reviewer running and `automatic --live` resumes it; a reviewer that never writes its file blocks the run at `review_timeout_seconds`, and no second reviewer is launched. Synthetic tests of this path are not live Claude validation.
+
+## Manual mode (retained)
+
+From this repository in a Herdr pane, after installing the workflow environment:
+
+```bash
+.venv/bin/python -m workflow launch project-workflows --live
+```
+
+This validates the committed feature configuration, runs preflight, creates a feature branch, prepares one worktree per selected lane at the same commit, then launches native Claude sessions through LangGraph and attaches them in one dedicated Herdr tab. It does not launch Pi skill-based implementation subagents. It never pushes or integrates into main automatically.
+
+Default run: `~/.local/state/md-manager-workflows/project-workflows/project-workflows-001`.
+Default integration branch: `feature/project-workflows/project-workflows-001`.
+Reusing that run directory is rejected rather than launching duplicates. `--run-id` chooses a deliberate new run; `--no-herdr` explicitly omits attachments. `--dry-run` validates configuration and prints the commands without executing Git, agents or checks.
+
+**Starting is one command; finishing is supervised.** Watch the Claude panes and answer permission prompts. When every worker finishes, return to Pi to collect handoffs (`freeze --handoff <lane>=<path>` per lane), freeze, review and approve. The start command returns at the handoff checkpoint rather than waiting forever or treating idle as completion. A separately started CLI process does not automatically wake this Pi chat.
+
+## Frozen backend registry seam
+
+The adapter must load `MD_MANAGER_PROJECTS_CONFIG` independently of existing skills configuration. Unset means `projects: []`. Explicit malformed configuration fails startup. Proposed exact file shape:
+
+```json
+{
+  "version": 1,
+  "projects": [{
+    "project_id": "md-manager",
+    "name": "MD Manager",
+    "repository": "/absolute/repository/path",
+    "workflows": [{
+      "workflow_id": "feature-implementation",
+      "runs_root": "/absolute/path/containing/run-directories",
+      "definition": {
+        "name": "Feature implementation",
+        "nodes": [
+          {"node_id": "launch_ui", "label": "Launch UI worker", "kind": "worker", "depends_on": []}
+        ]
+      }
+    }]
+  }]
+}
+```
+
+The single-node definition above illustrates shape, not the full production DAG. Use `graph_nodes(lanes)` from `workflow/export_state.py` for the pipeline definition of a given lane list (for this feature, `["ui", "adapter"]`). Tests may register a smaller valid graph. Project/workflow IDs are unique within their scope. Paths must be operator-supplied absolute canonical directories; never derive registrations from browser parameters or a run's `plan.repository` value. Reject overlapping/ambiguous run registrations. `repository` may differ from `runs_root` (real pipeline data lives outside the repo).
+
+Current definitions come from registry configuration. Each run's pinned definition comes from its persisted export, not the current registry definition. Public definitions add scope/version and compute the definition hash as specified in the project API contract.
+
+## Runtime storage seam
+
+The controller now writes **`run-state.json` atomically** during preparation and each CLI reporting boundary. The adapter must read this file, not launch Python or decode the checkpoint database. Export version 1.0.0 contains:
+
+- `run_id`, `base_commit`, stable `created_at`, persisted `updated_at` (unchanged exports do not bump it).
+- `definition: {name, nodes}`: pinned graph structure with node IDs, labels, kinds and dependencies.
+- `values`: LangGraph state; completed launch receipts at `ui`/`adapter`, frozen `snapshots`, successful `ui_packet`/`adapter_packet` paths, candidate `bundle`, accepted `review`, `approved_bundle`, and final `integrated_commit` as stages complete (from export 1.3.0 the per-lane receipts and packet paths live under `lanes.<lane>` and `packets.<lane>` instead).
+- `next`: pending internal graph node IDs.
+- `tasks`: `{node_id, error: string|null, interrupts: object[], result: object|null}`. Interrupts include their `kind`; a task result can preserve a successful sibling's pending writes after another branch failed.
+- `events`: persisted internal `{sequence,time,node,status,message}` events; normalize to workflow-v1 events at the API boundary.
+- `verification_packets`: `{phase,node_id,attempt,path,sha256}` entries. `path` is relative to the run root and `phase` is worker/candidate.
+
+Never return raw `values` directly: it can contain absolute paths. Project APIs must produce the committed public schemas and scoped artifact/result URLs. Resolve only registered packets inside the run, verify their hash, and resolve artifacts through their registry with containment checks. Packet format is defined in `workflow/checks.py` and documented in `workflow/RUNBOOK.md`.
+
+**Export version 1.2.0** (`workflow/export_state.py`) keeps everything above unchanged and adds two keys; the adapter accepts `1.0.0` (neither key), `1.1.0` (`review` only), `1.2.0` (both) and `1.3.0` (both, lanes from configuration; see below). Each is an object or `null`, derived read-only from the run's own files; a missing file is `null` and a malformed optional receipt is `null`, never a guess:
+
+- `review` (`null` unless `review.json` exists): `attempt` (1), `transport` (`native` when `review.interactive.json` exists, else `print` when `automatic-review.json` exists, else `manual`), `reviewer_session_id` (`review.json` `reviewer`: the Claude session UUID or the operator-stated identity), `independent`, `bundle_sha256`, `candidate_commit`, `verdict` (`approved`/`blocked`), `findings[]` with `severity`, `message`, `disposition`, `worker` (`ui|adapter|both|none` or `null`) and `requirement` (verbatim quote or `null`; both `null` for reviews recorded before the reviewer prompt asked for them), `reviewed_at` (`automatic-review.json` `accepted_at`, else the last `review` event time, else the mtime of `review.json`; UTC with a trailing `Z`), and `diff` (`{path: "review.diff", sha256, bytes}` or `null`).
+- `inputs` (`null` when `policy.json` is missing): `feature`, `policy_version`, `base_commit`, `source_branch`, `mode` (`automatic` iff `plan.json` has `automatic`), `automatic` (`{finish, permission_mode, worker_timeout_seconds, review_timeout_seconds, reviewer_transport}` or `null`; for plans that predate `reviewer_transport` the export records the transport a recorded review actually used, `native` or `print`, and `null` when no review has happened, never a default), `setup[]` (`{argv, command, timeout_seconds}` with `command = shlex.join(argv)`), `max_verification_attempts`, `failure_drill`, and `workers.<lane>` (keyed by the selected lanes in policy order): `role`, `task` (the plan's task text verbatim, including the appended ownership/checks JSON), `prompt` (`<worker>.prompt.txt` or `null` when the run did not record it), `owned_paths`, `checks[]` (`{id, kind, argv, command, timeout_seconds, scenarios}`), `launch` (the `<worker>.interactive.json` receipt: `session_id`, `launch_token`, `launch_requested_at` normalised to `Z`, `native_started_at` epoch ms, `observed_state`, `status`, `launcher_invocations`, `background_id`; or `null`), `completion` (`<worker>.completion.json` reduced to `{status, summary, open_assumptions}` or `null`), `handoff` (`{summary, open_assumptions}` or `null`) and `stop` (`{stopped, confirmed_at}` where `confirmed_at` is the stop file's mtime when stopped, else `null`).
+
+**Export version 1.3.0** (`EXPORT_VERSION`) is additive: the `definition` has one `launch_<lane>` (label `Launch <lane> worker`) and one `verify_<lane>` (`Verify <lane>`) node per selected lane before the fixed tail; `values.lanes.<lane>` and `values.packets.<lane>` replace the flat `<lane>`/`<lane>_packet` keys; `inputs.workers` is keyed by any lane id and each worker gains `required_check_kinds`; `inputs` gains `selected_workers` and `excluded_workers`; `review.findings[].worker` is a lane id, `multiple` or `none` (the legacy `both` survives only in reviews recorded before 1.3.0). A run recorded before 1.3.0 re-exports with its stored definition unchanged (same node ids and labels), both legacy lanes as `selected_workers`, `required_check_kinds` derived from the roles, and its launch evidence carried under `values.lanes`/`values.packets`. The adapter derives the lane list from `inputs.workers` and the node map from the `launch_<lane>`, `verify_<lane>` and `candidate_<lane>` naming; exports without `inputs` (1.0.0, 1.1.0) fall back to the fixed `ui`/`adapter` pair.
+
+Task and prompt texts, finding messages and requirement quotes can contain absolute paths: the adapter redacts them and truncates oversized texts. Runs recorded under an older version keep loading; re-export them so the viewer shows their review and inputs:
+
+```bash
+.venv/bin/python -m workflow export "$HOME/.local/state/md-manager-workflows/project-workflows/project-workflows-001"
+```
+
+The command takes the controller lock, reads the checkpoint without invoking any node, constructs no sessions, launches nothing, refuses a run whose `plan.json`, pinned policy or `review.json` fail validation, and leaves `updated_at` alone when nothing changed.
+
+Internal node IDs and state keys are not identical: `launch_<lane>` completes when `values.<lane>` (before 1.3.0) or `values.lanes.<lane>` exists; `handoff` uses `snapshots`; `verify_<lane>` uses `values.<lane>_packet` or `values.packets.<lane>`; `candidate` uses `bundle`; `review`, `approval`, `integrate` use `review`, `approved_bundle`, `integrated_commit`. Task errors override inferred completion; an interrupt marks its node awaiting approval. Nodes with no progress remain pending. Launch-node success means a session launched, not successful implementation. The graph is succeeded only when integrated with no pending work.
+
+Logical worker result IDs are the lane ids; verification-node detail may link to those workers' result routes. Worker results and candidate recheck evidence are distinct; do not present a candidate packet as the worker's own changed-file set. Raw event node aliases (`<lane>` for its launch, `freeze`, `candidate_<lane>`) map to the corresponding graph nodes; unknown aliases must not invent graph nodes. Required nullable v1 event fields remain explicit.
+
+API error events/log messages must be sanitized according to the public contract. Native observed states are historical observations, not a guarantee that a process is currently alive. Unsupported older run directories need explicit import support; do not fabricate a successful run or infer a pinned historical graph from the latest definition.
+
+## Browser fixtures and the combined candidate
+
+UI worker checks run without the new backend. Their Playwright config must explicitly mock **only** project API success responses when `WORKFLOW_VERIFICATION_PHASE=worker`. Use the committed response schemas/examples for these mocks.
+
+When `WORKFLOW_VERIFICATION_PHASE=candidate`, the same scenarios must exercise the real backend, with no mock project success routes. Seed a disposable configuration in the registry shape above and disposable run folders containing `plan.json`, `run-state.json` and any packet/artifact files needed. Register fixtures for completed, failed and awaiting-approval runs, an empty workflow, and an empty project. Use synthetic UUIDs/revisions and clearly test-only data, not real session paths. Backend tests independently seed the same documented format. The project error scenario may intentionally simulate a network error; other scenarios must use the candidate API.
+
+Both configs must leave existing Pi/Claude browsing usable via temporary skills fixtures. Do not use live skills or reuse a developer's server. The UI owns its dedicated test configuration under `tests/project-workflows/`; the root Playwright config is not shared worker ownership.
+
+Every scenario must assert behavior and attach its PNG using `[scenario:<id>]` and `screenshot:<id>`. Eight IDs are pinned in `policy.json` (`candidate-evidence` and `deferred-checks` cover the combined candidate's per-lane results and deferred worker-phase checks). The verifier enforces their presence and successful assertions, and records whether it checked the worker or the combined candidate.
+
+## Failure/checkpoint exercise and limits
+
+This feature uses verification policy v1.1.0. It intentionally blocks the adapter's **first worker-verification attempt**, after executing and preserving the real checks. The packet labels this as an injected gate failure, not a failing implementation test or a failed Claude worker. Genuine check failures remain visible too.
+
+In manual mode the freeze command exits with a blocked result; reopen the same run using the command below. Automatic mode performs this recovery itself in a new controller process.
+
+```bash
+.venv/bin/python -m workflow retry "$HOME/.local/state/md-manager-workflows/project-workflows/project-workflows-001" --phase worker --node adapter
+```
+
+This is a new controller process using the same persisted LangGraph thread/checkpoint. Expected: no worker relaunch; successful UI verification reused; adapter verification attempt 2 runs. Record the actual evidence, not only this expectation. `failure-drill.json` preserves pre-retry native identities; `failure-report.json` and the review bundle record post-retry identities and check-attempt directories. Null native launch time/count fields mean unavailable evidence, not a guessed count. Out-of-band manual native restarts are not certified by this report.
+
+Hard bounds in this profile:
+- One graph implementation worker per selected lane (this feature declares two); no nested agent tool. Bash is enabled only in automatic mode.
+- One pipeline-issued initial launch per worker intent; ambiguous launches never auto-retry.
+- At most **three verification attempts per lane/phase**, including the first; retry beyond this is rejected.
+- Each setup/check has a real process timeout; Playwright has one worker and zero retries per invocation.
+
+Interactive Claude conversations have no hard turn/token cap. Manual mode also has no session-lifetime cap; automatic mode enforces the deadlines described above while its controller runs. The operator remains responsible for included-usage decisions. Size requests in task prompts are not resource caps. When usage runs out, preserve the run and choose an explicitly approved plan or wait—no silent billing/provider switch.
+
+During the long worker phase, do another independent task and write `$RUN/return-note.md` with the current run, task and next action. Herdr is the chosen substitute for the lab's literal macOS/cmux tool requirement.
+"""Reusable policy/evidence gates. No agents, browsers, shells or graph launches.
+
+Inputs must come from a trusted verifier plus backend-owned artifact registry, not
+unchecked agent prose. Passing this evidence gate never authorizes integration.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import shlex
+from datetime import datetime
+from pathlib import Path
+
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import ValidationError
+
+CONTRACTS = Path(__file__).resolve().parents[1] / "contracts" / "workflow"
+
+
+# Check kinds that only mean something on the whole application: a lane's build and browser
+# suite compile against contracts and a server that another lane of the same run may be
+# changing. The worker phase still runs and records them on the lane's isolated snapshot,
+# but only the candidate phase, where every lane's work is combined, gates on them.
+# Lane-local kinds (unit, contract, integration) gate in both phases.
+DEFERRED_WORKER_KINDS = frozenset({"build", "browser"})
+
+
+def validate_schema(name: str, value: dict) -> None:
+    schema = json.loads((CONTRACTS / f"{name}.schema.json").read_text())
+    Draft202012Validator(schema, format_checker=FormatChecker()).validate(value)
+
+
+def policy_digest(policy: dict) -> str:
+    """Canonical UTF-8 JSON: sorted keys, no whitespace, literal Unicode."""
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def safe_path(value: str) -> str:
+    normalized = value.rstrip("/")
+    if not normalized or normalized.startswith("/") or any(char in normalized for char in "\\:*?[]") or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ValueError(f"Not an exact repository-relative path/prefix: {value}")
+    return normalized
+
+
+def owns(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def unique(items: list[dict], key: str) -> dict:
+    result = {item[key]: item for item in items}
+    if len(result) != len(items):
+        raise ValueError(f"Duplicate {key}")
+    return result
+
+
+# Policies before 1.2.0 derived the required check kinds from the role; the export of an old run keeps them.
+ROLE_REQUIRED_KINDS = {"frontend": ("build", "browser"), "backend": ("unit",)}
+
+
+def required_kinds(policy: dict, worker: dict) -> list[str]:
+    """The check kinds a lane must pass: declared from policy 1.2.0, derived from the role before."""
+    if "required_check_kinds" in worker:
+        return list(worker["required_check_kinds"])
+    if policy.get("version") in {"1.0.0", "1.1.0"} and worker.get("role") in ROLE_REQUIRED_KINDS:
+        return list(ROLE_REQUIRED_KINDS[worker["role"]])
+    raise ValueError(f"{worker.get('node_id')} declares no required_check_kinds")
+
+
+def validate_policy(policy: dict) -> dict:
+    validate_schema("verification", policy)
+    workers = unique(policy["workers"], "node_id")
+    claimed = []
+    for worker in workers.values():
+        paths = [safe_path(path) for path in worker["owned_paths"]]
+        for other_node, other_path in claimed:
+            if any(owns(path, other_path) or owns(other_path, path) for path in paths):
+                raise ValueError(f"Overlapping ownership: {worker['node_id']} and {other_node}")
+        claimed.extend((worker["node_id"], path) for path in paths)
+        checks = unique(worker["checks"], "id")
+        if len({tuple(check["argv"]) for check in checks.values()}) != len(checks):
+{
+  "version": "1.2.0",
+  "feature": "Parallel reviewers (slice B)",
+  "independent_review": true,
+  "integration_approval": true,
+  "max_verification_attempts": 3,
+  "setup": [
+    {
+      "argv": [
+        "npm",
+        "ci"
+      ],
+      "timeout_seconds": 600
+    }
+  ],
+  "workers": [
+    {
+      "node_id": "ui",
+      "role": "frontend",
+      "required_check_kinds": [
+        "build",
+        "browser"
+      ],
+      "owned_paths": [
+        "src/projects",
+        "tests/project-workflows"
+      ],
+      "checks": [
+        {
+          "id": "frontend-build",
+          "kind": "build",
+          "argv": [
+            "npm",
+            "run",
+            "build"
+          ],
+          "timeout_seconds": 180,
+          "scenarios": []
+        },
+        {
+          "id": "frontend-unit-regression",
+          "kind": "unit",
+          "argv": [
+            "npm",
+            "run",
+            "test:unit"
+          ],
+          "timeout_seconds": 180,
+          "scenarios": []
+        },
+        {
+          "id": "project-workflows-browser",
+          "kind": "browser",
+          "argv": [
+            "npx",
+            "--no-install",
+            "playwright",
+            "test",
+            "--config=tests/project-workflows/playwright.config.ts"
+          ],
+          "timeout_seconds": 300,
+          "scenarios": [
+            {
+              "id": "viewer-two-reviewers",
+              "description": "A seeded two-reviewer run shows both verdicts in the reviewer strip, a Reviewer column and filtering by reviewer; a legacy single-reviewer export shows one entry named review"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "node_id": "adapter",
+      "role": "backend",
+      "required_check_kinds": [
+        "unit"
+      ],
+      "owned_paths": [
+        "workflow",
+        "contracts",
+        "server",
+        "features/project-workflows"
+      ],
+      "checks": [
+        {
+          "id": "workflow-unit",
+          "kind": "unit",
+          "argv": [
+            "/home/agentops/dev/md-manager/.venv/bin/python",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "workflow",
+            "-t",
+            "."
+          ],
+          "timeout_seconds": 1200,
+          "scenarios": []
+        },
+        {
+          "id": "shared-contract",
+          "kind": "contract",
+          "argv": [
+            "npm",
+            "run",
+            "test:contracts"
+          ],
+          "timeout_seconds": 120,
+          "scenarios": []
+        },
+        {
+          "id": "backend-regression",
+          "kind": "unit",
+          "argv": [
+            "npm",
+            "run",
+            "test:unit"
+          ],
+          "timeout_seconds": 180,
+          "scenarios": []
+        },
+        {
+          "id": "backend-build",
+          "kind": "build",
+          "argv": [
+            "npm",
+            "run",
+            "build"
+          ],
+          "timeout_seconds": 180,
+          "scenarios": []
+        }
+      ]
+    }
+  ]
+}
+fixtures.ts
+global-teardown.ts
+harness.ts
+inputs.spec.ts
+lanes.spec.ts
+mock.ts
+playwright.config.ts
+projects.spec.ts
+review.spec.ts
+seed.ts
+support.ts
+26:  { node_id: 'review', label: 'Independent review', kind: 'review', depends_on: ['candidate'] },
+27:  { node_id: 'approval', label: 'Integration approval', kind: 'integration', depends_on: ['review'] },
+38:    { node_id: 'review', label: 'Independent review', kind: 'review', depends_on: ['candidate'] },
+39:    { node_id: 'approval', label: 'Integration approval', kind: 'integration', depends_on: ['review'] },
+90:  /** The export's `review` section as persisted (undefined leaves the key out; null is an explicit null). */
+91:  review?: unknown
+94:  /** Content written to `<run>/review.diff`, the diff the reviewer saw. */
+103:  if (spec.diffFile !== undefined) await writeFile(join(dir, 'review.diff'), spec.diffFile)
+136:      gate: { ...(packetSpec.gate ?? { status: 'passed', reasons: [] }), pending_gates: ['independent_review', 'integration_approval'], integration_allowed: false },
+157:  const sections = spec.review !== undefined || spec.inputs !== undefined
+162:    ...(spec.review !== undefined ? { review: spec.review } : {}), ...(spec.inputs !== undefined ? { inputs: spec.inputs } : {}),
+173:const UI_TASK = '# UI worker\n\nRender the review verdict on the review node. Show every finding with severity and disposition.\n\nApproved ownership and checks:\n{"node_id": "ui", "owned_paths": ["src/projects"]}'
+174:const ADAPTER_TASK = '# Adapter worker\n\nServe the review route from the export section.\n\nApproved ownership and checks:\n{"node_id": "adapter", "owned_paths": ["server"]}'
+179:  attempt: number; transport: 'native' | 'print' | 'manual'; reviewer_session_id: string; independent: true; bundle_sha256: string; candidate_commit: string
+180:  verdict: 'approved' | 'blocked'; findings: Finding[]; reviewed_at: string; diff: { path: string; sha256: string; bytes: number } | null
+192:  automatic: { finish: string; permission_mode: string; worker_timeout_seconds: number; review_timeout_seconds: number; reviewer_transport: string | null } | null
+200:const diffRegistration = (content: Buffer | string) => ({ path: 'review.diff', sha256: sha256(content), bytes: Buffer.byteLength(content) })
+203:function reviewSection(overrides: Partial<ReviewSection> = {}): ReviewSection {
+205:    attempt: 1, transport: 'native', reviewer_session_id: REVIEWER, independent: true, bundle_sha256: BUNDLE, candidate_commit: OUTPUT, verdict: 'approved',
+207:    reviewed_at: T2, diff: diffRegistration(DIFF), ...overrides,
+220:          command: 'npx --no-install playwright test --config=tests/project-workflows/playwright.config.ts', timeout_seconds: 300, scenarios: [{ id: 'review-verdict', description: 'The review node shows the verdict' }] }]
+234:    automatic: { finish: 'verified-feature-branch', permission_mode: 'bypassPermissions', worker_timeout_seconds: 3600, review_timeout_seconds: 1800, reviewer_transport: 'native' },
+255:/** Persisted state of a run that reached the review: both workers launched, snapshots frozen, packets passed, bundle built. */
+256:const reviewedValues = (extra: Record<string, unknown> = {}) => ({ ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/x', adapter_packet: '/y', bundle: '/synthetic/review-bundle.json', ...extra })
+257:const reviewedEvents: RawEvent[] = [...launchEvents,
+263:const reviewedPackets: PacketSpec[] = [{ node: 'ui' }, { node: 'adapter' }, { node: 'ui', phase: 'candidate' }, { node: 'adapter', phase: 'candidate' }]
+373:  const stored = { name: 'Vérification ✓', nodes: [{ node_id: 'z', label: 'Z', kind: 'worker', depends_on: [] }, { node_id: 'a', label: 'A', kind: 'review', depends_on: ['z'] }] }
+377:    + '{"depends_on":["z"],"kind":"review","label":"A","node_id":"a"}],"project_id":"p","workflow_id":"w"}'
+414:    await writeRun(runsRoot('alpha', 'main'), { runId: 'run-002', values: reviewedValues({ review: { verdict: 'approved' } }), next: ['approval'], events: reviewedEvents, packets: reviewedPackets,
+415:      review: reviewSection(), inputs: inputsSection(), diffFile: DIFF })
+419:      url('alpha', 'main', 'run-002', '/reviews/1'), url('alpha', 'main', 'run-002', '/inputs'), url('alpha', 'main', 'run-002', `/artifacts/patch-review-${sha256(DIFF).slice(0, 12)}`)]
+570:      { sequence: 13, time: T1, node: 'review', status: 'approved', message: 'claude-reviewer' },
+573:      bundle: '/synthetic/review-bundle.json', review: { reviewer: 'claude-reviewer', decision: 'approve' }, approved_bundle: 'e'.repeat(64), integrated_commit: OUTPUT },
+587:    assert.deepEqual(status, { launch_ui: 'succeeded', launch_adapter: 'succeeded', handoff: 'awaiting_approval', verify_ui: 'pending', verify_adapter: 'pending', candidate: 'pending', review: 'pending', approval: 'pending', integrate: 'pending' })
+660:    assertError(await get(app, url('alpha', 'main', 'drill', '/results/review/1')), 404, 'RESULT_NOT_FOUND')
+693:    await writeRun(rootDir, { runId: 'half-integrated', values: { ui: receipt('ui'), adapter: receipt('adapter'), integrated_commit: OUTPUT }, next: ['review'], events: launchEvents })
+946:test('a recorded review is served with its reviewer, redacted text, verbatim-only task links and the diff artifact; the review node links to it', async () => {
+948:    const leak = `${root}/runs/alpha/main/reviewed/worktree-ui/tests/harness.ts`
+956:      finding({ message: 'The adapter task is searched too.', disposition: 'resolved', worker: 'both', requirement: 'Serve the review route from the export section.' }),
+957:      finding({ message: 'Recorded before the reviewer prompt asked for links.', worker: null, requirement: null }),

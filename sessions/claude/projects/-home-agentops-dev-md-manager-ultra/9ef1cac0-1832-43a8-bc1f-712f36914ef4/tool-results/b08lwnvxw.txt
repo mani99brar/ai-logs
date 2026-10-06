@@ -1,0 +1,604 @@
+     1	/**
+     2	 * Synthetic project/workflow/run data for the Projects viewer browser tests. Identifiers and the shape of
+     3	 * each run are shared by both verification phases: in `worker` mode they are served as explicit contract
+     4	 * payloads by `mock.ts`; in `candidate` mode `seed.ts` writes the same logical runs to disk in the format
+     5	 * the real backend adapter projects. Nothing here is real execution evidence.
+     6	 *
+     7	 * Review results and run inputs exist in two forms: the raw export sections (`rawReviewSection`,
+     8	 * `rawInputsSection`, the shapes `workflow/export_state.py` writes) and their projections onto the
+     9	 * contract (`reviewResults`, `runInputs`, what the mocks serve). Texts take a `leak` argument: the seeds
+    10	 * pass a real absolute path under the temporary root so the adapter's redaction is exercised, the mocks
+    11	 * use the already-redacted marker `<path>`, so both phases render the same text.
+    12	 */
+    13	import { createHash } from 'node:crypto'
+    14	import { deflateSync } from 'node:zlib'
+    15	import {
+    16	  validateDefinition, validateReviewResult, validateRunDetail, validateRunInputs,
+    17	  type Project, type ReviewResult, type RunDetail, type RunInputs, type WorkflowDefinition,
+    18	} from '../../contracts/projects/v1.ts'
+    19	import { eventSchema, validateWorkerResult, type WorkerResult, type WorkflowEvent } from '../../contracts/workflow/v1.ts'
+    20	
+    21	export const PROJECT: Project = { project_id: 'alpha-project', name: 'Alpha project' }
+    22	export const EMPTY_PROJECT: Project = { project_id: 'empty-project', name: 'Empty project' }
+    23	export const WORKFLOW_ID = 'feature-flow'
+    24	export const WORKFLOW_NAME = 'Feature flow'
+    25	export const EMPTY_WORKFLOW_ID = 'empty-flow'
+    26	export const EMPTY_WORKFLOW_NAME = 'Empty flow'
+    27	export const RUN_SUCCEEDED = 'run-succeeded'
+    28	export const RUN_FAILED = 'run-failed'
+    29	export const RUN_AWAITING = 'run-awaiting'
+    30	/** Reviewed and blocked by the independent reviewer (print transport): the review node failed, the run failed. */
+    31	export const RUN_BLOCKED = 'run-blocked'
+    32	/** Integrated under export version 1.0.0: no review and no inputs sections although the review happened. */
+    33	export const RUN_LEGACY = 'run-legacy'
+    34	export const PINNED_LABEL = 'Verify UI (pinned r1)'
+    35	export const CURRENT_LABEL = 'Verify UI'
+    36	export const BASE_COMMIT = '1234567890abcdef1234567890abcdef12345678'
+    37	export const OUTPUT_COMMIT_UI = 'abcdef1234567890abcdef1234567890abcdef12'
+    38	export const OUTPUT_COMMIT_ADAPTER = 'fedcba0987654321fedcba0987654321fedcba09'
+    39	export const CANDIDATE_COMMIT = 'c'.repeat(40)
+    40	export const BUNDLE_SHA256 = 'f'.repeat(64)
+    41	export const UI_ASSUMPTION = 'Candidate verification serves artifacts through the run-scoped registry only.'
+    42	export const UI_CHANGED_FILES = ['src/App.tsx', 'src/projects/ProjectsView.tsx', 'tests/project-workflows/projects.spec.ts']
+    43	export const ADAPTER_CHANGED_FILES = ['server/projects.ts', 'server/projects.test.ts']
+    44	export const LOG_TEXT_PREFIX = 'synthetic check log:'
+    45	/** What the adapter substitutes for an absolute filesystem path; the mocks carry it literally. */
+    46	export const PATH_TOKEN = '<path>'
+    47	export const FEATURE_NAME = 'Review visibility and run inputs in the viewer'
+    48	export const REVIEWER_SESSION = '33333333-3333-4333-8333-333333333333'
+    49	export const PRINT_REVIEWER_SESSION = '44444444-4444-4444-8444-444444444444'
+    50	export const REVIEW_DIFF = [
+    51	  'diff --git a/src/projects/NodeDetail.tsx b/src/projects/NodeDetail.tsx',
+    52	  '--- a/src/projects/NodeDetail.tsx',
+    53	  '+++ b/src/projects/NodeDetail.tsx',
+    54	  '@@ -1,3 +1,4 @@',
+    55	  " import { useCallback, useState } from 'react'",
+    56	  "+import { ReviewPanel } from './ReviewDetail.tsx'",
+    57	  ' import {',
+    58	  '   fetchArtifactText,',
+    59	  '',
+    60	].join('\n')
+    61	
+    62	type DefinitionNode = WorkflowDefinition['nodes'][number]
+    63	
+    64	/** The production pipeline graph (`workflow/export_state.py` GRAPH_NODES). */
+    65	export const GRAPH_NODES: DefinitionNode[] = [
+    66	  { node_id: 'launch_ui', label: 'Launch UI worker', kind: 'worker', depends_on: [] },
+    67	  { node_id: 'launch_adapter', label: 'Launch adapter worker', kind: 'worker', depends_on: [] },
+    68	  { node_id: 'handoff', label: 'Freeze worker handoffs', kind: 'prepare', depends_on: ['launch_ui', 'launch_adapter'] },
+    69	  { node_id: 'verify_ui', label: CURRENT_LABEL, kind: 'verification', depends_on: ['handoff'] },
+    70	  { node_id: 'verify_adapter', label: 'Verify adapter', kind: 'verification', depends_on: ['handoff'] },
+    71	  { node_id: 'candidate', label: 'Verify combined candidate', kind: 'verification', depends_on: ['verify_ui', 'verify_adapter'] },
+    72	  { node_id: 'review', label: 'Independent review', kind: 'review', depends_on: ['candidate'] },
+    73	  { node_id: 'approval', label: 'Integration approval', kind: 'integration', depends_on: ['review'] },
+    74	  { node_id: 'integrate', label: 'Integrate candidate', kind: 'integration', depends_on: ['approval'] },
+    75	]
+    76	
+    77	/** The succeeded run was started under an older definition: one label differs, so its revision differs too. */
+    78	export const PINNED_NODES: DefinitionNode[] = GRAPH_NODES.map(node => (node.node_id === 'verify_ui' ? { ...node, label: PINNED_LABEL } : node))
+    79	
+    80	/** Definition revision exactly as the contract specifies: SHA-256 of canonical JSON without `definition_revision`. */
+    81	export function definitionRevision(definition: { contract_version: string; project_id: string; workflow_id: string; name: string; nodes: DefinitionNode[] }): string {
+    82	  const canonical = (value: unknown): string => {
+    83	    if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
+    84	    if (value && typeof value === 'object') {
+    85	      return `{${Object.keys(value as Record<string, unknown>).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`
+    86	    }
+    87	    return JSON.stringify(value)
+    88	  }
+    89	  const { contract_version, project_id, workflow_id, name, nodes } = definition
+    90	  return createHash('sha256').update(canonical({ contract_version, project_id, workflow_id, name, nodes }), 'utf8').digest('hex')
+    91	}
+    92	
+    93	function definition(projectId: string, workflowId: string, name: string, nodes: DefinitionNode[]): WorkflowDefinition {
+    94	  const base = { contract_version: '1.0.0' as const, project_id: projectId, workflow_id: workflowId, name, nodes }
+    95	  return validateDefinition({ ...base, definition_revision: definitionRevision(base) })
+    96	}
+    97	
+    98	export const CURRENT_DEFINITION = definition(PROJECT.project_id, WORKFLOW_ID, WORKFLOW_NAME, GRAPH_NODES)
+    99	export const PINNED_DEFINITION = definition(PROJECT.project_id, WORKFLOW_ID, WORKFLOW_NAME, PINNED_NODES)
+   100	export const EMPTY_WORKFLOW_DEFINITION = definition(PROJECT.project_id, EMPTY_WORKFLOW_ID, EMPTY_WORKFLOW_NAME, GRAPH_NODES.slice(0, 3))
+   101	
+   102	export const projectList = { projects: [PROJECT, EMPTY_PROJECT] }
+   103	export const workflowLists: Record<string, { workflows: WorkflowDefinition[] }> = {
+   104	  [PROJECT.project_id]: { workflows: [CURRENT_DEFINITION, EMPTY_WORKFLOW_DEFINITION] },
+   105	  [EMPTY_PROJECT.project_id]: { workflows: [] },
+   106	}
+   107	
+   108	export const T0 = '2026-03-01T10:00:00Z'
+   109	export const T1 = '2026-03-01T10:05:00Z'
+   110	export const T2 = '2026-03-01T10:20:00Z'
+   111	export const T3 = '2026-03-01T10:45:00Z'
+   112	
+   113	export const apiRunPath = (runId: string) => `/api/projects/${PROJECT.project_id}/workflows/${WORKFLOW_ID}/runs/${runId}`
+   114	
+   115	// ---- A tiny valid PNG (solid colour), so screenshot artifacts are real images -------------------------
+   116	
+   117	function crc32(bytes: Buffer): number {
+   118	  let crc = ~0
+   119	  for (const byte of bytes) {
+   120	    crc ^= byte
+   121	    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+   122	  }
+   123	  return ~crc >>> 0
+   124	}
+   125	
+   126	function chunk(type: string, data: Buffer): Buffer {
+   127	  const length = Buffer.alloc(4)
+   128	  length.writeUInt32BE(data.length)
+   129	  const body = Buffer.concat([Buffer.from(type, 'ascii'), data])
+   130	  const crc = Buffer.alloc(4)
+   131	  crc.writeUInt32BE(crc32(body))
+   132	  return Buffer.concat([length, body, crc])
+   133	}
+   134	
+   135	export function solidPng(width: number, height: number, rgb: [number, number, number]): Buffer {
+   136	  const header = Buffer.alloc(13)
+   137	  header.writeUInt32BE(width, 0)
+   138	  header.writeUInt32BE(height, 4)
+   139	  header[8] = 8 // bit depth
+   140	  header[9] = 2 // colour type: RGB
+   141	  const rows: Buffer[] = []
+   142	  for (let y = 0; y < height; y += 1) {
+   143	    const row = Buffer.alloc(1 + width * 3)
+   144	    for (let x = 0; x < width; x += 1) row.set(rgb, 1 + x * 3)
+   145	    rows.push(row)
+   146	  }
+   147	  return Buffer.concat([
+   148	    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+   149	    chunk('IHDR', header),
+   150	    chunk('IDAT', deflateSync(Buffer.concat(rows))),
+   151	    chunk('IEND', Buffer.alloc(0)),
+   152	  ])
+   153	}
+   154	
+   155	export const SCREENSHOT_PNG = solidPng(96, 64, [47, 122, 75])
+   156	
+   157	export function sha256(content: Buffer | string): string {
+   158	  return createHash('sha256').update(content).digest('hex')
+   159	}
+   160	
+   161	export const REVIEW_DIFF_ARTIFACT_ID = `patch-review-${sha256(REVIEW_DIFF).slice(0, 12)}`
+   162	
+   163	// ---- Artifacts and worker results ------------------------------------------------------------------
+   164	
+   165	export type ArtifactFile = { artifact_id: string; kind: WorkerResult['artifacts'][number]['kind']; content: Buffer; contentType: string }
+   166	
+   167	function logArtifact(id: string, command: string, exitCode: number): ArtifactFile {
+   168	  const content = Buffer.from(`${LOG_TEXT_PREFIX} ${command}\n... output elided ...\nexit ${exitCode}\n`, 'utf8')
+   169	  return { artifact_id: id, kind: 'log', content, contentType: 'text/plain; charset=utf-8' }
+   170	}
+   171	
+   172	export const UI_ARTIFACTS: ArtifactFile[] = [
+   173	  logArtifact('log-0-ui-build', 'npm run build', 0),
+   174	  logArtifact('log-1-ui-unit', 'npm run test:unit', 0),
+   175	  logArtifact('log-2-ui-browser', 'npx --no-install playwright test --config=tests/project-workflows/playwright.config.ts', 0),
+   176	  { artifact_id: 'screenshot-3-projects', kind: 'screenshot', content: SCREENSHOT_PNG, contentType: 'image/png' },
+   177	  { artifact_id: 'test_report-4-browser', kind: 'test_report', content: Buffer.from('{"stats":{"expected":6,"unexpected":0}}\n'), contentType: 'application/json' },
+   178	]
+   179	export const ADAPTER_ARTIFACTS: ArtifactFile[] = [
+   180	  logArtifact('log-0-adapter-unit', 'npx --no-install tsx --test server/projects.test.ts', 0),
+   181	]
+   182	/** The diff the reviewer saw, served through the artifact route as a patch. */
+   183	export const REVIEW_DIFF_ARTIFACT: ArtifactFile = { artifact_id: REVIEW_DIFF_ARTIFACT_ID, kind: 'patch', content: Buffer.from(REVIEW_DIFF, 'utf8'), contentType: 'text/plain; charset=utf-8' }
+   184	
+   185	function artifactRefs(files: ArtifactFile[]): WorkerResult['artifacts'] {
+   186	  return files.map(file => ({ artifact_id: file.artifact_id, kind: file.kind, uri: file.artifact_id, sha256: sha256(file.content) }))
+   187	}
+   188	
+   189	function checks(cwd: string, entries: { command: string; log: string; exit: number; start: string; finish: string }[]): WorkerResult['checks'] {
+   190	  return entries.map(entry => ({ command: entry.command, cwd, started_at: entry.start, finished_at: entry.finish, exit_code: entry.exit, log_artifact_id: entry.log }))
+   191	}
+   192	
+   193	export const UI_SESSION = '11111111-1111-4111-8111-111111111111'
+   194	export const ADAPTER_SESSION = '22222222-2222-4222-8222-222222222222'
+   195	
+   196	export function uiResult(runId: string): WorkerResult {
+   197	  return validateWorkerResult({
+   198	    contract_version: '1.0.0', run_id: runId, node_id: 'ui', attempt: 1, session_id: UI_SESSION,
+   199	    status: 'succeeded', base_commit: BASE_COMMIT, output_commit: OUTPUT_COMMIT_UI,
+   200	    changed_files: UI_CHANGED_FILES,
+   201	    checks: checks('verification/worker/ui/1/worktree', [
+   202	      { command: 'npm run build', log: 'log-0-ui-build', exit: 0, start: T1, finish: '2026-03-01T10:06:00Z' },
+   203	      { command: 'npm run test:unit', log: 'log-1-ui-unit', exit: 0, start: '2026-03-01T10:06:00Z', finish: '2026-03-01T10:07:00Z' },
+   204	      { command: 'npx --no-install playwright test --config=tests/project-workflows/playwright.config.ts', log: 'log-2-ui-browser', exit: 0, start: '2026-03-01T10:07:00Z', finish: '2026-03-01T10:12:00Z' },
+   205	    ]),
+   206	    open_assumptions: [UI_ASSUMPTION],
+   207	    artifacts: artifactRefs(UI_ARTIFACTS),
+   208	    summary: 'Trusted worker check capture of the UI worktree; not integration approval.',
+   209	    error: null,
+   210	  })
+   211	}
+   212	
+   213	export function adapterResult(runId: string, failed: boolean): WorkerResult {
+   214	  return validateWorkerResult({
+   215	    contract_version: '1.0.0', run_id: runId, node_id: 'adapter', attempt: 1, session_id: ADAPTER_SESSION,
+   216	    status: failed ? 'failed' : 'succeeded', base_commit: BASE_COMMIT, output_commit: failed ? null : OUTPUT_COMMIT_ADAPTER,
+   217	    changed_files: ADAPTER_CHANGED_FILES,
+   218	    checks: checks('verification/worker/adapter/1/worktree', [
+   219	      { command: 'npx --no-install tsx --test server/projects.test.ts', log: 'log-0-adapter-unit', exit: 0, start: T1, finish: '2026-03-01T10:08:00Z' },
+   220	    ]),
+   221	    open_assumptions: [],
+   222	    artifacts: artifactRefs(ADAPTER_ARTIFACTS),
+   223	    summary: failed ? 'Checks ran and were preserved; the verification gate was blocked by the configured failure drill.' : 'Trusted worker check capture of the adapter worktree; not integration approval.',
+   224	    error: failed ? { code: 'injected_gate_failure', message: 'Verification attempt 1 was blocked by the configured failure drill, not by a failing check.', retryable: true } : null,
+   225	  })
+   226	}
+   227	
+   228	// ---- Runs ----------------------------------------------------------------------------------------------
+   229	
+   230	type NodeState = { status: RunDetail['snapshot']['nodes'][number]['status']; attempt: number; session?: string | null; result?: string | null; review?: number }
+   231	
+   232	function runDetail(runId: string, status: RunDetail['summary']['status'], pinned: WorkflowDefinition, createdAt: string, updatedAt: string, states: Record<string, NodeState>, lastSequence: number): RunDetail {
+   233	  const resultPath = (node: string, attempt: number) => `${apiRunPath(runId)}/results/${node}/${attempt}`
+   234	  return validateRunDetail({
+   235	    summary: {
+   236	      contract_version: '1.0.0', project_id: PROJECT.project_id, workflow_id: WORKFLOW_ID,
+   237	      definition_revision: pinned.definition_revision, run_id: runId, status, created_at: createdAt, updated_at: updatedAt,
+   238	    },
+   239	    definition: pinned,
+   240	    snapshot: {
+   241	      contract_version: '1.0.0', run_id: runId, status, last_sequence: lastSequence,
+   242	      nodes: pinned.nodes.map(node => {
+   243	        const state = states[node.node_id] ?? { status: 'pending', attempt: 0 }
+   244	        return {
+   245	          node_id: node.node_id, kind: node.kind, depends_on: node.depends_on, status: state.status, attempt: state.attempt,
+   246	          session_id: state.session ?? null,
+   247	          result_uri: state.review ? `${apiRunPath(runId)}/reviews/${state.review}` : state.result ? resultPath(state.result, state.attempt) : null,
+   248	        }
+   249	      }),
+   250	    },
+   251	  })
+   252	}
+   253	
+   254	const done = (session?: string, result?: string): NodeState => ({ status: 'succeeded', attempt: 1, session: session ?? null, result: result ?? null })
+   255	/** Both launch nodes finished and, like the real adapter, link to the worker's verified result. */
+   256	const launched = { launch_ui: done(UI_SESSION, 'ui'), launch_adapter: done(ADAPTER_SESSION, 'adapter'), handoff: done() }
+   257	const verified = { ...launched, verify_ui: done(undefined, 'ui'), verify_adapter: done(undefined, 'adapter'), candidate: done() }
+   258	
+   259	export const runDetails: Record<string, RunDetail> = {
+   260	  [RUN_SUCCEEDED]: runDetail(RUN_SUCCEEDED, 'succeeded', PINNED_DEFINITION, T0, T3, {
+   261	    ...verified, review: { status: 'succeeded', attempt: 1, session: REVIEWER_SESSION, review: 1 }, approval: done(), integrate: done(),
+   262	  }, 18),
+   263	  [RUN_FAILED]: runDetail(RUN_FAILED, 'failed', CURRENT_DEFINITION, T1, T2, {
+   264	    ...launched,
+   265	    verify_ui: { status: 'succeeded', attempt: 2, result: 'ui' },
+   266	    verify_adapter: { status: 'failed', attempt: 1, result: 'adapter' },
+   267	  }, 9),
+   268	  [RUN_AWAITING]: runDetail(RUN_AWAITING, 'awaiting_approval', CURRENT_DEFINITION, T2, T3, {
+   269	    ...verified, review: { status: 'awaiting_approval', attempt: 1 },
+   270	  }, 12),
+   271	  [RUN_BLOCKED]: runDetail(RUN_BLOCKED, 'failed', CURRENT_DEFINITION, T1, T3, {
+   272	    ...verified, review: { status: 'failed', attempt: 1, session: PRINT_REVIEWER_SESSION, review: 1 },
+   273	  }, 10),
+   274	  [RUN_LEGACY]: runDetail(RUN_LEGACY, 'succeeded', CURRENT_DEFINITION, T0, T2, {
+   275	    ...verified, review: done(), approval: done(), integrate: done(),
+   276	  }, 6),
+   277	}
+   278	
+   279	/** Runs sorted by `updated_at` descending then `run_id` ascending, as the contract requires. */
+   280	export const runList = {
+   281	  runs: Object.values(runDetails).map(detail => detail.summary).sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.run_id.localeCompare(b.run_id)),
+   282	  next_cursor: null,
+   283	}
+   284	
+   285	export const workerResults: Record<string, Record<string, WorkerResult>> = {
+   286	  [RUN_SUCCEEDED]: { 'ui/1': uiResult(RUN_SUCCEEDED), 'adapter/1': adapterResult(RUN_SUCCEEDED, false) },
+   287	  [RUN_FAILED]: { 'ui/1': uiResult(RUN_FAILED), 'ui/2': { ...uiResult(RUN_FAILED), attempt: 2 }, 'adapter/1': adapterResult(RUN_FAILED, true) },
+   288	  [RUN_AWAITING]: { 'ui/1': uiResult(RUN_AWAITING), 'adapter/1': adapterResult(RUN_AWAITING, false) },
+   289	  [RUN_BLOCKED]: { 'ui/1': uiResult(RUN_BLOCKED), 'adapter/1': adapterResult(RUN_BLOCKED, false) },
+   290	  [RUN_LEGACY]: { 'ui/1': uiResult(RUN_LEGACY), 'adapter/1': adapterResult(RUN_LEGACY, false) },
+   291	}
+   292	
+   293	function event(runId: string, sequence: number, fields: Partial<WorkflowEvent> & Pick<WorkflowEvent, 'type' | 'message'>): WorkflowEvent {
+   294	  return eventSchema.parse({
+   295	    contract_version: '1.0.0', run_id: runId, event_id: `${runId}-event-${sequence}`, sequence,
+   296	    occurred_at: new Date(Date.parse(T0) + sequence * 60_000).toISOString().replace(/\.\d{3}Z$/, 'Z'),
+   297	    node_id: null, attempt: 0, status: null, artifact: null, result_uri: null, reused_from_attempt: null,
+   298	    ...fields,
+   299	  })
+   300	}
+   301	
+   302	export const REUSE_MESSAGE = 'Reused the successful UI verification from attempt 1; only the adapter lane was rerun.'
+   303	export const APPROVAL_MESSAGE = 'Independent review required before integration; awaiting the recorded review verdict.'
+   304	export const BLOCKED_MESSAGE = 'Independent reviewer blocked the candidate'
+   305	
+   306	export const runEvents: Record<string, WorkflowEvent[]> = {
+   307	  [RUN_SUCCEEDED]: [
+   308	    event(RUN_SUCCEEDED, 1, { type: 'status_changed', node_id: 'launch_ui', attempt: 1, status: 'running', message: 'Launching the native UI session' }),
+   309	    event(RUN_SUCCEEDED, 2, { type: 'status_changed', node_id: 'launch_ui', attempt: 1, status: 'succeeded', message: 'Native session launched and its turn ended; not implementation completion' }),
+   310	    event(RUN_SUCCEEDED, 3, { type: 'result_published', node_id: 'verify_ui', attempt: 1, message: 'UI verification packet captured', result_uri: runDetails[RUN_SUCCEEDED].snapshot.nodes.find(node => node.node_id === 'verify_ui')!.result_uri }),
+   311	    event(RUN_SUCCEEDED, 4, { type: 'status_changed', node_id: 'review', attempt: 1, status: 'succeeded', message: `Reviewer session ${REVIEWER_SESSION} approved the candidate` }),
+   312	    event(RUN_SUCCEEDED, 5, { type: 'status_changed', node_id: 'integrate', attempt: 1, status: 'succeeded', message: 'Fast-forwarded the feature branch' }),
+   313	  ],
+   314	  [RUN_FAILED]: [
+   315	    event(RUN_FAILED, 1, { type: 'status_changed', node_id: 'launch_ui', attempt: 1, status: 'succeeded', message: 'Native session launched and its turn ended; not implementation completion' }),
+   316	    event(RUN_FAILED, 2, { type: 'result_published', node_id: 'verify_adapter', attempt: 1, message: 'Adapter verification packet captured with a blocked gate', result_uri: runDetails[RUN_FAILED].snapshot.nodes.find(node => node.node_id === 'verify_adapter')!.result_uri }),
+   317	    event(RUN_FAILED, 3, { type: 'status_changed', node_id: 'verify_adapter', attempt: 1, status: 'failed', message: 'Injected gate failure (failure drill), checks preserved' }),
+   318	    event(RUN_FAILED, 4, { type: 'result_reused', node_id: 'verify_ui', attempt: 2, reused_from_attempt: 1, message: REUSE_MESSAGE }),
+   319	  ],
+   320	  [RUN_AWAITING]: [
+   321	    event(RUN_AWAITING, 1, { type: 'status_changed', node_id: 'candidate', attempt: 1, status: 'succeeded', message: 'Combined candidate checks passed' }),
+   322	    event(RUN_AWAITING, 2, { type: 'approval_requested', node_id: 'review', attempt: 1, status: 'awaiting_approval', message: APPROVAL_MESSAGE }),
+   323	  ],
+   324	  [RUN_BLOCKED]: [
+   325	    event(RUN_BLOCKED, 1, { type: 'status_changed', node_id: 'candidate', attempt: 1, status: 'succeeded', message: 'Combined candidate checks passed' }),
+   326	    event(RUN_BLOCKED, 2, { type: 'status_changed', node_id: 'review', attempt: 1, status: 'running', message: 'Launching the print-mode reviewer' }),
+   327	    event(RUN_BLOCKED, 3, { type: 'status_changed', node_id: 'review', attempt: 1, status: 'failed', message: BLOCKED_MESSAGE }),
+   328	  ],
+   329	  [RUN_LEGACY]: [
+   330	    event(RUN_LEGACY, 1, { type: 'status_changed', node_id: 'review', attempt: 1, status: 'succeeded', message: 'Review accepted (recorded before review results were exported)' }),
+   331	    event(RUN_LEGACY, 2, { type: 'status_changed', node_id: 'integrate', attempt: 1, status: 'succeeded', message: 'Fast-forwarded the feature branch' }),
+   332	  ],
+   333	}
+   334	
+   335	export const artifactFiles: Record<string, ArtifactFile[]> = {
+   336	  [RUN_SUCCEEDED]: [...UI_ARTIFACTS, ...ADAPTER_ARTIFACTS, REVIEW_DIFF_ARTIFACT],
+   337	  [RUN_FAILED]: [...UI_ARTIFACTS, ...ADAPTER_ARTIFACTS],
+   338	  [RUN_AWAITING]: [...UI_ARTIFACTS, ...ADAPTER_ARTIFACTS],
+   339	  [RUN_BLOCKED]: [...UI_ARTIFACTS, ...ADAPTER_ARTIFACTS],
+   340	  [RUN_LEGACY]: [...UI_ARTIFACTS, ...ADAPTER_ARTIFACTS],
+   341	}
+   342	
+   343	// ---- Worker tasks, prompts and the reviewer's quotes ----------------------------------------------------
+   344	
+   345	/** A requirement the reviewer quoted verbatim from the UI task. */
+   346	export const UI_QUOTE = 'Show every finding with its severity and disposition.'
+   347	/** A verbatim UI-task requirement that names a directory; the seeds put a real path here, the mocks the marker. */
+   348	export const uiPathQuote = (leak = PATH_TOKEN) => `Write screenshots below ${leak} only.`
+   349	/** A requirement the reviewer quoted verbatim from the adapter task. */
+   350	export const ADAPTER_QUOTE = 'Serve the review verdict from the export section only.'
+   351	/** A paraphrase of the UI requirement: not a verbatim substring of any task, so it never links. */
+   352	export const PARAPHRASED_QUOTE = 'Show each finding with severity and disposition'
+   353	
+   354	export function uiTask(leak = PATH_TOKEN): string {
+   355	  return [
+   356	    '# UI worker',
+   357	    '',
+   358	    'Render the review verdict on the review node and the run inputs on the worker nodes.',
+   359	    '',
+   360	    '## Deliverables',
+   361	    '',
+   362	    `- ${UI_QUOTE}`,
+   363	    '- Link each verbatim requirement quote to the task that contains it.',
+   364	    `- ${uiPathQuote(leak)}`,
+   365	    '',
+   366	    'Approved ownership and checks:',
+   367	    '{"node_id": "ui", "owned_paths": ["src/App.tsx", "src/App.css", "src/projects", "tests/project-workflows"], "checks": ["frontend-build", "frontend-unit", "frontend-typecheck", "project-workflows-browser"]}',
+   368	  ].join('\n')
+   369	}
+   370	
+   371	export function adapterTask(): string {
+   372	  return [
+   373	    '# Adapter worker',
+   374	    '',
+   375	    '## Deliverables',
+   376	    '',
+   377	    `- ${ADAPTER_QUOTE}`,
+   378	    '- Redact absolute paths from every served text.',
+   379	    '',
+   380	    'Approved ownership and checks:',
+   381	    '{"node_id": "adapter", "owned_paths": ["server", "config/projects.example.json"], "checks": ["backend-unit"]}',
+   382	  ].join('\n')
+   383	}
+   384	
+   385	export const uiPrompt = (leak = PATH_TOKEN) => `You are a workflow worker in your own worktree. Work only inside your owned paths and hand off with a completion signal.\n\n${uiTask(leak)}`
+   386	
+   387	/** The UI worker's completion summary; the seeds put a real path here, the mocks the marker. */
+   388	export const uiCompletionSummary = (leak = PATH_TOKEN) => `Implemented the review panel and the task panels; browser screenshots are under ${leak} for inspection.`
+   389	export const ADAPTER_COMPLETION_SUMMARY = 'Served the review and inputs routes with path redaction.'
+   390	export const ADAPTER_HANDOFF_SUMMARY = 'Served the review and inputs routes with path redaction; the diff artifact is hash-checked.'
+   391	export const ADAPTER_HANDOFF_ASSUMPTION = 'The artifact byte limit stays at the default.'
+   392	export const sourceBranch = (runId: string) => `feature/${WORKFLOW_ID}/${runId}`
+   393	
+   394	// ---- Raw export sections (the shapes workflow/export_state.py 1.2.0 writes) ------------------------------
+   395	
+   396	export type RawFinding = {
+   397	  severity: 'P0' | 'P1' | 'P2'
+   398	  message: string
+   399	  disposition: 'open' | 'resolved' | 'accepted'
+   400	  worker: 'ui' | 'adapter' | 'both' | 'none' | null
+   401	  requirement: string | null
+   402	}
+   403	export type RawReviewSection = {
+   404	  attempt: number
+   405	  transport: 'native' | 'print' | 'manual'
+   406	  reviewer_session_id: string
+   407	  independent: true
+   408	  bundle_sha256: string
+   409	  candidate_commit: string
+   410	  verdict: 'approved' | 'blocked'
+   411	  findings: RawFinding[]
+   412	  reviewed_at: string
+   413	  diff: { path: 'review.diff'; sha256: string; bytes: number } | null
+   414	}
+   415	export type RawCheck = { id: string; kind: 'build' | 'typecheck' | 'unit' | 'integration' | 'contract' | 'browser'; argv: string[]; command: string; timeout_seconds: number; scenarios: { id: string; description: string }[] }
+   416	export type RawWorkerInput = {
+   417	  role: 'frontend' | 'backend'
+   418	  task: string
+   419	  prompt: string | null
+   420	  owned_paths: string[]
+   421	  checks: RawCheck[]
+   422	  launch: { session_id: string | null; launch_token: string; launch_requested_at: string; native_started_at: number | null; observed_state: string | null; status: string; launcher_invocations: number; background_id: string | null } | null
+   423	  completion: { status: 'completed' | 'blocked'; summary: string; open_assumptions: string[] } | null
+   424	  handoff: { summary: string; open_assumptions: string[] } | null
+   425	  stop: { stopped: boolean; confirmed_at: string | null } | null
+   426	}
+   427	export type RawInputsSection = {
+   428	  feature: string
+   429	  policy_version: string
+   430	  base_commit: string
+   431	  source_branch: string | null
+   432	  mode: 'automatic' | 'manual'
+   433	  automatic: { finish: string; permission_mode: string; worker_timeout_seconds: number; review_timeout_seconds: number; reviewer_transport: 'native' | 'print' } | null
+   434	  setup: { argv: string[]; command: string; timeout_seconds: number }[]
+   435	  max_verification_attempts: number
+   436	  failure_drill: { node_id: string; phase: string; attempt: number } | null
+   437	  workers: Record<'ui' | 'adapter', RawWorkerInput>
+   438	}
+   439	
+   440	/** Receipts store `+00:00` offsets; the adapter normalises them to a trailing Z. */
+   441	const offset = (iso: string) => iso.replace(/Z$/, '+00:00')
+   442	const zulu = (value: string) => (value.endsWith('+00:00') ? `${value.slice(0, -6)}Z` : value)
+   443	
+   444	/** The reviewer's findings for a run; one message and one quote name a directory (redacted by the adapter). */
+   445	export function reviewFindings(runId: string, leak = PATH_TOKEN): RawFinding[] {
+   446	  if (runId === RUN_BLOCKED) {
+   447	    return [
+   448	      { severity: 'P1', message: 'The inputs route still serves the worktree path of the adapter lane.', disposition: 'open', worker: 'adapter', requirement: ADAPTER_QUOTE },
+   449	      { severity: 'P2', message: 'Naming of the review panel props was inconsistent; fixed before the verdict.', disposition: 'resolved', worker: 'ui', requirement: null },
+   450	    ]
+   451	  }
+   452	  return [
+   453	    { severity: 'P2', message: 'The findings table drops the disposition column below 480px.', disposition: 'open', worker: 'ui', requirement: UI_QUOTE },
+   454	    { severity: 'P2', message: `Screenshots were written beside ${leak} instead of below it.`, disposition: 'open', worker: 'ui', requirement: uiPathQuote(leak) },
+   455	    { severity: 'P2', message: 'The summary line paraphrases the disposition counts.', disposition: 'open', worker: 'ui', requirement: PARAPHRASED_QUOTE },
+   456	    { severity: 'P2', message: 'The root Playwright suite is not part of the policy check set.', disposition: 'open', worker: 'none', requirement: null },
+   457	    { severity: 'P2', message: 'The review route re-reads the export on every request.', disposition: 'accepted', worker: 'adapter', requirement: ADAPTER_QUOTE },
+   458	    { severity: 'P2', message: 'Both lanes duplicate the redaction regex in their tests.', disposition: 'accepted', worker: 'both', requirement: null },
+   459	  ]
+   460	}
+   461	
+   462	/** The export's `review` section for a run, or null for runs whose review was not reached or not exported. */
+   463	export function rawReviewSection(runId: string, leak = PATH_TOKEN): RawReviewSection | null {
+   464	  if (runId === RUN_SUCCEEDED) {
+   465	    return {
+   466	      attempt: 1, transport: 'native', reviewer_session_id: REVIEWER_SESSION, independent: true, bundle_sha256: BUNDLE_SHA256, candidate_commit: CANDIDATE_COMMIT,
+   467	      verdict: 'approved', findings: reviewFindings(runId, leak), reviewed_at: offset(T3),
+   468	      diff: { path: 'review.diff', sha256: sha256(REVIEW_DIFF), bytes: Buffer.byteLength(REVIEW_DIFF) },
+   469	    }
+   470	  }
+   471	  if (runId === RUN_BLOCKED) {
+   472	    return {
+   473	      attempt: 1, transport: 'print', reviewer_session_id: PRINT_REVIEWER_SESSION, independent: true, bundle_sha256: BUNDLE_SHA256, candidate_commit: CANDIDATE_COMMIT,
+   474	      verdict: 'blocked', findings: reviewFindings(runId, leak), reviewed_at: offset(T3), diff: null,
+   475	    }
+   476	  }
+   477	  return null
+   478	}
+   479	
+   480	export const UI_CHECKS: RawCheck[] = [
+   481	  { id: 'frontend-build', kind: 'build', argv: ['npm', 'run', 'build'], command: 'npm run build', timeout_seconds: 180, scenarios: [] },
+   482	  { id: 'frontend-unit', kind: 'unit', argv: ['npm', 'run', 'test:unit'], command: 'npm run test:unit', timeout_seconds: 180, scenarios: [] },
+   483	  { id: 'frontend-typecheck', kind: 'typecheck', argv: ['npx', '--no-install', 'tsc', '-b'], command: 'npx --no-install tsc -b', timeout_seconds: 120, scenarios: [] },
+   484	  {
+   485	    id: 'project-workflows-browser', kind: 'browser',
+   486	    argv: ['npx', '--no-install', 'playwright', 'test', '--config=tests/project-workflows/playwright.config.ts'],
+   487	    command: 'npx --no-install playwright test --config=tests/project-workflows/playwright.config.ts', timeout_seconds: 300,
+   488	    scenarios: [
+   489	      { id: 'review-verdict', description: 'The review node shows the verdict and findings' },
+   490	      { id: 'finding-to-task', description: 'A verbatim requirement quote links to the worker task' },
+   491	    ],
+   492	  },
+   493	]
+   494	export const ADAPTER_CHECKS: RawCheck[] = [
+   495	  { id: 'backend-unit', kind: 'unit', argv: ['npx', '--no-install', 'tsx', '--test', 'server/projects.test.ts'], command: 'npx --no-install tsx --test server/projects.test.ts', timeout_seconds: 180, scenarios: [] },
+   496	]
+   497	
+   498	const launchToken = (lane: 'ui' | 'adapter') => `00000000-0000-4000-8000-00000000000${lane === 'ui' ? 1 : 2}`
+   499	
+   500	function rawWorker(lane: 'ui' | 'adapter', runId: string, leak: string, requestedAt: string): RawWorkerInput {
+   501	  const ui = lane === 'ui'
+   502	  const failedAdapter = !ui && runId === RUN_FAILED
+   503	  return {
+   504	    role: ui ? 'frontend' : 'backend',
+   505	    task: ui ? uiTask(leak) : adapterTask(),
+   506	    prompt: ui ? uiPrompt(leak) : null,
+   507	    owned_paths: ui ? ['src/App.tsx', 'src/App.css', 'src/projects', 'tests/project-workflows'] : ['server', 'config/projects.example.json'],
+   508	    checks: ui ? UI_CHECKS : ADAPTER_CHECKS,
+   509	    launch: {
+   510	      session_id: ui ? UI_SESSION : ADAPTER_SESSION, launch_token: launchToken(lane), launch_requested_at: offset(requestedAt),
+   511	      native_started_at: Date.parse(requestedAt) + 2000, observed_state: failedAdapter ? 'working' : 'done', status: 'attached_session_available',
+   512	      launcher_invocations: 1, background_id: ui ? '10001' : '10002',
+   513	    },
+   514	    completion: failedAdapter ? null : ui
+   515	      ? { status: 'completed', summary: uiCompletionSummary(leak), open_assumptions: [UI_ASSUMPTION] }
+   516	      : { status: 'completed', summary: ADAPTER_COMPLETION_SUMMARY, open_assumptions: [] },
+   517	    // The UI handoff repeats the completion; the adapter's was amended when it was accepted, so it differs.
+   518	    handoff: failedAdapter ? null : ui
+   519	      ? { summary: uiCompletionSummary(leak), open_assumptions: [UI_ASSUMPTION] }
+   520	      : { summary: ADAPTER_HANDOFF_SUMMARY, open_assumptions: [ADAPTER_HANDOFF_ASSUMPTION] },
+   521	    stop: failedAdapter ? { stopped: false, confirmed_at: null } : { stopped: true, confirmed_at: offset(T2) },
+   522	  }
+   523	}
+   524	
+   525	/** The export's `inputs` section for a run, or null for the legacy export that predates it. */
+   526	export function rawInputsSection(runId: string, leak = PATH_TOKEN): RawInputsSection | null {
+   527	  if (runId === RUN_LEGACY) return null
+   528	  const requestedAt = runId === RUN_SUCCEEDED ? T0 : runId === RUN_AWAITING ? T2 : T1
+   529	  const manual = runId === RUN_AWAITING
+   530	  return {
+   531	    feature: FEATURE_NAME, policy_version: '1.1.0', base_commit: BASE_COMMIT, source_branch: sourceBranch(runId),
+   532	    mode: manual ? 'manual' : 'automatic',
+   533	    automatic: manual ? null : {
+   534	      finish: 'verified-feature-branch', permission_mode: 'bypassPermissions',
+   535	      worker_timeout_seconds: runId === RUN_SUCCEEDED ? 14400 : 3600, review_timeout_seconds: 1800,
+   536	      reviewer_transport: runId === RUN_BLOCKED ? 'print' : 'native',
+   537	    },
+   538	    setup: [{ argv: ['npm', 'ci'], command: 'npm ci', timeout_seconds: 600 }],
+   539	    max_verification_attempts: 3,
+   540	    failure_drill: runId === RUN_FAILED ? { node_id: 'adapter', phase: 'worker', attempt: 1 } : null,
+   541	    workers: { ui: rawWorker('ui', runId, leak, requestedAt), adapter: rawWorker('adapter', runId, leak, requestedAt) },
+   542	  }
+   543	}
+   544	
+   545	// ---- Projections onto the contract (what the mocks serve) ----------------------------------------------
+   546	
+   547	/** The lanes whose task text contains the quote verbatim; the same rule the adapter applies. */
+   548	function lanesQuoting(requirement: string | null, tasks: Record<'ui' | 'adapter', string>): ('ui' | 'adapter')[] {
+   549	  if (requirement === null) return []
+   550	  return (['ui', 'adapter'] as const).filter(lane => tasks[lane].includes(requirement))
+   551	}
+   552	
+   553	function projectReview(runId: string, section: RawReviewSection, tasks: Record<'ui' | 'adapter', string>): ReviewResult {
+   554	  return validateReviewResult({
+   555	    contract_version: '1.2.0', run_id: runId, node_id: 'review', attempt: section.attempt,
+   556	    reviewer: { session_id: section.reviewer_session_id, transport: section.transport, independent: true },
+   557	    bundle_sha256: section.bundle_sha256, candidate_commit: section.candidate_commit, verdict: section.verdict,
+   558	    findings: section.findings.map(finding => ({ ...finding, requirement_found_in: lanesQuoting(finding.requirement, tasks) })),
+   559	    reviewed_at: zulu(section.reviewed_at),
+   560	    diff: section.diff === null ? null : { artifact_id: REVIEW_DIFF_ARTIFACT_ID, kind: 'patch', uri: `${apiRunPath(runId)}/artifacts/${REVIEW_DIFF_ARTIFACT_ID}`, sha256: section.diff.sha256 },
+   561	  })
+   562	}
+   563	
+   564	function projectInputs(runId: string, section: RawInputsSection): RunInputs {
+   565	  return validateRunInputs({
+   566	    contract_version: '1.2.0', run_id: runId, feature: section.feature, base_commit: section.base_commit, source_branch: section.source_branch,
+   567	    mode: section.mode, automatic: section.automatic,
+   568	    setup: section.setup.map(step => ({ command: step.command, timeout_seconds: step.timeout_seconds })),
+   569	    max_verification_attempts: section.max_verification_attempts,
+   570	    workers: (['ui', 'adapter'] as const).map(lane => {
+   571	      const worker = section.workers[lane]
+   572	      return {
+   573	        node_id: lane, launch_node_id: `launch_${lane}`, role: worker.role,
+   574	        task: { text: worker.task, truncated: false },
+   575	        prompt: worker.prompt === null ? null : { text: worker.prompt, truncated: false },
+   576	        owned_paths: worker.owned_paths,
+   577	        checks: worker.checks.map(({ id, kind, command, timeout_seconds, scenarios }) => ({ id, kind, command, timeout_seconds, scenarios })),
+   578	        launch: worker.launch === null ? null : {
+   579	          session_id: worker.launch.session_id, launch_requested_at: zulu(worker.launch.launch_requested_at),
+   580	          native_started_at: worker.launch.native_started_at === null ? null : new Date(worker.launch.native_started_at).toISOString(),
+   581	          observed_state: worker.launch.observed_state, status: worker.launch.status, launcher_invocations: worker.launch.launcher_invocations,
+   582	        },
+   583	        completion: worker.completion, handoff: worker.handoff,
+   584	        stop: worker.stop === null ? null : { stopped: worker.stop.stopped, confirmed_at: worker.stop.confirmed_at === null ? null : zulu(worker.stop.confirmed_at) },
+   585	      }
+   586	    }),
+   587	  })
+   588	}
+   589	
+   590	const taskTexts = (section: RawInputsSection | null): Record<'ui' | 'adapter', string> => ({ ui: section?.workers.ui.task ?? '', adapter: section?.workers.adapter.task ?? '' })
+   591	
+   592	const ALL_RUNS = [RUN_SUCCEEDED, RUN_FAILED, RUN_AWAITING, RUN_BLOCKED, RUN_LEGACY]
+   593	
+   594	/** Projected review results per run (runs without one are absent: the mock answers 404 REVIEW_NOT_FOUND). */
+   595	export const reviewResults: Record<string, ReviewResult> = Object.fromEntries(ALL_RUNS.flatMap(runId => {
+   596	  const section = rawReviewSection(runId)
+   597	  return section === null ? [] : [[runId, projectReview(runId, section, taskTexts(rawInputsSection(runId)))]]
+   598	}))
+   599	
+   600	/** Projected run inputs per run (the legacy run is absent: the mock answers 404 INPUTS_NOT_FOUND). */
+   601	export const runInputs: Record<string, RunInputs> = Object.fromEntries(ALL_RUNS.flatMap(runId => {
+   602	  const section = rawInputsSection(runId)
+   603	  return section === null ? [] : [[runId, projectInputs(runId, section)]]
+   604	}))

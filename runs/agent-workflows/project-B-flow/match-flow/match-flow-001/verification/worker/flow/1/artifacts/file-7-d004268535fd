@@ -1,0 +1,427 @@
+import { describe, expect, it } from "vitest";
+import {
+  createMatchConfig,
+  createMatchState,
+  elapsed,
+  hashState,
+  matchRules,
+  remaining,
+  stepMatch,
+  type MatchConfig,
+  type MatchEvent,
+  type MatchInput,
+  type MatchReport,
+  type MatchState,
+} from "./index.js";
+
+const PUBLIC = createMatchConfig({ kind: "public" });
+const PRIVATE = createMatchConfig({ kind: "private" });
+const READY = 400;
+const DEPARTURE = 900;
+const DURATION = 42_000;
+
+/** Recursively frozen, so a step that mutated its input would throw. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+/** Drives one match through frozen states and inputs, keeping every event. */
+class Script {
+  state: MatchState;
+  events: MatchEvent[] = [];
+  last: readonly MatchEvent[] = [];
+
+  constructor(
+    readonly config: MatchConfig,
+    tick = 0,
+  ) {
+    this.state = deepFreeze(createMatchState(config, tick));
+  }
+
+  at(tick: number, ...reports: MatchReport[]): this {
+    const input: MatchInput = deepFreeze({ tick, reports });
+    const stepped = stepMatch(this.config, this.state, input);
+    this.state = deepFreeze(stepped.state);
+    this.last = stepped.events;
+    this.events.push(...stepped.events);
+    return this;
+  }
+
+  kinds(): string[] {
+    return this.last.map((event) => event.kind);
+  }
+}
+
+const join = (...ids: string[]): MatchReport[] => ids.map((playerId) => ({ kind: "join", playerId }));
+const leave = (...ids: string[]): MatchReport[] => ids.map((playerId) => ({ kind: "leave", playerId }));
+const start = (playerId: string): MatchReport => ({ kind: "start", playerId });
+const claimEnd = (tick: number, winner: string): MatchReport => ({ kind: "match-ended", tick, reason: "claim", winner });
+const deadlineEnd = (tick: number): MatchReport => ({ kind: "match-ended", tick, reason: "deadline", winner: null });
+const FAULT: MatchReport = { kind: "fault" };
+const EIGHT = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"];
+
+/** A private match of `ids` that the first id starts at tick 10: control starts at 410. */
+function privateRunning(ids: string[]): Script {
+  return new Script(PRIVATE).at(1, ...join(...ids)).at(10, start(ids[0]!)).at(10 + READY);
+}
+
+describe("match config", () => {
+  it("takes the public seats and the private limits from the content rules and the duration from the claim rules", () => {
+    expect(PUBLIC).toEqual({ kind: "public", custom: false, seats: 8, minPlayers: 8, readyTicks: 400, departureTicks: 900, durationTicks: 42_000, startingGold: 50 });
+    expect(PRIVATE).toEqual({ kind: "private", custom: true, seats: 8, minPlayers: 2, readyTicks: 400, departureTicks: 900, durationTicks: 42_000, startingGold: 50 });
+    expect(() => createMatchConfig({ kind: "private", rules: { ...matchRules, readyTicks: 0 } })).toThrow(/readyTicks/);
+    expect(() => createMatchConfig({ kind: "private", durationTicks: 0 })).toThrow(RangeError);
+    expect(() => createMatchConfig({ kind: "ranked" as never })).toThrow(RangeError);
+    expect(createMatchState(PRIVATE)).toMatchObject({ tick: 0, phase: "lobby", custom: true, players: [], host: null, end: null, results: null });
+  });
+});
+
+describe("phases (§2)", () => {
+  it("moves a full public lobby through ready, departure and exploration on their ticks", () => {
+    const script = new Script(PUBLIC).at(1, ...join(...EIGHT.slice(0, 7)));
+    expect(script.state.phase).toBe("lobby");
+    script.at(5, ...join("p8"));
+    expect(script.state.phase).toBe("ready");
+    expect(script.state.readyTick).toBe(5);
+    expect(script.last.at(-1)).toEqual({ kind: "phase-changed", tick: 5, from: "lobby", to: "ready" });
+    script.at(5 + READY - 1);
+    expect(script.state.phase).toBe("ready");
+    script.at(5 + READY);
+    expect(script.last).toEqual([
+      { kind: "phase-changed", tick: 405, from: "ready", to: "departure" },
+      { kind: "control-started", tick: 405 },
+    ]);
+    expect(script.state).toMatchObject({ phase: "departure", controlStartTick: 405, readyTick: null });
+    script.at(405 + DEPARTURE - 1);
+    expect(script.state.phase).toBe("departure");
+    script.at(405 + DEPARTURE);
+    expect(script.last).toEqual([{ kind: "phase-changed", tick: 1305, from: "departure", to: "exploration" }]);
+    script.at(5_000, deadlineEnd(5_000));
+    expect(script.state.phase).toBe("ended");
+    expect(script.events.filter((event) => event.kind === "phase-changed").map((event) => event.kind === "phase-changed" && event.to)).toEqual([
+      "ready",
+      "departure",
+      "exploration",
+      "ended",
+    ]);
+    expect(script.state.custom).toBe(false);
+    expect(script.state.results!.custom).toBe(false);
+  });
+
+  it("refuses a start request in a public match and never starts one short-handed", () => {
+    const script = new Script(PUBLIC).at(1, ...join(...EIGHT.slice(0, 7)), start("p1"));
+    expect(script.last.at(-1)).toEqual({ kind: "start-refused", tick: 1, playerId: "p1", reason: "public" });
+    expect(script.state).toMatchObject({ phase: "lobby", host: null });
+    script.at(2_000);
+    expect(script.state.phase).toBe("lobby");
+  });
+
+  it("refuses the ninth joiner of a full lobby", () => {
+    const script = new Script(PRIVATE).at(1, ...join(...EIGHT, "p9"));
+    expect(script.last.filter((event) => event.kind === "join-refused")).toEqual([{ kind: "join-refused", tick: 1, playerId: "p9", reason: "full" }]);
+    expect(script.state.players).toHaveLength(8);
+    const full = new Script(PUBLIC).at(1, ...join(...EIGHT, "p9"));
+    expect(full.last.filter((event) => event.kind === "join-refused")).toHaveLength(1);
+    expect(full.state.phase).toBe("ready");
+  });
+
+  it("starts a private match of two to eight players on the host's request and marks it custom", () => {
+    const script = new Script(PRIVATE).at(1, ...join("host"));
+    expect(script.last).toEqual([
+      { kind: "player-joined", tick: 1, playerId: "host" },
+      { kind: "host-changed", tick: 1, playerId: "host" },
+    ]);
+    script.at(2, start("host"));
+    expect(script.last).toEqual([{ kind: "start-refused", tick: 2, playerId: "host", reason: "too-few" }]);
+    script.at(3, ...join("guest"), start("guest"));
+    expect(script.last.at(-1)).toEqual({ kind: "start-refused", tick: 3, playerId: "guest", reason: "not-host" });
+    expect(script.state.phase).toBe("lobby");
+    script.at(4, start("host"));
+    expect(script.last).toEqual([{ kind: "phase-changed", tick: 4, from: "lobby", to: "ready" }]);
+    expect(script.state).toMatchObject({ phase: "ready", readyTick: 4, custom: true });
+    script.at(4, start("host"));
+    expect(script.last).toEqual([]);
+    script.at(5, start("host"));
+    expect(script.last).toEqual([]);
+    const eight = new Script(PRIVATE).at(1, ...join(...EIGHT)).at(2, start("p1"));
+    expect(eight.state.phase).toBe("ready");
+  });
+
+  it("passes the private host to the earliest joiner still present", () => {
+    const script = new Script(PRIVATE).at(1, ...join("zed", "amy")).at(2, ...join("bob")).at(3, ...leave("zed"));
+    expect(script.last).toEqual([
+      { kind: "player-left", tick: 3, playerId: "zed" },
+      { kind: "host-changed", tick: 3, playerId: "amy" },
+    ]);
+    script.at(4, ...leave("amy", "bob"));
+    expect(script.state.host).toBeNull();
+    expect(script.state.phase).toBe("lobby");
+    script.at(5, ...join("cat"));
+    expect(script.state.host).toBe("cat");
+  });
+
+  it("refuses late joiners after the lobby, including a player who left after control start", () => {
+    const ready = new Script(PRIVATE).at(1, ...join("a", "b")).at(2, start("a")).at(3, ...join("late"));
+    expect(ready.last).toEqual([{ kind: "join-refused", tick: 3, playerId: "late", reason: "started" }]);
+    const script = privateRunning(["a", "b", "c"]);
+    script.at(500, ...join("late"));
+    expect(script.last).toEqual([{ kind: "join-refused", tick: 500, playerId: "late", reason: "started" }]);
+    script.at(410 + DEPARTURE).at(410 + DEPARTURE + 1, ...join("late"), ...leave("c"));
+    expect(script.state.phase).toBe("exploration");
+    expect(script.last[0]).toMatchObject({ kind: "join-refused", reason: "started" });
+    script.at(2_000, ...join("c"));
+    expect(script.last).toEqual([{ kind: "join-refused", tick: 2_000, playerId: "c", reason: "started" }]);
+    expect(script.state.players.map((player) => [player.id, player.left])).toEqual([
+      ["a", false],
+      ["b", false],
+      ["c", true],
+    ]);
+    script.at(2_001, ...join("a"));
+    expect(script.last).toEqual([]);
+  });
+
+  it("keeps a private ready check with two players left and returns to the lobby below that", () => {
+    const script = new Script(PRIVATE).at(1, ...join("a", "b", "c")).at(2, start("a")).at(100, ...leave("c"));
+    expect(script.state).toMatchObject({ phase: "ready", readyTick: 2 });
+    expect(script.state.players.map((player) => player.id)).toEqual(["a", "b"]);
+    script.at(101, ...leave("a"));
+    expect(script.last).toEqual([
+      { kind: "player-left", tick: 101, playerId: "a" },
+      { kind: "host-changed", tick: 101, playerId: "b" },
+      { kind: "phase-changed", tick: 101, from: "ready", to: "lobby" },
+    ]);
+    expect(script.state).toMatchObject({ phase: "lobby", readyTick: null, host: "b" });
+    script.at(2 + READY);
+    expect(script.state.phase).toBe("lobby");
+    expect(script.events.some((event) => event.kind === "control-started")).toBe(false);
+  });
+
+  it("returns a public ready check to the lobby when a seat empties, and restarts the countdown when it refills", () => {
+    const script = new Script(PUBLIC).at(1, ...join(...EIGHT)).at(50, ...leave("p3"));
+    expect(script.last.at(-1)).toEqual({ kind: "phase-changed", tick: 50, from: "ready", to: "lobby" });
+    expect(script.state.players).toHaveLength(7);
+    script.at(60, ...join("p9"));
+    expect(script.state).toMatchObject({ phase: "ready", readyTick: 60 });
+    script.at(1 + READY);
+    expect(script.state.phase).toBe("ready");
+    script.at(60 + READY);
+    expect(script.last).toContainEqual({ kind: "control-started", tick: 460 });
+  });
+
+  it("emits control-started exactly once, on its scheduled tick, even when an input skips past it", () => {
+    const script = new Script(PRIVATE).at(1, ...join("a", "b")).at(7, start("a")).at(5_000);
+    expect(script.last).toEqual([
+      { kind: "phase-changed", tick: 407, from: "ready", to: "departure" },
+      { kind: "control-started", tick: 407 },
+      { kind: "phase-changed", tick: 1_307, from: "departure", to: "exploration" },
+    ]);
+    script.at(5_001).at(9_000);
+    expect(script.events.filter((event) => event.kind === "control-started")).toEqual([{ kind: "control-started", tick: 407 }]);
+    expect(script.state.controlStartTick).toBe(407);
+  });
+
+  it("applies a transition due on a tick before that tick's reports", () => {
+    const script = new Script(PRIVATE).at(1, ...join("a", "b")).at(10, start("a")).at(410, ...leave("b"), ...join("late"));
+    expect(script.kinds()).toEqual(["phase-changed", "control-started", "player-left", "join-refused"]);
+    expect(script.state.phase).toBe("departure");
+    expect(script.state.players.find((player) => player.id === "b")!.left).toBe(true);
+  });
+
+  it("ignores stale and repeated ticks and never mutates its input", () => {
+    const script = privateRunning(["a", "b"]);
+    const before = script.state;
+    for (const tick of [script.state.tick, script.state.tick - 1, 0]) {
+      const result = stepMatch(PRIVATE, before, deepFreeze({ tick, reports: [...join("x"), FAULT, ...leave("a")] }));
+      expect(result.state).toBe(before);
+      expect(result.events).toEqual([]);
+    }
+    expect(() => stepMatch(PRIVATE, before, { tick: 1.5, reports: [] })).toThrow(RangeError);
+  });
+
+  it("refuses malformed reports", () => {
+    const state = privateRunning(["a", "b"]).at(420).state;
+    const bad = (report: unknown) => () => stepMatch(PRIVATE, state, { tick: 421, reports: [report as MatchReport] });
+    expect(bad({ kind: "join", playerId: "" })).toThrow(RangeError);
+    expect(bad({ kind: "gold", playerId: "a", gold: -1 })).toThrow(/gold/);
+    expect(bad({ kind: "gold", playerId: "a", gold: 1.5 })).toThrow(/gold/);
+    expect(bad({ kind: "duel-ended", playerIds: ["a", "a"], winner: null })).toThrow(/themselves/);
+    expect(bad({ kind: "duel-ended", playerIds: ["a", "b"], winner: "c" })).toThrow(/did not fight/);
+    expect(bad({ kind: "collected", playerId: "ghost" })).toThrow(/unknown player ghost/);
+    expect(bad({ kind: "match-ended", tick: 420, reason: "claim", winner: "a" })).toThrow(/tick 420/);
+    expect(bad({ kind: "match-ended", tick: 421, reason: "claim", winner: "ghost" })).toThrow(/unknown player/);
+    expect(bad({ kind: "match-ended", tick: 421, reason: "deadline", winner: "a" })).toThrow(/no winner/);
+    expect(bad({ kind: "teleport" })).toThrow(/unknown report/);
+  });
+});
+
+describe("endings (§2, §5, §12)", () => {
+  it("ends with the claim's winner", () => {
+    const script = privateRunning(["a", "b"]).at(2_999).at(3_000, claimEnd(3_000, "b"));
+    expect(script.last.map((event) => event.kind)).toEqual(["phase-changed", "match-ended"]);
+    expect(script.last[1]).toMatchObject({ kind: "match-ended", tick: 3_000, reason: "claim", winner: "b" });
+    expect(script.state).toMatchObject({ phase: "ended", end: { reason: "claim", winner: "b", tick: 3_000 } });
+    expect(script.state.results).toMatchObject({ reason: "claim", winner: "b", tick: 3_000, custom: true, elapsedTicks: 2_590 });
+    expect(script.state.results!.players.map((player) => [player.id, player.winner])).toEqual([
+      ["b", true],
+      ["a", false],
+    ]);
+  });
+
+  it("ends with no winner at the claim module's deadline", () => {
+    const script = privateRunning(["a", "b"]).at(410 + DURATION, deadlineEnd(410 + DURATION));
+    expect(script.state.end).toEqual({ reason: "deadline", winner: null, tick: 42_410 });
+    expect(script.state.results).toMatchObject({ reason: "deadline", winner: null, elapsedTicks: DURATION });
+    expect(script.state.results!.players.every((player) => !player.winner)).toBe(true);
+  });
+
+  it("lets a claim on the deadline tick beat the deadline, whatever the report order", () => {
+    const tick = 410 + DURATION;
+    for (const reports of [
+      [deadlineEnd(tick), claimEnd(tick, "a")],
+      [claimEnd(tick, "a"), deadlineEnd(tick)],
+      [FAULT, deadlineEnd(tick), claimEnd(tick, "a"), ...leave("a", "b")],
+    ]) {
+      const script = privateRunning(["a", "b"]).at(tick, ...reports);
+      expect(script.state.end).toEqual({ reason: "claim", winner: "a", tick });
+    }
+  });
+
+  it("changes nothing after the match has ended", () => {
+    const script = privateRunning(["a", "b"]).at(3_000, claimEnd(3_000, "a"));
+    const ended = script.state;
+    for (const reports of [[claimEnd(3_001, "b")], [deadlineEnd(3_001)], [FAULT], leave("a", "b"), [{ kind: "collected", playerId: "b" } as const], join("x")]) {
+      script.at(3_001, ...reports);
+      expect(script.state).toBe(ended);
+      expect(script.last).toEqual([]);
+    }
+    script.at(99_999);
+    expect(script.state).toBe(ended);
+    expect(script.events.filter((event) => event.kind === "match-ended")).toHaveLength(1);
+  });
+
+  it("ignores claim reports before control start", () => {
+    const script = new Script(PRIVATE).at(1, ...join("a", "b")).at(2, deadlineEnd(2)).at(3, start("a")).at(4, claimEnd(4, "a"));
+    expect(script.state).toMatchObject({ phase: "ready", end: null });
+  });
+
+  it("abandons the match when the last player leaves in any phase after the lobby, but not in the lobby", () => {
+    const lobby = new Script(PRIVATE).at(1, ...join("a", "b")).at(2, ...leave("a", "b"));
+    expect(lobby.state).toMatchObject({ phase: "lobby", end: null, players: [] });
+
+    const ready = new Script(PRIVATE).at(1, ...join("a", "b")).at(2, start("a")).at(3, ...leave("b", "a"));
+    expect(ready.state.end).toEqual({ reason: "abandoned", winner: null, tick: 3 });
+    expect(ready.state.results).toMatchObject({ reason: "abandoned", winner: null, elapsedTicks: 0, players: [] });
+
+    const publicReady = new Script(PUBLIC).at(1, ...join(...EIGHT)).at(2, ...leave(...EIGHT));
+    expect(publicReady.state.end).toMatchObject({ reason: "abandoned" });
+
+    const departure = privateRunning(["a", "b"]).at(500, ...leave("a")).at(600, ...leave("b"));
+    expect(departure.state.end).toEqual({ reason: "abandoned", winner: null, tick: 600 });
+    expect(departure.state.results!.players.map((player) => [player.id, player.left])).toEqual([
+      ["a", true],
+      ["b", true],
+    ]);
+
+    const exploration = privateRunning(["a", "b"]).at(20_000, ...leave("a", "b"));
+    expect(exploration.state.end).toMatchObject({ reason: "abandoned", tick: 20_000 });
+    expect(exploration.last.at(-1)).toMatchObject({ kind: "match-ended", reason: "abandoned", winner: null });
+  });
+
+  it("aborts from any phase on a server fault, with no winner", () => {
+    const phases = {
+      lobby: new Script(PRIVATE).at(1, ...join("a")),
+      ready: new Script(PRIVATE).at(1, ...join("a", "b")).at(2, start("a")),
+      departure: privateRunning(["a", "b"]),
+      exploration: privateRunning(["a", "b"]).at(5_000),
+    };
+    for (const [phase, script] of Object.entries(phases)) {
+      expect(script.state.phase).toBe(phase);
+      const tick = script.state.tick + 1;
+      script.at(tick, FAULT);
+      expect(script.state.end).toEqual({ reason: "aborted", winner: null, tick });
+      expect(script.last).toContainEqual({ kind: "phase-changed", tick, from: phase, to: "ended" });
+      expect(script.state.results).toMatchObject({ reason: "aborted", winner: null });
+    }
+    const empty = new Script(PUBLIC).at(1, FAULT);
+    expect(empty.state.end).toMatchObject({ reason: "aborted" });
+  });
+
+  it("prefers a fault to an empty room on the same tick", () => {
+    const script = privateRunning(["a", "b"]).at(700, ...leave("a", "b"), FAULT);
+    expect(script.state.end).toMatchObject({ reason: "aborted" });
+  });
+});
+
+describe("timer (§2)", () => {
+  it("counts from control start, never negative, and freezes at the end", () => {
+    const script = privateRunning(["a", "b"]);
+    const control = 410;
+    const lobby = new Script(PRIVATE).at(1, ...join("a")).state;
+    expect([elapsed(lobby, 100), remaining(lobby, 100)]).toEqual([0, DURATION]);
+    const state = script.state;
+    expect([elapsed(state, control - 50), remaining(state, control - 50)]).toEqual([0, DURATION]);
+    expect([elapsed(state, control), remaining(state, control)]).toEqual([0, DURATION]);
+    expect([elapsed(state, control + 21_000), remaining(state, control + 21_000)]).toEqual([21_000, 21_000]);
+    expect([elapsed(state, control + DURATION), remaining(state, control + DURATION)]).toEqual([DURATION, 0]);
+    expect([elapsed(state, control + DURATION + 500), remaining(state, control + DURATION + 500)]).toEqual([DURATION + 500, 0]);
+    script.at(control + 1_000, claimEnd(control + 1_000, "a"));
+    expect([elapsed(script.state, control + 5_000), remaining(script.state, control + 5_000)]).toEqual([1_000, DURATION - 1_000]);
+    expect(() => elapsed(state, 0.5)).toThrow(RangeError);
+  });
+});
+
+describe("results (§2)", () => {
+  it("counts every kind of accomplishment and orders the winner, then rubbings held, then id", () => {
+    const stat = (report: MatchReport) => report;
+    const script = new Script(PRIVATE)
+      .at(1, ...join("dan", "amy", "bea", "cal"))
+      // Before control start nothing counts.
+      .at(2, stat({ kind: "collected", playerId: "amy" }), stat({ kind: "gold", playerId: "amy", gold: 999 }), start("dan"))
+      .at(402)
+      .at(500, stat({ kind: "collected", playerId: "amy" }), stat({ kind: "collected", playerId: "amy" }), stat({ kind: "collected", playerId: "bea" }))
+      .at(600, stat({ kind: "island-visited", playerId: "amy", island: "palm" }), stat({ kind: "island-visited", playerId: "amy", island: "ash" }))
+      .at(601, stat({ kind: "island-visited", playerId: "amy", island: "palm" }), stat({ kind: "island-visited", playerId: "cal", island: "mist" }))
+      .at(2_000, stat({ kind: "duel-ended", playerIds: ["amy", "bea"], winner: "bea" }), stat({ kind: "stole", playerId: "bea" }), stat({ kind: "lost", playerId: "amy" }))
+      .at(2_001, stat({ kind: "gold", playerId: "bea", gold: 60 }), stat({ kind: "gold", playerId: "amy", gold: 40 }))
+      .at(3_000, stat({ kind: "duel-ended", playerIds: ["cal", "dan"], winner: null }), stat({ kind: "duel-ended", playerIds: ["dan", "bea"], winner: "dan" }))
+      .at(3_001, stat({ kind: "stole", playerId: "dan" }), stat({ kind: "lost", playerId: "bea" }))
+      .at(4_000, ...leave("cal"))
+      .at(4_100, stat({ kind: "cache-claimed", playerId: "amy" }), stat({ kind: "cache-claimed", playerId: "amy" }))
+      .at(9_000, claimEnd(9_000, "dan"))
+      .at(9_001, stat({ kind: "collected", playerId: "cal" }));
+    const results = script.state.results!;
+    expect(results).toMatchObject({ reason: "claim", winner: "dan", tick: 9_000, custom: true, elapsedTicks: 8_598 });
+    const line = { thefts: 0, lost: 0, collected: 0, duelsWon: 0, duelsLost: 0, duelsDrawn: 0, gold: 50, cachesClaimed: 0, islandsVisited: 0, left: false, winner: false };
+    expect(results.players).toEqual([
+      { ...line, id: "dan", winner: true, rubbingsHeld: 1, thefts: 1, duelsWon: 1, duelsDrawn: 1 },
+      { ...line, id: "amy", rubbingsHeld: 3, collected: 2, lost: 1, duelsLost: 1, gold: 40, cachesClaimed: 2, islandsVisited: 2 },
+      { ...line, id: "bea", rubbingsHeld: 1, collected: 1, thefts: 1, lost: 1, duelsWon: 1, duelsLost: 1, gold: 60 },
+      { ...line, id: "cal", rubbingsHeld: 0, duelsDrawn: 1, islandsVisited: 1, left: true },
+    ]);
+    expect(script.events.filter((event) => event.kind === "match-ended")).toEqual([{ kind: "match-ended", tick: 9_000, reason: "claim", winner: "dan", results }]);
+    expect(script.state.players.find((player) => player.id === "amy")!.stats.islands).toEqual(["ash", "palm"]);
+  });
+
+  it("breaks ties on held rubbings by id in UTF-16 order, and never goes below zero held", () => {
+    const script = privateRunning(["p9", "p10", "B", "a"])
+      .at(500, { kind: "lost", playerId: "a" }, { kind: "lost", playerId: "a" })
+      .at(600, deadlineEnd(600));
+    expect(script.state.results!.players.map((player) => [player.id, player.rubbingsHeld])).toEqual([
+      ["B", 0],
+      ["a", 0],
+      ["p10", 0],
+      ["p9", 0],
+    ]);
+  });
+
+  it("builds the same results and hash from the same inputs", () => {
+    const a = privateRunning(["x", "y"]).at(900, { kind: "collected", playerId: "y" }).at(1_000, claimEnd(1_000, "x"));
+    const b = privateRunning(["x", "y"]).at(900, { kind: "collected", playerId: "y" }).at(1_000, claimEnd(1_000, "x"));
+    expect(hashState(a.state)).toBe(hashState(b.state));
+    expect(a.state.results).toEqual(b.state.results);
+  });
+});

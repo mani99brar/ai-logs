@@ -1,0 +1,232 @@
+import { matchMaker } from "colyseus";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { encounterRules } from "@pirate-sea-race/content/encounters";
+import { matchRules, PRIVATE_MIN_PLAYERS } from "@pirate-sea-race/content/match";
+import { MATCH_ROOM, MATCH_STARTED_MESSAGE, MatchMessageType, MAX_START_MATCH_PER_SECOND } from "@pirate-sea-race/protocol";
+import { MatchRoom, recordedOutcomes, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { AHEAD, HeadlessClient, sleep } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, HOST_SEAT, quickEncounters } from "./rubbingsSetup.js";
+import { flowTuning } from "./matchFlowSetup.js";
+import { EAST, HUB_X, OPEN_ROW, playersAt, roomOf, tracker } from "./seaDuelSetup.js";
+
+/**
+ * The lobby and the start of a private match (§2) through the real room: the host starts with two or more players
+ * and one cannot, anyone else's start is refused, a late arrival is refused at admission, the ready countdown runs
+ * and control starts with the departure's protection for every ship, and the timer counts down to the claim
+ * deadline. Test-only timings: a 1 s countdown, the rules' own 45 s protection, and a 10 s match.
+ */
+const READY_TICKS = 20;
+const MATCH_TICKS = 200;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  const matchTuning = flowTuning({
+    match: { ...matchRules, readyTicks: READY_TICKS },
+    encounters: { ...quickEncounters, spawnProtectionTicks: encounterRules.spawnProtectionTicks },
+    claim: { ...claimRules, channelTicks: 40, deadlineTicks: MATCH_TICKS },
+  });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+const listingOf = async (client: HeadlessClient) => (await matchMaker.query({ name: MATCH_ROOM, code: client.code }))[0];
+
+describe.concurrent("the lobby (§2)", () => {
+  it("starts only at the host's request with two or more players, counts down, refuses late arrivals, then gives every ship the departure's protection", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    expect(host.phase).toBe("lobby");
+    await host.waitFor(() => host.seat === 1 && host.hostSeat === 1);
+    expect(host.room.state.minPlayers).toBe(PRIVATE_MIN_PLAYERS);
+
+    // Alone, the host cannot start: the match module's minimum is two.
+    host.startMatch();
+    await host.waitFor(() => host.startRefusals.length === 1);
+    expect(host.startRefusals).toEqual(["too-few"]);
+    expect(host.phase).toBe("lobby");
+
+    // A second player joins the lobby; only the host may start.
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    track(guest);
+    await guest.waitFor(() => guest.seat === 2 && guest.room.state.roster.size === 2);
+    expect([...guest.room.state.roster.values()].map((entry) => entry.seat).sort()).toEqual([1, 2]);
+    expect(guest.hostSeat).toBe(1);
+    guest.startMatch();
+    await guest.waitFor(() => guest.startRefusals.length === 1);
+    expect(guest.startRefusals).toEqual(["not-host"]);
+    expect(guest.phase).toBe("lobby");
+    // In the lobby nobody sails: a held throttle moves nothing.
+    await host.placeShip(endpoint, { tileX: HUB_X - 3, tileY: OPEN_ROW, heading: EAST });
+    const parked = host.ship()!;
+    await host.hold(AHEAD, 400);
+    expect(host.ship()).toEqual(parked);
+
+    // The host starts: the ready countdown, during which admission already refuses a late arrival.
+    host.startMatch();
+    await host.waitFor(() => host.phase === "ready");
+    const room = roomOf(host);
+    const readyTick = room.flowState.readyTick!;
+    expect(host.room.state.readyEndsAt).toBe(readyTick + READY_TICKS);
+    expect((await listingOf(host))?.metadata).toMatchObject({ started: true });
+    await expect(HeadlessClient.join(endpoint, host.code)).rejects.toThrow(MATCH_STARTED_MESSAGE);
+
+    // Control starts when the countdown ends, on its tick: every ship protected for the departure's 45 s.
+    for (const client of [host, guest]) await client.waitForControl(3000);
+    const controlStart = room.flowState.controlStartTick!;
+    expect(controlStart).toBe(readyTick + READY_TICKS);
+    expect(host.room.state.controlStartTick).toBe(controlStart);
+    expect(host.phase).toBe("departure");
+    for (const client of [host, guest]) {
+      await client.waitFor(() => client.status()?.protection === "spawn");
+      expect(client.status()!.protectedUntil).toBe(controlStart + encounterRules.spawnProtectionTicks);
+    }
+    expect(room.encounterState.players.map((player) => [player.id, player.protection])).toEqual(
+      [host.sessionId, guest.sessionId].sort().map((id) => [id, { source: "spawn", endTick: controlStart + encounterRules.spawnProtectionTicks }]),
+    );
+    // Late arrivals stay refused, with a clear message; the players now sail.
+    await expect(HeadlessClient.join(endpoint, host.code)).rejects.toThrow(MATCH_STARTED_MESSAGE);
+    await host.hold(AHEAD, 400);
+    await host.waitFor(() => host.ship()!.x > parked.x);
+  });
+
+  it("runs no encounter before control start: a grapple pressed in the lobby lands on nobody", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { start: false })) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(host);
+    expect(room.flowState.phase).toBe("lobby");
+    const windup = quickEncounters.grapple.windupTicks;
+    const from = room.matchState.worldTick;
+    while (room.matchState.worldTick < from + windup + 10) {
+      host.tapGrapple();
+      await sleep(100);
+    }
+    expect(room.encounterState.attempts).toEqual([]);
+    expect(room.encounterState.duels).toEqual([]);
+    expect(guest.status()?.mode ?? "sea").toBe("sea");
+    expect(room.flowState.phase).toBe("lobby");
+  });
+
+  it("refuses a late arrival at admission, before the room seats it, and in the room itself while the listing still says open", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    track(guest);
+    await host.waitFor(() => host.playerCount === 2);
+    host.startMatch();
+    await host.waitFor(() => host.phase === "ready");
+    const room = roomOf(host);
+    const deadline = Date.now() + 3000;
+    while ((await listingOf(host))?.metadata?.started !== true) {
+      if (Date.now() > deadline) throw new Error("the listing did not close");
+      await sleep(20);
+    }
+    // The listing says started: admission refuses, and the room never sees the request.
+    const joins = vi.spyOn(MatchRoom.prototype, "onJoin");
+    onTestFinished(() => joins.mockRestore());
+    await expect(HeadlessClient.join(endpoint, host.code)).rejects.toThrow(MATCH_STARTED_MESSAGE);
+    expect(joins.mock.contexts.filter((context) => context === room)).toEqual([]);
+    // The listing lags the room (it is updated asynchronously): the room's own check refuses the same request.
+    await room.setMatchmaking({ metadata: { ...(await listingOf(host))!.metadata, started: false } });
+    await expect(HeadlessClient.join(endpoint, host.code)).rejects.toThrow(MATCH_STARTED_MESSAGE);
+    expect(joins.mock.contexts.filter((context) => context === room)).toHaveLength(1);
+    expect(host.playerCount).toBe(2);
+  });
+
+  it("ignores a malformed start and more than four starts a second from one player", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    track(guest);
+    await host.waitFor(() => host.playerCount === 2);
+    // A start carries nothing: one with a field is dropped, not treated as the host's start.
+    host.room.send(MatchMessageType.Start, { now: true });
+    await sleep(300);
+    expect(host.phase).toBe("lobby");
+    expect(host.startRefusals).toEqual([]);
+    // A burst from the guest: the room hears four of them this second, each refused, and drops the rest.
+    for (let sent = 0; sent < MAX_START_MATCH_PER_SECOND + 3; sent++) guest.startMatch();
+    await guest.waitFor(() => guest.startRefusals.length === MAX_START_MATCH_PER_SECOND);
+    await sleep(300);
+    expect(guest.startRefusals).toEqual(Array.from({ length: MAX_START_MATCH_PER_SECOND }, () => "not-host"));
+    expect(host.phase).toBe("lobby");
+  });
+
+  it("hears a player's starts again once the second of a capped burst has passed", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    track(guest);
+    await host.waitFor(() => host.playerCount === 2);
+    for (let sent = 0; sent < MAX_START_MATCH_PER_SECOND + 2; sent++) guest.startMatch();
+    await guest.waitFor(() => guest.startRefusals.length === MAX_START_MATCH_PER_SECOND);
+    // The room's second (60 frames) is over: the next start is judged, and refused as before.
+    await sleep(1200);
+    guest.startMatch();
+    await guest.waitFor(() => guest.startRefusals.length === MAX_START_MATCH_PER_SECOND + 1, 3000);
+    expect(guest.startRefusals.at(-1)).toBe("not-host");
+  });
+
+  it("goes back to the lobby when a player leaves the countdown with fewer than two, and admits again", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    await host.waitFor(() => host.playerCount === 2);
+    host.startMatch();
+    await host.waitFor(() => host.phase === "ready");
+    await guest.leave();
+    await host.waitFor(() => host.phase === "lobby");
+    expect(host.room.state.readyEndsAt).toBe(0);
+    // The lobby lists only the host again.
+    expect([...host.room.state.roster.values()].map((entry) => entry.seat)).toEqual([1]);
+    // The listing reopens: admission takes new players again.
+    const deadline = Date.now() + 3000;
+    while ((await listingOf(host))?.metadata?.started !== false) {
+      if (Date.now() > deadline) throw new Error("the listing did not reopen");
+      await sleep(20);
+    }
+    const second = await HeadlessClient.join(endpoint, host.code);
+    track(second);
+    await host.waitFor(() => host.playerCount === 2);
+    expect(host.phase).toBe("lobby");
+  });
+
+  it("runs the timer from the match's duration down to zero exactly at the claim deadline, where the match ends with no winner", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    track(guest);
+    await host.waitFor(() => host.playerCount === 2);
+    expect(host.room.state.durationTicks).toBe(MATCH_TICKS);
+    // Before control start the timer shows the full duration.
+    expect(host.remainingTicks).toBe(MATCH_TICKS);
+    host.startMatch();
+    await host.waitForControl(3000);
+    const room = roomOf(host);
+    const controlStart = room.flowState.controlStartTick!;
+    // The claim config's deadline is the timer's end: one number, from one set of rules.
+    expect(room.claimConfiguration!.deadlineTick).toBe(controlStart + MATCH_TICKS);
+    expect(host.room.state.deadlineTick).toBe(controlStart + MATCH_TICKS);
+    // Every patch shows the time left at its own tick.
+    for (let sample = 0; sample < 5; sample++) {
+      await sleep(150);
+      expect(host.remainingTicks).toBe(MATCH_TICKS - (host.worldTick - controlStart));
+    }
+    await host.waitFor(() => host.results() !== undefined, 15_000);
+    expect(host.remainingTicks).toBe(0);
+    expect(host.results()).toMatchObject({ reason: "deadline", winnerSeat: 0, tick: controlStart + MATCH_TICKS, elapsedTicks: MATCH_TICKS });
+    expect(host.phase).toBe("ended");
+    expect(recordedOutcomes().find((outcome) => outcome.code === host.code)?.results).toMatchObject({ reason: "deadline", winner: null });
+  }, 25_000);
+});

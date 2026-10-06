@@ -1,0 +1,559 @@
+     1	import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+     2	import { presetRubbings } from "@pirate-sea-race/content/objectives";
+     3	import { describe, expect, it } from "vitest";
+     4	import { nextInt } from "../random.js";
+     5	import {
+     6	  createIntelConfig,
+     7	  createIntelState,
+     8	  hashState,
+     9	  intelRules,
+    10	  replayIntel,
+    11	  sectorOf,
+    12	  stepIntel,
+    13	  type IntelConfig,
+    14	  type IntelMapShape,
+    15	  type IntelMessage,
+    16	  type IntelMessageKind,
+    17	  type IntelReplayTick,
+    18	  type IntelRubbing,
+    19	  type IntelState,
+    20	  type IntelWorldView,
+    21	  type RubbingType,
+    22	  type TargetedRumorRequest,
+    23	  type TargetedRumorResult,
+    24	} from "./index.js";
+    25	
+    26	type Draw = (bound: number) => number;
+    27	
+    28	function generator(seed: number): Draw {
+    29	  let rng = seed >>> 0;
+    30	  return (bound) => {
+    31	    const drawn = nextInt(rng, bound);
+    32	    rng = drawn.state;
+    33	    return drawn.value;
+    34	  };
+    35	}
+    36	
+    37	/** Recursively frozen, so a step that mutated its input would throw. */
+    38	function deepFreeze<T>(value: T): T {
+    39	  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    40	    Object.freeze(value);
+    41	    for (const child of Object.values(value)) deepFreeze(child);
+    42	  }
+    43	  return value;
+    44	}
+    45	
+    46	const T = 256;
+    47	/** A slice-sized sea with four islands, and an alpha-sized one with twelve on a 4 × 3 grid. */
+    48	const SLICE_MAP: IntelMapShape = { widthTiles: 224, heightTiles: 208, subUnitsPerTile: T, islands: ["Palm Key", "Ash Isle", "Mist Rock", "Old Ruin"].map((name) => ({ name })) };
+    49	const ALPHA_MAP: IntelMapShape = { widthTiles: 300, heightTiles: 240, subUnitsPerTile: T, islands: Array.from({ length: 12 }, (_, index) => ({ name: `Isle ${index + 1}` })) };
+    50	
+    51	function islandPoint(map: IntelMapShape, island: number): { x: number; y: number } {
+    52	  const columns = map.islands.length === 4 ? 2 : 4;
+    53	  const rows = map.islands.length / columns;
+    54	  const column = island % columns;
+    55	  const row = Math.floor(island / columns);
+    56	  return {
+    57	    x: Math.floor(((2 * column + 1) * map.widthTiles * T) / (2 * columns)),
+    58	    y: Math.floor(((2 * row + 1) * map.heightTiles * T) / (2 * rows)),
+    59	  };
+    60	}
+    61	
+    62	interface Scenario {
+    63	  readonly name: string;
+    64	  readonly seed: number;
+    65	  readonly preset: RulesPresetId;
+    66	  /** Compressed reveal times, or the real ones. */
+    67	  readonly realTimes: boolean;
+    68	  readonly endTick: number;
+    69	  /** Per mille of steps that jump ahead by up to 40 ticks. */
+    70	  readonly skipPerMille: number;
+    71	}
+    72	
+    73	const START = 60;
+    74	const QUICK_RULES = { ...intelRules, carrierIntervalTicks: 100, sightingDelayTicks: 100, sectorRevealTicks: 1_200, carrierRevealTicks: 2_400 };
+    75	
+    76	const SCENARIOS: readonly Scenario[] = [
+    77	  // The real constants past minute 28 and five more carrier intervals: 36,660 ticks after control start.
+    78	  { name: "real times, slice", seed: 20260924, preset: "slice", realTimes: true, endTick: START + 36_660, skipPerMille: 0 },
+    79	  { name: "quick, slice, seed 1", seed: 1, preset: "slice", realTimes: false, endTick: 3_400, skipPerMille: 0 },
+    80	  { name: "quick, slice, seed 2", seed: 2, preset: "slice", realTimes: false, endTick: 3_400, skipPerMille: 0 },
+    81	  { name: "quick, alpha, seed 3", seed: 3, preset: "alpha", realTimes: false, endTick: 3_400, skipPerMille: 0 },
+    82	  { name: "quick, slice, skipping, seed 4", seed: 4, preset: "slice", realTimes: false, endTick: 3_400, skipPerMille: 300 },
+    83	  { name: "quick, alpha, skipping, seed 5", seed: 5, preset: "alpha", realTimes: false, endTick: 3_400, skipPerMille: 300 },
+    84	  { name: "real times, alpha, skipping, seed 6", seed: 6, preset: "alpha", realTimes: true, endTick: START + 36_000, skipPerMille: 500 },
+    85	];
+    86	
+    87	interface SimPlayer {
+    88	  x: number;
+    89	  y: number;
+    90	  heading: number;
+    91	}
+    92	
+    93	const DIRECTIONS = [
+    94	  [1, 0],
+    95	  [1, 1],
+    96	  [0, 1],
+    97	  [-1, 1],
+    98	  [-1, 0],
+    99	  [-1, -1],
+   100	  [0, -1],
+   101	  [1, -1],
+   102	] as const;
+   103	
+   104	/**
+   105	 * A seeded match seen from outside: ships sail and turn, players collect sealed sources and claim caches, fight duels
+   106	 * (reserving their rubbings) that end in a theft or a draw, leave (their rubbings go into a cache where they were)
+   107	 * and join, and buy targeted rumors, sometimes repeating a request id. Some scenarios jump several ticks at once.
+   108	 */
+   109	function randomScript(scenario: Scenario, config: IntelConfig, map: IntelMapShape): IntelReplayTick[] {
+   110	  const draw = generator(scenario.seed);
+   111	  const chance = (perMille: number) => draw(1000) < perMille;
+   112	  const preset = rulesPresets[scenario.preset];
+   113	  const width = map.widthTiles * T;
+   114	  const height = map.heightTiles * T;
+   115	  const players = new Map<string, SimPlayer>();
+   116	  let nextPlayer = 0;
+   117	  const join = () => {
+   118	    players.set(`crew-${nextPlayer++}`, { x: draw(width), y: draw(height), heading: draw(8) });
+   119	  };
+   120	  for (let index = 0; index < preset.maxPlayers; index++) join();
+   121	  const rubbings = new Map<string, IntelRubbing>();
+   122	  const deck = presetRubbings(preset);
+   123	  deck.forEach((rubbing, index) => {
+   124	    const island = Math.floor(index / preset.sourcesPerIsland);
+   125	    // Spread each type over the islands: deal by a seeded shuffle of the deck positions.
+   126	    rubbings.set(rubbing.id, { id: rubbing.id, type: rubbing.type, place: { kind: "source", island, ...islandPoint(map, island) } });
+   127	  });
+   128	  // Shuffle which type sits on which island.
+   129	  const ids = [...rubbings.keys()];
+   130	  for (let index = ids.length - 1; index > 0; index--) {
+   131	    const other = draw(index + 1);
+   132	    const a = rubbings.get(ids[index]!)!;
+   133	    const b = rubbings.get(ids[other]!)!;
+   134	    rubbings.set(a.id, { ...a, place: b.place });
+   135	    rubbings.set(b.id, { ...b, place: a.place });
+   136	  }
+   137	  const duels: { a: string; b: string; until: number }[] = [];
+   138	  const inDuel = (id: string) => duels.some((duel) => duel.a === id || duel.b === id);
+   139	  const heldTypes = (id: string) =>
+   140	    [...rubbings.values()].filter((rubbing) => (rubbing.place.kind === "carried" || rubbing.place.kind === "duel") && rubbing.place.playerId === id).map((rubbing) => rubbing.type);
+   141	  const pick = <T>(items: readonly T[]): T | undefined => (items.length === 0 ? undefined : items[draw(items.length)]);
+   142	  const requestIds: string[] = [];
+   143	
+   144	  const script: IntelReplayTick[] = [];
+   145	  let tick = 0;
+   146	  while (tick < scenario.endTick) {
+   147	    const dt = chance(scenario.skipPerMille) ? 2 + draw(39) : 1;
+   148	    tick += dt;
+   149	    for (const player of players.values()) {
+   150	      if (chance(15)) player.heading = draw(8);
+   151	      const [dx, dy] = DIRECTIONS[player.heading]!;
+   152	      player.x = Math.min(Math.max(player.x + dx * 64 * dt, 0), width - 1);
+   153	      player.y = Math.min(Math.max(player.y + dy * 64 * dt, 0), height - 1);
+   154	      if (player.x === 0 || player.y === 0 || player.x === width - 1 || player.y === height - 1) player.heading = draw(8);
+   155	    }
+   156	    const free = [...players.keys()].filter((id) => !inDuel(id));
+   157	    // Collect a sealed source of a missing type; the ship is then at that island.
+   158	    if (chance(8)) {
+   159	      const id = pick(free);
+   160	      if (id !== undefined) {
+   161	        const held = heldTypes(id);
+   162	        const target = pick([...rubbings.values()].filter((rubbing) => rubbing.place.kind === "source" && !held.includes(rubbing.type)));
+   163	        if (target !== undefined && target.place.kind === "source") {
+   164	          const player = players.get(id)!;
+   165	          player.x = target.place.x;
+   166	          player.y = target.place.y;
+   167	          rubbings.set(target.id, { ...target, place: { kind: "carried", playerId: id } });
+   168	        }
+   169	      }
+   170	    }
+   171	    // Claim a cached copy of a missing type.
+   172	    if (chance(10)) {
+   173	      const id = pick(free);
+   174	      if (id !== undefined) {
+   175	        const held = heldTypes(id);
+   176	        const target = pick([...rubbings.values()].filter((rubbing) => rubbing.place.kind === "cache" && !held.includes(rubbing.type)));
+   177	        if (target !== undefined) rubbings.set(target.id, { ...target, place: { kind: "carried", playerId: id } });
+   178	      }
+   179	    }
+   180	    // Duels reserve both inventories and end in a theft or a draw.
+   181	    for (const duel of duels.filter((candidate) => candidate.until <= tick)) {
+   182	      duels.splice(duels.indexOf(duel), 1);
+   183	      for (const rubbing of rubbings.values()) {
+   184	        if (rubbing.place.kind === "duel") rubbings.set(rubbing.id, { ...rubbing, place: { kind: "carried", playerId: rubbing.place.playerId } });
+   185	      }
+   186	      if (chance(850)) {
+   187	        const [winner, loser] = chance(500) ? [duel.a, duel.b] : [duel.b, duel.a];
+   188	        const winnerTypes = heldTypes(winner);
+   189	        const stolen = pick(
+   190	          [...rubbings.values()].filter(
+   191	            (rubbing) => rubbing.place.kind === "carried" && rubbing.place.playerId === loser && !winnerTypes.includes(rubbing.type),
+   192	          ),
+   193	        );
+   194	        if (stolen !== undefined) rubbings.set(stolen.id, { ...stolen, place: { kind: "carried", playerId: winner } });
+   195	      }
+   196	      for (const rubbing of rubbings.values()) {
+   197	        const place = rubbing.place;
+   198	        if (place.kind === "carried" && inDuel(place.playerId)) rubbings.set(rubbing.id, { ...rubbing, place: { kind: "duel", playerId: place.playerId } });
+   199	      }
+   200	    }
+   201	    if (chance(12)) {
+   202	      const a = pick(free);
+   203	      const b = pick(free.filter((id) => id !== a));
+   204	      if (a !== undefined && b !== undefined) {
+   205	        duels.push({ a, b, until: tick + 20 + draw(80) });
+   206	        for (const rubbing of rubbings.values()) {
+   207	          const place = rubbing.place;
+   208	          if (place.kind === "carried" && (place.playerId === a || place.playerId === b)) {
+   209	            rubbings.set(rubbing.id, { ...rubbing, place: { kind: "duel", playerId: place.playerId } });
+   210	          }
+   211	        }
+   212	      }
+   213	    }
+   214	    // Leaving drops everything into a cache where the ship was; someone new may join.
+   215	    if (chance(2) && players.size > 2) {
+   216	      const id = pick(free);
+   217	      if (id !== undefined) {
+   218	        const player = players.get(id)!;
+   219	        for (const rubbing of rubbings.values()) {
+   220	          if (rubbing.place.kind === "carried" && rubbing.place.playerId === id) rubbings.set(rubbing.id, { ...rubbing, place: { kind: "cache", x: player.x, y: player.y } });
+   221	        }
+   222	        players.delete(id);
+   223	      }
+   224	    }
+   225	    if (chance(2) && players.size < preset.maxPlayers) join();
+   226	
+   227	    const requests: TargetedRumorRequest[] = [];
+   228	    if (tick > config.controlStartTick - 20 && chance(15)) {
+   229	      const playerId = pick([...players.keys(), "nobody"])!;
+   230	      const reuse = requestIds.length > 0 && chance(250);
+   231	      const requestId = reuse ? requestIds[draw(requestIds.length)]! : `req-${requestIds.length}`;
+   232	      if (!reuse) requestIds.push(requestId);
+   233	      requests.push({ requestId, playerId, type: config.types[draw(config.types.length)]! });
+   234	    }
+   235	    const view: IntelWorldView = {
+   236	      tick,
+   237	      players: [...players].map(([id, player]) => ({ id, x: player.x, y: player.y })),
+   238	      rubbings: [...rubbings.values()],
+   239	    };
+   240	    script.push(deepFreeze({ view, requests }));
+   241	  }
+   242	  return script;
+   243	}
+   244	
+   245	/** What a view says, for checking messages against it. */
+   246	interface Facts {
+   247	  readonly players: ReadonlySet<string>;
+   248	  readonly held: ReadonlyMap<string, readonly RubbingType[]>;
+   249	  readonly sourceIslands: readonly { type: RubbingType; island: number }[];
+   250	  readonly cacheSectors: readonly { type: RubbingType; sector: number }[];
+   251	  readonly carriers: readonly { type: RubbingType; sector: number; holder: string }[];
+   252	}
+   253	
+   254	function factsOf(config: IntelConfig, view: IntelWorldView): Facts {
+   255	  const positions = new Map(view.players.map((player) => [player.id, player]));
+   256	  const held = new Map<string, RubbingType[]>(view.players.map((player) => [player.id, []]));
+   257	  const sourceIslands: { type: RubbingType; island: number }[] = [];
+   258	  const cacheSectors: { type: RubbingType; sector: number }[] = [];
+   259	  const carriers: { type: RubbingType; sector: number; holder: string }[] = [];
+   260	  for (const rubbing of view.rubbings) {
+   261	    const place = rubbing.place;
+   262	    if (place.kind === "source") sourceIslands.push({ type: rubbing.type, island: place.island });
+   263	    else if (place.kind === "cache") cacheSectors.push({ type: rubbing.type, sector: sectorOf(config, place) });
+   264	    else {
+   265	      held.get(place.playerId)!.push(rubbing.type);
+   266	      carriers.push({ type: rubbing.type, sector: sectorOf(config, positions.get(place.playerId)!), holder: place.playerId });
+   267	    }
+   268	  }
+   269	  return { players: new Set(positions.keys()), held, sourceIslands, cacheSectors, carriers };
+   270	}
+   271	
+   272	/** The keys each message kind may carry: none is an id, and only `final-route` has a position. */
+   273	const BODY_KEYS: Record<IntelMessageKind, readonly string[]> = {
+   274	  rumor: ["entry", "kind", "reason", "target", "tick", "type"],
+   275	  "carrier-sighting": ["kind", "seenTick", "sightings", "tick"],
+   276	  "no-lead": ["kind", "reason", "tick", "type"],
+   277	  "rumor-stale": ["entry", "kind", "tick", "type"],
+   278	  "rumor-resolved": ["entry", "kind", "tick", "type"],
+   279	  "final-sector": ["kind", "name", "sector", "tick"],
+   280	  "final-route": ["kind", "restored", "tick", "x", "y"],
+   281	  "final-route-inactive": ["kind", "tick"],
+   282	  "sector-reveal": ["caches", "kind", "sources", "tick"],
+   283	  "carrier-report": ["carriers", "kind", "seenTick", "tick"],
+   284	};
+   285	const BROADCASTS: ReadonlySet<IntelMessageKind> = new Set(["final-sector", "sector-reveal", "carrier-report"]);
+   286	const NESTED_KEYS = new Set(["kind", "island", "sector", "name", "type", "reason"]);
+   287	
+   288	/** Every kind, outcome and path the property runs must reach, filled as they run. */
+   289	const EXERCISED = new Set<string>();
+   290	const MUST_EXERCISE = [
+   291	  ...Object.keys(BODY_KEYS).map((kind) => `message:${kind}`),
+   292	  ...(["rumor", "sighting", "capped", "none", "duplicate"] satisfies TargetedRumorResult[]).map((result) => `outcome:${result}`),
+   293	  ...["start", "fresh", "targeted", "replacement"].map((reason) => `rumor:${reason}`),
+   294	  ...["fresh", "targeted", "replacement"].map((reason) => `sighting:${reason}`),
+   295	  "rumor:island",
+   296	  "rumor:sector",
+   297	  "route:restored",
+   298	  "sighting:deferred",
+   299	  "sighting:deferred-delivered",
+   300	  "sighting:several-types",
+   301	  "skipped-ticks",
+   302	];
+   303	
+   304	function allStrings(value: unknown, out: string[] = []): string[] {
+   305	  if (typeof value === "string") out.push(value);
+   306	  else if (Array.isArray(value)) for (const item of value) allStrings(item, out);
+   307	  else if (typeof value === "object" && value !== null) for (const item of Object.values(value)) allStrings(item, out);
+   308	  return out;
+   309	}
+   310	
+   311	/**
+   312	 * Checks every message of a run against the design's rules (§3, §5, §11, §16), with the views that produced them. It
+   313	 * returns nothing and throws on the first violation, with the tick and message.
+   314	 */
+   315	class Checker {
+   316	  private readonly rumors = new Map<string, { type: RubbingType; closed: boolean; target: unknown }>();
+   317	  private readonly sightings = new Map<string, number>();
+   318	  private readonly carriersAt = new Map<number, Facts["carriers"]>();
+   319	  private readonly ids = new Set<string>();
+   320	  private previousTick = -Infinity;
+   321	  private previousState: IntelState | undefined;
+   322	
+   323	  constructor(
+   324	    private readonly config: IntelConfig,
+   325	    private readonly skipping: boolean,
+   326	  ) {}
+   327	
+   328	  check(view: IntelWorldView, messages: readonly IntelMessage[], state: IntelState): void {
+   329	    const config = this.config;
+   330	    const tick = view.tick;
+   331	    if (tick - this.previousTick > 1 && this.previousTick >= config.controlStartTick) EXERCISED.add("skipped-ticks");
+   332	    this.previousTick = tick;
+   333	    const facts = factsOf(config, view);
+   334	    this.carriersAt.set(tick, facts.carriers);
+   335	    for (const player of view.players) this.ids.add(player.id);
+   336	    for (const rubbing of view.rubbings) this.ids.add(rubbing.id);
+   337	    if (state.players.some((player) => player.pending !== null)) EXERCISED.add("sighting:deferred");
+   338	    const fail = (message: IntelMessage, why: string): never => {
+   339	      throw new Error(`tick ${tick}: ${why}: ${JSON.stringify(message)}`);
+   340	    };
+   341	    if (tick < config.controlStartTick && messages.length > 0) fail(messages[0]!, "a message before control start");
+   342	    for (const message of messages) {
+   343	      const body = message.body;
+   344	      EXERCISED.add(`message:${body.kind}`);
+   345	      if (body.tick !== tick) fail(message, "wrong tick");
+   346	      // Keys: exactly the allowed ones, nested ones from the small sector/target vocabulary.
+   347	      expect(Object.keys(body).sort()).toEqual([...BODY_KEYS[body.kind]]);
+   348	      for (const nested of ["target", "sources", "caches", "carriers", "sightings"] as const) {
+   349	        const value = (body as Record<string, unknown>)[nested];
+   350	        if (value === undefined) continue;
+   351	        for (const item of Array.isArray(value) ? value : [value]) {
+   352	          for (const key of Object.keys(item as object)) if (!NESTED_KEYS.has(key)) fail(message, `nested key ${key}`);
+   353	        }
+   354	      }
+   355	      // No id anywhere in a body.
+   356	      for (const text of allStrings(body)) if (this.ids.has(text)) fail(message, `the id ${text} leaks`);
+   357	      // Addressing: broadcasts to everyone, everything else to one player present now.
+   358	      if (BROADCASTS.has(body.kind)) {
+   359	        if (message.to.kind !== "everyone") fail(message, "a broadcast addressed to someone");
+   360	        continue;
+   361	      }
+   362	      if (message.to.kind !== "player" || !facts.players.has(message.to.playerId)) fail(message, "not addressed to one present player");
+   363	      const recipient = (message.to as { playerId: string }).playerId;
+   364	      const held = facts.held.get(recipient)!;
+   365	      const complete = config.types.every((type) => held.includes(type));
+   366	      const key = (entry: number) => `${recipient}#${entry}`;
+   367	      switch (body.kind) {
+   368	        case "final-route":
+   369	          // The only exact position ever sent, and only to a full-set holder.
+   370	          if (!complete || body.x !== config.finalIsland.x || body.y !== config.finalIsland.y) fail(message, "a route to a player without a full set");
+   371	          if (body.restored) EXERCISED.add("route:restored");
+   372	          break;
+   373	        case "final-route-inactive":
+   374	          if (complete) fail(message, "a route suspended for a full set");
+   375	          break;
+   376	        case "rumor": {
+   377	          EXERCISED.add(`rumor:${body.reason}`);
+   378	          EXERCISED.add(`rumor:${body.target.kind}`);
+   379	          if (held.includes(body.type)) fail(message, "a rumor for a held type");
+   380	          const target = body.target;
+   381	          const there =
+   382	            target.kind === "island"
+   383	              ? facts.sourceIslands.some((source) => source.type === body.type && source.island === target.island)
+   384	              : facts.cacheSectors.some((cache) => cache.type === body.type && cache.sector === target.sector);
+   385	          if (!there) fail(message, "a rumor pointing at nothing");
+   386	          // Sources before caches: a cache lead only when no sealed source of the type is left outside the journal.
+   387	          if (target.kind === "sector") {
+   388	            const journaled = this.activeIslands(recipient, body.type);
+   389	            if (facts.sourceIslands.some((source) => source.type === body.type && !journaled.has(source.island))) {
+   390	              fail(message, "a cache rumor while an eligible sealed source existed");
+   391	            }
+   392	          }
+   393	          if (this.rumors.has(key(body.entry))) fail(message, "a journal entry reused");
+   394	          this.rumors.set(key(body.entry), { type: body.type, closed: false, target });
+   395	          break;
+   396	        }
+   397	        case "rumor-stale":
+   398	        case "rumor-resolved": {
+   399	          // Only journal rumors close; a carrier sighting has no entry, so it can never go stale.
+   400	          const rumor = this.rumors.get(key(body.entry));
+   401	          if (rumor === undefined || rumor.closed || rumor.type !== body.type) fail(message, "closing no open journal rumor");
+   402	          rumor!.closed = true;
+   403	          if (body.kind === "rumor-resolved" && !held.includes(body.type)) fail(message, "resolved without the type");
+   404	          if (body.kind === "rumor-stale") {
+   405	            if (held.includes(body.type)) fail(message, "stale although the holder has the type");
+   406	            const target = rumor!.target as { kind: "island"; island: number } | { kind: "sector"; sector: number };
+   407	            const there =
+   408	              target.kind === "island"
+   409	                ? facts.sourceIslands.some((source) => source.type === body.type && source.island === target.island)
+   410	                : facts.cacheSectors.some((cache) => cache.type === body.type && cache.sector === target.sector);
+   411	            if (there) fail(message, "stale while the target still holds the type");
+   412	          }
+   413	          break;
+   414	        }
+   415	        case "carrier-sighting": {
+   416	          if (body.sightings.length === 0) fail(message, "a sighting message with no sighting");
+   417	          if (new Set(body.sightings.map((sighting) => sighting.type)).size !== body.sightings.length) fail(message, "a type sighted twice in one message");
+   418	          if (body.sightings.length > 1) EXERCISED.add("sighting:several-types");
+   419	          if (body.seenTick >= tick) fail(message, "a sighting of the present");
+   420	          const age = tick - body.seenTick;
+   421	          const interval = config.carrierIntervalTicks;
+   422	          if (!this.skipping && (age < interval || age >= 2 * interval)) fail(message, `a sighting ${age} ticks old`);
+   423	          const then = this.carriersAt.get(body.seenTick);
+   424	          if (then === undefined) fail(message, "a sighting of a tick never seen");
+   425	          for (const sighting of body.sightings) {
+   426	            EXERCISED.add(`sighting:${sighting.reason}`);
+   427	            if (held.includes(sighting.type)) fail(message, "a sighting for a held type");
+   428	            if (!then!.some((carrier) => carrier.type === sighting.type && carrier.sector === sighting.sector && carrier.holder !== recipient)) {
+   429	              fail(message, "a sighting of no other carrier");
+   430	            }
+   431	            // Carriers last: a sighting only when no source or cache of the type exists at all.
+   432	            if (facts.sourceIslands.some((source) => source.type === sighting.type) || facts.cacheSectors.some((cache) => cache.type === sighting.type)) {
+   433	              fail(message, "a carrier sighting while a source or cache existed");
+   434	            }
+   435	          }
+   436	          if (tick < config.carrierRevealTick) {
+   437	            const snapshot = `${recipient}@${Math.floor((tick - config.controlStartTick) / interval)}`;
+   438	            const count = (this.sightings.get(snapshot) ?? 0) + 1;
+   439	            if (count > 1) fail(message, "a second sighting message in one snapshot");
+   440	            this.sightings.set(snapshot, count);
+   441	          }
+   442	          break;
+   443	        }
+   444	        case "no-lead":
+   445	          if (held.includes(body.type)) fail(message, "a no-lead for a held type");
+   446	          break;
+   447	      }
+   448	    }
+   449	    this.checkPending(tick, facts, messages, state);
+   450	    this.previousState = state;
+   451	  }
+   452	
+   453	  /** The islands of the player's journal rumors for the type that are still open. */
+   454	  private activeIslands(playerId: string, type: RubbingType): Set<number> {
+   455	    const islands = new Set<number>();
+   456	    for (const [key, rumor] of this.rumors) {
+   457	      if (!key.startsWith(`${playerId}#`) || rumor.closed || rumor.type !== type) continue;
+   458	      const target = rumor.target as { kind: string; island?: number };
+   459	      if (target.kind === "island") islands.add(target.island!);
+   460	    }
+   461	    return islands;
+   462	  }
+   463	
+   464	  /**
+   465	   * After every step, each player has at most one pending sighting message holding a set of types. At the first
+   466	   * boundary after a type was deferred, it goes out in a sighting, unless the checker finds it ineligible (held, a
+   467	   * source or cache exists, or no one else carries it), or finds no other carrier of it in the previous snapshot to
+   468	   * read, in which case it must still be pending.
+   469	   */
+   470	  private checkPending(tick: number, facts: Facts, messages: readonly IntelMessage[], state: IntelState): void {
+   471	    const fail = (why: string): never => {
+   472	      throw new Error(`tick ${tick}: ${why}`);
+   473	    };
+   474	    for (const player of state.players) {
+   475	      if (player.pending === null) continue;
+   476	      const types = player.pending.types.map((pending) => pending.type);
+   477	      if (types.length === 0) fail(`${player.id} has an empty pending message`);
+   478	      if (new Set(types).size !== types.length) fail(`${player.id} has a type pending twice`);
+   479	    }
+   480	    const previous = this.previousState;
+   481	    const newest = state.snapshots.at(-1);
+   482	    if (previous === undefined || newest === undefined || newest.boundary <= (previous.snapshots.at(-1)?.boundary ?? -1)) return;
+   483	    const older = state.snapshots.length === 2 ? state.snapshots[0]! : undefined;
+   484	    const olderCarriers = older === undefined ? [] : this.carriersAt.get(older.tick)!;
+   485	    for (const before of previous.players) {
+   486	      const now = state.players.find((player) => player.id === before.id);
+   487	      if (before.pending === null || now === undefined) continue;
+   488	      const sighted = new Set(
+   489	        messages.flatMap((message) =>
+   490	          message.to.kind === "player" && message.to.playerId === before.id && message.body.kind === "carrier-sighting"
+   491	            ? message.body.sightings.map((sighting) => sighting.type)
+   492	            : [],
+   493	        ),
+   494	      );
+   495	      for (const { type } of before.pending.types) {
+   496	        const stillPending = now.pending?.types.some((pending) => pending.type === type) ?? false;
+   497	        const eligible =
+   498	          !facts.held.get(before.id)!.includes(type) &&
+   499	          !facts.sourceIslands.some((source) => source.type === type) &&
+   500	          !facts.cacheSectors.some((cache) => cache.type === type) &&
+   501	          facts.carriers.some((carrier) => carrier.type === type && carrier.holder !== before.id);
+   502	        const readable = olderCarriers.some((carrier) => carrier.type === type && carrier.holder !== before.id);
+   503	        if (sighted.has(type)) EXERCISED.add("sighting:deferred-delivered");
+   504	        else if (eligible && readable) fail(`${before.id}'s deferred ${type} sighting was not delivered at the boundary`);
+   505	        else if (eligible && !stillPending) fail(`${before.id}'s deferred ${type} sighting was dropped while eligible`);
+   506	        else if (!eligible && stillPending) fail(`${before.id}'s deferred ${type} sighting is still pending although ineligible`);
+   507	      }
+   508	    }
+   509	  }
+   510	}
+   511	
+   512	function setup(scenario: Scenario) {
+   513	  const map = scenario.preset === "slice" ? SLICE_MAP : ALPHA_MAP;
+   514	  const config = createIntelConfig({
+   515	    preset: scenario.preset,
+   516	    finalIsland: { x: (map.widthTiles * T) >> 1, y: ((map.heightTiles * T) >> 1) + 77 },
+   517	    controlStartTick: START,
+   518	    map,
+   519	    ...(scenario.realTimes ? {} : { rules: QUICK_RULES }),
+   520	  });
+   521	  return { config, script: randomScript(scenario, config, map) };
+   522	}
+   523	
+   524	describe("intel property runs (§3, §5, §11, §16)", () => {
+   525	  for (const scenario of SCENARIOS) {
+   526	    it(`keep every message within the rules: ${scenario.name}`, { timeout: 120_000 }, () => {
+   527	      const { config, script } = setup(scenario);
+   528	      if (scenario.realTimes && scenario.skipPerMille === 0) {
+   529	        expect(config.carrierIntervalTicks).toBe(600);
+   530	        expect(script.at(-1)!.view.tick - config.controlStartTick).toBeGreaterThanOrEqual(36_000);
+   531	        expect(script.at(-1)!.view.tick).toBeGreaterThan(config.carrierRevealTick + 4 * config.carrierIntervalTicks);
+   532	      }
+   533	      const checker = new Checker(config, scenario.skipPerMille > 0);
+   534	      let state = createIntelState(config, scenario.seed);
+   535	      const kinds = new Set<string>();
+   536	      const messages: IntelMessage[] = [];
+   537	      for (const { view, requests } of script) {
+   538	        // Frozen (views are frozen too), so a step that wrote into its input would throw.
+   539	        const stepped = stepIntel(config, deepFreeze(state), view, requests ?? []);
+   540	        messages.push(...stepped.messages);
+   541	        expect(stepped.outcomes.map((outcome) => outcome.requestId)).toEqual((requests ?? []).map((request) => request.requestId));
+   542	        for (const outcome of stepped.outcomes) EXERCISED.add(`outcome:${outcome.result}`);
+   543	        checker.check(view, stepped.messages, stepped.state);
+   544	        for (const message of stepped.messages) kinds.add(message.body.kind);
+   545	        state = stepped.state;
+   546	      }
+   547	      // The run reached the reveals it spans.
+   548	      expect(kinds.has("sector-reveal") && kinds.has("carrier-report")).toBe(true);
+   549	      // Replaying the same script from the same seed reaches the same state.
+   550	      const replayed = replayIntel(config, createIntelState(config, scenario.seed), script);
+   551	      expect(replayed.hash).toBe(hashState(state));
+   552	      expect(replayed.messages).toEqual(messages);
+   553	    });
+   554	  }
+   555	
+   556	  it("exercise every message kind, outcome and lead path (EXERCISED)", () => {
+   557	    expect(MUST_EXERCISE.filter((path) => !EXERCISED.has(path))).toEqual([]);
+   558	  });
+   559	});

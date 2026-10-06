@@ -1,0 +1,673 @@
+import {
+  DUEL_BUTTONS,
+  DUEL_INPUT,
+  movesetVersion,
+  strikesWithHitbox,
+  THROW_CHORD_PARTNER,
+  type CancelCommand,
+  type DuelMove,
+  type DuelMoveset,
+  type GuardLevel,
+} from "@pirate-sea-race/content/moves";
+import { clampInt, divTrunc } from "../fixed.js";
+import { overlaps, worldBox, type Facing, type WorldBox } from "./boxes.js";
+import {
+  atWall,
+  boltDirection,
+  firstMeeting,
+  firstReach,
+  insideZone,
+  laidZone,
+  pathX,
+  projectileOf,
+  releasedBolt,
+  substeps,
+  type BoltPath,
+} from "./entities.js";
+import { directions, sanitizeDuelInput, type DuelInputs } from "./input.js";
+import {
+  canAct,
+  currentMoveFrame,
+  findMove,
+  kitOf,
+  moveDuration,
+  type Bolt,
+  type DuelConfig,
+  type DuelEvent,
+  type DuelResult,
+  type DuelState,
+  type FighterState,
+  type InputBuffer,
+  type PlayerIndex,
+  type Stance,
+  type Zone,
+} from "./state.js";
+
+/** One player's input for this frame, read against last frame's held buttons. */
+interface FrameInput {
+  readonly bits: number;
+  readonly h: -1 | 0 | 1;
+  readonly v: -1 | 0 | 1;
+  readonly buffer: InputBuffer;
+}
+
+/** What a contact deals: a strike's or throw's own fields, or a bolt's (its projectile data). */
+interface Strike {
+  /** The move or projectile id events name. */
+  readonly id: string;
+  readonly damage: number;
+  readonly hitstun: number;
+  readonly blockstun: number;
+  readonly hitPushback: number;
+  readonly blockPushback: number;
+  readonly launch: number;
+  readonly guardStaminaCost: number;
+}
+
+/** What one fighter's move or bolt does to the other this frame, detected against the start-of-frame state. */
+interface Contact {
+  readonly kind: "hit" | "block" | "grab";
+  readonly strike: Strike;
+  /** The defender's stance at contact. */
+  readonly stance: Stance;
+  /**
+   * For a bolt's contact, the way the bolt flies: the defender is pushed that way, and the owner is neither moved nor
+   * marked as having hit. Null for the fighter's own move.
+   */
+  readonly bolt: Facing | null;
+}
+
+function strikeOf(move: DuelMove): Strike {
+  const { damage, hitstun, blockstun, hitPushback, blockPushback, launch, guardStaminaCost } = move;
+  return { id: move.timing.id, damage, hitstun, blockstun, hitPushback, blockPushback, launch, guardStaminaCost };
+}
+
+type Pair<T> = readonly [T, T];
+
+const OTHER = [1, 0] as const;
+
+/** One value per fighter, player one's first. */
+function both<T>(each: (index: PlayerIndex) => T): Pair<T> {
+  return [each(0), each(1)];
+}
+
+/**
+ * Advances the duel by one 60 Hz frame (order of operations in docs/duel.md):
+ *
+ * 1. read both inputs (opposite directions cancel; newly pressed buttons enter the 4-frame buffer);
+ * 2. detect every hit, block and grab of the frame against the start-of-frame state of both fighters, and sweep both
+ *    bolts (one released this frame included) against each other and the opposing hurtbox;
+ * 3. settle same-frame interactions (throw against throw breaks both; a strike or bolt that hits or is blocked beats a
+ *    throw; the opponent's own move takes priority over its bolt; two bolts that meet destroy each other);
+ * 4. apply all results together, damage and stamina from start-of-frame values; fighters not struck advance their
+ *    action (a light or heavy may still become the throw inside the chord window, a feint may be cancelled into a
+ *    normal) or start a new one from their input;
+ * 5. move, apply gravity, keep fighters inside the walls and apart; move bolts, age bolts and smoke screens;
+ * 6. regenerate stamina, mark the fighters inside a smoke screen, then decide KO, timeout and overtime from both
+ *    fighters' health.
+ *
+ * Neither fighter is processed "first": every decision for one fighter reads only the start-of-frame state and the
+ * frame's inputs. The input state is never mutated. A finished duel only advances its frame counter.
+ */
+export function stepDuel(config: DuelConfig, state: DuelState, inputs: DuelInputs): DuelState {
+  const { moveset } = config;
+  const version = movesetVersion(moveset);
+  if (state.movesetVersion !== version) {
+    throw new Error(`the duel runs on moveset ${state.movesetVersion}, not ${version}`);
+  }
+  const frame = state.frame + 1;
+  if (state.result !== null) return { ...state, frame, events: [] };
+
+  const fighters = state.fighters;
+  const input: Pair<FrameInput> = [readInput(moveset, fighters[0], inputs[0]), readInput(moveset, fighters[1], inputs[1])];
+
+  // 2. Detection, each against the same start-of-frame state.
+  let contacts: Pair<Contact | null> = [detect(moveset, fighters, 0, input), detect(moveset, fighters, 1, input)];
+  const bolts = sweepBolts(moveset, fighters, input);
+
+  // 3. Same-frame interactions.
+  const clash = contacts[0]?.kind === "grab" && contacts[1]?.kind === "grab";
+  if (clash) {
+    contacts = [null, null];
+  } else {
+    // A grab fails against a strike or bolt that hits or is blocked on the same frame; an active hitbox that misses
+    // does not stop it.
+    const strikes = (contact: Contact | null) => contact !== null && contact.kind !== "grab";
+    contacts = [
+      contacts[0]?.kind === "grab" && (strikes(contacts[1]) || bolts.contacts[1] !== null) ? null : contacts[0],
+      contacts[1]?.kind === "grab" && (strikes(contacts[0]) || bolts.contacts[0] !== null) ? null : contacts[1],
+    ];
+  }
+  const escape: Pair<boolean> = [escapes(fighters[0], input[0]), escapes(fighters[1], input[1])];
+  const throwBreak = clash || escape[0] || escape[1];
+  // A bolt's contact applies unless the opponent's own move connects on the same frame, which takes priority and spends
+  // the bolt; on a throw break nothing applies, and the bolt flies on.
+  const boltSpent: Pair<boolean> = both((index) => bolts.clash || (bolts.contacts[index] !== null && !throwBreak));
+  if (!throwBreak) contacts = both((index) => contacts[index] ?? bolts.contacts[index]);
+
+  // Displacement from pushback and throw breaks, from start-of-frame positions.
+  const shift = [0, 0];
+  const minX = moveset.fighter.pushbox.halfWidth;
+  const maxX = moveset.arena.width - minX;
+  for (const attacker of [0, 1] as const) {
+    const contact = contacts[attacker];
+    if (contact === null || contact.kind === "grab") continue;
+    const defender = OTHER[attacker];
+    const def = fighters[defender];
+    const push = contact.kind === "hit" ? contact.strike.hitPushback : contact.strike.blockPushback;
+    const direction = contact.bolt ?? awayFrom(def, fighters[attacker]);
+    const target = clampInt(def.x + direction * push, minX, maxX);
+    shift[defender]! += target - def.x;
+    // Against a wall, the rest of a strike's pushback moves the attacker back instead; a bolt never moves its owner.
+    if (contact.bolt === null) shift[attacker]! -= direction * (push - Math.abs(target - def.x));
+  }
+  if (throwBreak) {
+    for (const index of [0, 1] as const) {
+      shift[index]! += awayFrom(fighters[index], fighters[OTHER[index]]) * moveset.fighter.throwBreakPushback;
+    }
+  }
+
+  // 4. Apply results and advance actions.
+  const events: DuelEvent[] = [];
+  const spent = [false, false];
+  const next = both((index): FighterState => {
+    const self = fighters[index];
+    const opponent = fighters[OTHER[index]];
+    const incoming = contacts[OTHER[index]];
+    const outgoing = contacts[index];
+    const own = input[index];
+    let fighter: FighterState = { ...self, held: own.bits, buffer: own.buffer };
+    if (throwBreak) {
+      // Two throws on one frame, or an escape: both fighters recover apart with no damage.
+      if (clash) events.push({ kind: "throw-clash", attacker: index, moveId: self.moveId ?? "", damage: 0 });
+      if (escape[OTHER[index]]) events.push({ kind: "throw-escape", attacker: index, moveId: moveset.commands.throw, damage: 0 });
+      return startTimed(fighter, "throw-break", moveset.fighter.throwBreakFrames);
+    }
+    if (incoming !== null) {
+      const attacker = OTHER[index];
+      const result = react(moveset, fighter, incoming, attacker);
+      events.push(result.event);
+      if (incoming.kind === "block") spent[index] = true;
+      return result.fighter;
+    }
+    if (outgoing !== null && outgoing.bolt === null) fighter = { ...fighter, moveHit: true };
+    if (fighter.action === "thrown") {
+      if (fighter.timer > 0) return { ...fighter, timer: fighter.timer - 1, actionFrame: fighter.actionFrame + 1 };
+      // The escape window ran out: the throw lands.
+      const move = findMove(moveset, moveset.commands.throw);
+      const damage = scaledDamage(moveset, move.damage, fighter.combo);
+      events.push({ kind: "throw", attacker: OTHER[index], moveId: move.timing.id, damage });
+      return {
+        ...startTimed(fighter, "knockdown", move.hitstun),
+        health: Math.max(0, fighter.health - damage),
+        combo: fighter.combo + 1,
+      };
+    }
+    if (!canAct(self)) return chordThrow(moveset, fighter) ?? cancelFeint(moveset, fighter, opponent, own) ?? progress(moveset, fighter);
+    const started = choose(moveset, fighter, opponent, own);
+    if (started.action === "dash" || started.action === "backdash") spent[index] = true;
+    return started;
+  });
+
+  // 5. Movement: velocities, gravity and landing, walls, then pushboxes; then the bolts and smoke screens.
+  const moved = both((index) => move(moveset, next[index], shift[index]!));
+  const separated = separate(moveset, fighters, moved);
+  const zones = both((index) => nextZone(moveset, fighters[index]));
+  const flown = both((index) => nextBolt(moveset, bolts.paths[index], boltSpent[index]));
+
+  // 6. Stamina regeneration, smoke screen marks, then the result.
+  const rules = moveset.rules;
+  const final = both((index): FighterState => {
+    const fighter = { ...separated[index], bolt: flown[index], zone: zones[index] };
+    const marked = { ...fighter, obscured: insideZone(moveset, fighter, zones) };
+    if (spent[index]) return { ...marked, staminaIdle: 0 };
+    const idle = fighter.staminaIdle + 1;
+    const regenerates =
+      idle > rules.staminaRegenDelayFrames && (idle - rules.staminaRegenDelayFrames) % rules.staminaRegenIntervalFrames === 0;
+    return { ...marked, staminaIdle: idle, stamina: regenerates ? Math.min(rules.maxStamina, fighter.stamina + 1) : fighter.stamina };
+  });
+
+  const result = decide(moveset, state, frame, final);
+  return {
+    ...state,
+    frame,
+    phase: result === null ? (state.phase === "round" && frame >= rules.roundFrames ? "overtime" : state.phase) : "over",
+    fighters: final,
+    events,
+    result,
+  };
+}
+
+function readInput(moveset: DuelMoveset, fighter: FighterState, raw: number): FrameInput {
+  const bits = sanitizeDuelInput(raw);
+  const pressed = bits & ~fighter.held;
+  const buffer = Object.fromEntries(
+    DUEL_BUTTONS.map((button) => [
+      button,
+      (pressed & DUEL_INPUT[button]) !== 0 ? moveset.rules.inputBufferFrames : Math.max(0, fighter.buffer[button] - 1),
+    ]),
+  ) as unknown as InputBuffer;
+  return { bits, ...directions(bits), buffer };
+}
+
+/** -1 or 1: the direction pointing from `other` to `self` (behind `self`'s facing when they share an x). */
+function awayFrom(self: FighterState, other: FighterState): Facing {
+  return self.x > other.x ? 1 : self.x < other.x ? -1 : self.facing === 1 ? -1 : 1;
+}
+
+function isActiveFrame(move: DuelMove, moveFrame: number): boolean {
+  return moveFrame > move.timing.startup && moveFrame <= move.timing.startup + move.timing.active;
+}
+
+function isAirborne(fighter: FighterState): boolean {
+  return fighter.y > 0 || fighter.vy > 0 || fighter.action === "jump";
+}
+
+/** A free or blocking fighter changes stance with this frame's input; anyone else keeps the one they had. */
+function stanceOf(fighter: FighterState, input: FrameInput): Stance {
+  if (isAirborne(fighter)) return "airborne";
+  if (canAct(fighter) || fighter.action === "blockstun") return input.v === -1 ? "crouching" : "standing";
+  return fighter.crouching ? "crouching" : "standing";
+}
+
+function detect(moveset: DuelMoveset, fighters: Pair<FighterState>, attacker: PlayerIndex, input: Pair<FrameInput>): Contact | null {
+  const att = fighters[attacker];
+  if (att.action !== "attack" || att.moveId === null || att.moveHit) return null;
+  const move = findMove(moveset, att.moveId);
+  if (!strikesWithHitbox(move) || !isActiveFrame(move, currentMoveFrame(att))) return null;
+  const defender = OTHER[attacker];
+  const def = fighters[defender];
+  const stance = stanceOf(def, input[defender]);
+  const reaches = () =>
+    overlaps(worldBox(move.hitbox, att.x, att.y, att.facing), worldBox(moveset.fighter.hurtboxes[stance], def.x, def.y, def.facing));
+
+  if (move.kind === "throw") {
+    const throwable =
+      stance !== "airborne" && !["hitstun", "blockstun", "thrown", "throw-break", "knockdown"].includes(def.action);
+    return throwable && reaches() ? { kind: "grab", strike: strikeOf(move), stance, bolt: null } : null;
+  }
+  if (!strikable(moveset, def, stance, move.guard) || !reaches()) return null;
+  const guarding = guards(def, stance, input[defender], move.guard, awayFrom(def, att));
+  return { kind: guarding ? "block" : "hit", strike: strikeOf(move), stance, bolt: null };
+}
+
+/**
+ * Whether a strike (or a bolt) of guard level `guard` can touch the defender at all: knocked-down and held fighters,
+ * and a fighter in its move's strike-invulnerable frames, cannot be struck; crouching avoids highs whether or not it
+ * guards.
+ */
+function strikable(moveset: DuelMoveset, def: FighterState, stance: Stance, guard: GuardLevel): boolean {
+  if (def.action === "thrown" || def.action === "knockdown") return false;
+  if (def.action === "attack" && def.moveId !== null && findMove(moveset, def.moveId).strikeInvulnerable >= currentMoveFrame(def)) {
+    return false;
+  }
+  return !(guard === "high" && stance === "crouching");
+}
+
+/**
+ * Whether the defender guards: it can act (or is in blockstun), is grounded, holds `away` (away from the attacker,
+ * or the way a bolt flies), and its stance blocks the level: standing blocks highs and mids, crouching blocks lows.
+ */
+function guards(def: FighterState, stance: Stance, input: FrameInput, guard: GuardLevel, away: Facing): boolean {
+  return (
+    stance !== "airborne" &&
+    (canAct(def) || def.action === "blockstun") &&
+    input.h === away &&
+    (stance === "standing" ? guard === "high" || guard === "mid" : guard === "low")
+  );
+}
+
+/** Both fighters' bolts this frame: their paths, their contacts (by owner), and whether they destroyed each other. */
+interface BoltSweep {
+  readonly paths: Pair<BoltPath | null>;
+  readonly contacts: Pair<Contact | null>;
+  readonly clash: boolean;
+}
+
+/**
+ * Sweeps both bolts along this frame's movement in substeps, moved in step: a bolt already flying moves its speed, one
+ * released this frame is tested where it appears. Each bolt's first overlap with the opposing hurtbox (start-of-frame,
+ * as for strikes) and the two bolts' first overlap are compared: bolts that meet no later than either one reaches a
+ * fighter destroy each other; otherwise every bolt that reaches its target contacts it. Nothing depends on the slot.
+ */
+function sweepBolts(moveset: DuelMoveset, fighters: Pair<FighterState>, input: Pair<FrameInput>): BoltSweep {
+  const paths = both((index): BoltPath | null => {
+    const owner = fighters[index];
+    const { bolt } = owner;
+    if (bolt !== null) return bolt.life > 1 ? { bolt: { ...bolt, life: bolt.life - 1 }, from: bolt.x, travel: bolt.vx } : null;
+    const released = releasedBolt(moveset, owner);
+    return released === null ? null : { bolt: released, from: released.x, travel: 0 };
+  });
+  const count = substeps(moveset, paths);
+  const reach = both((owner): { at: number; contact: Contact } | null => {
+    const path = paths[owner];
+    if (path === null) return null;
+    const defender = OTHER[owner];
+    const def = fighters[defender];
+    const stance = stanceOf(def, input[defender]);
+    const projectile = projectileOf(moveset, path.bolt);
+    if (!strikable(moveset, def, stance, projectile.guard)) return null;
+    const target: WorldBox = worldBox(moveset.fighter.hurtboxes[stance], def.x, def.y, def.facing);
+    const at = firstReach(moveset, path, count, target);
+    if (at === null) return null;
+    const direction = boltDirection(path.bolt);
+    const guarding = guards(def, stance, input[defender], projectile.guard, direction);
+    const { id, damage, hitstun, blockstun, hitPushback, blockPushback, guardStaminaCost } = projectile;
+    const strike: Strike = { id, damage, hitstun, blockstun, hitPushback, blockPushback, launch: 0, guardStaminaCost };
+    return { at, contact: { kind: guarding ? "block" : "hit", strike, stance, bolt: direction } };
+  });
+  const [a, b] = paths;
+  const meeting = a !== null && b !== null ? firstMeeting(moveset, a, b, count) : null;
+  const clash = meeting !== null && reach.every((entry) => entry === null || meeting <= entry.at);
+  return { paths, contacts: both((index) => (clash ? null : (reach[index]?.contact ?? null))), clash };
+}
+
+/**
+ * A bolt after this frame: gone when spent (contact or clash) or at a wall, else moved (its path already ended the
+ * life of a bolt on its last frame).
+ */
+function nextBolt(moveset: DuelMoveset, path: BoltPath | null, spent: boolean): Bolt | null {
+  if (path === null || spent) return null;
+  const x = pathX(path, 1, 1);
+  return atWall(moveset, path.bolt, x) ? null : { ...path.bolt, x };
+}
+
+/** A smoke screen after this frame: laid on the cast's first active frame, gone at the end of its life. */
+function nextZone(moveset: DuelMoveset, fighter: FighterState): Zone | null {
+  const { zone } = fighter;
+  if (zone !== null) return zone.life > 1 ? { ...zone, life: zone.life - 1 } : null;
+  return laidZone(moveset, fighter);
+}
+
+/** A thrown fighter escapes by pressing light and heavy (both within the buffer) while the window is open. */
+function escapes(fighter: FighterState, input: FrameInput): boolean {
+  return fighter.action === "thrown" && fighter.timer > 0 && input.buffer.light > 0 && input.buffer.heavy > 0;
+}
+
+function scaledDamage(moveset: DuelMoveset, damage: number, comboHits: number): number {
+  const scaling = moveset.rules.comboScaling;
+  const percent = scaling[Math.min(comboHits, scaling.length - 1)]!;
+  return divTrunc(damage * percent, 100);
+}
+
+/** Starts a timed action lasting `frames` frames, the current one included. */
+function startTimed(fighter: FighterState, action: FighterState["action"], frames: number): FighterState {
+  return {
+    ...fighter,
+    action,
+    actionFrame: 1,
+    timer: Math.max(0, frames - 1),
+    moveId: null,
+    moveHit: false,
+    vx: 0,
+    vy: fighter.y > 0 ? Math.min(fighter.vy, 0) : 0,
+    crouching: false,
+  };
+}
+
+function react(moveset: DuelMoveset, fighter: FighterState, contact: Contact, attacker: PlayerIndex): { fighter: FighterState; event: DuelEvent } {
+  const { strike, stance } = contact;
+  const { rules } = moveset;
+  const moveId = strike.id;
+  const crouching = stance === "crouching";
+  if (contact.kind === "grab") {
+    // The escape window is the ten frames after the grab; presses from before it do not count.
+    const held = startTimed(fighter, "thrown", rules.throwEscapeFrames + 1);
+    return {
+      fighter: { ...held, combo: 0, buffer: { ...held.buffer, light: 0, heavy: 0 } },
+      event: { kind: "grab", attacker, moveId, damage: 0 },
+    };
+  }
+  if (contact.kind === "block") {
+    const cost = strike.guardStaminaCost;
+    if (cost > fighter.stamina) {
+      const staggered = startTimed(fighter, "stagger", rules.guardBreakStaggerFrames);
+      return {
+        fighter: { ...staggered, combo: 0, stamina: Math.min(rules.maxStamina, fighter.stamina + rules.guardBreakStaminaRestore) },
+        event: { kind: "guard-break", attacker, moveId, damage: 0 },
+      };
+    }
+    return {
+      fighter: { ...startTimed(fighter, "blockstun", strike.blockstun), combo: 0, crouching, stamina: fighter.stamina - cost },
+      event: { kind: "block", attacker, moveId, damage: 0 },
+    };
+  }
+  // A fighter still in hitstun continues the combo; a free one starts a new one.
+  const comboHits = fighter.action === "hitstun" && !canAct(fighter) ? fighter.combo : 0;
+  const damage = scaledDamage(moveset, strike.damage, comboHits);
+  const combo = comboHits + 1;
+  const capped = combo >= rules.comboCap;
+  const struck = startTimed(fighter, capped ? "knockdown" : "hitstun", capped ? rules.forcedRecoveryFrames : strike.hitstun);
+  return {
+    fighter: {
+      ...struck,
+      health: Math.max(0, fighter.health - damage),
+      combo,
+      crouching: capped ? false : crouching,
+      vy: strike.launch > 0 ? strike.launch : struck.vy,
+    },
+    event: { kind: "hit", attacker, moveId, damage },
+  };
+}
+
+/** One more frame of an action the fighter cannot leave yet. */
+function progress(moveset: DuelMoveset, fighter: FighterState): FighterState {
+  const actionFrame = fighter.actionFrame + 1;
+  const timer = Math.max(0, fighter.timer - 1);
+  switch (fighter.action) {
+    case "attack": {
+      const move = findMove(moveset, fighter.moveId!);
+      return { ...fighter, actionFrame, timer, vx: advance(move, actionFrame, fighter.facing) };
+    }
+    case "dash":
+    case "backdash":
+      return { ...fighter, actionFrame, timer };
+    case "jump":
+      return { ...fighter, actionFrame };
+    default:
+      return { ...fighter, actionFrame, timer, vx: 0 };
+  }
+}
+
+/**
+ * The throw chord window (§8, keyboard rollover): a light or heavy move that a free fighter started becomes the throw
+ * when the other button is pressed within `throwChordFrames` frames of the start, before the move's first active
+ * frame. The throw keeps the frames already spent, so it lands as if both buttons had gone down together, and a lone
+ * light or heavy keeps its own startup. `fighter` carries this frame's input buffer; null leaves the move as it is.
+ */
+function chordThrow(moveset: DuelMoveset, fighter: FighterState): FighterState | null {
+  if (fighter.action !== "attack" || fighter.moveId === null || fighter.moveHit) return null;
+  if (fighter.actionFrame > moveset.rules.throwChordFrames) return null;
+  const { commands } = moveset;
+  const command = (Object.keys(THROW_CHORD_PARTNER) as (keyof typeof THROW_CHORD_PARTNER)[]).find((name) => commands[name] === fighter.moveId);
+  if (command === undefined || fighter.buffer[THROW_CHORD_PARTNER[command]] === 0) return null;
+  if (fighter.actionFrame >= findMove(moveset, fighter.moveId).timing.startup) return null;
+  const grab = findMove(moveset, commands.throw);
+  const actionFrame = fighter.actionFrame + 1;
+  return {
+    ...fighter,
+    moveId: grab.timing.id,
+    actionFrame,
+    timer: moveDuration(grab) - actionFrame,
+    crouching: grab.stance === "crouching",
+    vx: advance(grab, actionFrame, fighter.facing),
+    buffer: { ...fighter.buffer, light: 0, heavy: 0 },
+  };
+}
+
+function advance(move: DuelMove, moveFrame: number, facing: Facing): number {
+  return move.advance !== 0 && moveFrame <= move.timing.startup + move.timing.active ? move.advance * facing : 0;
+}
+
+/** The way a fighter starting something faces: towards the opponent (§8's auto-facing). */
+function facingTowards(self: FighterState, opponent: FighterState): Facing {
+  return opponent.x > self.x ? 1 : opponent.x < self.x ? -1 : self.facing;
+}
+
+/** Starts move `id` on its first frame, facing `facing`, with the buttons it used taken out of the buffer. */
+function startAttack(moveset: DuelMoveset, self: FighterState, facing: Facing, id: string, used: InputBuffer): FighterState {
+  const move = findMove(moveset, id);
+  return {
+    ...self,
+    facing,
+    combo: 0,
+    moveHit: false,
+    vy: 0,
+    action: "attack",
+    moveId: id,
+    actionFrame: 1,
+    timer: moveDuration(move) - 1,
+    crouching: move.stance === "crouching",
+    vx: advance(move, 1, facing),
+    buffer: used,
+  };
+}
+
+function consume(buffer: InputBuffer, ...buttons: readonly (keyof InputBuffer)[]): InputBuffer {
+  return { ...buffer, ...Object.fromEntries(buttons.map((button) => [button, 0])) } as InputBuffer;
+}
+
+/**
+ * The normal a buffered light or heavy asks for (§8): both are the throw; down + heavy the low sweep, forward + heavy
+ * the launcher; down + light the anti-air. Null without either press.
+ */
+function normalCommand(input: FrameInput, facing: Facing): { command: CancelCommand; used: readonly (keyof InputBuffer)[] } | null {
+  const { buffer, h, v } = input;
+  if (buffer.light > 0 && buffer.heavy > 0) return { command: "throw", used: ["light", "heavy"] };
+  if (buffer.heavy > 0) return { command: v === -1 ? "downHeavy" : h === facing ? "forwardHeavy" : "heavy", used: ["heavy"] };
+  if (buffer.light > 0) return { command: v === -1 ? "downLight" : "light", used: ["light"] };
+  return null;
+}
+
+/** A special whose entity (bolt or smoke screen) is still out cannot start again: at most one of each per fighter. */
+function specialReady(moveset: DuelMoveset, self: FighterState, id: string): boolean {
+  const move = findMove(moveset, id);
+  return !(move.projectile !== undefined && self.bolt !== null) && !(move.zone !== undefined && self.zone !== null);
+}
+
+/**
+ * A feint's cancel: from the move frame its `cancel` opens (after the readable reappearance), a buffered normal it
+ * lists replaces the rest of the feint, as if started by a free fighter. Specials, the feint included, never cancel it.
+ * Null leaves the feint running.
+ */
+function cancelFeint(moveset: DuelMoveset, fighter: FighterState, opponent: FighterState, input: FrameInput): FighterState | null {
+  if (fighter.action !== "attack" || fighter.moveId === null) return null;
+  const { cancel } = findMove(moveset, fighter.moveId);
+  if (cancel === undefined || currentMoveFrame(fighter) < cancel.opens) return null;
+  const facing = facingTowards(fighter, opponent);
+  const normal = normalCommand(input, facing);
+  if (normal === null || !cancel.into.includes(normal.command)) return null;
+  return startAttack(moveset, fighter, facing, moveset.commands[normal.command], consume(fighter.buffer, ...normal.used));
+}
+
+/** A free fighter turns to face the opponent and starts whatever its input asks for (§8's priorities). */
+function choose(moveset: DuelMoveset, self: FighterState, opponent: FighterState, input: FrameInput): FighterState {
+  const facing = facingTowards(self, opponent);
+  const { buffer, h, v } = input;
+  const { commands, fighter: body, rules } = moveset;
+  const kit = kitOf(moveset, self);
+  const base: FighterState = { ...self, facing, combo: 0, moveHit: false, moveId: null, crouching: false, vy: 0 };
+  const attack = (id: string, used: InputBuffer): FighterState => startAttack(moveset, base, facing, id, used);
+  const forward = h === facing;
+  const back = h === -facing;
+
+  if (buffer.light > 0 && buffer.heavy > 0) return attack(commands.throw, consume(buffer, "light", "heavy"));
+  if (buffer.special1 > 0 && specialReady(moveset, self, kit.special1)) return attack(kit.special1, consume(buffer, "special1"));
+  if (buffer.special2 > 0 && specialReady(moveset, self, kit.special2)) return attack(kit.special2, consume(buffer, "special2"));
+  if (buffer.heavy > 0) {
+    return attack(v === -1 ? commands.downHeavy : forward ? commands.forwardHeavy : commands.heavy, consume(buffer, "heavy"));
+  }
+  if (buffer.light > 0) return attack(v === -1 ? commands.downLight : commands.light, consume(buffer, "light"));
+  if (buffer.dash > 0 && self.stamina >= rules.dashStaminaCost) {
+    const frames = back ? body.backdashFrames : body.dashFrames;
+    return {
+      ...base,
+      action: back ? "backdash" : "dash",
+      actionFrame: 1,
+      timer: frames - 1,
+      vx: back ? -facing * body.backdashSpeed : facing * body.dashSpeed,
+      stamina: self.stamina - rules.dashStaminaCost,
+      buffer: consume(buffer, "dash"),
+    };
+  }
+  /** A free action: its frame count carries on while the fighter keeps doing it. */
+  const free = (action: "idle" | "walk" | "crouch" | "jump", vx: number): FighterState => ({
+    ...base,
+    action,
+    actionFrame: self.action === action ? self.actionFrame + 1 : 1,
+    timer: 0,
+    vx,
+  });
+  if (v === 1) return { ...free("jump", h * body.jumpSpeedX), vy: body.jumpVelocity };
+  if (v === -1) return { ...free("crouch", 0), crouching: true };
+  if (h !== 0) return free("walk", forward ? facing * body.walkForwardSpeed : -facing * body.walkBackSpeed);
+  return free("idle", 0);
+}
+
+/** Velocity, gravity and landing for one fighter, plus this frame's pushback, kept inside the walls. */
+function move(moveset: DuelMoveset, fighter: FighterState, shift: number): FighterState {
+  const minX = moveset.fighter.pushbox.halfWidth;
+  const maxX = moveset.arena.width - minX;
+  const x = clampInt(fighter.x + shift + fighter.vx, minX, maxX);
+  if (fighter.y === 0 && fighter.vy <= 0) return { ...fighter, x, vy: 0 };
+  const y = fighter.y + fighter.vy;
+  if (y > 0) return { ...fighter, x, y, vy: fighter.vy - moveset.fighter.gravity };
+  const landed = { ...fighter, x, y: 0, vx: 0, vy: 0 };
+  return fighter.action === "jump" ? { ...landed, action: "idle", actionFrame: 1 } : landed;
+}
+
+/**
+ * Pushes overlapping pushboxes apart, each fighter by half the overlap rounded up, so neither side is favoured; a
+ * fighter against a wall passes its share to the other. `before` is the start-of-frame state, for ties.
+ */
+function separate(moveset: DuelMoveset, before: Pair<FighterState>, fighters: Pair<FighterState>): Pair<FighterState> {
+  const { halfWidth, height } = moveset.fighter.pushbox;
+  const [a, b] = fighters;
+  const dx = Math.abs(a.x - b.x);
+  if (dx >= 2 * halfWidth || a.y >= b.y + height || b.y >= a.y + height) return fighters;
+  const aLeft = leftFirst(a, b, before[0], before[1]);
+  if (aLeft === null) return fighters;
+  const [left, right] = aLeft ? [a, b] : [b, a];
+  const half = divTrunc(2 * halfWidth - dx + 1, 2);
+  const minX = halfWidth;
+  const maxX = moveset.arena.width - halfWidth;
+  let leftX = left.x - half;
+  let rightX = right.x + half;
+  if (leftX < minX) {
+    rightX += minX - leftX;
+    leftX = minX;
+  }
+  if (rightX > maxX) {
+    leftX = Math.max(minX, leftX - (rightX - maxX));
+    rightX = maxX;
+  }
+  const placedLeft = { ...left, x: leftX };
+  const placedRight = { ...right, x: rightX };
+  return aLeft ? [placedLeft, placedRight] : [placedRight, placedLeft];
+}
+
+/**
+ * Whether fighter `a` ends up on the left of `b`: by x, then by start-of-frame x (fighters never pass through each
+ * other), then by velocity, then by facing (the one facing right is on the left). Every key flips when the arena is
+ * mirrored, so the answer never depends on the slot; a tie on all of them is `null`, and the two stay where they are.
+ */
+function leftFirst(a: FighterState, b: FighterState, a0: FighterState, b0: FighterState): boolean | null {
+  if (a.x !== b.x) return a.x < b.x;
+  if (a0.x !== b0.x) return a0.x < b0.x;
+  if (a.vx !== b.vx) return a.vx < b.vx;
+  if (a.facing !== b.facing) return a.facing === 1;
+  return null;
+}
+
+/** KO first (both at once is a draw), then the clock: timeout, overtime, draw (§7). */
+function decide(moveset: DuelMoveset, state: DuelState, frame: number, fighters: Pair<FighterState>): DuelResult | null {
+  const [a, b] = fighters;
+  if (a.health === 0 && b.health === 0) return { winner: null, reason: "double-ko", frame };
+  if (a.health === 0 || b.health === 0) return { winner: a.health === 0 ? 1 : 0, reason: "ko", frame };
+  const { roundFrames, overtimeFrames } = moveset.rules;
+  const compare = (reason: DuelResult["reason"]): DuelResult | null =>
+    a.health === b.health ? (reason === "timeout" ? null : { winner: null, reason, frame }) : { winner: a.health > b.health ? 0 : 1, reason, frame };
+  if (state.phase === "round" && frame >= roundFrames) return compare("timeout");
+  if (state.phase === "overtime" && frame >= roundFrames + overtimeFrames) return compare("overtime");
+  return null;
+}

@@ -1,0 +1,751 @@
+import { randomBytes } from "node:crypto";
+import { Client, type Room } from "@colyseus/sdk";
+import {
+  Buttons,
+  CREATE_TOKEN_BYTES,
+  DuelMessageType,
+  formatCreateToken,
+  FruitMessageType,
+  JournalMessageType,
+  MATCH_ROOM,
+  MatchMessageType,
+  MessageType,
+  normalizeMatchCode,
+  parseJournal,
+  parseKnownIslands,
+  parseRumorOffers,
+  PROTOCOL_VERSION,
+  RubbingMessageType,
+  RuinMessageType,
+  ShopMessageType,
+  TEST_PLACEMENT_PATH,
+  type BuyTonicMessage,
+  type TonicPurchaseMessage,
+  type TonicUsedMessage,
+  type UseTonicMessage,
+  type AnswerRuinMessage,
+  type BuyRumorMessage,
+  type JournalEntry,
+  type JournalMessage,
+  type KnownIsland,
+  type RumorResultMessage,
+  type FruitInspectedMessage,
+  type InspectFruitMessage,
+  type OpenRuinMessage,
+  type RuinOpenedMessage,
+  type RuinResultMessage,
+  type ChooseTheftMessage,
+  type DuelReadyMessage,
+  type InputMessage,
+  type RevealMessage,
+  type StartMatchMessage,
+  type StartRefusedMessage,
+  type TestPlacement,
+} from "@pirate-sea-race/protocol";
+import type { MatchStateSchema, SeaDuelSchema } from "@pirate-sea-race/server/schema";
+import { HeadlessDuelClient } from "./headlessDuelClient.js";
+
+export interface HeadlessClientOptions {
+  /** Override the protocol version sent on join, to exercise the version check. */
+  readonly protocolVersion?: number;
+  /**
+   * Whether this player reports its arena ready as soon as a duel at sea is reserved for it (default true), as the
+   * browser does once its arena scene is up. Off, the test calls `ready()` itself, or never (§6: forfeit at 10 s).
+   */
+  readonly autoReady?: boolean;
+  /** How often the fighter's duel client ticks, in milliseconds. */
+  readonly duelTickMs?: number;
+}
+
+/** A telegraphed grapple as this client decoded it. */
+export interface GrappleView {
+  readonly attackerId: string;
+  readonly defenderId: string;
+  readonly aim: number;
+  readonly startTick: number;
+  readonly landTick: number;
+}
+
+/** This player's own encounter status (§6), as decoded. */
+export interface StatusView {
+  readonly mode: string;
+  readonly protection: string;
+  readonly protectedUntil: number;
+  readonly cooldownUntil: number;
+  readonly respawnAt: number;
+}
+
+/**
+ * This player's own objective status (§4, §11, §12), as decoded: gold, rubbings, what the island and the dock they are
+ * moored at hold, E's target and progress, their theft choice and their last results. Lists are type names.
+ */
+export interface ObjectivesView {
+  readonly gold: number;
+  readonly rubbings: string[];
+  readonly islandTypes: string[];
+  readonly cacheTypes: string[];
+  readonly target: string;
+  readonly channel: string;
+  readonly channelType: string;
+  readonly channelHeld: number;
+  readonly channelTotal: number;
+  readonly channelResult: string;
+  readonly channelResultAt: number;
+  readonly theftDuel: string;
+  readonly theftOptions: string[];
+  readonly theftDeadline: number;
+  readonly settledRole: string;
+  readonly stolen: string;
+  readonly goldChange: number;
+  readonly settledAt: number;
+  readonly settledChoice: string;
+  readonly choiceDeadline: number;
+}
+
+/** This player's own view of the final island and the claim (§5), as decoded from its private status. */
+export interface ClaimView {
+  readonly fullSet: boolean;
+  readonly routeKnown: boolean;
+  readonly routeActive: boolean;
+  readonly routeX: number;
+  readonly routeY: number;
+  readonly claim: string;
+  readonly claimHeld: number;
+  readonly claimTotal: number;
+  readonly claimInterrupt: string;
+  readonly claimInterruptAt: number;
+}
+
+/** One line of the results screen, as decoded. */
+export interface ResultLineView {
+  /** The player's seat (the results name players by seat, never by session id). */
+  readonly seat: number;
+  readonly winner: boolean;
+  readonly left: boolean;
+  readonly rubbingsHeld: number;
+  readonly collected: number;
+  readonly thefts: number;
+  readonly lost: number;
+  readonly duelsWon: number;
+  readonly duelsLost: number;
+  readonly duelsDrawn: number;
+  readonly gold: number;
+  readonly cachesClaimed: number;
+  readonly islandsVisited: number;
+}
+
+/** The match's end as decoded: its reason, the winner (empty for none), its tick and the results screen's lines. */
+export interface ResultsView {
+  readonly reason: string;
+  /** The winner's seat, 0 for no winner. */
+  readonly winnerSeat: number;
+  readonly tick: number;
+  readonly elapsedTicks: number;
+  readonly players: ResultLineView[];
+}
+
+/** This player's own view of the ruin where it is moored (§3), as decoded from its private status. */
+export interface RuinView {
+  /** "locked", "unlocked", "solved", or "" when not moored at an island with a ruin. */
+  readonly ruin: string;
+  readonly ruinOpen: boolean;
+  readonly ruinLockedUntil: number;
+}
+
+/** This player's own fruit fields (§9), as decoded from its private status. */
+export interface FruitView {
+  /** "duelist" until this player eats a fruit, then that fruit's kit. */
+  readonly kit: string;
+  /** The pedestal at the dock where this player is moored: "full", "empty", or "" when none. */
+  readonly pedestal: string;
+  readonly fruitHeld: number;
+  readonly fruitTotal: number;
+  /** "eaten:<kit>", "interrupted:<reason>", "refused:<reason>" or "". */
+  readonly fruitResult: string;
+  readonly fruitResultAt: number;
+}
+
+/** A fruit pedestal's marker as decoded: its island, dock and place, and whether it is full. Never its fruit. */
+export interface PedestalMarkerView {
+  readonly id: string;
+  readonly island: number;
+  readonly dock: number;
+  readonly full: boolean;
+}
+
+/** An island's ruin marker as decoded: its island, where it stands and whether it is unlocked. */
+export interface RuinMarkerView {
+  readonly island: number;
+  readonly x: number;
+  readonly y: number;
+  readonly unlocked: boolean;
+}
+
+/** A supply crate marker as decoded: its id and where it floats. */
+export interface CrateView {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+}
+
+/** This player's own shop fields (§11), as decoded from its private status. */
+export interface ShopView {
+  readonly gold: number;
+  readonly tonics: number;
+  /** The drunk tonic's last boosted world tick, 0 when none. */
+  readonly tonicUntil: number;
+  /** The server's top speed for this player's ship's next step: 39, or 43 with a tonic. */
+  readonly maxSpeed: number;
+}
+
+/** A recovery cache marker as decoded: a position and a dock, no contents. */
+export interface CacheView {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly dock: number;
+}
+
+const list = (text: string): string[] => (text === "" ? [] : text.split(","));
+
+export interface ShipView {
+  readonly id: string;
+  readonly slot: number;
+  readonly x: number;
+  readonly y: number;
+  readonly heading: number;
+  readonly speed: number;
+  /** The dock the ship is moored at, or -1 at sea. */
+  readonly dock: number;
+}
+
+/** Protocol axes: `moveX` turns (positive to starboard), `moveY` is the throttle (negative ahead, positive astern). */
+export interface Movement {
+  readonly moveX: number;
+  readonly moveY: number;
+  readonly buttons?: number;
+}
+
+/** Full ahead, no turn. */
+export const AHEAD: Movement = { moveX: 0, moveY: -1 };
+
+/**
+ * A browserless player: joins a private match through the real Colyseus SDK, decodes the synced state, and sends
+ * frame-tagged inputs with increasing sequence numbers, exactly as the web client does. It also keeps every raw frame
+ * the server sent it, so tests can check what actually crossed the network.
+ */
+export class HeadlessClient {
+  private seq = 0;
+  private open = true;
+  private readonly frames: Uint8Array[] = [];
+  private readiedKey: string | undefined;
+  /** Every reveal the server sent this player, in order (§2, §5). */
+  readonly reveals: RevealMessage[] = [];
+  /** Every ruin clue the server sent this player, in order (§3: only for the ruin it opened). */
+  readonly clues: RuinOpenedMessage[] = [];
+  /** Every ruin verdict the server sent this player, in order. */
+  readonly ruinResults: RuinResultMessage[] = [];
+  /** Every pedestal inspection the server sent this player, in order (§9: only of the pedestal where it is moored). */
+  readonly inspections: FruitInspectedMessage[] = [];
+  /** Every lead the server sent this player, in order (§3, §11: rumors, sightings and journal notices, to it only). */
+  readonly leads: JournalMessage[] = [];
+  /** Every answer to this player's targeted rumor requests, in order. */
+  readonly rumorResults: RumorResultMessage[] = [];
+  /** Every answer to this player's tonic purchases, in order (§11). */
+  readonly tonicPurchases: TonicPurchaseMessage[] = [];
+  /** Every answer to this player's drink requests, in order. */
+  readonly tonicUses: TonicUsedMessage[] = [];
+  /** Every message the server sent this player, decoded, in order, by type. */
+  readonly messages: { readonly type: string | number; readonly message: unknown }[] = [];
+  private shopRequests = 0;
+  /** Input messages are withheld (never sent, as a stalled network would) until this `Date.now()`. */
+  private withheldUntil = 0;
+  private rumorRequests = 0;
+  private ruinRequests = 0;
+  /** Every start refusal the server sent this player. */
+  readonly startRefusals: string[] = [];
+  /**
+   * This player as a fighter at sea: the same duel client as a standalone duel's (`HeadlessDuelClient`), over this
+   * match room, following whichever duel the room holds for this player. It idles (holds no input) until `play`.
+   */
+  readonly fighter: HeadlessDuelClient<MatchStateSchema>;
+
+  private constructor(
+    readonly room: Room<unknown, MatchStateSchema>,
+    options: HeadlessClientOptions = {},
+  ) {
+    room.onLeave(() => {
+      this.open = false;
+    });
+    this.fighter = HeadlessDuelClient.overMatch(
+      room,
+      { lobby: () => this.duelEntry()?.[1], key: () => this.duelEntry()?.[0] },
+      { tickMs: options.duelTickMs ?? 4 },
+    );
+    room.onMessage(MatchMessageType.Reveal, (message: RevealMessage) => void this.reveals.push(message));
+    room.onMessage(RuinMessageType.Clue, (message: RuinOpenedMessage) => void this.clues.push(message));
+    room.onMessage(RuinMessageType.Result, (message: RuinResultMessage) => void this.ruinResults.push(message));
+    room.onMessage(FruitMessageType.Inspected, (message: FruitInspectedMessage) => void this.inspections.push(message));
+    room.onMessage(JournalMessageType.Lead, (message: JournalMessage) => void this.leads.push(message));
+    room.onMessage(JournalMessageType.RumorResult, (message: RumorResultMessage) => void this.rumorResults.push(message));
+    room.onMessage(MatchMessageType.StartRefused, (message: StartRefusedMessage) => void this.startRefusals.push(message.reason));
+    room.onMessage(ShopMessageType.TonicPurchase, (message: TonicPurchaseMessage) => void this.tonicPurchases.push(message));
+    room.onMessage(ShopMessageType.TonicUsed, (message: TonicUsedMessage) => void this.tonicUses.push(message));
+    if (options.autoReady !== false) {
+      room.onStateChange(() => {
+        const key = this.duelEntry()?.[0];
+        if (key !== undefined && key !== this.readiedKey) this.ready();
+      });
+    }
+    // Recording raw frames wraps an internal of @colyseus/sdk 0.18.4, not its public API: the handler the room sets
+    // on `room.connection.events.onmessage` (Room.mjs) to decode every frame. If an SDK upgrade moves it, fail here,
+    // clearly, rather than record nothing and let the frame checks pass vacuously.
+    const events = room.connection?.events;
+    if (typeof events?.onmessage !== "function") {
+      throw new Error("HeadlessClient: @colyseus/sdk has no room.connection.events.onmessage handler to wrap (written against 0.18.4)");
+    }
+    // Recording every decoded message wraps the SDK's `dispatchMessage` (Room.mjs, 0.18.4), which hands each message to
+    // its handler: a `"*"` handler hears only types nobody else handles.
+    const target = room as unknown as { dispatchMessage?: (type: string | number, message: unknown) => void };
+    if (typeof target.dispatchMessage !== "function") throw new Error("HeadlessClient: @colyseus/sdk has no room.dispatchMessage to wrap (written against 0.18.4)");
+    const dispatch = target.dispatchMessage.bind(room);
+    target.dispatchMessage = (type, message) => {
+      this.messages.push({ type, message });
+      dispatch(type, message);
+    };
+    const decode = events.onmessage;
+    events.onmessage = (event: { data: ArrayBuffer }) => {
+      this.frames.push(new Uint8Array(event.data.slice(0)));
+      decode.call(events, event);
+    };
+  }
+
+  /** Creates a private match on the server at `endpoint` (for example `http://127.0.0.1:2593`). */
+  static async create(endpoint: string, options: HeadlessClientOptions = {}): Promise<HeadlessClient> {
+    const client = new Client(endpoint);
+    const room = await client.create<MatchStateSchema>(MATCH_ROOM, {
+      protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
+      createToken: newCreateToken(),
+    });
+    const headless = new HeadlessClient(room, options);
+    await headless.waitFor(() => headless.code !== "" && headless.ship() !== undefined);
+    return headless;
+  }
+
+  /** Joins the private match with `code` (any case). */
+  static async join(endpoint: string, code: string, options: HeadlessClientOptions = {}): Promise<HeadlessClient> {
+    const client = new Client(endpoint);
+    const room = await client.join<MatchStateSchema>(MATCH_ROOM, {
+      protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
+      code: normalizeMatchCode(code),
+    });
+    const headless = new HeadlessClient(room, options);
+    await headless.waitFor(() => headless.ship() !== undefined);
+    return headless;
+  }
+
+  get sessionId(): string {
+    return this.room.sessionId;
+  }
+
+  get connected(): boolean {
+    return this.open;
+  }
+
+  get code(): string {
+    return this.room.state?.code ?? "";
+  }
+
+  get frame(): number {
+    return this.room.state?.frame ?? 0;
+  }
+
+  /** Players in the match, whether this client can see their ships or not. */
+  get playerCount(): number {
+    return this.room.state?.players ?? 0;
+  }
+
+  /** The ships in this client's decoded state: its own and those in its sight. */
+  visibleShipIds(): string[] {
+    return [...(this.room.state?.ships?.keys() ?? [])].sort();
+  }
+
+  /** The authoritative state of a ship as last decoded, by default this client's own. */
+  ship(id: string = this.sessionId): ShipView | undefined {
+    const ship = this.room.state?.ships?.get(id);
+    if (ship === undefined) return undefined;
+    return { id: ship.id, slot: ship.slot, x: ship.x, y: ship.y, heading: ship.heading, speed: ship.speed, dock: ship.dock };
+  }
+
+  /** The world tick of the last decoded patch (20 a second). */
+  get worldTick(): number {
+    return this.room.state?.worldTick ?? 0;
+  }
+
+  /** The telegraphed grapples in this client's decoded state: those whose attacker it sees, or aimed at it. */
+  grapples(): GrappleView[] {
+    return [...(this.room.state?.grapples?.values() ?? [])].map(({ attackerId, defenderId, aim, startTick, landTick }) => ({ attackerId, defenderId, aim, startTick, landTick }));
+  }
+
+  /** The duel markers in this client's decoded state: those within its sight. */
+  markers(): { x: number; y: number; startTick: number }[] {
+    return [...(this.room.state?.markers?.values() ?? [])].map(({ x, y, startTick }) => ({ x, y, startTick }));
+  }
+
+  /** This player's own encounter status, as decoded. */
+  status(): StatusView | undefined {
+    const status = this.room.state?.status?.get(this.sessionId);
+    if (status === undefined) return undefined;
+    const { mode, protection, protectedUntil, cooldownUntil, respawnAt } = status;
+    return { mode, protection, protectedUntil, cooldownUntil, respawnAt };
+  }
+
+  /** This player's own objective status (gold, rubbings, holds, theft choice), as decoded. */
+  objectives(): ObjectivesView | undefined {
+    const status = this.room.state?.status?.get(this.sessionId);
+    if (status === undefined) return undefined;
+    return {
+      gold: status.gold,
+      rubbings: list(status.rubbings),
+      islandTypes: list(status.islandTypes),
+      cacheTypes: list(status.cacheTypes),
+      target: status.target,
+      channel: status.channel,
+      channelType: status.channelType,
+      channelHeld: status.channelHeld,
+      channelTotal: status.channelTotal,
+      channelResult: status.channelResult,
+      channelResultAt: status.channelResultAt,
+      theftDuel: status.theftDuel,
+      theftOptions: list(status.theftOptions),
+      theftDeadline: status.theftDeadline,
+      settledRole: status.settledRole,
+      stolen: status.stolen,
+      goldChange: status.goldChange,
+      settledAt: status.settledAt,
+      settledChoice: status.settledChoice,
+      choiceDeadline: status.choiceDeadline,
+    };
+  }
+
+  /** This player's gold, as decoded (0 before the status arrives). */
+  gold(): number {
+    return this.objectives()?.gold ?? 0;
+  }
+
+  /** The rubbing types this player holds, in type order, as decoded. */
+  rubbings(): string[] {
+    return this.objectives()?.rubbings ?? [];
+  }
+
+  /** The recovery cache markers in this client's decoded state: those within its sight. */
+  caches(): CacheView[] {
+    return [...(this.room.state?.caches?.entries() ?? [])].map(([id, cache]) => ({ id, x: cache.x, y: cache.y, dock: cache.dock }));
+  }
+
+  /** The supply crate markers in this client's decoded state: those within its sight. */
+  crates(): CrateView[] {
+    return [...(this.room.state?.crates?.entries() ?? [])].map(([id, crate]) => ({ id, x: crate.x, y: crate.y })).sort((a, b) => (a.id < b.id ? -1 : 1));
+  }
+
+  /** This player's own gold, tonics, active tonic and top speed, as decoded. */
+  shopView(): ShopView | undefined {
+    const status = this.room.state?.status?.get(this.sessionId);
+    if (status === undefined) return undefined;
+    return { gold: status.gold, tonics: status.tonics, tonicUntil: status.tonicUntil, maxSpeed: status.maxSpeed };
+  }
+
+  /** Buys a sail tonic (the shop's Buy button), with a fresh request id unless one is given (a retry); returns the id. */
+  buyTonic(requestId = `s${++this.shopRequests}`): string {
+    this.room.send(ShopMessageType.BuyTonic, { requestId } satisfies BuyTonicMessage);
+    return requestId;
+  }
+
+  /** Drinks a sail tonic (T), with a fresh request id unless one is given (a retry); returns the id. */
+  useTonic(requestId = `u${++this.shopRequests}`): string {
+    this.room.send(ShopMessageType.UseTonic, { requestId } satisfies UseTonicMessage);
+    return requestId;
+  }
+
+  /** The answers to a tonic purchase id so far. */
+  tonicPurchaseAnswers(requestId: string): TonicPurchaseMessage[] {
+    return this.tonicPurchases.filter((result) => result.requestId === requestId);
+  }
+
+  /** The answers to a drink id so far. */
+  tonicUseAnswers(requestId: string): TonicUsedMessage[] {
+    return this.tonicUses.filter((result) => result.requestId === requestId);
+  }
+
+  /**
+   * Withholds every input message for `ms` from now, as a stalled network would: the player's keys stay down (the
+   * holds keep calling `sendInput`), but nothing reaches the server until the stall ends.
+   */
+  stallInput(ms: number): void {
+    this.withheldUntil = Date.now() + ms;
+  }
+
+  /** This player's own view of the ruin where it is moored, as decoded. */
+  ruinView(): RuinView | undefined {
+    const status = this.room.state?.status?.get(this.sessionId);
+    if (status === undefined) return undefined;
+    return { ruin: status.ruin, ruinOpen: status.ruinOpen, ruinLockedUntil: status.ruinLockedUntil };
+  }
+
+  /** The islands' ruin markers in this client's decoded state: those of islands in its sight or where it is moored. */
+  ruinMarkers(): RuinMarkerView[] {
+    return [...(this.room.state?.ruins?.values() ?? [])].map(({ island, x, y, unlocked }) => ({ island, x, y, unlocked })).sort((a, b) => a.island - b.island);
+  }
+
+  /** This player's own fruit fields, as decoded. */
+  fruitView(): FruitView | undefined {
+    const status = this.room.state?.status?.get(this.sessionId);
+    if (status === undefined) return undefined;
+    const { kit, pedestal, fruitHeld, fruitTotal, fruitResult, fruitResultAt } = status;
+    return { kit, pedestal, fruitHeld, fruitTotal, fruitResult, fruitResultAt };
+  }
+
+  /** The fruit pedestals' markers in this client's decoded state: those whose dock is in its sight. */
+  pedestalMarkers(): PedestalMarkerView[] {
+    return [...(this.room.state?.pedestals?.entries() ?? [])].map(([id, { island, dock, full }]) => ({ id, island, dock, full })).sort((a, b) => a.island - b.island);
+  }
+
+  /** This player's journal log, as decoded from its private status (§3, §13). */
+  journal(): JournalEntry[] {
+    return parseJournal(this.room.state?.status?.get(this.sessionId)?.journal ?? "");
+  }
+
+  /** The islands this player knows, as decoded from its private status (§13). */
+  knownIslands(): KnownIsland[] {
+    return parseKnownIslands(this.room.state?.status?.get(this.sessionId)?.knownIslands ?? "");
+  }
+
+  /** What a targeted rumor about each missing type would yield, as decoded from its private status (§11). */
+  rumorOffers(): { type: string; offer: string }[] {
+    return parseRumorOffers(this.room.state?.status?.get(this.sessionId)?.rumorOffers ?? "");
+  }
+
+  /** Asks for a targeted rumor about `type` (the journal's Buy button), with a fresh request id unless one is given; returns the id. */
+  buyRumor(type: BuyRumorMessage["type"], requestId = `t${++this.rumorRequests}`): string {
+    this.room.send(JournalMessageType.BuyRumor, { requestId, type } satisfies BuyRumorMessage);
+    return requestId;
+  }
+
+  /** The answers to a request id so far. */
+  rumorAnswers(requestId: string): RumorResultMessage[] {
+    return this.rumorResults.filter((result) => result.requestId === requestId);
+  }
+
+  /** Inspects the pedestal at the dock this player is moored at (F in the browser). */
+  inspectFruit(): void {
+    this.room.send(FruitMessageType.Inspect, {} satisfies InspectFruitMessage);
+  }
+
+  /** Opens the ruin of the island this player is moored at (R in the browser). */
+  openRuin(): void {
+    this.room.send(RuinMessageType.Open, {} satisfies OpenRuinMessage);
+  }
+
+  /** Answers the ruin this player has open, with a fresh request id unless one is given (a retry); returns the id. */
+  answerRuin(attempt: AnswerRuinMessage["attempt"], requestId = `r${++this.ruinRequests}`): string {
+    this.room.send(RuinMessageType.Answer, { requestId, attempt } satisfies AnswerRuinMessage);
+    return requestId;
+  }
+
+  /** Resolves with the verdict for a request id once it arrives (the latest, for a retried id). */
+  async ruinResult(requestId: string, timeoutMs = 5000, after = 0): Promise<RuinResultMessage> {
+    await this.waitFor(() => this.ruinResults.slice(after).some((result) => result.requestId === requestId), timeoutMs);
+    return this.ruinResults.slice(after).find((result) => result.requestId === requestId)!;
+  }
+
+  /** §2's phase, as decoded: "lobby", "ready", "departure", "exploration" or "ended". */
+  get phase(): string {
+    return this.room.state?.phase ?? "";
+  }
+
+  /** The private host's seat, as decoded (0: none). */
+  get hostSeat(): number {
+    return this.room.state?.hostSeat ?? 0;
+  }
+
+  /** This player's own seat, from its private status (0 before it arrives). */
+  get seat(): number {
+    return this.room.state?.status?.get(this.sessionId)?.seat ?? 0;
+  }
+
+  /** The timer: world ticks left, as decoded. */
+  get remainingTicks(): number {
+    return this.room.state?.remainingTicks ?? 0;
+  }
+
+  /** The private host asks to start the ready countdown (§2), as the lobby's Start button does. */
+  startMatch(): void {
+    this.room.send(MatchMessageType.Start, {} satisfies StartMatchMessage);
+  }
+
+  /** Resolves once player control has started (§2: the departure, or later). */
+  async waitForControl(timeoutMs = 5000): Promise<void> {
+    await this.waitFor(() => this.phase === "departure" || this.phase === "exploration" || this.phase === "ended", timeoutMs);
+  }
+
+  /** This player's route and claim, as decoded from its private status. */
+  claimView(): ClaimView | undefined {
+    const status = this.room.state?.status?.get(this.sessionId);
+    if (status === undefined) return undefined;
+    const { fullSet, routeKnown, routeActive, routeX, routeY, claim, claimHeld, claimTotal, claimInterrupt, claimInterruptAt } = status;
+    return { fullSet, routeKnown, routeActive, routeX, routeY, claim, claimHeld, claimTotal, claimInterrupt, claimInterruptAt };
+  }
+
+  /** The match's end and results screen, once decoded (undefined while the match runs). */
+  results(): ResultsView | undefined {
+    const state = this.room.state;
+    if (state === undefined || !state.endReason) return undefined;
+    return {
+      reason: state.endReason,
+      winnerSeat: state.winnerSeat,
+      tick: state.endTick,
+      elapsedTicks: state.elapsedTicks,
+      players: [...state.results].map((line) => ({
+        seat: line.seat,
+        winner: line.winner,
+        left: line.left,
+        rubbingsHeld: line.rubbingsHeld,
+        collected: line.collected,
+        thefts: line.thefts,
+        lost: line.lost,
+        duelsWon: line.duelsWon,
+        duelsLost: line.duelsLost,
+        duelsDrawn: line.duelsDrawn,
+        gold: line.gold,
+        cachesClaimed: line.cachesClaimed,
+        islandsVisited: line.islandsVisited,
+      })),
+    };
+  }
+
+  /** Sends a theft choice for this player's current choice window (or any duel key and type, for validation tests). */
+  chooseTheft(type: string, duel: string = this.objectives()?.theftDuel ?? ""): void {
+    this.room.send(RubbingMessageType.ChooseTheft, { duel, type } as ChooseTheftMessage);
+  }
+
+  /** How many duel lobbies this client decoded: its own duel at sea, or none. */
+  get duelCount(): number {
+    return this.room.state?.duels?.size ?? 0;
+  }
+
+  /** Reports this fighter's arena loaded (§6), for the duel the room holds for it now. */
+  ready(): void {
+    this.readiedKey = this.duelEntry()?.[0];
+    this.room.send(DuelMessageType.Ready, {} satisfies DuelReadyMessage);
+  }
+
+  private duelEntry(): [string, SeaDuelSchema] | undefined {
+    const duels = this.room.state?.duels;
+    if (duels === undefined) return undefined;
+    for (const entry of duels.entries()) if ([...entry[1].seats].some((seat) => seat.sessionId === this.sessionId)) return entry;
+    return undefined;
+  }
+
+  /** How many raw frames the server has sent this client so far; a mark for `framesSince`. */
+  get frameCount(): number {
+    return this.frames.length;
+  }
+
+  /** The raw frames received since a `frameCount` mark. */
+  framesSince(mark: number): readonly Uint8Array[] {
+    return this.frames.slice(mark);
+  }
+
+  /**
+   * Test-only: asks the server at `endpoint` to put this client's ship at rest on a tile. Works only on a server
+   * started with its test-placement setting on. Resolves once this client has decoded the new position.
+   */
+  async placeShip(endpoint: string, placement: Omit<TestPlacement, "code" | "sessionId">): Promise<void> {
+    const response = await fetch(`${endpoint}${TEST_PLACEMENT_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: this.code, sessionId: this.sessionId, ...placement }),
+    });
+    if (!response.ok) throw new Error(`placement refused: HTTP ${response.status} ${await response.text()}`);
+    const placed = (await response.json()) as { x: number; y: number };
+    await this.waitFor(() => this.ship()?.x === placed.x && this.ship()?.y === placed.y && this.ship()?.speed === 0);
+  }
+
+  /** Sends one input tagged with the last decoded frame and the next sequence number. */
+  sendInput(movement: Movement): InputMessage {
+    const message: InputMessage = {
+      seq: ++this.seq,
+      frame: this.frame,
+      buttons: movement.buttons ?? 0,
+      moveX: movement.moveX,
+      moveY: movement.moveY,
+    };
+    if (Date.now() >= this.withheldUntil) this.room.send(MessageType.Input, message);
+    return message;
+  }
+
+  /** Sends anything at all, for tests of the server's validation. */
+  sendRaw(type: string, payload: unknown): void {
+    this.room.send(type, payload);
+  }
+
+  /** Holds a movement for `durationMs`, refreshing it faster than the server's hold window, then releases it. */
+  async hold(movement: Movement, durationMs: number): Promise<void> {
+    const until = Date.now() + durationMs;
+    while (Date.now() < until) {
+      this.sendInput(movement);
+      await sleep(100);
+    }
+    this.sendInput({ moveX: 0, moveY: 0 });
+  }
+
+  /** Keeps sending a movement until `predicate` holds (or `timeoutMs` passes), then releases it. */
+  async holdUntil(movement: Movement, predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    try {
+      while (!predicate()) {
+        if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs} ms of holding ${JSON.stringify(movement)}`);
+        this.sendInput(movement);
+        await sleep(50);
+      }
+    } finally {
+      this.sendInput({ moveX: 0, moveY: 0 });
+    }
+  }
+
+  /** Resolves once `predicate` holds, polling the decoded state; rejects after `timeoutMs`. */
+  async waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs} ms`);
+      await sleep(20);
+    }
+  }
+
+  /** Presses the grapple (J) as a tap: one message with the button, then its release. */
+  tapGrapple(movement: Movement = { moveX: 0, moveY: 0 }): void {
+    this.sendInput({ ...movement, buttons: (movement.buttons ?? 0) | Buttons.Grapple });
+    this.sendInput(movement);
+  }
+
+  /** Leaves the match: a quit, which forfeits a duel at once. A client whose connection is down stops reconnecting. */
+  async leave(): Promise<void> {
+    await this.fighter.stop();
+    if (!this.open) return;
+    this.room.reconnection.enabled = false;
+    if (this.room.connection?.isOpen !== true) {
+      this.open = false;
+      return;
+    }
+    await Promise.race([this.room.leave(true).catch(() => undefined), sleep(2000)]);
+  }
+}
+
+/** A fresh one-time create token from Node's crypto API. */
+export function newCreateToken(): string {
+  return formatCreateToken(randomBytes(CREATE_TOKEN_BYTES));
+}
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

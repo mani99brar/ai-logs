@@ -1,0 +1,240 @@
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { Buttons, WORLD_HOLD_GRACE_FRAMES } from "@pirate-sea-race/protocol";
+import { startGameServer, type MatchRoom, type RunningGameServer } from "@pirate-sea-race/server";
+import { fruitRules } from "@pirate-sea-race/simulation/fruits";
+import { findPlayer, objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { sleep, type HeadlessClient, type Movement } from "@pirate-sea-race/test-tools";
+import { tuned } from "./rubbingsSetup.js";
+import { dockFor, EAST, HOLD_E, HUB_X, OPEN_ROW, playersAt, roomOf, tracker, until, type Seat } from "./seaDuelSetup.js";
+
+/**
+ * Holds through short network gaps (the operator's playtest bug, §12, `docs/architecture.md`): a player holds E (or F)
+ * as a browser does, resending the held input every 100 ms, while the headless client's transport withholds its input
+ * messages for a while (`stallInput`), as a stalled network would. A world hold button survives gaps of up to 750 ms
+ * (`WORLD_HOLD_GRACE_FRAMES`) in the room's hold reads only; movement keeps the 250 ms lapse, and a moored ship keeps its
+ * mooring. The collection is the real six seconds here (the rules' own `collectTicks`); eating is three.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  server = await startGameServer({
+    port: 0,
+    host: "127.0.0.1",
+    handleSignals: false,
+    testPlacement: true,
+    matchTuning: tuned({ testFruits: ["ember", "smoke", "smoke", "ember"], testHooks: true }),
+  });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+const SEAT: Seat = { tileX: HUB_X - 6, tileY: OPEN_ROW, heading: EAST };
+const SUN_DOCK = dockFor("sun");
+const COLLECT_TICKS = objectiveRules.collectTicks;
+const RESEND_MS = 100;
+
+const channelOf = (room: MatchRoom, id: string) => findPlayer(room.ledgerState, id)?.channel ?? null;
+
+/** Places a ship on a dock's tile and moors it by holding `movement` (E, with a throttle or not) until it is moored. */
+async function moor(client: HeadlessClient, dock: { id: number; tileX: number; tileY: number }, movement: Movement = HOLD_E): Promise<void> {
+  await client.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+  const deadline = Date.now() + 5000;
+  while (client.ship()?.dock !== dock.id) {
+    if (Date.now() > deadline) throw new Error("not moored");
+    client.sendInput(movement);
+    await sleep(50);
+  }
+}
+
+/**
+ * Holds `movement` as a browser does (resent every 100 ms, never released) until `done`, stalling the transport for
+ * each `[atMs, forMs]` of `stalls` (measured from the start). Every 10 ms it samples the room: returns the ledger
+ * channels' start ticks seen, and whether the ship ever left its dock.
+ */
+async function holdThrough(
+  client: HeadlessClient,
+  movement: Movement,
+  stalls: readonly (readonly [number, number])[],
+  done: () => boolean,
+  timeoutMs = 12_000,
+): Promise<{ starts: Set<number>; castOff: boolean; cancelledDuring: boolean[] }> {
+  const room = roomOf(client);
+  const start = Date.now();
+  const pending = [...stalls];
+  const starts = new Set<number>();
+  const cancelledDuring = stalls.map(() => false);
+  let castOff = false;
+  let lastSend = 0;
+  while (!done()) {
+    const now = Date.now() - start;
+    if (now > timeoutMs) throw new Error(`hold not done within ${timeoutMs} ms`);
+    const next = pending[0];
+    if (next !== undefined && now >= next[0]) {
+      client.stallInput(next[1]);
+      pending.shift();
+    }
+    if (now - lastSend >= RESEND_MS) {
+      client.sendInput(movement);
+      lastSend = now;
+    }
+    const channel = channelOf(room, client.sessionId);
+    if (channel !== null) starts.add(channel.startTick);
+    stalls.forEach(([at, length], index) => {
+      if (channel === null && now > at + WORLD_HOLD_GRACE_FRAMES * (1000 / 60) + 100 && now < at + length) cancelledDuring[index] = true;
+    });
+    if (room.matchState.ships.find((ship) => ship.id === client.sessionId)?.dock === -1) castOff = true;
+    await sleep(10);
+  }
+  return { starts, castOff, cancelledDuring };
+}
+
+describe.concurrent("holds through short network gaps", () => {
+  it("completes a full 6 s collection while E is held through two stalls of 300–450 ms, bridging both gaps", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [SEAT], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await moor(player, SUN_DOCK);
+    const held = await holdThrough(
+      player,
+      HOLD_E,
+      [
+        [1500, 350],
+        [3500, 450],
+      ],
+      () => player.rubbings().includes("sun"),
+    );
+    player.sendInput({ moveX: 0, moveY: 0 });
+    // One channel from start to finish: neither stall reset it.
+    expect(held.starts.size).toBe(1);
+    expect(held.castOff).toBe(false);
+    expect(room.ledgerState.rubbings.find((rubbing) => rubbing.location.kind === "player" && rubbing.location.playerId === player.sessionId)?.type).toBe("sun");
+    await player.waitFor(() => player.objectives()?.channelResult === "collected:sun");
+    // The room's diagnostics counted the two gaps it bridged, and no lapse.
+    expect(room.inputDiagnostics(player.sessionId)).toMatchObject({ gapsBridged: 2, holdsLapsed: 0 });
+  }, 30_000);
+
+  it("cancels the collection when a stall outlasts the grace (1.2 s): the channel is gone, and E held again starts it from zero; the lapse is logged", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const warn = vi.spyOn(console, "warn");
+    onTestFinished(() => void warn.mockRestore());
+    const [player] = (await playersAt(endpoint, [SEAT], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await moor(player, SUN_DOCK);
+    let firstStart: number | undefined;
+    let restarted: { startTick: number; heldTicks: number } | undefined;
+    const held = await holdThrough(player, HOLD_E, [[1000, 1200]], () => {
+      const channel = channelOf(room, player.sessionId);
+      firstStart ??= channel?.startTick;
+      if (channel !== null && firstStart !== undefined && channel.startTick !== firstStart) restarted ??= { startTick: channel.startTick, heldTicks: channel.heldTicks };
+      return restarted !== undefined;
+    });
+    player.sendInput({ moveX: 0, moveY: 0 });
+    // The channel was gone during the stall, past the grace window; E held again started a new one from zero.
+    expect(held.cancelledDuring).toEqual([true]);
+    expect([...held.starts]).toEqual([firstStart]);
+    expect(restarted!.startTick).toBeGreaterThan(firstStart! + Math.floor(1200 / 50) - 2);
+    expect(restarted!.heldTicks).toBeLessThanOrEqual(2);
+    expect(player.rubbings()).toEqual([]);
+    expect(room.inputDiagnostics(player.sessionId)).toMatchObject({ gapsBridged: 0, holdsLapsed: 1 });
+    const logged = warn.mock.calls.map((call) => String(call[0])).filter((line) => line.includes(player.sessionId));
+    expect(logged).toEqual([expect.stringMatching(new RegExp(`^match ${room.state.code}: ${player.sessionId}'s held hold button lapsed after (7[5-9]\\d|8\\d\\d) ms without input$`))]);
+  }, 30_000);
+
+  it("cancels the collection at once on an explicit key-up, on the next world tick", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [SEAT], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await moor(player, SUN_DOCK);
+    await player.hold(HOLD_E, 1000);
+    // `hold` ended with the release: a message without E. The clock is held so the release lines up with one tick.
+    player.sendInput(HOLD_E);
+    await until(() => (channelOf(room, player.sessionId)?.heldTicks ?? 0) > 20, 3000, "the hold");
+    room.pauseAfterTick(room.matchState.worldTick);
+    await until(() => room.worldPaused, 2000, "the pause");
+    expect(channelOf(room, player.sessionId)).not.toBeNull();
+    player.sendInput({ moveX: 0, moveY: 0 });
+    await sleep(150);
+    room.stepWorldTicks(1);
+    expect(channelOf(room, player.sessionId)).toBeNull();
+    room.resumeWorld();
+    expect(room.inputDiagnostics(player.sessionId)).toMatchObject({ gapsBridged: 0, holdsLapsed: 0 });
+  }, 30_000);
+
+  it("keeps a ship moored with W and E held through a 400 ms stall: neither cast off nor its collection reset", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [SEAT], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    // Driven in with ahead and E held, as a player does: it moors with ahead as its mooring throttle.
+    const aheadAndE: Movement = { moveX: 0, moveY: -1, buttons: Buttons.Interact };
+    await moor(player, SUN_DOCK, aheadAndE);
+    expect(room.matchState.ships.find((ship) => ship.id === player.sessionId)!.mooredThrottle).toBe(1);
+    const held = await holdThrough(player, aheadAndE, [[1500, 400]], () => player.rubbings().includes("sun"));
+    player.sendInput({ moveX: 0, moveY: 0 });
+    expect(held.castOff).toBe(false);
+    expect(held.starts.size).toBe(1);
+    expect(player.ship()?.dock).toBe(SUN_DOCK.id);
+    expect(room.inputDiagnostics(player.sessionId)).toMatchObject({ gapsBridged: 1, holdsLapsed: 0 });
+  }, 30_000);
+
+  it("eats a fruit while F is held through a 400 ms stall, and a longer stall interrupts it as released", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [SEAT], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    // Palm Key's pedestal (its highest-id dock) holds Ember (test-only).
+    const pedestal = seaMap.docks.filter((dock) => dock.island === 0).at(-1)!;
+    const holdF: Movement = { moveX: 0, moveY: 0, buttons: Buttons.Fruit };
+    await moor(player, pedestal);
+    // Too long a stall first: the grace ends, the channel is interrupted as released.
+    await holdThrough(player, holdF, [[600, 1200]], () => player.fruitView()?.fruitResult === "interrupted:released");
+    player.stallInput(0);
+    player.sendInput({ moveX: 0, moveY: 0 });
+    await sleep(200);
+    expect(room.fruitState.meals).toEqual([]);
+    // Then a 400 ms stall inside the three seconds: bridged, eaten.
+    const channels: number[] = [];
+    const sample = setInterval(() => {
+      const channel = room.fruitState.channels.find((each) => each.playerId === player.sessionId);
+      if (channel !== undefined) channels.push(channel.held);
+    }, 10);
+    try {
+      await holdThrough(player, holdF, [[1000, 400]], () => player.fruitView()?.kit === "ember");
+    } finally {
+      clearInterval(sample);
+    }
+    player.sendInput({ moveX: 0, moveY: 0 });
+    // Its progress only ever grew: no reset during the stall.
+    expect(channels.every((held, index) => index === 0 || held >= channels[index - 1]!)).toBe(true);
+    expect(room.fruitState.meals).toEqual([expect.objectContaining({ playerId: player.sessionId, kit: "ember" })]);
+    expect(fruitRules.eatTicks).toBe(60);
+    expect(room.inputDiagnostics(player.sessionId)).toMatchObject({ gapsBridged: 1, holdsLapsed: 1 });
+  }, 30_000);
+
+  it("keeps movement's 250 ms lapse: a ship sailing ahead through a 400 ms stall slows as with no input", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [SEAT], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    const ahead: Movement = { moveX: 0, moveY: -1, buttons: Buttons.Interact };
+    const speeds: number[] = [];
+    const start = Date.now();
+    let stalled = false;
+    while (Date.now() - start < 2500) {
+      if (!stalled && Date.now() - start > 1200) {
+        player.stallInput(400);
+        stalled = true;
+      }
+      player.sendInput(ahead);
+      speeds.push(room.matchState.ships.find((ship) => ship.id === player.sessionId)!.speed);
+      await sleep(RESEND_MS);
+    }
+    player.sendInput({ moveX: 0, moveY: 0 });
+    // At full speed before the stall; the lapse let drag slow it during the stall (E held changes nothing at sea).
+    expect(Math.max(...speeds)).toBe(39);
+    expect(speeds.slice(speeds.indexOf(39)).some((speed) => speed < 39)).toBe(true);
+    expect(room.inputDiagnostics(player.sessionId)).toMatchObject({ gapsBridged: 1 });
+  }, 30_000);
+});

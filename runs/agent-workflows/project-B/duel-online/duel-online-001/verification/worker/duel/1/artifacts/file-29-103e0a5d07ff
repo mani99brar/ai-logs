@@ -1,0 +1,161 @@
+import { hashState } from "../hash.js";
+import { sanitizeDuelInput, type DuelInputs } from "../duel/input.js";
+import { createDuelInputLog } from "../duel/replay.js";
+import { snapshotDuel } from "../duel/snapshot.js";
+import type { DuelConfig, DuelState, PlayerIndex } from "../duel/state.js";
+import { stepDuel } from "../duel/step.js";
+import type { DuelInputLog } from "@pirate-sea-race/content/moves";
+import { HELD_INPUT_FRAMES, type ConfirmedFrames } from "./rollback.js";
+
+/** One frame bundle every this many frames (20 a second). */
+export const BUNDLE_FRAMES = 3;
+/** Every this many bundles carries a full snapshot (every 6 frames); the others carry the hash. */
+export const SNAPSHOT_EVERY_BUNDLES = 2;
+
+/** How far back the authority remembers which frames it substituted (the client's input lead is at most 30). */
+const RECENT_FRAMES = 64;
+
+/** A frame bundle as the server sends it: `substituted` is always present. */
+export interface AuthorityBundle extends ConfirmedFrames {
+  readonly substituted: number;
+}
+
+export interface AuthorityStats {
+  /** Frames whose input came from a message, per player. */
+  received: [number, number];
+  /** Frames where the held input was repeated because none arrived in time, per player. */
+  repeated: [number, number];
+  /** Frames where neutral was used (no input for more than HELD_INPUT_FRAMES), per player. */
+  neutral: [number, number];
+  /** Inputs that arrived after their frame was stepped with a substitute; ignored (late input never rewrites a frame). */
+  late: [number, number];
+  /** Copies of an input already received (each frame travels in two messages), ignored. */
+  duplicates: [number, number];
+}
+
+/**
+ * The server's side of the duel netcode (§15), pure so tests can run it without a network: it steps `stepDuel` once
+ * per call with each player's input for that frame, and assembles the frame bundles.
+ *
+ * - Each frame's input comes from the first message that carried it; later copies are ignored.
+ * - An input for a frame already stepped is ignored: late input never rewrites a completed frame.
+ * - A player with no input for a frame gets their last input repeated for up to HELD_INPUT_FRAMES (250 ms) after
+ *   their last received frame, then neutral. Both count as substitutions and are flagged in the bundle.
+ * - Every BUNDLE_FRAMES frames (and on the frame the duel ends) a bundle carries the pairs applied since the last one;
+ *   every SNAPSHOT_EVERY_BUNDLES-th bundle, and the last, carries a snapshot, the others the state hash.
+ */
+export class DuelAuthority {
+  readonly stats: AuthorityStats = { received: [0, 0], repeated: [0, 0], neutral: [0, 0], late: [0, 0], duplicates: [0, 0] };
+  private current: DuelState;
+  private readonly initial: DuelState;
+  private readonly pending: [Map<number, number>, Map<number, number>] = [new Map(), new Map()];
+  private readonly held: [number, number] = [0, 0];
+  private readonly heldFrame: [number | undefined, number | undefined] = [undefined, undefined];
+  private readonly scripted: [((state: DuelState) => number) | undefined, ((state: DuelState) => number) | undefined] = [undefined, undefined];
+  private readonly applied: DuelInputs[] = [];
+  /** Recently stepped frames whose input was substituted, per player, to tell a late input from a redundant copy. */
+  private readonly recentSubstitutes: [Set<number>, Set<number>] = [new Set(), new Set()];
+  private unsent: { inputs: DuelInputs[]; substituted: number } = { inputs: [], substituted: 0 };
+  private bundles = 0;
+
+  constructor(
+    private readonly config: DuelConfig,
+    initial: DuelState,
+  ) {
+    this.current = initial;
+    this.initial = initial;
+  }
+
+  get state(): DuelState {
+    return this.current;
+  }
+
+  get frame(): number {
+    return this.current.frame;
+  }
+
+  get over(): boolean {
+    return this.current.result !== null;
+  }
+
+  /**
+   * Inputs from one message: `inputs[k]` is for frame `lastFrame - inputs.length + 1 + k`. Returns how many were
+   * new; frames already stepped or already received are ignored.
+   */
+  receive(player: PlayerIndex, lastFrame: number, inputs: readonly number[]): number {
+    const first = lastFrame - inputs.length + 1;
+    let fresh = 0;
+    inputs.forEach((bits, index) => {
+      const frame = first + index;
+      if (frame <= this.current.frame) {
+        if (this.recentSubstitutes[player].has(frame)) this.stats.late[player]++;
+        else this.stats.duplicates[player]++;
+      } else if (this.pending[player].has(frame)) this.stats.duplicates[player]++;
+      else {
+        this.pending[player].set(frame, sanitizeDuelInput(bits));
+        fresh++;
+      }
+    });
+    return fresh;
+  }
+
+  /** Makes a player's input come from `script` (the practice dummy) instead of messages; undefined undoes it. */
+  script(player: PlayerIndex, script: ((state: DuelState) => number) | undefined): void {
+    this.scripted[player] = script;
+  }
+
+  /** Steps one frame; returns the bundle due after it, if one is. */
+  step(): AuthorityBundle | undefined {
+    const frame = this.current.frame + 1;
+    const index = this.unsent.inputs.length;
+    for (const recent of this.recentSubstitutes) recent.delete(frame - RECENT_FRAMES);
+    const pair = ([0, 1] as const).map((player) => {
+      const script = this.scripted[player];
+      if (script !== undefined) return sanitizeDuelInput(script(this.current));
+      const received = this.pending[player].get(frame);
+      this.pending[player].delete(frame);
+      if (received !== undefined) {
+        this.held[player] = received;
+        this.heldFrame[player] = frame;
+        this.stats.received[player]++;
+        return received;
+      }
+      this.unsent.substituted |= 1 << (2 * index + player);
+      this.recentSubstitutes[player].add(frame);
+      const since = this.heldFrame[player];
+      if (since !== undefined && frame - since <= HELD_INPUT_FRAMES) {
+        this.stats.repeated[player]++;
+        return this.held[player];
+      }
+      this.stats.neutral[player]++;
+      return 0;
+    }) as unknown as DuelInputs;
+    this.current = stepDuel(this.config, this.current, pair);
+    this.applied.push(pair);
+    this.unsent.inputs.push(pair);
+    if (frame % BUNDLE_FRAMES !== 0 && !this.over) return undefined;
+    this.bundles++;
+    const withSnapshot = this.bundles % SNAPSHOT_EVERY_BUNDLES === 0 || this.over;
+    const bundle: AuthorityBundle = {
+      frame,
+      inputs: this.unsent.inputs,
+      substituted: this.unsent.substituted,
+      ...(withSnapshot ? { snapshot: snapshotDuel(this.current) } : { hash: hashState(this.current) }),
+    };
+    this.unsent = { inputs: [], substituted: 0 };
+    return bundle;
+  }
+
+  /**
+   * A bundle with the current state and no inputs: sent at the fight's start and to a player who (re)joins, so their
+   * client can start from it. It confirms nothing; the pairs since the last bundle follow in the next one.
+   */
+  snapshotBundle(): AuthorityBundle {
+    return { frame: this.current.frame, inputs: [], substituted: 0, snapshot: snapshotDuel(this.current) };
+  }
+
+  /** Every pair applied so far, as an input log from the initial state (for `replayDuel`). */
+  inputLog(): DuelInputLog {
+    return createDuelInputLog(this.config, this.initial.frame, this.applied);
+  }
+}

@@ -1,0 +1,331 @@
+import { duelistMoveset, validateDuelInputLog } from "@pirate-sea-race/content/moves";
+import { describe, expect, it } from "vitest";
+import { canonicalize } from "../hash.js";
+import { nextInt } from "../random.js";
+import {
+  createDuelInputLog,
+  createDuelState,
+  defaultDuelConfig as config,
+  duelInput as I,
+  hashState,
+  mirrorDuelInput,
+  MOVESET_VERSION,
+  movesetVersion,
+  replayDuel,
+  restoreDuel,
+  sliceDuelInputLog,
+  snapshotDuel,
+  stepDuel,
+  traceDuel,
+  type DuelConfig,
+  type DuelEvent,
+  type DuelInputs,
+  type DuelState,
+  type FighterState,
+} from "./index.js";
+
+const FRAMES = config.moveset.rules.roundFrames;
+
+/** A seeded pseudo-random fight that lasts the round: mostly movement and guard, with occasional one-frame attacks. */
+function randomInputs(seed: number, frames: number): DuelInputs[] {
+  let rng = seed;
+  const draw = (bound: number) => {
+    const drawn = nextInt(rng, bound);
+    rng = drawn.state;
+    return drawn.value;
+  };
+  const held = [0, 0];
+  const left = [0, 0];
+  const inputs: DuelInputs[] = [];
+  for (let frame = 0; frame < frames; frame++) {
+    for (const player of [0, 1] as const) {
+      if (left[player] === 0) {
+        // Player one starts on the left, so its back is left; player two's is right.
+        const back = player === 0 ? I("left") : I("right");
+        const forward = player === 0 ? I("right") : I("left");
+        const moves = [0, back, back, back | I("down"), forward, forward, I("down"), I("up"), I("up") | forward, I("up") | back, I("dash"), back | I("dash"), I("left", "right")];
+        const attacks = [I("light"), I("heavy"), I("down", "heavy"), forward | I("heavy"), I("down", "light"), I("special1"), I("special2"), I("light", "heavy")];
+        const attack = draw(100) < 12;
+        held[player] = attack ? attacks[draw(attacks.length)]! : moves[draw(moves.length)]!;
+        left[player] = attack ? 1 : 1 + draw(30);
+      }
+      left[player]!--;
+    }
+    inputs.push([held[0]!, held[1]!]);
+  }
+  return inputs;
+}
+
+const INPUTS = randomInputs(2, FRAMES);
+const LOG = createDuelInputLog(config, 0, INPUTS);
+
+describe("determinism (§19)", () => {
+  it("gives the same hash for the same initial state and input log", () => {
+    const first = replayDuel(config, createDuelState(config), LOG);
+    const second = replayDuel(config, createDuelState(config), JSON.parse(JSON.stringify(LOG)));
+    expect(second.hash).toBe(first.hash);
+    expect(first.hash).toBe(hashState(first.state));
+    // The fight runs the whole round to a timeout and exercises the rules, not just walking.
+    expect(first.state.frame).toBe(FRAMES);
+    expect(first.state.result).toMatchObject({ reason: "timeout", frame: FRAMES });
+    const kinds = new Set(traceDuel(config, createDuelState(config), INPUTS).flatMap((state) => state.events.map((event) => event.kind)));
+    expect([...kinds].sort()).toEqual(["block", "grab", "hit", "throw"]);
+  });
+
+  it("gives a different hash when one input changes", () => {
+    // Player one starts the advancing thrust on the first frame instead of crouching. (A first-frame dash, as before
+    // the throw chord window re-timed this log, is absorbed by frame 2069, when player one walks into player two in
+    // the corner in both runs; the thrust changes the health of the rest of the fight.)
+    const changed = INPUTS.map((frame) => [...frame] as const);
+    changed[0] = [I("special1"), changed[0]![1]];
+    expect(changed[0]).not.toEqual(INPUTS[0]);
+    const original = replayDuel(config, createDuelState(config), LOG);
+    const edited = replayDuel(config, createDuelState(config), createDuelInputLog(config, 0, changed));
+    expect(edited.hash).not.toBe(original.hash);
+  });
+
+  it("restores a snapshot taken at frame N and replays the logged inputs from N to the same hash", () => {
+    const full = replayDuel(config, createDuelState(config), LOG);
+    const trace = traceDuel(config, createDuelState(config), INPUTS);
+    for (const frame of [0, 1, 1234, FRAMES - 1, FRAMES]) {
+      // The snapshot travels as JSON, as a server checkpoint would.
+      const wire = JSON.stringify(snapshotDuel(trace[frame]!));
+      const restored = restoreDuel(config, JSON.parse(wire));
+      expect(hashState(restored)).toBe(hashState(trace[frame]));
+      expect(replayDuel(config, restored, sliceDuelInputLog(LOG, frame)).hash).toBe(full.hash);
+    }
+  });
+
+  it("never mutates the state it steps from", () => {
+    const deepFreeze = <T>(value: T): T => {
+      if (typeof value === "object" && value !== null) {
+        for (const child of Object.values(value)) deepFreeze(child);
+        Object.freeze(value);
+      }
+      return value;
+    };
+    let state = deepFreeze(createDuelState(config));
+    for (const frameInputs of INPUTS.slice(0, 600)) {
+      const before = canonicalize(state);
+      const next = stepDuel(config, state, frameInputs);
+      expect(canonicalize(state)).toBe(before);
+      state = deepFreeze(next);
+    }
+  });
+
+  it("keeps every number in the state a safe integer", () => {
+    for (const state of traceDuel(config, createDuelState(config), INPUTS)) expect(() => canonicalize(state)).not.toThrow();
+  });
+});
+
+describe("move data version", () => {
+  // One datum changed: the jab deals 46 instead of 45.
+  const other: DuelConfig = {
+    moveset: { ...duelistMoveset, moves: duelistMoveset.moves.map((move) => (move.timing.id === "jab" ? { ...move, damage: 46 } : move)) },
+  };
+
+  it("is recorded in the duel state", () => {
+    expect(createDuelState(config).movesetVersion).toBe(MOVESET_VERSION);
+    expect(movesetVersion(config.moveset)).toBe(MOVESET_VERSION);
+  });
+
+  it("is derived from the move data: it is the data's state hash", () => {
+    expect(MOVESET_VERSION).toBe(hashState(duelistMoveset));
+    expect(movesetVersion(other.moveset)).toBe(hashState(other.moveset));
+    expect(movesetVersion(other.moveset)).not.toBe(MOVESET_VERSION);
+    // Pinned so that a change to the Duelist's data is deliberate: update it with the data (and see docs/duel.md).
+    expect(MOVESET_VERSION).toBe("248675b2a680c2c7");
+  });
+
+  it("refuses to restore, replay or step a duel from the old data once a move datum changes", () => {
+    const state = traceDuel(config, createDuelState(config), INPUTS.slice(0, 120))[120]!;
+    expect(() => restoreDuel(other, JSON.parse(JSON.stringify(snapshotDuel(state))))).toThrow(/moveset/);
+    expect(() => stepDuel(other, state, [0, 0])).toThrow(/moveset/);
+    expect(() => replayDuel(other, state, sliceDuelInputLog(LOG, 120))).toThrow(/moveset/);
+    // A log recorded on the old data is refused even from a state on the new data.
+    const fresh = traceDuel(other, createDuelState(other), INPUTS.slice(0, 120))[120]!;
+    expect(() => replayDuel(other, fresh, sliceDuelInputLog(LOG, 120))).toThrow(/log was recorded on moveset/);
+    expect(replayDuel(other, fresh, sliceDuelInputLog(createDuelInputLog(other, 0, INPUTS), 120)).state.frame).toBe(FRAMES);
+  });
+
+  it("refuses a log that does not start at the state's frame or is malformed", () => {
+    const initial = createDuelState(config);
+    expect(() => replayDuel(config, initial, sliceDuelInputLog(LOG, 10))).toThrow(/frame/);
+    expect(() => replayDuel(config, initial, { ...LOG, inputs: [[0, 1024]] })).toThrow(/invalid duel input log/);
+    expect(() => restoreDuel(config, { movesetVersion: MOVESET_VERSION })).toThrow(/not a duel state/);
+    expect(validateDuelInputLog(JSON.parse(JSON.stringify(LOG))).ok).toBe(true);
+  });
+});
+
+describe("restoring a snapshot", () => {
+  const trace = traceDuel(config, createDuelState(config), INPUTS);
+  // A frame with an attack and events, and the final frame with its result, so that every field has a value.
+  const busy = trace.find((state) => state.events.length > 0 && state.fighters.some((fighter) => fighter.action === "attack"))!;
+  const over = trace[FRAMES]!;
+
+  /** Every path to a leaf of plain data, with its value. */
+  function leaves(value: unknown, path: (string | number)[] = []): [(string | number)[], unknown][] {
+    if (typeof value !== "object" || value === null) return [[path, value]];
+    return Object.entries(value).flatMap(([key, child]) => leaves(child, [...path, Array.isArray(value) ? Number(key) : key]));
+  }
+
+  /** A JSON copy of `state` with the value at `path` replaced (or removed, for `undefined`). */
+  function withValue(state: DuelState, path: readonly (string | number)[], value: unknown): unknown {
+    const copy = JSON.parse(JSON.stringify(state)) as Record<string | number, unknown>;
+    let parent = copy;
+    for (const key of path.slice(0, -1)) parent = parent[key] as Record<string | number, unknown>;
+    const last = path[path.length - 1]!;
+    if (value === undefined) delete parent[last];
+    else parent[last] = value;
+    return copy;
+  }
+
+  it("accepts the snapshots the step produces", () => {
+    for (const state of [trace[0]!, busy, over]) expect(hashState(restoreDuel(config, JSON.parse(JSON.stringify(snapshotDuel(state)))))).toBe(hashState(state));
+  });
+
+  it("refuses a snapshot with any field of the wrong type or missing", () => {
+    for (const state of [busy, over]) {
+      const paths = leaves(state);
+      expect(paths.length).toBeGreaterThan(40);
+      for (const [path, value] of paths) {
+        const wrongType = typeof value === "number" ? String(value) : typeof value === "string" ? 7 : typeof value === "boolean" ? 1 : value === null ? 1 : null;
+        for (const malformed of [wrongType, undefined, { nested: true }]) {
+          expect(() => restoreDuel(config, withValue(state, path, malformed)), `${path.join(".")} = ${JSON.stringify(malformed)}`).toThrow();
+        }
+      }
+    }
+  });
+
+  it.each([
+    ["an x beyond the right wall", ["fighters", 0, "x"], config.moveset.arena.width],
+    ["an x inside the left wall's pushbox", ["fighters", 1, "x"], 1],
+    ["a fractional position", ["fighters", 0, "y"], 0.5],
+    ["negative health", ["fighters", 0, "health"], -1],
+    ["health above the maximum", ["fighters", 1, "health"], 1001],
+    ["stamina above the maximum", ["fighters", 0, "stamina"], 101],
+    ["a facing of 0", ["fighters", 0, "facing"], 0],
+    ["an unknown action", ["fighters", 0, "action"], "fly"],
+    ["an unknown move", ["fighters", 0, "moveId"], "fireball"],
+    ["a combo past the cap", ["fighters", 1, "combo"], 6],
+    ["undefined input bits", ["fighters", 1, "held"], 512],
+    ["a buffered press older than the buffer", ["fighters", 0, "buffer", "light"], 5],
+    ["an unknown buffered button", ["fighters", 0, "buffer", "haki"], 1],
+    ["an extra fighter field", ["fighters", 0, "armor"], 1],
+    ["a third fighter", ["fighters", 2], createDuelState(config).fighters[0]],
+    ["a negative frame", ["frame"], -1],
+    ["an unknown phase", ["phase"], "intermission"],
+    ["a generator state beyond 32 bits", ["rng"], 2 ** 32],
+    ["an event of an unknown kind", ["events", 0], { kind: "parry", attacker: 0, moveId: "jab", damage: 0 }],
+    ["an event by a third player", ["events", 0], { kind: "hit", attacker: 2, moveId: "jab", damage: 45 }],
+    ["an extra state field", ["haki"], 0],
+    ["a result while the round runs", ["result"], { winner: 0, reason: "ko", frame: 1 }],
+  ] as const)("refuses %s", (_label, path, value) => {
+    expect(() => restoreDuel(config, withValue(trace[0]!, path, value))).toThrow(/not a duel state/);
+  });
+
+  it("refuses an attack without a move, a move outside an attack and a finished duel without a result", () => {
+    const attacking = busy.fighters.findIndex((fighter) => fighter.action === "attack");
+    expect(() => restoreDuel(config, withValue(busy, ["fighters", attacking, "moveId"], null))).toThrow(/not a duel state/);
+    expect(() => restoreDuel(config, withValue(trace[0]!, ["fighters", 0, "moveId"], "jab"))).toThrow(/not a duel state/);
+    expect(() => restoreDuel(config, withValue(over, ["result"], null))).toThrow(/not a duel state/);
+    expect(() => restoreDuel(config, withValue(over, ["phase"], "round"))).toThrow(/not a duel state/);
+  });
+});
+
+describe("symmetry", () => {
+  const width = config.moveset.arena.width;
+
+  function mirrorFighter(fighter: FighterState): FighterState {
+    return { ...fighter, x: width - fighter.x, vx: -fighter.vx, facing: fighter.facing === 1 ? -1 : 1, held: mirrorDuelInput(fighter.held) };
+  }
+
+  const swapEvent = (event: DuelEvent): DuelEvent => ({ ...event, attacker: event.attacker === 0 ? 1 : 0 });
+  const sortedEvents = (events: readonly DuelEvent[]) => [...events].sort((a, b) => a.attacker - b.attacker || a.kind.localeCompare(b.kind));
+
+  /** The same duel seen from the other side: slots swapped, positions mirrored about the centre. */
+  function mirrorState(state: DuelState): DuelState {
+    const winner = state.result?.winner;
+    return {
+      ...state,
+      fighters: [mirrorFighter(state.fighters[1]), mirrorFighter(state.fighters[0])],
+      events: sortedEvents(state.events.map(swapEvent)),
+      result: state.result === null ? null : { ...state.result, winner: winner === null || winner === undefined ? null : winner === 0 ? 1 : 0 },
+    };
+  }
+
+  /** Plain data without negative zeros or event order, for comparison. */
+  const normal = (state: DuelState) => JSON.parse(canonicalize({ ...state, events: sortedEvents(state.events) })) as unknown;
+
+  const R = I("right");
+  const L = I("left");
+  const hold = (frames: number, p1 = 0, p2 = 0): DuelInputs[] => Array.from({ length: frames }, () => [p1, p2] as const);
+
+  const THROW = I("light", "heavy");
+
+  /**
+   * An exchange near a wall: a jab trade, a blocked heavy and its punish, two throws on one frame, a cross-up, an
+   * escaped throw and a landed one, a blocked low, a counter slash through a thrust, then random play.
+   */
+  const exchange: DuelInputs[] = [
+    ...hold(20, R, 0),
+    ...hold(1, I("light"), I("light")),
+    ...hold(30, 0, R),
+    ...hold(1, I("heavy"), R),
+    ...hold(34, 0, R),
+    ...hold(1, 0, I("light")),
+    ...hold(40, R, 0),
+    ...hold(1, THROW, THROW),
+    ...hold(40),
+    ...hold(1, I("dash"), I("up", "left")),
+    ...hold(50, R, L),
+    ...hold(40, R, R),
+    ...hold(1, R, THROW),
+    ...hold(13, R, 0),
+    ...hold(1, THROW, 0),
+    ...hold(30),
+    ...hold(40, R, R),
+    ...hold(1, R, THROW),
+    ...hold(40),
+    ...hold(30, R, R),
+    ...hold(1, I("down", "right"), I("down", "heavy")),
+    ...hold(40, I("down", "right"), 0),
+    ...hold(1, I("special2"), I("special1")),
+    ...hold(60),
+    ...randomInputs(7, 600),
+  ];
+
+  /** Traces a start and its mirror image (inputs mirrored and swapped) and compares them frame by frame. */
+  function expectMirrored(start: DuelState, inputs: readonly DuelInputs[]): DuelState[] {
+    const a = traceDuel(config, start, inputs);
+    const b = traceDuel(config, mirrorState(start), inputs.map(([p1, p2]) => [mirrorDuelInput(p2), mirrorDuelInput(p1)] as const));
+    for (let frame = 0; frame < a.length; frame++) expect(normal(b[frame]!), `frame ${frame}`).toEqual(normal(mirrorState(a[frame]!)));
+    return a;
+  }
+
+  it("gives the mirrored outcome, frame by frame, when the two players swap sides and slots", () => {
+    const start = createDuelState(config, { x: [8000, 9200] });
+    expect(normal(mirrorState(start))).toEqual(normal(createDuelState(config, { x: [width - 9200, width - 8000] })));
+    const a = expectMirrored(start, exchange);
+    // The exchange really contains simultaneous and opposing events, starting with the jab trade: both players' jabs,
+    // pressed on frame 21, hit each other on frame 28.
+    expect(sortedEvents(a[28]!.events).map(({ kind, attacker, moveId }) => `${kind} ${attacker} ${moveId}`)).toEqual(["hit 0 jab", "hit 1 jab"]);
+    const kinds = new Set(a.flatMap((state) => state.events.map((event) => event.kind)));
+    expect([...kinds].sort()).toEqual(expect.arrayContaining(["block", "grab", "hit", "throw", "throw-clash", "throw-escape"]));
+  });
+
+  it("separates an exact tie (equal x and equal facing) the same way on both sides", () => {
+    // Player one dashes into player two, who staggers facing the same way; both end the movement on x = 5064.
+    const start = createDuelState(config, { x: [5000, 5064] });
+    const tie: DuelState = {
+      ...start,
+      fighters: [
+        { ...start.fighters[0], action: "dash", actionFrame: 1, timer: 10, vx: 64, facing: 1 },
+        { ...start.fighters[1], action: "stagger", actionFrame: 1, timer: 10, facing: 1 },
+      ],
+    };
+    const a = expectMirrored(tie, hold(20));
+    // The dasher came from the left, so it stays on the left: each moves half the overlap.
+    expect(a[1]!.fighters.map((fighter) => fighter.x)).toEqual([5064 - 256, 5064 + 256]);
+  });
+});

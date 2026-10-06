@@ -1,0 +1,232 @@
+import * as Phaser from "phaser";
+import { defaultDuelConfig, findMove, worldBox, type DuelState, type FighterState, type WorldBox } from "@pirate-sea-race/simulation/duel";
+import type { DuelFeedEvent } from "@pirate-sea-race/simulation/netcode";
+import { ArenaFlashes, type ArenaFlash } from "./duelEvents.js";
+import { cssColor } from "./matchView.js";
+
+const { moveset } = defaultDuelConfig;
+const SUB = moveset.arena.subPixelsPerPixel;
+export const ARENA_WIDTH = moveset.arena.width / SUB;
+export const ARENA_HEIGHT = 320;
+/** The floor's height on the canvas, in pixels from the top. */
+const FLOOR = ARENA_HEIGHT - 40;
+
+export const FIGHTER_COLORS = [0xf4b942, 0x3dd6d0] as const;
+const BACKGROUND = 0x1b2a38;
+const FLOOR_COLOR = 0x3b5266;
+const HURTBOX_COLOR = 0x46e06b;
+const HITBOX_COLOR = 0xff3b30;
+const PUSHBOX_COLOR = 0x6aa9ff;
+
+/** What the arena draws from: the client's predicted duel, its fresh events, and the view options. */
+export interface ArenaSource {
+  /** The predicted state to draw, or undefined before the duel exists. */
+  state(): DuelState | undefined;
+  /** Events of newly simulated frames, each once (stable ids). */
+  drainEvents(): DuelFeedEvent[];
+  /** The predicted state of an earlier frame, while the client still holds it. */
+  stateAt(frame: number): DuelState | undefined;
+  /** The developer toggle: draw hurtboxes, pushboxes and active hitboxes. */
+  showBoxes(): boolean;
+  /** Big centred text: the countdown, or the result. */
+  banner(): string;
+}
+
+/** A fighter as drawn this frame, for the DOM report the browser tests read. */
+export interface DrawnFighter {
+  readonly x: number;
+  readonly y: number;
+  readonly action: string;
+  readonly moveId: string | null;
+  readonly facing: number;
+  readonly health: number;
+}
+
+/** Arena pixels of a box in sub-pixels (y up from the floor). */
+function toCanvas(box: WorldBox): { x: number; y: number; w: number; h: number } {
+  return { x: box.x0 / SUB, y: FLOOR - box.y1 / SUB, w: (box.x1 - box.x0) / SUB, h: (box.y1 - box.y0) / SUB };
+}
+
+function stance(fighter: FighterState): "standing" | "crouching" | "airborne" {
+  if (fighter.y > 0 || fighter.vy > 0 || fighter.action === "jump") return "airborne";
+  return fighter.crouching ? "crouching" : "standing";
+}
+
+/** The fighter's active hitbox this frame, if its move is on an active frame. */
+function activeHitbox(fighter: FighterState): WorldBox | undefined {
+  if (fighter.action !== "attack" || fighter.moveId === null) return undefined;
+  const move = findMove(moveset, fighter.moveId);
+  const frame = fighter.actionFrame;
+  const active = typeof move.timing.active === "number" ? move.timing.active : 0;
+  if (frame <= move.timing.startup || frame > move.timing.startup + active) return undefined;
+  return worldBox(move.hitbox, fighter.x, fighter.y, fighter.facing);
+}
+
+/** The outline colour that tells the fighter's state at a glance. */
+function stateColor(fighter: FighterState): number {
+  switch (fighter.action) {
+    case "hitstun":
+    case "knockdown":
+      return 0xff5a4f;
+    case "blockstun":
+      return 0xffffff;
+    case "stagger":
+      return 0xff9f1c;
+    case "thrown":
+    case "throw-break":
+      return 0xc77dff;
+    case "attack":
+      return activeHitbox(fighter) === undefined ? 0xfff3b0 : 0xff3b30;
+    default:
+      return 0x0b1620;
+  }
+}
+
+function actionLabel(fighter: FighterState): string {
+  if (fighter.action === "attack" && fighter.moveId !== null) {
+    const move = findMove(moveset, fighter.moveId);
+    return `${move.timing.name} ${fighter.actionFrame}`;
+  }
+  return fighter.crouching && fighter.action !== "crouch" ? `${fighter.action} (low)` : fighter.action;
+}
+
+/**
+ * The duel arena with placeholder shapes: each fighter is its stance's hurtbox in its colour, outlined by its state
+ * (red when hit, white when blocking, yellow in startup, red while its hitbox is active), with a nose on the side it
+ * faces and its current move above it. The developer toggle adds every hurtbox, pushbox and active hitbox. Hits,
+ * blocks, throws and the KO flash once each, by their stable event ids (`ArenaFlashes`). The scene reports what it drew as data
+ * attributes on its parent (`data-fighters`, `data-boxes`, `data-frame`) for the browser tests.
+ */
+export class ArenaScene extends Phaser.Scene {
+  private graphics!: Phaser.GameObjects.Graphics;
+  private boxes!: Phaser.GameObjects.Graphics;
+  private labels: Phaser.GameObjects.Text[] = [];
+  private bannerText!: Phaser.GameObjects.Text;
+  private readonly flashes = new ArenaFlashes();
+  private readonly flashTexts = new Map<string, Phaser.GameObjects.Text>();
+  private lastReport = "";
+  /** Frames whose active hitbox was drawn, since the page loaded. */
+  private hitboxFrames = 0;
+  /** The frame drawn last: hitboxes of the frames stepped since then are drawn too, so a slow render misses none. */
+  private lastDrawnFrame = -1;
+
+  constructor(
+    private readonly source: ArenaSource,
+    private readonly report: HTMLElement,
+  ) {
+    super("arena");
+  }
+
+  create(): void {
+    const floor = this.add.graphics();
+    floor.fillStyle(FLOOR_COLOR, 1);
+    floor.fillRect(0, FLOOR, ARENA_WIDTH, ARENA_HEIGHT - FLOOR);
+    this.graphics = this.add.graphics().setDepth(1);
+    this.boxes = this.add.graphics().setDepth(2);
+    const style = { fontFamily: "system-ui, sans-serif", fontSize: "12px", color: "#e8f1f5" };
+    this.labels = [this.add.text(0, 0, "", style).setOrigin(0.5, 1).setDepth(3), this.add.text(0, 0, "", style).setOrigin(0.5, 1).setDepth(3)];
+    this.bannerText = this.add
+      .text(ARENA_WIDTH / 2, 90, "", { fontFamily: "system-ui, sans-serif", fontSize: "36px", color: "#fff3b0" })
+      .setOrigin(0.5, 0.5)
+      .setDepth(4);
+  }
+
+  override update(time: number): void {
+    const state = this.source.state();
+    this.graphics.clear();
+    this.boxes.clear();
+    this.bannerText.setText(this.source.banner());
+    if (state === undefined) return;
+    const showBoxes = this.source.showBoxes();
+    let hurtboxes = 0;
+    let hitboxes = 0;
+    state.fighters.forEach((fighter, index) => {
+      const body = toCanvas(worldBox(moveset.fighter.hurtboxes[stance(fighter)], fighter.x, fighter.y, fighter.facing));
+      const knockedDown = fighter.action === "knockdown";
+      this.graphics.fillStyle(FIGHTER_COLORS[index]!, 1);
+      if (knockedDown) this.graphics.fillRect(body.x - body.h / 4, FLOOR - body.w / 2, body.h / 2, body.w / 2);
+      else this.graphics.fillRect(body.x, body.y, body.w, body.h);
+      this.graphics.lineStyle(3, stateColor(fighter), 1);
+      if (!knockedDown) this.graphics.strokeRect(body.x, body.y, body.w, body.h);
+      // The nose: which way the fighter faces.
+      const noseX = fighter.facing === 1 ? body.x + body.w : body.x;
+      this.graphics.fillStyle(0x0b1620, 1);
+      this.graphics.fillTriangle(noseX, body.y + 10, noseX + 8 * fighter.facing, body.y + 16, noseX, body.y + 22);
+      this.labels[index]!.setPosition(body.x + body.w / 2, body.y - 4).setText(actionLabel(fighter));
+
+      if (!showBoxes) return;
+      hurtboxes++;
+      this.boxes.lineStyle(2, HURTBOX_COLOR, 1);
+      this.boxes.strokeRect(body.x - 3, body.y - 3, body.w + 6, body.h + 6);
+      const { halfWidth, height } = moveset.fighter.pushbox;
+      const push = toCanvas({ x0: fighter.x - halfWidth, x1: fighter.x + halfWidth, y0: fighter.y, y1: fighter.y + height });
+      this.boxes.lineStyle(1, PUSHBOX_COLOR, 0.8);
+      this.boxes.strokeRect(push.x, push.y, push.w, push.h);
+    });
+    if (showBoxes) {
+      // Every active hitbox since the last picture: at 60 fps just this frame's, on a slower render the skipped ones too.
+      const first = Math.min(state.frame, Math.max(this.lastDrawnFrame + 1, state.frame - 60));
+      for (let frame = first; frame <= state.frame; frame++) {
+        const past = frame === state.frame ? state : this.source.stateAt(frame);
+        const active = past?.fighters.map(activeHitbox).filter((box) => box !== undefined) ?? [];
+        if (active.length > 0 && frame > this.lastDrawnFrame) this.hitboxFrames++;
+        for (const hit of active) {
+          if (frame === state.frame) hitboxes++;
+          const box = toCanvas(hit);
+          this.boxes.fillStyle(HITBOX_COLOR, frame === state.frame ? 0.6 : 0.3);
+          this.boxes.fillRect(box.x, box.y, box.w, box.h);
+        }
+      }
+    }
+    this.lastDrawnFrame = state.frame;
+
+    for (const flash of this.flashes.add(this.source.drainEvents(), time)) this.flash(flash, state);
+    for (const flash of this.flashes.expire(time)) {
+      this.flashTexts.get(flash.id)?.destroy();
+      this.flashTexts.delete(flash.id);
+    }
+
+    const drawn: DrawnFighter[] = state.fighters.map((fighter) => ({
+      x: fighter.x,
+      y: fighter.y,
+      action: fighter.action,
+      moveId: fighter.moveId,
+      facing: fighter.facing,
+      health: fighter.health,
+    }));
+    const report = JSON.stringify(drawn);
+    if (report !== this.lastReport) {
+      this.report.dataset["fighters"] = report;
+      this.lastReport = report;
+    }
+    this.report.dataset["frame"] = String(state.frame);
+    this.report.dataset["boxes"] = JSON.stringify({ shown: showBoxes, hurtboxes, hitboxes, hitboxFrames: this.hitboxFrames });
+  }
+
+  /** A short text over the fighter an event happened to (the flash's text and lifetime come from `flashFor`). */
+  private flash(flash: ArenaFlash, state: DuelState): void {
+    const x = flash.over === "centre" ? ARENA_WIDTH / 2 : state.fighters[flash.over].x / SUB;
+    const y = flash.over === "centre" ? 140 : FLOOR - 120;
+    const label = this.add.text(x, y, flash.text, { fontFamily: "system-ui, sans-serif", fontSize: "18px", color: cssColor(0xfff3b0) }).setOrigin(0.5, 0.5).setDepth(5);
+    this.flashTexts.set(flash.id, label);
+  }
+}
+
+/**
+ * The arena is a few flat shapes, so it uses Phaser's canvas renderer: without a GPU (a software WebGL) WebGL would
+ * cost the main thread tens of milliseconds a frame, which the client's 4 ms tick and the round-trip probes share.
+ */
+export function startArena(parent: HTMLElement, source: ArenaSource): Phaser.Game {
+  return new Phaser.Game({
+    type: Phaser.CANVAS,
+    parent,
+    width: ARENA_WIDTH,
+    height: ARENA_HEIGHT,
+    backgroundColor: BACKGROUND,
+    banner: false,
+    audio: { noAudio: true },
+    scene: new ArenaScene(source, parent),
+  });
+}
+
+export { HITBOX_COLOR, HURTBOX_COLOR };

@@ -1,0 +1,206 @@
+# PRD: Review Visibility and Run Inputs
+
+Status: Draft for approval — implementation has not started. Written 2026-09-21 after the first live automatic run (project-workflows-001). Three decisions are still open; see section 11.
+
+## 1. Problem
+
+The first live run reached a verified feature branch, but two things that decided the outcome are invisible in the Projects viewer and one is invisible while it happens.
+
+- The reviewer's verdict and six findings exist only in `review.json` in the run directory. The viewer's review node shows "No result has been published" and "No session recorded", because the projects API contract has no result type for a review and the adapter drops `values.review` from the export.
+- The reviewer runs as a headless `claude --print` process. Unlike the two workers, it gets no Herdr pane, so nobody can watch it read the diff or see where its 30-minute budget goes.
+- The run's inputs are not shown anywhere: the task text each worker received, the owned paths and checks from the policy, the handoff and completion files, the launch receipts with session ids and timestamps, and the automatic-mode deadlines. A reader of the viewer cannot answer "what was this worker asked to do?" without opening `plan.json`.
+
+The viewer therefore shows that a run succeeded, but not what it was asked to build or why the reviewer let it through.
+
+## 2. Goals and non-goals
+
+Goals, each with its acceptance test in section 9:
+
+1. The reviewer is a native Claude session that appears as a third pane in the run's Herdr tab, and its transcript is resumable like a worker's.
+2. The review node in the viewer shows the verdict, the reviewer session, the bundle hash it reviewed, and every finding with severity and disposition, linked to the task it relates to.
+3. Every run and every worker node shows its inputs: task text, owned paths, checks, handoff, completion signal, launch receipt, and the automatic-mode settings.
+4. Nothing in the viewer is derived from raw `values`; every new field is a versioned contract field with paths redacted.
+
+Non-goals:
+
+- No launch, approve or retry controls in the viewer. It stays read-only.
+- No change to the reviewer's authority. It still cannot edit or run commands, and a blocked verdict still stops the run.
+- No change to how findings gate integration. P0/P1 must be resolved, P2 may stay open.
+- No live streaming of the reviewer's transcript into the viewer. The Herdr pane is the live view; the viewer shows the persisted result.
+
+## 3. Feature A: reviewer as an attachable native session
+
+The review node launches the reviewer the same way workers are launched: `claude --bg --name workflow-<run>-reviewer` in `review-worktree/`, with tools limited to Read, Glob and Grep, no MCP servers, the run directory added as a readable path, and permission mode `dontAsk` so it never blocks on a prompt. `attach_panels` gains a third pane in the run's tab, labelled `Claude: reviewer`, attached through the same `attach-one` path with identity re-checked in the pane process.
+
+The verdict moves from print-mode structured output to a completion file, mirroring the worker protocol:
+
+| Item | Value |
+| --- | --- |
+| File | `<run>/review.completion.json` |
+| Bound to | run id, `review` node, bundle SHA-256, candidate commit, reviewer session UUID |
+| Payload | verdict `approved` or `blocked`, findings `[{severity, message, disposition, worker, requirement}]` |
+| Accepted when | file validates against the review schema and the native session is `idle` or `done` |
+| Timeout | `review_timeout_seconds` from launch of the reviewer session, default 30 minutes |
+| Independence | reviewer session UUID must differ from both worker session UUIDs; the launcher verifies this from the inventory |
+| Human input | allowed, exactly as for workers: the operator may answer the reviewer in its pane. The transcript is the record of it. The verdict is still only the completion file |
+| Reviews per bundle | one. A blocked verdict ends the run; a new bundle means a new run |
+
+```mermaid
+sequenceDiagram
+  participant C as review node
+  participant R as reviewer session
+  participant H as Herdr pane
+  C->>R: claude --bg in review-worktree (read-only tools)
+  C->>H: attach pane "Claude: reviewer"
+  R->>R: read review.diff, packets, screenshots
+  R->>C: write review.completion.json, end turn
+  C->>C: validate schema, bundle hash, session identity
+  C->>R: claude stop (identity re-checked)
+```
+
+The stop is deliberate: once the verdict is accepted the session is stopped and its transcript stays resumable, exactly like a worker after freeze.
+
+The reviewer gets the same capabilities as a worker session: a pane, a human who can type into it, the same completion-file protocol, and the same automatic wait. If the reviewer stops to ask a question, the operator answers in the pane and the automatic flow resumes when the file appears and the session goes idle. What this trades away: `--json-schema` guaranteed a well-formed verdict from print mode. With a file protocol the schema check moves to the controller, and a reviewer that ends its turn without writing the file idles until the timeout, the same rule as workers. Print mode stays available behind a `--reviewer-transport print` flag for environments without Herdr.
+
+## 4. Feature B: review verdict and findings in the viewer
+
+The review node gets a result of its own, served at `.../runs/<run>/reviews/<attempt>` and linked from the node's `result_uri`, so the viewer treats it like a worker result rather than a special case.
+
+| Field | Source | Shown as |
+| --- | --- | --- |
+| verdict | `review.json` | status pill: approved or blocked |
+| reviewer | reviewer session UUID | session id on the node, same place a worker shows it |
+| bundle_sha256, candidate_commit | `review.json` | what exactly was reviewed, linked to the candidate node |
+| findings | `review.json` | table: severity, disposition, message with paths redacted |
+| finding.worker | reviewer, one of `ui`, `adapter`, `both`, `none` | groups the table by worker; each group links to that worker node's Task panel |
+| finding.requirement | reviewer, a short quote from the task text the finding relates to, or null | shown under the message; clicking it opens the worker's Task panel scrolled to that quote when the quote is found verbatim |
+| reviewed_at, duration | reviewer receipt | timing next to the verdict |
+| diff | `review.diff` registered as an artifact | "Diff the reviewer saw" link, bounded download |
+
+Disposition is one of open, resolved, accepted. The viewer groups findings by disposition and shows a one-line summary under the verdict, for example "approved with 6 findings: 4 open, 2 accepted, none blocking".
+
+The point of the link is to let a reader judge whether a finding is about something the worker was asked to do. The reviewer prompt asks for `worker` and `requirement` on every finding; a quote that does not match the task text verbatim is still shown, just without the link, and the adapter never guesses a match.
+
+A manual-mode review, where a human wrote `review.json`, is served through the same result with the reviewer field holding the operator's stated identity. A blocked review is served the same way with verdict `blocked`; the node status stays failed and the findings explain why.
+
+## 5. Feature C: run inputs in the viewer
+
+A run gains an "Assignment" view answering what it was asked to build, under what rules, and what each worker reported back. One new route, `.../runs/<run>/inputs`, served from a new `inputs` section of the export rather than from `values`.
+
+| Input | Producer file | Shown where |
+| --- | --- | --- |
+| Feature name, base commit, source branch, mode (manual or automatic) | `plan.json` | run header |
+| Automatic settings: worker and reviewer deadlines, permission mode, finish | `plan.automatic` | run header, automatic runs only |
+| Task text per worker, rendered as Markdown | `plan.nodes.<worker>.task` | worker node detail, "Task" panel; also the run's Assignment tab |
+| Owned paths and required checks per worker | `policy.json` | worker node detail beside the task; check ids link to the executed checks |
+| Setup commands and verification attempt cap | `policy.json` | Assignment tab |
+| Launch receipt: session UUID, requested and native start time, observed state | `<worker>.interactive.json` | worker node detail, replaces "No session recorded" where it applies |
+| Completion signal: status, summary, open assumptions | `<worker>.completion.json` | worker node detail, "Reported by the worker" |
+| Handoff as accepted by the controller | `<worker>.handoff.json` | worker node detail, only when it differs from the completion signal |
+| Stop confirmation time | `<worker>.stop.json` | worker node detail timeline |
+
+Rules the adapter keeps:
+
+- Task text is the appended prompt the worker actually received, including the JSON policy block, so what the viewer shows is what the model saw.
+- Absolute paths in any of these files pass through `redactPaths`. Owned paths are repository-relative and stay as they are.
+- Reads are bounded like every other run file; task text over the limit is truncated with a marker, never silently cut.
+- Inputs are pinned per run from the run's own files. A later edit to `features/<name>/` does not change what an old run displays.
+
+## 6. Contract changes that must land before the run
+
+The workflow rule is that shared contracts are committed before either worker starts, so these are ours to write and commit first, with contract tests, before `launch`.
+
+| Contract | Change | Version |
+| --- | --- | --- |
+| `contracts/projects` | new `reviewResult` type: run_id, node_id `review`, attempt, reviewer session, bundle_sha256, candidate_commit, verdict, findings with `worker` and `requirement`, reviewed_at, diff artifact reference | 1.1.0, additive |
+| `contracts/projects` | new `runInputs` type: feature, base_commit, source_branch, mode, automatic settings, per-worker task, owned_paths, checks, launch receipt, completion, handoff | 1.1.0, additive |
+| `contracts/projects` | node `result_uri` may point at a review result for `review` nodes; `session_id` populated for the review node | 1.1.0 |
+| `contracts/workflow` | `run-state.json` export gains `review` and `inputs` sections; `values` stays as is | export 1.1.0 |
+| `contracts/workflow` | `review.completion.json` schema, shared with the reviewer prompt; findings carry `worker` and `requirement` | new file |
+
+Existing 1.0.0 payloads stay valid. Old runs without the new export sections are served with `inputs: null` and no review result, never with fabricated values.
+
+Examples and negative tests go into `contracts/projects/examples.ts` and `contract.test.ts` so both workers build against the same fixtures.
+
+## 7. Controller changes we make ourselves before the run
+
+These live in `workflow/`, which no worker may edit, so they are done and tested by us before `prepare`, in this order:
+
+1. `export_state.py`: add `review` (from `review.json` and the reviewer receipt) and `inputs` (from `plan.json`, `policy.json`, receipts, completion and handoff files) to the export as explicit sections. Bump the export version to 1.1.0.
+2. `workflow export <run>`: a new read-only CLI action that rebuilds `run-state.json` from the run directory's files under the current export version, so project-workflows-001 shows its assignment and verdict as soon as the viewer can render them. It takes the controller lock, launches nothing, and refuses a run whose `plan.json` or `review.json` fail validation.
+3. `automatic.py`: replace `review_candidate`'s print-mode call with a native `--bg` launch in `review-worktree/`, a `wait_review` poll mirroring `wait_handoffs`, schema validation of `review.completion.json`, the bundle and identity re-checks that exist today, and a confirmed stop. Keep print mode behind `--reviewer-transport print`.
+4. `interactive.py`: extend `attach_panels` and `attach-one` to a third pane for the reviewer, reusing `settle` and `require_shell`.
+5. `pipeline.py`: the review node records the reviewer session UUID in a `review.interactive.json` receipt and an event, so the export and the viewer can show it.
+6. Tests: offline reviewer through `FakeSessions`, the three-process recovery test extended to a reviewer interruption, an export test asserting old runs still load, and a re-export test on a copy of a 1.0.0 run directory.
+
+None of this changes what the workers see, so the feature run can start as soon as it is merged to `main`.
+
+## 8. Worker assignments, ownership and checks
+
+The feature runs as `features/review-visibility/` with the same two roles and the same ownership split as the first run, so no new policy shape is needed.
+
+| Worker | Owned paths | Deliverables | Checks |
+| --- | --- | --- | --- |
+| adapter (backend) | `server/`, `config/projects.example.json` | `reviews/<attempt>` route, `inputs` route, review node `session_id` and `result_uri`, redaction, bounded reads, old-run fallbacks, `server/projects.test.ts` extended | `backend-unit` (projects tests), `backend-regression` (`npm run test:unit`), `shared-contract` (`npm run test:contracts`), `backend-build` |
+| ui (frontend) | `src/App.tsx`, `src/App.css`, `src/graph`, `src/projects`, `src/index.css`, `tests/project-workflows` | findings panel on the review node with links to task text, Assignment tab on the run, Task and Reported-by-worker panels on worker nodes, worker-mode mocks and candidate-mode seeds for the new routes | `frontend-build`, `frontend-unit-regression`, `project-workflows-browser` with the scenarios in section 9 |
+
+Both task files state the same boundary as before: no dependency changes, no edits to contracts, policy, `workflow/` or the root Playwright config, and escalation to the operator when a needed change falls outside ownership.
+
+The run itself is the first end-to-end test of Feature A: the reviewer for this run is launched as a pane and reviews the code that adds the review panel.
+
+## 9. Acceptance scenarios for verification
+
+Browser scenarios pinned in the policy, each with a `[scenario:<id>]` title and a `screenshot:<id>` attachment, run against mocks in worker mode and the real adapter in candidate mode:
+
+| Scenario id | Asserts |
+| --- | --- |
+| review-verdict | review node shows approved, reviewer session, bundle hash, and a findings table grouped by worker with severity and disposition |
+| finding-to-task | a finding with a verbatim `requirement` quote links to the worker's Task panel and the quote is highlighted there; a finding whose quote is not found shows the quote without a link |
+| review-blocked | a seeded blocked review shows verdict blocked, node failed, and the findings that caused it |
+| run-assignment | the run's Assignment tab shows feature, branch, mode, deadlines, setup commands and both workers' tasks rendered as Markdown |
+| worker-inputs | a worker node shows its task, owned paths, required checks linked to executed checks, launch receipt and completion signal |
+| inputs-legacy | a seeded run without the 1.1.0 export sections shows "inputs not recorded" and no review result, with no error |
+| paths-redacted | no absolute path from the seeded fixtures appears anywhere in the rendered review or inputs |
+
+Controller-side acceptance, covered by `workflow/` tests before the run and confirmed on the run itself:
+
+- The reviewer session appears in `claude agents --json` with the run's reviewer name and a UUID different from both workers, and a third pane exists in the run's tab.
+- `review.completion.json` is rejected when its bundle hash, candidate commit or session UUID do not match, and the node fails closed.
+- Interrupting the supervisor during the review leaves the reviewer running and the run resumable.
+- `run-state.json` for the run carries `review` and `inputs`, and its `updated_at` does not change when nothing else did.
+
+## 10. Risks and open questions
+
+- **A reviewer that ends its turn without a verdict idles until the timeout.** Print mode could not do this. Mitigation: the completion prompt says the file is the last action; the same idle-plus-file rule as workers applies; the deadline is the backstop. Because the operator can answer in the pane, a reviewer that stops to ask is recoverable, which print mode was not.
+- **A human can type into the reviewer pane.** Decided: allowed, same as workers. The reviewer is therefore only as independent as the operator makes it. The transcript is retained and the viewer shows the session id, so any influence is auditable.
+- **Single review per bundle.** Decided: a blocked verdict ends the run, and there is no second reviewer. Fixing findings means a new run with a new bundle.
+- **Task text may embed absolute paths.** The policy JSON appended to each task holds repository-relative paths only, but a task author could paste one. Mitigation: `redactPaths` on the whole task text before serving; the acceptance scenario `paths-redacted` checks it.
+- **Requirement quotes will often not match verbatim.** Models paraphrase. Mitigation: the link is optional; the quote is still shown; the reviewer prompt asks for exact quotes and gives an example. Open: measure the match rate on this run and decide whether fuzzy matching is worth it.
+- **Export version bump touches old runs.** Mitigation: `workflow export <run>` rebuilds any run's export from its files, and the adapter serves "not recorded" for runs that were not re-exported. Never infer from `values`.
+- **Three panes in one tab on a small screen.** Open: stack the reviewer pane below the workers, or open it only when the review node starts. Default proposal: create it at review start, in the same tab.
+- **Bash-enabled workers touching contract or workflow files.** Ownership blocks it at freeze, but it ends the run. Mitigation is unchanged: the task files state the boundary and the escalation path.
+- **Issue #3 (stale task error) will show again on this run's own viewer** if any lane is retried. It is a viewer bug on the same node the feature adds to. Open: include the `paused` projection fix in the adapter's task, or leave it for its own issue.
+
+## 11. Recommendation and sequencing
+
+Do it as one feature run, `review-visibility-001`, in this order:
+
+1. Contracts 1.1.0 with examples and tests, committed to `main`.
+2. Controller changes (export sections, re-export command, reviewer pane and completion protocol, third pane), tested offline, committed to `main`. This is where the reviewer pane gets its first offline test with a fake session.
+3. `features/review-visibility/` with the two task files and a policy that pins the seven scenarios above, plus issues #3 and #6 folded into the adapter task if decided below.
+4. `launch review-visibility --live --automatic --worker-timeout-seconds 7200`. The reviewer for this run is the first live use of Feature A.
+5. Read the review, merge, and the viewer then shows this run's own assignment and verdict as its first real data.
+
+Why this order: workers cannot build against routes whose contract does not exist, and the run cannot exercise the reviewer pane unless the controller change is already on `main` when `prepare` pins the commit.
+
+Left out of this run: issues #4 (attempt from event text), #5 (list caching), #7 (reuse signal) and #8 (root Playwright scope). They are real but unrelated to visibility, and a smaller run has a better chance of a clean first attempt.
+
+Decisions:
+
+- [x] Reviewer gets the same capabilities as workers: pane, human input, completion protocol, automatic wait
+- [x] One review per bundle, no retry
+- [x] Findings link to the task they relate to via `worker` and `requirement`
+- [x] `workflow export <run>` re-exports old runs so project-workflows-001 shows its own data
+- [ ] Task display: the exact prompt the model received (proposed) or the authored Markdown file
+- [ ] Three-pane layout: same tab at review start (proposed) or a separate tab
+- [ ] Whether issues #3 and #6 ride along in the adapter task

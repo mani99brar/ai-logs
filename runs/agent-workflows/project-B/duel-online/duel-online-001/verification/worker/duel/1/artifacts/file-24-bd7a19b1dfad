@@ -1,0 +1,150 @@
+import { z } from "zod";
+import { createTokenSchema, matchCodeSchema } from "./join.js";
+import { encodedSize, MAX_INPUT_LEAD_FRAMES, MAX_INPUT_MESSAGE_BYTES, MAX_SEQUENCE, type InputContext, type InputRejection } from "./input.js";
+
+/** The Colyseus room name of a standalone duel (the combat spike, §18 stage 1). */
+export const DUEL_ROOM = "duel";
+
+export const DuelMessageType = {
+  /** Client → server: batched, redundant frame-tagged duel inputs (`DuelInputMessage`). */
+  Input: "duel-input",
+  /** Server → client: the inputs the server applied since the last bundle, with a snapshot or a hash (`DuelFrameBundle`). */
+  Frames: "duel-frames",
+  /** Both ways: a round-trip probe from the server (`DuelProbe`) and the client's echo (`DuelProbeReply`). */
+  Probe: "duel-probe",
+  /** Client → server, practice rooms only: the dummy's behaviour (`DuelPracticeMessage`). */
+  Practice: "duel-practice",
+} as const;
+
+/**
+ * The highest duel input: every bit of `DUEL_INPUT` (content's `DUEL_INPUT_MASK`, which the protocol does not depend
+ * on). A server unit test keeps the two equal.
+ */
+export const DUEL_INPUT_BITS_MAX = 0x1ff;
+
+/** Inputs one message carries at most: the newest frame and the three before it. */
+export const MAX_DUEL_INPUTS_PER_MESSAGE = 4;
+/** Clients send input messages at most this often (every second frame), half the gate's cap. */
+export const DUEL_INPUT_MESSAGES_PER_SECOND = 30;
+/** The server sends one frame bundle every this many frames (20 a second)... */
+export const DUEL_BUNDLE_FRAMES = 3;
+/** ...and a full snapshot in every this many bundles (every 6 frames); the others carry the state hash. */
+export const DUEL_SNAPSHOT_EVERY_BUNDLES = 2;
+/** The countdown before the fight, in frames (§6: three seconds). */
+export const DUEL_COUNTDOWN_FRAMES = 180;
+/** A player absent this long forfeits (§12); they may rejoin the same duel until then. */
+export const DUEL_RECONNECT_SECONDS = 10;
+
+/**
+ * One client's duel input message (§15, batched and redundant): `inputs` holds the input bits (`DUEL_INPUT`) of
+ * consecutive frames, oldest first, ending with frame `frame`; so `inputs[k]` is for frame
+ * `frame - inputs.length + 1 + k`. A client repeats each frame in two messages, so one lost message loses no input.
+ * The server takes each frame's input from the first message that carries it and ignores frames it has already
+ * stepped. It is checked like world input: size, strictly increasing `seq`, and `frame` no more than
+ * MAX_INPUT_LEAD_FRAMES ahead of the server.
+ */
+export const duelInputMessageSchema = z.strictObject({
+  seq: z.int().min(1).max(MAX_SEQUENCE),
+  frame: z.int().min(1).max(MAX_SEQUENCE),
+  inputs: z.array(z.int().min(0).max(DUEL_INPUT_BITS_MAX)).min(1).max(MAX_DUEL_INPUTS_PER_MESSAGE),
+});
+
+export type DuelInputMessage = z.infer<typeof duelInputMessageSchema>;
+
+export type DuelInputValidation = { ok: true; input: DuelInputMessage } | { ok: false; reason: InputRejection };
+
+/** The first frame a duel input message carries. */
+export function firstInputFrame(message: Pick<DuelInputMessage, "frame" | "inputs">): number {
+  return message.frame - message.inputs.length + 1;
+}
+
+/**
+ * Validates an untrusted duel input message with the world input's limits: MAX_INPUT_MESSAGE_BYTES, the schema, a
+ * sequence number above the last accepted one, and a newest frame at most MAX_INPUT_LEAD_FRAMES past the server's.
+ * The server's frame is negative during the countdown (frames left until the fight's frame 0).
+ */
+export function validateDuelInputMessage(message: unknown, context: InputContext): DuelInputValidation {
+  const size = encodedSize(message);
+  if (size === undefined) return { ok: false, reason: "malformed" };
+  if (size > MAX_INPUT_MESSAGE_BYTES) return { ok: false, reason: "oversized" };
+  const parsed = duelInputMessageSchema.safeParse(message);
+  if (!parsed.success) return { ok: false, reason: "malformed" };
+  const input = parsed.data;
+  if (input.seq <= context.lastAcceptedSeq) return { ok: false, reason: "stale-sequence" };
+  if (input.frame > context.serverFrame + MAX_INPUT_LEAD_FRAMES) return { ok: false, reason: "future-frame" };
+  return { ok: true, input };
+}
+
+/**
+ * Server → client, one per DUEL_BUNDLE_FRAMES: the inputs the server applied to both players, substitutions included,
+ * for each frame since the last bundle, ending with frame `frame`. `inputs[k]` is `[player one, player two]` for frame
+ * `frame - inputs.length + 1 + k`. `substituted` has bit `2k + p` set when player `p`'s input for that frame was not
+ * received in time (the held input repeated, or neutral). Every DUEL_SNAPSHOT_EVERY_BUNDLES-th bundle carries the full
+ * state after `frame` as `snapshot` (a `DuelSnapshot`, checked by `restoreDuel`); the others carry its `hashState` as
+ * `hash`. A bundle with no inputs and a snapshot is a resync point (the fight's frame 0, or a rejoin).
+ */
+export const duelFrameBundleSchema = z.strictObject({
+  frame: z.int().min(0).max(MAX_SEQUENCE),
+  inputs: z.array(z.tuple([z.int().min(0).max(DUEL_INPUT_BITS_MAX), z.int().min(0).max(DUEL_INPUT_BITS_MAX)])),
+  substituted: z.int().min(0),
+  snapshot: z.unknown().optional(),
+  hash: z.string().regex(/^[0-9a-f]{16}$/).optional(),
+});
+
+export type DuelFrameBundle = z.infer<typeof duelFrameBundleSchema>;
+
+/**
+ * Server → client round-trip probe: `id` to echo, the server's duel `frame` when it was sent (negative during the
+ * countdown), and `rtt`, the server's latest round-trip measurement for this client in milliseconds (0 before any).
+ */
+export const duelProbeSchema = z.strictObject({
+  id: z.int().min(1).max(MAX_SEQUENCE),
+  frame: z.int(),
+  rtt: z.number().min(0),
+});
+
+export type DuelProbe = z.infer<typeof duelProbeSchema>;
+
+/** Client → server: the echo of a probe, sent as soon as it arrives. */
+export const duelProbeReplySchema = z.strictObject({ id: z.int().min(1).max(MAX_SEQUENCE) });
+
+export type DuelProbeReply = z.infer<typeof duelProbeReplySchema>;
+
+/** A practice dummy either stands idle or holds back to guard (§13's idle or defensive opponent). */
+export const DUMMY_BEHAVIOURS = ["idle", "guard"] as const;
+export type DummyBehaviour = (typeof DUMMY_BEHAVIOURS)[number];
+
+export const duelPracticeMessageSchema = z.strictObject({ dummy: z.enum(DUMMY_BEHAVIOURS) });
+
+export type DuelPracticeMessage = z.infer<typeof duelPracticeMessageSchema>;
+
+/** Creating a duel: like a match, with a one-time token; `practice` makes a one-player room against the dummy. */
+export const createDuelOptionsSchema = z.object({
+  protocolVersion: z.int(),
+  createToken: createTokenSchema,
+  practice: z.boolean().optional(),
+});
+
+/** Joining a duel by its code. */
+export const joinDuelOptionsSchema = z.object({
+  protocolVersion: z.int(),
+  code: matchCodeSchema,
+});
+
+export type CreateDuelOptions = z.infer<typeof createDuelOptionsSchema>;
+export type JoinDuelOptions = z.infer<typeof joinDuelOptionsSchema>;
+
+/** The duel room's phases: waiting for the second player, the countdown, the fight, and its result. */
+export const DUEL_PHASES = ["waiting", "countdown", "fighting", "over"] as const;
+export type DuelRoomPhase = (typeof DUEL_PHASES)[number];
+
+/** Why a duel ended: the step's own result, or a player absent past DUEL_RECONNECT_SECONDS (or quitting). */
+export type DuelEndReason = "ko" | "double-ko" | "timeout" | "overtime" | "forfeit";
+
+export const NO_SUCH_DUEL_MESSAGE = "No duel with that code";
+export const DUEL_CODE_REQUIRED_MESSAGE = "Joining this duel needs its code";
+export const DUEL_UNAVAILABLE_MESSAGE = "That duel is full or no longer exists";
+
+export function duelFullMessage(): string {
+  return "That duel already has two players";
+}

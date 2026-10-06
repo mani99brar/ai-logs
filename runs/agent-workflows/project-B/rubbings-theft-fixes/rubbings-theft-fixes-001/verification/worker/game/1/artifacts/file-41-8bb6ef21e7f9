@@ -1,0 +1,344 @@
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { isNavigable, seaMap } from "@pirate-sea-race/content";
+import { defaultSimulationConfig, hullPathIsClear, tileCentre } from "@pirate-sea-race/simulation";
+import { Buttons, MessageType, PROTOCOL_VERSION, TEST_PLACEMENT_PATH } from "@pirate-sea-race/protocol";
+import { MatchRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { findPlayer } from "@pirate-sea-race/simulation/objectives";
+import { AHEAD, HeadlessClient, sleep } from "@pirate-sea-race/test-tools";
+import { expectRoomChecks } from "./seaDuelSetup.js";
+
+let server: RunningGameServer;
+let endpoint: string;
+const clients: HeadlessClient[] = [];
+
+/**
+ * An open stretch of sea: the row three tiles south of the hub, which the map keeps clear of land and shoals for 20
+ * tiles east and west of the hub (checked below).
+ */
+const OPEN_ROW = seaMap.hub.tileY + 3;
+const HUB_X = seaMap.hub.tileX;
+const OPEN_REACH = 20;
+
+/** The match rooms this test's clients joined: checked after it, like `tracker`'s (`expectRoomChecks`). */
+const rooms = new Set<MatchRoom>();
+
+async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
+  const joined = await client;
+  clients.push(joined);
+  rooms.add(matchMaker.getLocalRoomById(joined.room.roomId) as unknown as MatchRoom);
+  return joined;
+}
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  const checked = [...rooms];
+  rooms.clear();
+  await Promise.all(clients.splice(0).map((client) => client.leave()));
+  await sleep(150);
+  for (const room of checked) expectRoomChecks(room);
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+function roomOf(client: HeadlessClient): MatchRoom {
+  return matchMaker.getLocalRoomById(client.room.roomId) as unknown as MatchRoom;
+}
+
+describe("test sea", () => {
+  it("keeps the open row clear for a hull from 20 tiles west of the hub to 20 tiles east", () => {
+    const [west, east] = [tileCentre(defaultSimulationConfig, HUB_X - OPEN_REACH, OPEN_ROW), tileCentre(defaultSimulationConfig, HUB_X + OPEN_REACH, OPEN_ROW)];
+    expect(hullPathIsClear(defaultSimulationConfig, west.x, west.y, east.x, east.y)).toBe(true);
+    // And the rows the tests put a second ship on.
+    for (const row of [OPEN_ROW + 3, OPEN_ROW + 4]) expect(isNavigable(seaMap, HUB_X - 6, row)).toBe(true);
+  });
+});
+
+describe("private match", () => {
+  it("creates a custom match with a six-character code", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    expect(host.code).toMatch(/^[A-Z0-9]{6}$/);
+    expect(host.room.state.custom).toBe(true);
+    expect(host.room.state.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(host.playerCount).toBe(1);
+    expect(host.ship()).toMatchObject({ speed: 0, dock: -1 });
+  });
+
+  it("lets two clients in sight of each other see the same authoritative sailing", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await track(HeadlessClient.join(endpoint, host.code.toLowerCase()));
+    expect(guest.room.roomId).toBe(host.room.roomId);
+    await host.waitFor(() => host.playerCount === 2);
+    await host.placeShip(endpoint, { tileX: HUB_X - 6, tileY: OPEN_ROW, heading: 0 });
+    await guest.placeShip(endpoint, { tileX: HUB_X - 6, tileY: OPEN_ROW + 4, heading: 0 });
+    await guest.waitFor(() => guest.ship(host.sessionId) !== undefined);
+
+    const start = host.ship()!;
+    expect(guest.ship(host.sessionId)).toEqual(start);
+    const guestStart = guest.ship()!;
+
+    // Full ahead along heading 0 (east): the ship accelerates east and keeps its row.
+    await host.hold(AHEAD, 600);
+    await host.waitFor(() => host.ship()!.x > start.x);
+    expect(host.ship()!.y).toBe(start.y);
+
+    // Both clients converge on the same server-decided position once the ship has coasted to a stop.
+    await host.waitFor(() => host.ship()!.speed === 0, 5000);
+    const settled = host.ship()!;
+    await guest.waitFor(() => guest.ship(host.sessionId)?.x === settled.x);
+    expect(guest.ship(host.sessionId)).toEqual(settled);
+    expect(settled.x).toBeGreaterThan(start.x);
+    // The guest sent nothing, so its ship has not moved.
+    expect(guest.ship()).toEqual(guestStart);
+    expect(host.ship(guest.sessionId)).toEqual(guestStart);
+  });
+
+  it("removes a ship when its player leaves", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    await host.waitFor(() => host.playerCount === 2);
+    await guest.placeShip(endpoint, { tileX: HUB_X - 6, tileY: OPEN_ROW, heading: 0 });
+    await host.placeShip(endpoint, { tileX: HUB_X - 4, tileY: OPEN_ROW, heading: 0 });
+    await host.waitFor(() => host.ship(guest.sessionId) !== undefined);
+    await guest.leave();
+    await host.waitFor(() => host.playerCount === 1);
+    await host.waitFor(() => host.ship(guest.sessionId) === undefined);
+    // A consented leave is the ledger's quit (§12): the player has left the ledger's match, and no tick saw its ship
+    // removed while the ledger still counted it.
+    const room = roomOf(host);
+    expect(findPlayer(room.ledgerState, guest.sessionId)?.status).toBe("left");
+    expect(room.matchState.ships.map((ship) => ship.id)).toEqual([host.sessionId]);
+    expectRoomChecks(room);
+  });
+
+  it("refuses a client with a different protocol version", async () => {
+    await expect(HeadlessClient.create(endpoint, { protocolVersion: PROTOCOL_VERSION - 1 })).rejects.toThrow(
+      /Protocol version mismatch/,
+    );
+    const host = await track(HeadlessClient.create(endpoint));
+    await expect(HeadlessClient.join(endpoint, host.code, { protocolVersion: PROTOCOL_VERSION - 1 })).rejects.toThrow(
+      /Protocol version mismatch/,
+    );
+    expect(host.playerCount).toBe(1);
+  });
+
+  it("refuses an unknown code", async () => {
+    await expect(HeadlessClient.join(endpoint, "ZZZZZ9")).rejects.toThrow(/No match with that code/);
+  });
+
+  it("holds eight players on eight spawn slots and refuses a ninth", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let index = 0; index < 7; index++) await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 8);
+    const room = roomOf(host);
+    const slots = new Set([...room.state.ships.values()].map((ship) => ship.slot));
+    expect(slots.size).toBe(8);
+    // Spawn slots are out of each other's sight: every player starts seeing only their own ship.
+    for (const client of clients) await client.waitFor(() => client.visibleShipIds().length === 1 && client.ship() !== undefined);
+    await expect(HeadlessClient.join(endpoint, host.code)).rejects.toThrow(/full/);
+  });
+});
+
+describe("sailing and docking on the server", () => {
+  it("docks at a dock with interact at low speed, records the dock, and casts off on throttle", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const dock = seaMap.docks.find((each) => each.side === "S")!;
+    // One tile out from the dock, at rest.
+    await host.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY + 1, heading: 48 });
+    host.sendInput({ moveX: 0, moveY: 0, buttons: Buttons.Interact });
+    await host.waitFor(() => host.ship()!.dock === dock.id);
+    const moored = host.ship()!;
+    expect(moored).toMatchObject({ x: dock.tileX * 256 + 128, y: dock.tileY * 256 + 128, speed: 0 });
+    // Turning alone does not move a moored ship.
+    await host.hold({ moveX: 1, moveY: 0 }, 300);
+    expect(host.ship()).toEqual(moored);
+    // Astern casts off.
+    await host.holdUntil({ moveX: 0, moveY: 1 }, () => host.ship()!.dock === -1 && host.ship()!.y > moored.y);
+  });
+
+  it("docks a ship driven into its dock with ahead held and interact tapped, as a player does", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const dock = seaMap.docks.find((each) => each.side === "S")!;
+    // Six tiles south, heading north, full ahead the whole way; interact tapped briefly every 300 ms.
+    await host.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY + 6, heading: 48 });
+    const deadline = Date.now() + 8000;
+    while (host.ship()!.dock !== dock.id && Date.now() < deadline) {
+      host.sendInput({ ...AHEAD, buttons: Buttons.Interact });
+      await sleep(30);
+      for (let beat = 0; beat < 9; beat++) {
+        host.sendInput(AHEAD);
+        await sleep(30);
+      }
+    }
+    expect(host.ship()).toMatchObject({ x: dock.tileX * 256 + 128, y: dock.tileY * 256 + 128, speed: 0, dock: dock.id });
+  });
+
+  it("keeps a ship moored through an input stall, however long, until the player releases or reverses the throttle", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const dock = seaMap.docks.find((each) => each.side === "S")!;
+    const berth = tileCentre(defaultSimulationConfig, dock.tileX, dock.tileY);
+    /** Sends a movement every 50 ms for `durationMs` (without releasing it after), checking the ship after each. */
+    const keepSending = async (movement: Parameters<HeadlessClient["sendInput"]>[0], durationMs: number, check: () => void = () => {}) => {
+      const until = Date.now() + durationMs;
+      while (Date.now() < until) {
+        host.sendInput(movement);
+        await sleep(50);
+        check();
+      }
+    };
+    const stayMoored = () => expect(host.ship()).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+    /** Docks with ahead and E held, as a player drives in, then stalls with both still held and resumes with E released. */
+    const dockThenStall = async () => {
+      await host.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY + 2, heading: 48 });
+      const deadline = Date.now() + 5000;
+      while (host.ship()!.dock !== dock.id) {
+        if (Date.now() > deadline) throw new Error("did not dock");
+        host.sendInput({ ...AHEAD, buttons: Buttons.Interact });
+        await sleep(50);
+      }
+      await keepSending({ ...AHEAD, buttons: Buttons.Interact }, 200, stayMoored);
+      // Nothing from the client for 400 ms: the server's held input lapses after 250 ms (INPUT_HOLD_FRAMES).
+      await sleep(400);
+      stayMoored();
+      // The player's ahead key never went up, so resuming with it held (and E released) is not a fresh press.
+      await keepSending(AHEAD, 600, stayMoored);
+    };
+
+    await dockThenStall();
+    // Astern casts off at once.
+    await keepSending({ moveX: 0, moveY: 1 }, 600);
+    expect(host.ship()!.dock).toBe(-1);
+    // Let go, and let the ship come to rest before placing it again.
+    host.sendInput({ moveX: 0, moveY: 0 });
+    await host.waitFor(() => host.ship()!.speed === 0);
+
+    await dockThenStall();
+    // Releasing ahead keeps it moored; pressing ahead again casts off.
+    await keepSending({ moveX: 0, moveY: 0 }, 200, stayMoored);
+    await keepSending(AHEAD, 600);
+    expect(host.ship()!.dock).toBe(-1);
+  });
+
+  it("stops a ship against land without entering it", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const island = seaMap.islands[0]!;
+    // Two tiles west of Palm Key's rectangle on its middle row, heading east into the island.
+    const row = island.tileY + 4;
+    await host.placeShip(endpoint, { tileX: island.tileX - 3, tileY: row, heading: 0 });
+    await host.hold(AHEAD, 1500);
+    await host.waitFor(() => host.ship()!.speed === 0);
+    const ship = host.ship()!;
+    const frontTile = Math.floor((ship.x + 80) / 256);
+    expect(isNavigable(seaMap, frontTile, row)).toBe(true);
+    expect(isNavigable(seaMap, frontTile + 1, row)).toBe(false);
+  });
+});
+
+describe("test placement", () => {
+  it("refuses land, strangers and malformed requests", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const island = seaMap.islands[0]!;
+    const post = (body: unknown) =>
+      fetch(`${endpoint}${TEST_PLACEMENT_PATH}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const valid = { code: host.code, sessionId: host.sessionId, tileX: HUB_X, tileY: OPEN_ROW, heading: 0 };
+    expect((await post(valid)).status).toBe(200);
+    const onLand = { ...valid, tileX: island.tileX + 5, tileY: island.tileY + 4 };
+    expect(isNavigable(seaMap, onLand.tileX, onLand.tileY)).toBe(false);
+    expect((await post(onLand)).status).toBe(400);
+    expect((await post({ ...valid, sessionId: "somebody" })).status).toBe(404);
+    expect((await post({ ...valid, code: host.code === "ZZZZZ9" ? "ZZZZZ8" : "ZZZZZ9" })).status).toBe(404);
+    expect((await post({ ...valid, heading: 64 })).status).toBe(400);
+    expect((await post({ ...valid, extra: true })).status).toBe(400);
+    expect((await post({ ...valid, tileX: seaMap.widthTiles })).status).toBe(400);
+  });
+});
+
+describe("match clock", () => {
+  it("steps the simulation about 60 times a second and patches clients no faster than 20 Hz", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    await host.placeShip(endpoint, { tileX: HUB_X - OPEN_REACH, tileY: OPEN_ROW, heading: 0 });
+    const room = roomOf(host);
+    const broadcasts = vi.spyOn(room, "broadcastPatch");
+    let patches = 0;
+    host.room.onStateChange(() => patches++);
+    const startFrame = room.state.frame;
+    const startedAt = performance.now();
+    // A sailing ship changes the state on every world step, so every patch the server sends carries a change.
+    await host.hold(AHEAD, 2000);
+    const seconds = (performance.now() - startedAt) / 1000;
+    const framesPerSecond = (room.state.frame - startFrame) / seconds;
+    const broadcastsPerSecond = broadcasts.mock.calls.length / seconds;
+    const patchesPerSecond = patches / seconds;
+    broadcasts.mockRestore();
+    // §15's rates as literals, so that a misread constant cannot move the expectation with it.
+    expect(framesPerSecond).toBeGreaterThan(60 * 0.85);
+    expect(framesPerSecond).toBeLessThan(60 * 1.15);
+    // The server's patch timer runs at 20 Hz; clients decode at most that many patches. The lower bounds only catch
+    // a much slower patch rate: a busy machine delays timer callbacks, so they are looser than the upper ones.
+    expect(broadcastsPerSecond).toBeGreaterThan(20 * 0.7);
+    expect(broadcastsPerSecond).toBeLessThan(20 * 1.15);
+    expect(patchesPerSecond).toBeLessThan(20 * 1.15);
+    expect(patchesPerSecond).toBeGreaterThan(20 * 0.5);
+  });
+
+  it("keeps eight sailing ships with per-client views inside the 60 Hz step budget", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let index = 0; index < 7; index++) await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 8);
+    // All eight in one cluster, so every view holds every ship and changes as they sail.
+    await Promise.all(clients.map((client, index) => client.placeShip(endpoint, { tileX: HUB_X - 8 + 2 * index, tileY: OPEN_ROW, heading: 8 * index })));
+    const room = roomOf(host);
+    const startFrame = room.state.frame;
+    const startedAt = performance.now();
+    await Promise.all(clients.map((client, index) => client.hold({ moveX: index % 2 === 0 ? 1 : -1, moveY: -1 }, 1500)));
+    const framesPerSecond = (room.state.frame - startFrame) / ((performance.now() - startedAt) / 1000);
+    expect(framesPerSecond).toBeGreaterThan(60 * 0.85);
+    for (const client of clients) expect(client.connected).toBe(true);
+  });
+});
+
+describe("input validation on the server", () => {
+  it("drops malformed, oversized, stale and future-frame messages and keeps the room running", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 2);
+    await host.placeShip(endpoint, { tileX: HUB_X - 6, tileY: OPEN_ROW, heading: 0 });
+    await guest.placeShip(endpoint, { tileX: HUB_X - 6, tileY: OPEN_ROW + 3, heading: 0 });
+    const start = host.ship()!;
+
+    host.sendRaw(MessageType.Input, "not an input");
+    host.sendRaw(MessageType.Input, { seq: 1, frame: 0, buttons: 0, moveX: 0, moveY: -5 });
+    host.sendRaw(MessageType.Input, { seq: 2, frame: 0, buttons: 0, moveX: 0, moveY: -1, padding: "x".repeat(400) });
+    host.sendRaw(MessageType.Input, { seq: 3, frame: host.frame + 10_000, buttons: 0, moveX: 0, moveY: -1 });
+    host.sendRaw("teleport", { x: 0, y: 0 });
+    await sleep(300);
+
+    expect(host.connected).toBe(true);
+    expect(guest.connected).toBe(true);
+    expect(host.ship()).toEqual(start);
+    const dropped = roomOf(host).droppedInputs(host.sessionId)!;
+    expect(dropped).toMatchObject({ malformed: 2, oversized: 1, "future-frame": 1 });
+
+    // A late, lower sequence number is ignored: the ship keeps its accepted throttle.
+    host.sendRaw(MessageType.Input, { seq: 50, frame: host.frame, buttons: 0, moveX: 0, moveY: -1 });
+    host.sendRaw(MessageType.Input, { seq: 40, frame: host.frame, buttons: 0, moveX: 0, moveY: 1 });
+    await host.waitFor(() => host.ship()!.x > start.x);
+    expect(roomOf(host).droppedInputs(host.sessionId)!["stale-sequence"]).toBe(1);
+    await guest.waitFor(() => (guest.ship(host.sessionId)?.x ?? 0) > start.x);
+    expect(host.connected && guest.connected).toBe(true);
+  });
+
+  it("drops input beyond the per-second rate cap without disconnecting", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let index = 0; index < 100; index++) host.sendInput({ moveX: 0, moveY: 0 });
+    await sleep(200);
+    expect(host.connected).toBe(true);
+    expect(roomOf(host).droppedInputs(host.sessionId)!["rate-limited"]).toBeGreaterThan(0);
+  });
+});

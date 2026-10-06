@@ -1,0 +1,176 @@
+import type { DuelConfig, DuelState, PlayerIndex } from "../duel/state.js";
+import { DuelClock } from "./clock.js";
+import type { DuelFeedEvent } from "./events.js";
+import { DuelRollback, HISTORY_FRAMES, type ConfirmedFrames, type DuelNetStats } from "./rollback.js";
+
+/** Inputs one message carries (the protocol's MAX_DUEL_INPUTS_PER_MESSAGE): the newest frame and three before it. */
+export const INPUTS_PER_MESSAGE = 4;
+/** A message goes out once this many new frames are tagged, so each frame travels in two messages. */
+export const SEND_EVERY_FRAMES = 2;
+/** Messages per second at most (the protocol's DUEL_INPUT_MESSAGES_PER_SECOND), half the server's cap. */
+export const MESSAGES_PER_SECOND = 30;
+/** Frames the client clock may advance in one tick; a longer gap is caught up over the next ticks. */
+export const CATCH_UP_FRAMES = 4;
+/** A gap this long (a stall or a hidden tab) is not caught up: the client restarts from the latest snapshot. */
+export const RESYNC_FRAMES = 30;
+
+/** An input message as the protocol's `DuelInputMessage`: `inputs` ends with frame `frame`. */
+export interface OutgoingDuelInput {
+  readonly seq: number;
+  readonly frame: number;
+  readonly inputs: readonly number[];
+}
+
+export interface DuelSessionStats extends DuelNetStats {
+  /** Times the clock jumped to the server's frame from the latest snapshot. */
+  resyncs: number;
+  /** Input messages sent. */
+  messages: number;
+  /** Messages held back to stay under MESSAGES_PER_SECOND (their frames travel in the next message that goes). */
+  throttledSends: number;
+}
+
+export interface DuelSessionOptions {
+  readonly config: DuelConfig;
+  readonly player: PlayerIndex;
+  /** The duel's frame-0 state, created from the room's seed exactly as the server created it. */
+  readonly initial: DuelState;
+  readonly historyFrames?: number;
+}
+
+/**
+ * One duel client, for the browser and the headless test client alike: the rollback core, the client clock and the
+ * input stream in one pure object. The caller owns the transport and the time: it passes probes and frame bundles as
+ * they arrive, calls `tick` often (every few milliseconds) with the time and the input held now, and sends whatever
+ * `tick` returns.
+ *
+ * Each tick advances the client's frame towards the server's current frame as the clock estimates it (a fixed-step
+ * accumulator on the caller's clock, never the display's frame rate), at most CATCH_UP_FRAMES at a time, or restarts
+ * from the latest snapshot after a gap of RESYNC_FRAMES. The input held at client frame `c` is tagged for frame
+ * `c + inputDelay`, the same shared delay the server applies to both players, and every SEND_EVERY_FRAMES frames the
+ * last INPUTS_PER_MESSAGE tagged frames go out in one message.
+ */
+export class DuelClientSession {
+  readonly rollback: DuelRollback;
+  readonly clock = new DuelClock();
+  private delay: number | undefined;
+  private rtt = 0;
+  /** The client's frame on the server's timeline: negative during the countdown. */
+  private clientFrame: number | undefined;
+  private taggedThrough = 0;
+  private sentThrough = 0;
+  private seq = 0;
+  private readonly sendTimes: number[] = [];
+  private throttled = false;
+  private readonly counters = { resyncs: 0, messages: 0, throttledSends: 0 };
+
+  constructor(options: DuelSessionOptions) {
+    this.rollback = new DuelRollback(options.config, options.player, options.initial, options.historyFrames ?? HISTORY_FRAMES);
+  }
+
+  get player(): PlayerIndex {
+    return this.rollback.player;
+  }
+
+  /** The shared input delay in frames, once the server has chosen it. */
+  get inputDelay(): number | undefined {
+    return this.delay;
+  }
+
+  set inputDelay(frames: number | undefined) {
+    this.delay = frames;
+  }
+
+  /** The latest round trip the server measured for this client, in milliseconds (0 before the first). */
+  get rttMs(): number {
+    return this.rtt;
+  }
+
+  /** The client's frame on the server's timeline (negative in the countdown), once the clock has a sample. */
+  get frame(): number | undefined {
+    return this.clientFrame;
+  }
+
+  /** The newest frame an input has been tagged for; it moves only when a tick tagged new frames. */
+  get lastTaggedFrame(): number {
+    return this.taggedThrough;
+  }
+
+  /** The predicted state to draw. */
+  get state(): DuelState {
+    return this.rollback.state;
+  }
+
+  /** The newest state stepped from the server's inputs: what the HUD reports as authoritative. */
+  get confirmedState(): DuelState {
+    return this.rollback.confirmedState;
+  }
+
+  get stats(): DuelSessionStats {
+    return { ...this.rollback.stats, substitutedFrames: [...this.rollback.stats.substitutedFrames], ...this.counters };
+  }
+
+  /** A round-trip probe arrived: the server's frame when it left, and the round trip it last measured. */
+  receiveProbe(probe: { readonly frame: number; readonly rtt: number }, nowMs: number): void {
+    if (probe.rtt > 0) this.rtt = probe.rtt;
+    this.clock.observe(probe.frame, nowMs, this.rtt);
+  }
+
+  /** A frame bundle arrived. */
+  receiveBundle(bundle: ConfirmedFrames, nowMs: number): void {
+    this.clock.observe(bundle.frame, nowMs, this.rtt);
+    this.rollback.applyBundle(bundle);
+  }
+
+  /**
+   * Advances the client to the server's estimated frame at `nowMs`, tags the held input `bits` for the frames that
+   * came due, steps the prediction, and returns the input message to send now, if any.
+   */
+  tick(nowMs: number, bits: number): OutgoingDuelInput | undefined {
+    const estimate = this.clock.serverFrameAt(nowMs);
+    if (estimate === undefined) return undefined;
+    const target = Math.floor(estimate);
+    if (this.clientFrame === undefined) this.clientFrame = target;
+    const gap = target - this.clientFrame;
+    if (gap > RESYNC_FRAMES) {
+      this.clientFrame = target;
+      if (this.rollback.resync()) this.counters.resyncs++;
+    } else if (gap > 0) {
+      this.clientFrame += Math.min(gap, CATCH_UP_FRAMES);
+    }
+
+    if (this.delay !== undefined) {
+      const through = this.clientFrame + this.delay;
+      // After a long gap only the frames one message can still carry are worth tagging.
+      let frame = Math.max(this.taggedThrough + 1, 1, through - INPUTS_PER_MESSAGE + 1);
+      for (; frame <= through; frame++) this.rollback.setLocalInput(frame, bits);
+      this.taggedThrough = Math.max(this.taggedThrough, through);
+    }
+    this.rollback.stepTo(this.clientFrame);
+    return this.send(nowMs);
+  }
+
+  /** The events of newly simulated frames, each reported once whatever rollback re-simulates. */
+  drainEvents(): DuelFeedEvent[] {
+    return this.rollback.drainEvents();
+  }
+
+  private send(nowMs: number): OutgoingDuelInput | undefined {
+    if (this.taggedThrough - this.sentThrough < SEND_EVERY_FRAMES) return undefined;
+    // (A microsecond of tolerance keeps a steady 30 a second from tripping on rounding.)
+    while (this.sendTimes.length > 0 && this.sendTimes[0]! <= nowMs - 1000 + 1e-3) this.sendTimes.shift();
+    if (this.sendTimes.length >= MESSAGES_PER_SECOND) {
+      if (!this.throttled) this.counters.throttledSends++;
+      this.throttled = true;
+      return undefined;
+    }
+    this.throttled = false;
+    const first = Math.max(1, this.taggedThrough - INPUTS_PER_MESSAGE + 1);
+    const inputs: number[] = [];
+    for (let frame = first; frame <= this.taggedThrough; frame++) inputs.push(this.rollback.localInput(frame) ?? 0);
+    this.sendTimes.push(nowMs);
+    this.sentThrough = this.taggedThrough;
+    this.counters.messages++;
+    return { seq: ++this.seq, frame: this.taggedThrough, inputs };
+  }
+}

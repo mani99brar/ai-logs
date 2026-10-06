@@ -1,0 +1,178 @@
+import { describe, expect, it } from "vitest";
+import {
+  AXIS_SCALE,
+  addShip,
+  createMatchState,
+  defaultSimulationConfig as config,
+  hashState,
+  isqrt,
+  mapBounds,
+  quantizeAxis,
+  removeShip,
+  step,
+  toTilePosition,
+  WORLD_STEP_INTERVAL,
+  type MatchState,
+  type PlayerInput,
+} from "./index.js";
+
+interface LoggedInput {
+  readonly frame: number;
+  readonly shipId: string;
+  readonly input: PlayerInput;
+}
+
+/** Replays an input log: each entry becomes that ship's held input from its frame on. */
+function run(initial: MatchState, log: readonly LoggedInput[], steps: number): MatchState {
+  let state = initial;
+  const held: Record<string, PlayerInput> = {};
+  for (let index = 0; index < steps; index++) {
+    const frame = state.frame + 1;
+    for (const entry of log) if (entry.frame === frame) held[entry.shipId] = entry.input;
+    state = step(config, state, held);
+  }
+  return state;
+}
+
+function matchWithShips(seed: number, ids: readonly string[]): MatchState {
+  return ids.reduce((state, id) => addShip(config, state, id), createMatchState(seed));
+}
+
+const move = (moveX: number, moveY: number): PlayerInput => ({ buttons: 0, moveX, moveY });
+
+const inputLog: LoggedInput[] = [
+  { frame: 1, shipId: "a", input: move(AXIS_SCALE, 0) },
+  { frame: 10, shipId: "b", input: move(0, -AXIS_SCALE) },
+  { frame: 90, shipId: "a", input: move(AXIS_SCALE, AXIS_SCALE) },
+  { frame: 200, shipId: "c", input: move(-600, 300) },
+  { frame: 320, shipId: "b", input: move(0, 0) },
+  { frame: 450, shipId: "a", input: move(-AXIS_SCALE, 0) },
+];
+
+describe("determinism", () => {
+  it("gives the same hash for the same initial state and input log after 600 steps", () => {
+    const first = run(matchWithShips(1234, ["a", "b", "c"]), inputLog, 600);
+    const second = run(matchWithShips(1234, ["a", "b", "c"]), inputLog, 600);
+    expect(first.frame).toBe(600);
+    expect(hashState(first)).toBe(hashState(second));
+    expect(first).toEqual(second);
+  });
+
+  it("gives a different hash when one input changes", () => {
+    const changed = inputLog.map((entry, index) => (index === 3 ? { ...entry, input: move(-600, -300) } : entry));
+    const original = run(matchWithShips(1234, ["a", "b", "c"]), inputLog, 600);
+    const altered = run(matchWithShips(1234, ["a", "b", "c"]), changed, 600);
+    expect(hashState(altered)).not.toBe(hashState(original));
+  });
+
+  it("hashes the complete state, including the generator", () => {
+    const state = matchWithShips(1, ["a"]);
+    expect(hashState({ ...state, rng: state.rng + 1 })).not.toBe(hashState(state));
+    expect(hashState({ ...state, frame: 1 })).not.toBe(hashState(state));
+  });
+
+  it("does not depend on key order", () => {
+    const state = matchWithShips(99, ["a", "b"]);
+    const reordered = { ships: state.ships.map((ship) => ({ ...ship })).map((ship) => {
+      const { heading, vy, vx, y, x, slot, id } = ship;
+      return { heading, vy, vx, y, x, slot, id };
+    }), rng: state.rng, worldTick: state.worldTick, frame: state.frame };
+    expect(hashState(reordered)).toBe(hashState(state));
+  });
+
+  it("keeps every number in the state an integer", () => {
+    const state = run(matchWithShips(7, ["a", "b", "c"]), inputLog, 600);
+    for (const ship of state.ships) {
+      for (const value of [ship.x, ship.y, ship.vx, ship.vy, ship.heading, ship.slot]) expect(Number.isInteger(value)).toBe(true);
+    }
+  });
+
+  it("does not mutate the state it is given", () => {
+    const state = Object.freeze(matchWithShips(5, ["a"]));
+    expect(() => step(config, state, { a: move(AXIS_SCALE, 0) })).not.toThrow();
+    expect(state.frame).toBe(0);
+  });
+});
+
+describe("clock", () => {
+  it("advances world logic only on every third step", () => {
+    let state = matchWithShips(42, ["a"]);
+    const start = state.ships[0]!;
+    const inputs = { a: move(AXIS_SCALE, 0) };
+    for (let frame = 1; frame <= 30; frame++) {
+      const before = state;
+      state = step(config, state, inputs);
+      expect(state.frame).toBe(frame);
+      if (frame % WORLD_STEP_INTERVAL === 0) {
+        expect(state.worldTick).toBe(before.worldTick + 1);
+        expect(state.ships[0]!.x).toBeGreaterThan(before.ships[0]!.x);
+      } else {
+        expect(state.worldTick).toBe(before.worldTick);
+        expect(state.ships).toBe(before.ships);
+      }
+    }
+    expect(state.worldTick).toBe(10);
+    expect(state.ships[0]!.x - start.x).toBe(10 * config.ship.speedSubUnitsPerWorldStep);
+  });
+});
+
+describe("movement", () => {
+  it("normalises diagonals with integer maths", () => {
+    const state = step(config, step(config, step(config, matchWithShips(3, ["a"]), {}), {}), { a: move(AXIS_SCALE, AXIS_SCALE) });
+    const ship = state.ships[0]!;
+    const speed = config.ship.speedSubUnitsPerWorldStep;
+    expect(ship.vx).toBe(ship.vy);
+    expect(isqrt(ship.vx * ship.vx + ship.vy * ship.vy)).toBeLessThanOrEqual(speed);
+    expect(ship.vx).toBe(Math.trunc((speed * AXIS_SCALE) / isqrt(2 * AXIS_SCALE * AXIS_SCALE)));
+  });
+
+  it("clamps ships to the map bounds", () => {
+    const state = run(matchWithShips(3, ["a"]), [{ frame: 1, shipId: "a", input: move(-AXIS_SCALE, -AXIS_SCALE) }], 60 * 30);
+    const ship = state.ships[0]!;
+    expect(ship.x).toBe(0);
+    expect(ship.y).toBe(0);
+    const far = run(matchWithShips(3, ["a"]), [{ frame: 1, shipId: "a", input: move(AXIS_SCALE, AXIS_SCALE) }], 60 * 30);
+    expect(far.ships[0]!.x).toBe(mapBounds(config).maxX);
+    expect(far.ships[0]!.y).toBe(mapBounds(config).maxY);
+    const corner = toTilePosition(config, far.ships[0]!.x, far.ships[0]!.y);
+    expect(corner.tileX).toBe(config.map.widthTiles - 1);
+    expect(corner.tileY).toBe(config.map.heightTiles - 1);
+  });
+
+  it("treats an out-of-range simulation axis as clamped", () => {
+    const wild = step(config, step(config, step(config, matchWithShips(3, ["a"]), {}), {}), { a: move(50 * AXIS_SCALE, 0) });
+    expect(wild.ships[0]!.vx).toBe(config.ship.speedSubUnitsPerWorldStep);
+  });
+
+  it("quantizes protocol axes into integer simulation units", () => {
+    expect(quantizeAxis(1)).toBe(AXIS_SCALE);
+    expect(quantizeAxis(-0.5)).toBe(-AXIS_SCALE / 2);
+    expect(quantizeAxis(7)).toBe(AXIS_SCALE);
+    expect(quantizeAxis(Number.NaN)).toBe(0);
+  });
+
+  it("reads a position as a tile plus an offset", () => {
+    const size = config.map.subUnitsPerTile;
+    expect(toTilePosition(config, 3 * size + 5, 2 * size)).toEqual({ tileX: 3, tileY: 2, offsetX: 5, offsetY: 0 });
+  });
+});
+
+describe("spawning", () => {
+  it("gives eight ships eight different slots, chosen by the seeded generator", () => {
+    const ids = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const state = matchWithShips(2024, ids);
+    expect(new Set(state.ships.map((ship) => ship.slot)).size).toBe(8);
+    expect(() => addShip(config, state, "i")).toThrow(/no free spawn slot/);
+    const other = matchWithShips(2025, ids);
+    expect(other.ships.map((ship) => ship.slot)).not.toEqual(state.ships.map((ship) => ship.slot));
+  });
+
+  it("frees a slot when a ship leaves", () => {
+    const state = removeShip(matchWithShips(1, ["a", "b"]), "a");
+    expect(state.ships.map((ship) => ship.id)).toEqual(["b"]);
+  });
+
+  it("refuses a duplicate ship id", () => {
+    expect(() => addShip(config, matchWithShips(1, ["a"]), "a")).toThrow();
+  });
+});

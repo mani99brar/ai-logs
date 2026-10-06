@@ -1,0 +1,160 @@
+import { describe, expect, it } from "vitest";
+import { Buttons, DuelMessageType, MessageType, validateInputMessage, type InputMessage } from "@pirate-sea-race/protocol";
+import { GRAPPLE_BUTTON } from "@pirate-sea-race/simulation";
+import type { MatchRoom } from "./connection.js";
+import { SeaDuelRouter } from "./duelTransport.js";
+import { compassToward, elapsedText, grappleLine, incomingLine, protectionLine, respawnLine, secondsUntil } from "./hud.js";
+import { InputSender } from "./inputSender.js";
+import { KeyboardHelm } from "./keyboard.js";
+import type { GrappleSnapshot, StatusSnapshot } from "./matchView.js";
+
+/** A key event as the browser dispatches it on the window: Node has no KeyboardEvent, so an Event with a code. */
+const key = (target: EventTarget, type: "keydown" | "keyup", code: string): Event => {
+  const event = Object.assign(new Event(type, { cancelable: true }), { code });
+  target.dispatchEvent(event);
+  return event;
+};
+
+describe("the grapple key (§8: J in the world)", () => {
+  it("latches a tap of J like E: kept until the next read, reported once, and sent in the input message", () => {
+    const page = new EventTarget();
+    const keyboard = new KeyboardHelm(page as unknown as Window);
+    expect(key(page, "keydown", "KeyJ").defaultPrevented).toBe(true);
+    key(page, "keyup", "KeyJ");
+    const tapped = keyboard.helm();
+    expect(tapped).toEqual({ moveX: 0, moveY: 0, buttons: Buttons.Grapple });
+    expect(keyboard.helm().buttons).toBe(0);
+    // Held, it stays in every read; with E and sailing it combines.
+    key(page, "keydown", "KeyJ");
+    key(page, "keydown", "KeyE");
+    key(page, "keydown", "ArrowUp");
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: -1, buttons: Buttons.Grapple | Buttons.Interact });
+    expect(keyboard.helm().buttons).toBe(Buttons.Grapple | Buttons.Interact);
+    for (const code of ["KeyJ", "KeyE", "ArrowUp"]) key(page, "keyup", code);
+    expect(keyboard.helm().buttons).toBe(0);
+
+    // The tap goes out as one valid input message carrying the grapple bit, the simulation's GRAPPLE_BUTTON.
+    const sent: InputMessage[] = [];
+    const sender = new InputSender({ send: (type, message) => type === MessageType.Input && sent.push(message) });
+    sender.update(tapped, 0);
+    sender.update(keyboard.helm(), 17);
+    expect(sent.map((message) => message.buttons)).toEqual([Buttons.Grapple, 0]);
+    expect(validateInputMessage(sent[0], { lastAcceptedSeq: 0, serverFrame: sent[0]!.frame }).ok).toBe(true);
+    expect(Buttons.Grapple).toBe(GRAPPLE_BUTTON);
+  });
+
+  it("forgets a tap of J when the window loses focus", () => {
+    const page = new EventTarget();
+    const keyboard = new KeyboardHelm(page as unknown as Window);
+    key(page, "keydown", "KeyJ");
+    key(page, "keyup", "KeyJ");
+    page.dispatchEvent(new Event("blur"));
+    expect(keyboard.helm().buttons).toBe(0);
+  });
+});
+
+describe("the sea HUD's encounter lines", () => {
+  const sea: StatusSnapshot = { mode: "sea", protection: "", protectedUntil: 0, cooldownUntil: 0, respawnAt: 0 };
+  const ship = (id: string, x: number, y: number) => ({ id, slot: 0, x, y, heading: 0, speed: 0, dock: -1 });
+  const grapple: GrappleSnapshot = { attackerId: "a", defenderId: "b", aim: 0, startTick: 100, landTick: 120 };
+
+  it("counts whole seconds up", () => {
+    expect(secondsUntil(120, 100)).toBe(1);
+    expect(secondsUntil(121, 100)).toBe(2);
+    expect(secondsUntil(100, 120)).toBe(0);
+    expect(elapsedText(100, 100 + 20 * 75)).toBe("1:15");
+    expect(elapsedText(100, 90)).toBe("0:00");
+  });
+
+  it("shows the grapple ready, aiming, and cooling down after a miss", () => {
+    expect(grappleLine({ selfId: "a", encounter: sea, grapples: [], worldTick: 0 })).toMatchObject({ state: "ready" });
+    expect(grappleLine({ selfId: "a", encounter: sea, grapples: [grapple], worldTick: 110 })).toEqual({ text: "Grappling, aimed east", state: "aiming", seconds: 1 });
+    expect(grappleLine({ selfId: "a", encounter: { ...sea, cooldownUntil: 240 }, grapples: [], worldTick: 120 })).toEqual({
+      text: "J: grapple in 6 s",
+      state: "cooldown",
+      seconds: 6,
+    });
+    expect(grappleLine({ selfId: "a", encounter: { ...sea, mode: "respawning" }, grapples: [], worldTick: 0 })).toMatchObject({ state: "unavailable", text: "" });
+  });
+
+  it("warns the target of an incoming grapple, with the side it comes from", () => {
+    const ships = [ship("a", 0, 0), ship("b", 1000, 0)];
+    expect(incomingLine({ selfId: "b", grapples: [grapple], ships, worldTick: 105 })).toMatchObject({ state: "west", seconds: 1 });
+    expect(incomingLine({ selfId: "b", grapples: [grapple], ships, worldTick: 105 }).text).toContain("Incoming grapple from the west");
+    // Without the attacker's ship, from the side opposite its aim.
+    expect(incomingLine({ selfId: "b", grapples: [grapple], ships: [ships[1]!], worldTick: 105 })).toMatchObject({ state: "west" });
+    expect(incomingLine({ selfId: "a", grapples: [grapple], ships, worldTick: 105 })).toEqual({ text: "", state: "none" });
+    expect(compassToward({ x: 0, y: 0 }, { x: 0, y: -10 })).toBe("north");
+    expect(compassToward({ x: 0, y: 0 }, { x: 10, y: 10 })).toBe("south-east");
+  });
+
+  it("shows protection time left and the respawn countdown", () => {
+    expect(protectionLine({ encounter: { ...sea, protection: "win", protectedUntil: 260 }, worldTick: 100 })).toEqual({
+      text: "Protected for 8 s (won a duel)",
+      state: "win",
+      seconds: 8,
+    });
+    expect(protectionLine({ encounter: sea, worldTick: 100 })).toEqual({ text: "", state: "none" });
+    expect(respawnLine({ encounter: { ...sea, mode: "respawning", respawnAt: 400 }, worldTick: 130 })).toEqual({
+      text: "Duel lost: respawning at a dock in 14 s",
+      state: "respawning",
+      seconds: 14,
+    });
+    expect(respawnLine({ encounter: sea, worldTick: 130 })).toEqual({ text: "", state: "none" });
+  });
+});
+
+describe("the duel router of a match room", () => {
+  /** A match room as the router uses it: its state, its sends and its message and connection hooks. */
+  function fakeRoom() {
+    const handlers = new Map<string, (message: unknown) => void>();
+    const sent: [string, unknown][] = [];
+    const signal = () => Object.assign(() => undefined, { remove: () => undefined });
+    const duels = new Map<string, { seats: { sessionId: string; slot: number; connected: boolean }[] }>();
+    const room = {
+      sessionId: "me",
+      state: { duels },
+      send: (type: string, message: unknown) => sent.push([type, message]),
+      onMessage: (type: string, handler: (message: unknown) => void) => {
+        handlers.set(type, handler);
+        return () => handlers.delete(type);
+      },
+      onDrop: signal(),
+      onReconnect: signal(),
+      onLeave: signal(),
+    };
+    return { room: room as unknown as MatchRoom, handlers, sent, duels };
+  }
+
+  it("finds this player's duel, holds early messages for its client, and sends the ready report", () => {
+    const { room, handlers, sent, duels } = fakeRoom();
+    const router = new SeaDuelRouter(room);
+    expect(router.current()).toBeUndefined();
+    duels.set("d1", { seats: [{ sessionId: "other", slot: 0, connected: true }, { sessionId: "third", slot: 1, connected: true }] });
+    expect(router.current()).toBeUndefined();
+    duels.set("d2", { seats: [{ sessionId: "other", slot: 0, connected: true }, { sessionId: "me", slot: 1, connected: true }] });
+    expect(router.current()).toBe("d2");
+
+    // A probe that beats the client is handed over when it subscribes; later ones go straight to it.
+    handlers.get(DuelMessageType.Probe)!({ id: 1, frame: -174, rtt: 0 });
+    const transport = router.transport("d2");
+    const probes: unknown[] = [];
+    const stop = transport.onMessage(DuelMessageType.Probe, (message) => probes.push(message));
+    handlers.get(DuelMessageType.Probe)!({ id: 2, frame: -168, rtt: 1 });
+    expect(probes).toEqual([
+      { id: 1, frame: -174, rtt: 0 },
+      { id: 2, frame: -168, rtt: 1 },
+    ]);
+    expect(transport.lobby()).toBe(duels.get("d2"));
+    transport.ready();
+    expect(sent).toEqual([[DuelMessageType.Ready, {}]]);
+
+    // Once the client goes, whatever it did not take belongs to the old duel and is dropped.
+    stop();
+    handlers.get(DuelMessageType.Frames)!({ frame: 600, inputs: [], substituted: 0 });
+    router.forget();
+    const frames: unknown[] = [];
+    router.transport("d3").onMessage(DuelMessageType.Frames, (message) => frames.push(message));
+    expect(frames).toEqual([]);
+  });
+});

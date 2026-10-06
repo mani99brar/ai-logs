@@ -1,0 +1,509 @@
+     1	import { test, expect, type APIRequestContext, type Page, type TestInfo } from '@playwright/test'
+     2	import { rm, writeFile } from 'node:fs/promises'
+     3	import { randomUUID } from 'node:crypto'
+     4	import { join } from 'node:path'
+     5	import { PI, currentCrumb, fileUrl, node, openGraph, roots, waitForApi } from '../helpers.ts'
+     6	import { verificationPhase } from './harness.ts'
+     7	import { installProjectMocks, mockResponse } from './mock.ts'
+     8	import {
+     9	  APPROVAL_MESSAGE,
+    10	  CURRENT_LABEL,
+    11	  EMPTY_PROJECT,
+    12	  EMPTY_WORKFLOW_ID,
+    13	  EMPTY_WORKFLOW_NAME,
+    14	  LOG_TEXT_PREFIX,
+    15	  PINNED_LABEL,
+    16	  PROJECT,
+    17	  REUSE_MESSAGE,
+    18	  RUN_AWAITING,
+    19	  RUN_BLOCKED,
+    20	  RUN_FAILED,
+    21	  RUN_LEGACY,
+    22	  RUN_SUCCEEDED,
+    23	  UI_ASSUMPTION,
+    24	  WORKFLOW_ID,
+    25	  WORKFLOW_NAME,
+    26	  runDetails,
+    27	} from './fixtures.ts'
+    28	
+    29	const phase = verificationPhase()
+    30	
+    31	const projectsUrl = '/projects'
+    32	const projectUrl = (projectId: string) => `/projects/${encodeURIComponent(projectId)}`
+    33	const workflowUrl = (projectId: string, workflowId: string) => `${projectUrl(projectId)}/workflows/${encodeURIComponent(workflowId)}`
+    34	const runUrl = (runId: string, nodeId?: string) => `${workflowUrl(PROJECT.project_id, WORKFLOW_ID)}/runs/${encodeURIComponent(runId)}${nodeId ? `/nodes/${encodeURIComponent(nodeId)}` : ''}`
+    35	const apiRun = (runId: string) => `/api/projects/${PROJECT.project_id}/workflows/${WORKFLOW_ID}/runs/${runId}`
+    36	
+    37	const rootsNav = (page: Page) => page.getByRole('navigation', { name: 'Roots' })
+    38	const workspace = (page: Page) => page.getByTestId('projects-workspace')
+    39	const graphNode = (page: Page, nodeId: string) => page.locator(`[data-testid="workflow-graph"] [data-graph-node="${nodeId}"]`)
+    40	const nodeListItem = (page: Page, nodeId: string) => page.locator(`[data-testid="run-node-list"] [data-node-id="${nodeId}"]`)
+    41	const nodeDetail = (page: Page) => page.getByTestId('node-detail')
+    42	
+    43	/** No view action may launch, approve, retry, delete or edit a run: no such real controls exist (graph nodes are read-only selectors). */
+    44	async function expectNoExecutionControls(page: Page) {
+    45	  const controls = workspace(page).locator('button, input, select, textarea, [role="menuitem"]')
+    46	  await expect(controls.filter({ hasText: /approve|retry|launch|start|resume|delete|cancel|integrate|edit|save/i })).toHaveCount(0)
+    47	  await expect(page.locator('form')).toHaveCount(0)
+    48	}
+    49	
+    50	async function attach(page: Page, testInfo: TestInfo, id: string) {
+    51	  const image = testInfo.outputPath(`${id}.png`)
+    52	  await page.screenshot({ path: image, fullPage: true })
+    53	  await testInfo.attach(`screenshot:${id}`, { path: image, contentType: 'image/png' })
+    54	}
+    55	
+    56	async function waitForProjectsApi(request: APIRequestContext) {
+    57	  if (phase !== 'candidate') return
+    58	  await expect.poll(async () => (await request.get('/api/projects')).status(), { timeout: 30_000 }).toBe(200)
+    59	}
+    60	
+    61	test.beforeEach(async ({ page, request }) => {
+    62	  await waitForApi(request)
+    63	  await waitForProjectsApi(request)
+    64	  if (phase === 'worker') await installProjectMocks(page)
+    65	})
+    66	
+    67	test(`[scenario:projects-navigation] Pi and Claude remain usable and Projects opens registered projects (${phase})`, async ({ page }, testInfo) => {
+    68	  // The existing skills graph still loads at Home with only the two sources, and the roots strip offers Projects.
+    69	  await openGraph(page)
+    70	  await expect(rootsNav(page).getByRole('link')).toHaveText(['Pi', 'Claude', 'Projects'])
+    71	  await expect(page.locator('.graph-canvas .node')).toHaveCount(2)
+    72	  await expect(page.getByRole('toolbar', { name: 'File operations' })).toBeVisible()
+    73	
+    74	  // Projects opens the registered project list without disturbing the skills domain.
+    75	  await rootsNav(page).getByRole('link', { name: 'Projects' }).click()
+    76	  await expect(page).toHaveURL(/\/projects$/)
+    77	  await expect(currentCrumb(page)).toHaveText('Projects')
+    78	  await expect(rootsNav(page).getByRole('link', { name: 'Projects' })).toHaveAttribute('aria-current', 'page')
+    79	  const list = page.getByTestId('projects-list')
+    80	  await expect(list.getByRole('link')).toContainText([PROJECT.name, EMPTY_PROJECT.name])
+    81	  await expect(page.getByTestId('projects-info')).toContainText('Read-only')
+    82	  await expect(page.getByRole('toolbar', { name: 'File operations' })).toHaveCount(0)
+    83	  await expect(page.locator('.graph-canvas')).toHaveCount(0)
+    84	  await expectNoExecutionControls(page)
+    85	  await attach(page, testInfo, 'projects-navigation')
+    86	
+    87	  // Pi and Claude roots are still one click away and still browse the real skills API.
+    88	  await rootsNav(page).getByRole('link', { name: 'Pi' }).click()
+    89	  await expect(page).toHaveURL(/\/browse\/Pi$/)
+    90	  await expect(currentCrumb(page)).toHaveText('Pi')
+    91	  await expect(node(page, `Pi/${PI}`)).toBeVisible()
+    92	  await rootsNav(page).getByRole('link', { name: 'Claude' }).click()
+    93	  await expect(currentCrumb(page)).toHaveText('Claude')
+    94	  await expect(node(page, 'Claude/claude-personal')).toBeVisible()
+    95	
+    96	  // Browser history moves between the two domains without losing either view.
+    97	  await page.goBack()
+    98	  await expect(currentCrumb(page)).toHaveText('Pi')
+    99	  await page.goBack()
+   100	  await expect(currentCrumb(page)).toHaveText('Projects')
+   101	  await expect(list.getByRole('link')).toHaveCount(2)
+   102	  await page.goForward()
+   103	  await expect(currentCrumb(page)).toHaveText('Pi')
+   104	  await expect(node(page, 'Pi')).toBeVisible()
+   105	
+   106	  // Documents still open, and the unsaved-edit guard still protects a dirty draft from leaving to Projects.
+   107	  const scratch = join(roots.piPersonal, `projects-nav-${randomUUID()}.md`)
+   108	  await writeFile(scratch, '# Scratch\n\nEditable.\n')
+   109	  try {
+   110	    await page.goto(fileUrl('Pi', PI, scratch.slice(roots.piPersonal.length + 1)))
+   111	    await expect(page.getByTestId('document-view').getByRole('heading', { level: 2 })).toContainText('projects-nav-')
+   112	    await page.getByRole('button', { name: 'Edit', exact: true }).click()
+   113	    await page.locator('.cm-content').click()
+   114	    await page.keyboard.press('Control+End')
+   115	    await page.keyboard.type('draft')
+   116	    await rootsNav(page).getByRole('link', { name: 'Projects' }).click()
+   117	    const dialog = page.getByRole('dialog')
+   118	    await expect(dialog).toContainText('Discard changes?')
+   119	    await dialog.getByRole('button', { name: 'Cancel' }).click()
+   120	    await expect(page).toHaveURL(/\/file\/Pi\//)
+   121	    await expect(page.locator('.cm-content')).toContainText('draft')
+   122	    await rootsNav(page).getByRole('link', { name: 'Projects' }).click()
+   123	    await page.getByRole('dialog').getByRole('button', { name: 'Discard' }).click()
+   124	    await expect(currentCrumb(page)).toHaveText('Projects')
+   125	  } finally {
+   126	    await rm(scratch, { force: true })
+   127	  }
+   128	})
+   129	
+   130	test(`[scenario:workflow-run-graph] Select a project, workflow and run and inspect the pinned graph (${phase})`, async ({ page }, testInfo) => {
+   131	  await page.goto(projectsUrl)
+   132	  await page.getByTestId('projects-list').getByRole('link', { name: PROJECT.name }).click()
+   133	  await expect(currentCrumb(page)).toHaveText(PROJECT.name)
+   134	  const workflows = page.getByTestId('workflows-list')
+   135	  await expect(workflows.getByRole('link')).toContainText([WORKFLOW_NAME, EMPTY_WORKFLOW_NAME])
+   136	  await workflows.getByRole('link', { name: new RegExp(`^${WORKFLOW_NAME}`) }).click()
+   137	  await expect(page).toHaveURL(new RegExp(`${workflowUrl(PROJECT.project_id, WORKFLOW_ID)}$`))
+   138	  await expect(currentCrumb(page)).toHaveText(WORKFLOW_NAME)
+   139	
+   140	  // The run list carries each run's actual status, newest first; the current definition graph shows the latest labels.
+   141	  const runList = page.getByTestId('run-list')
+   142	  await expect(runList.locator('li')).toHaveCount(5)
+   143	  await expect(runList.locator(`[data-run-id="${RUN_SUCCEEDED}"]`)).toHaveAttribute('data-status', 'succeeded')
+   144	  await expect(runList.locator(`[data-run-id="${RUN_FAILED}"]`)).toHaveAttribute('data-status', 'failed')
+   145	  await expect(runList.locator(`[data-run-id="${RUN_AWAITING}"]`)).toHaveAttribute('data-status', 'awaiting_approval')
+   146	  await expect(runList.locator(`[data-run-id="${RUN_BLOCKED}"]`)).toHaveAttribute('data-status', 'failed')
+   147	  await expect(runList.locator(`[data-run-id="${RUN_LEGACY}"]`)).toHaveAttribute('data-status', 'succeeded')
+   148	  await expect(page.getByTestId('current-definition')).toContainText('9 nodes')
+   149	  await expect(page.getByRole('group', { name: `Current definition graph of ${WORKFLOW_NAME}` }).locator('[data-graph-node="verify_ui"]')).toHaveAttribute('aria-label', new RegExp(`^${CURRENT_LABEL}, verification`))
+   150	
+   151	  // The succeeded run was started under an older definition and is rendered against that pinned graph.
+   152	  await runList.getByRole('link', { name: new RegExp(`^${RUN_SUCCEEDED}`) }).click()
+   153	  await expect(page).toHaveURL(new RegExp(`${runUrl(RUN_SUCCEEDED)}$`))
+   154	  const runView = page.getByTestId('run-view')
+   155	  await expect(runView).toHaveAttribute('data-run-status', 'succeeded')
+   156	  await expect(page.getByTestId('run-status')).toContainText('Succeeded')
+   157	  await expect(page.getByTestId('definition-changed')).toBeVisible()
+   158	  await expect(graphNode(page, 'verify_ui')).toHaveAttribute('aria-label', new RegExp(`^${PINNED_LABEL.replace(/[()]/g, '\\$&')}, verification, succeeded, attempt 1`))
+   159	  await expect(page.locator('[data-testid="workflow-graph"] [data-graph-node]')).toHaveCount(9)
+   160	  await expect(page.locator('[data-testid="workflow-graph"] [data-graph-node][data-status="succeeded"]')).toHaveCount(9)
+   161	  await expect(page.locator('[data-testid="workflow-graph"] [data-edge-from="handoff"][data-edge-to="verify_ui"]')).toHaveCount(1)
+   162	  await expect(page.getByTestId('node-hint')).toBeVisible()
+   163	
+   164	  // Keyboard: focus a graph node, move with arrows, open with Enter; the selection is reflected in the URL and list.
+   165	  await graphNode(page, 'launch_ui').focus()
+   166	  await page.keyboard.press('ArrowRight')
+   167	  await expect(graphNode(page, 'launch_adapter')).toBeFocused()
+   168	  await page.keyboard.press('Enter')
+   169	  await expect(page).toHaveURL(new RegExp(`${runUrl(RUN_SUCCEEDED, 'launch_adapter')}$`))
+   170	  await expect(nodeDetail(page)).toHaveAttribute('data-node-id', 'launch_adapter')
+   171	  await expect(nodeDetail(page).getByRole('heading', { level: 3 })).toContainText('Launch adapter worker')
+   172	  await expect(page.getByTestId('node-status-meaning')).toContainText('not workflow completion')
+   173	  await expect(nodeListItem(page, 'launch_adapter').getByRole('link')).toHaveAttribute('aria-current', 'page')
+   174	  await attach(page, testInfo, 'workflow-run-graph')
+   175	
+   176	  // Back returns to the run without a selected node; a different run shows its own (current) definition.
+   177	  await page.goBack()
+   178	  await expect(page).toHaveURL(new RegExp(`${runUrl(RUN_SUCCEEDED)}$`))
+   179	  await expect(page.getByTestId('node-hint')).toBeVisible()
+   180	  await page.goBack()
+   181	  await expect(currentCrumb(page)).toHaveText(WORKFLOW_NAME)
+   182	  await runList.getByRole('link', { name: new RegExp(`^${RUN_FAILED}`) }).click()
+   183	  await expect(runView).toHaveAttribute('data-run-status', 'failed')
+   184	  await expect(page.getByTestId('definition-current')).toBeVisible()
+   185	  await expect(graphNode(page, 'verify_ui')).toHaveAttribute('aria-label', new RegExp(`^${CURRENT_LABEL}, verification, succeeded`))
+   186	  await expect(graphNode(page, 'verify_adapter')).toHaveAttribute('data-status', 'failed')
+   187	  await expect(graphNode(page, 'integrate')).toHaveAttribute('data-status', 'pending')
+   188	  await expectNoExecutionControls(page)
+   189	})
+   190	
+   191	test(`[scenario:run-evidence] Inspect worker checks, changed files, assumptions, logs and screenshot evidence (${phase})`, async ({ page, request }, testInfo) => {
+   192	  // Discover which nodes published results: from the explicit fixtures in worker mode, from the real adapter in candidate mode.
+   193	  type Snapshot = { snapshot: { nodes: { node_id: string; result_uri: string | null; attempt: number }[] } }
+   194	  type Result = { artifacts: { kind: string }[]; checks: unknown[] }
+   195	  const detail: Snapshot = phase === 'worker' ? runDetails[RUN_SUCCEEDED] : await (await request.get(apiRun(RUN_SUCCEEDED))).json()
+   196	  // Worker results only: the review node links to the review result, which carries no artifacts.
+   197	  const published = detail.snapshot.nodes.filter(node => node.result_uri !== null && node.result_uri.includes('/results/'))
+   198	  expect(published.length, 'the succeeded run must expose at least one node result').toBeGreaterThan(0)
+   199	  const results = await Promise.all(published.map(async node => ({
+   200	    node,
+   201	    result: (phase === 'worker' ? mockResponse(new URL(node.result_uri!, 'http://mock')) && JSON.parse(mockResponse(new URL(node.result_uri!, 'http://mock')).body as string) : await (await request.get(node.result_uri!)).json()) as Result,
+   202	  })))
+   203	  const withScreenshot = results.find(entry => entry.result.artifacts.some(artifact => artifact.kind === 'screenshot'))
+   204	  expect(withScreenshot, 'a node result must carry screenshot evidence').toBeTruthy()
+   205	  const target = withScreenshot!.node
+   206	
+   207	  await page.goto(runUrl(RUN_SUCCEEDED))
+   208	  await nodeListItem(page, target.node_id).getByRole('link').click()
+   209	  await expect(nodeDetail(page)).toHaveAttribute('data-node-id', target.node_id)
+   210	  await expect(page.getByTestId('node-attempt')).toHaveText(String(target.attempt))
+   211	  const result = page.getByTestId('worker-result')
+   212	  await expect(result).toBeVisible()
+   213	  await expect(page.getByTestId('worker-summary')).not.toBeEmpty()
+   214	
+   215	  // Checks actually executed, with exit codes and their log artifacts loaded on demand.
+   216	  const checks = page.getByTestId('checks-list').locator('.check')
+   217	  await expect(checks).toHaveCount(withScreenshot!.result.checks.length)
+   218	  await expect(checks.first().locator('.check-exit')).toContainText('exit 0')
+   219	  await checks.first().getByRole('button', { name: 'Show contents' }).click()
+   220	  const log = checks.first().locator('[data-testid^="artifact-text:"]')
+   221	  await expect(log).toContainText(LOG_TEXT_PREFIX)
+   222	  await checks.first().getByRole('button', { name: 'Hide contents' }).click()
+   223	  await expect(log).toHaveCount(0)
+   224	
+   225	  // Changed files, assumptions and screenshots come from the result, not from the viewer.
+   226	  await expect(page.getByTestId('changed-files').locator('li')).toContainText(['src/App.tsx'])
+   227	  await expect(page.getByTestId('assumptions').locator('li')).toContainText([UI_ASSUMPTION])
+   228	  const screenshot = page.getByTestId('screenshots').locator('img').first()
+   229	  await expect(screenshot).toBeVisible()
+   230	  await expect.poll(() => screenshot.evaluate(image => (image as unknown as { naturalWidth: number }).naturalWidth)).toBeGreaterThan(0)
+   231	  await expect(page.getByTestId('node-events').or(page.getByTestId('events-none'))).toBeVisible()
+   232	  await expect(page.getByTestId('reuse-none').or(page.getByTestId('reuse-list'))).toBeVisible()
+   233	  await attach(page, testInfo, 'run-evidence')
+   234	
+   235	  // Nodes without a result say so explicitly instead of showing another node's evidence.
+   236	  const unpublished = detail.snapshot.nodes.find(node => node.result_uri === null)
+   237	  if (unpublished) {
+   238	    await nodeListItem(page, unpublished.node_id).getByRole('link').click()
+   239	    await expect(page.getByTestId('result-none')).toBeVisible()
+   240	    await expect(page.getByTestId('worker-result')).toHaveCount(0)
+   241	  }
+   242	
+   243	  // Explicit reuse evidence: the failed run reran only the adapter lane and reused the UI verification.
+   244	  await page.goto(runUrl(RUN_FAILED, 'verify_ui'))
+   245	  await expect(nodeDetail(page)).toHaveAttribute('data-node-id', 'verify_ui')
+   246	  if (phase === 'worker') {
+   247	    await expect(page.getByTestId('reuse-list')).toContainText(REUSE_MESSAGE)
+   248	    await expect(page.getByTestId('reuse-list')).toContainText('Attempt 2 reused the result of attempt 1')
+   249	  } else {
+   250	    // The adapter decides how persisted evidence maps to reuse events; either explicit reuse or an explicit absence is shown.
+   251	    await expect(page.getByTestId('reuse-none').or(page.getByTestId('reuse-list'))).toBeVisible()
+   252	  }
+   253	  await expectNoExecutionControls(page)
+   254	})
+   255	
+   256	test(`[scenario:empty-states] Distinguish no workflows from no runs (${phase})`, async ({ page }, testInfo) => {
+   257	  await page.goto(projectUrl(EMPTY_PROJECT.project_id))
+   258	  await expect(currentCrumb(page)).toHaveText(EMPTY_PROJECT.name)
+   259	  const emptyWorkflows = page.getByTestId('empty-workflows')
+   260	  await expect(emptyWorkflows).toContainText(`${EMPTY_PROJECT.name} has no workflow definitions`)
+   261	  await expect(page.getByTestId('workflows-list')).toHaveCount(0)
+   262	  await expect(page.getByTestId('projects-error')).toHaveCount(0)
+   263	  const noWorkflowsText = await emptyWorkflows.innerText()
+   264	
+   265	  await page.goto(workflowUrl(PROJECT.project_id, EMPTY_WORKFLOW_ID))
+   266	  await expect(currentCrumb(page)).toHaveText(EMPTY_WORKFLOW_NAME)
+   267	  const emptyRuns = page.getByTestId('empty-runs')
+   268	  await expect(emptyRuns).toContainText('No runs have been recorded for this workflow')
+   269	  await expect(page.getByTestId('run-list')).toHaveCount(0)
+   270	  // The workflow itself exists: its current definition is still shown next to the empty run list.
+   271	  await expect(page.getByTestId('current-definition')).toContainText('3 nodes')
+   272	  await expect(page.getByRole('group', { name: `Current definition graph of ${EMPTY_WORKFLOW_NAME}` })).toBeVisible()
+   273	  expect(await emptyRuns.innerText()).not.toEqual(noWorkflowsText)
+   274	  await attach(page, testInfo, 'empty-states')
+   275	
+   276	  // The populated project and workflow show lists, never an empty state.
+   277	  await page.goto(projectUrl(PROJECT.project_id))
+   278	  await expect(page.getByTestId('workflows-list')).toBeVisible()
+   279	  await expect(page.getByTestId('empty-workflows')).toHaveCount(0)
+   280	})
+   281	
+   282	test(`[scenario:failed-and-paused] Show failure and awaiting-approval state without implying completion (${phase})`, async ({ page }, testInfo) => {
+   283	  // A narrow viewport must still give a usable single-column layout with no horizontal overflow.
+   284	  await page.setViewportSize({ width: 420, height: 900 })
+   285	
+   286	  await page.goto(runUrl(RUN_FAILED, 'verify_adapter'))
+   287	  await expect(page.getByTestId('run-view')).toHaveAttribute('data-run-status', 'failed')
+   288	  await expect(page.getByTestId('run-status')).toContainText('Failed')
+   289	  await expect(page.getByTestId('run-status-meaning')).toContainText('did not complete')
+   290	  await expect(nodeDetail(page)).toHaveAttribute('data-node-id', 'verify_adapter')
+   291	  await expect(nodeDetail(page).locator('.status-badge').first()).toHaveText('Failed')
+   292	  await expect(page.getByTestId('node-status-meaning')).toContainText('This step failed')
+   293	  await expect(page.getByTestId('node-attempt')).toHaveText('1')
+   294	  // Downstream nodes have not started: attempt 0, pending, no session, no result.
+   295	  await expect(nodeListItem(page, 'candidate')).toHaveAttribute('data-status', 'pending')
+   296	  await nodeListItem(page, 'integrate').getByRole('link').click()
+   297	  await expect(page.getByTestId('node-attempt')).toHaveText('0 (not started)')
+   298	  await expect(page.getByTestId('result-none')).toBeVisible()
+   299	  if (phase === 'worker') {
+   300	    await page.goto(runUrl(RUN_FAILED, 'verify_adapter'))
+   301	    await expect(page.getByTestId('worker-error')).toContainText('injected_gate_failure')
+   302	    await expect(page.getByTestId('worker-error')).toContainText('Retrying is done through the workflow CLI')
+   303	  }
+   304	
+   305	  await page.goto(runUrl(RUN_AWAITING, 'review'))
+   306	  await expect(page.getByTestId('run-view')).toHaveAttribute('data-run-status', 'awaiting_approval')
+   307	  await expect(page.getByTestId('run-status')).toContainText('Awaiting approval')
+   308	  await expect(page.getByTestId('run-status-meaning')).toContainText('not complete')
+   309	  await expect(nodeDetail(page)).toHaveAttribute('data-node-id', 'review')
+   310	  await expect(page.getByTestId('awaiting-notice')).toContainText('Viewing does not approve it')
+   311	  if (phase === 'worker') await expect(page.getByTestId('awaiting-notice')).toContainText(APPROVAL_MESSAGE)
+   312	  await expect(graphNode(page, 'review')).toHaveAttribute('data-status', 'awaiting_approval')
+   313	  await expect(graphNode(page, 'approval')).toHaveAttribute('data-status', 'pending')
+   314	  await expect(graphNode(page, 'integrate')).toHaveAttribute('data-status', 'pending')
+   315	  // The launch nodes finished, and the viewer says what that does (not) mean.
+   316	  await nodeListItem(page, 'launch_ui').getByRole('link').click()
+   317	  await expect(page.getByTestId('node-status-meaning')).toContainText('This is not workflow completion')
+   318	  await expect(page.getByTestId('run-status')).toContainText('Awaiting approval')
+   319	  await expectNoExecutionControls(page)
+   320	  const overflow = await page.evaluate('({ scroll: document.documentElement.scrollWidth, inner: window.innerWidth })') as { scroll: number; inner: number }
+   321	  expect(overflow.scroll, 'narrow layout must not overflow horizontally').toBeLessThanOrEqual(overflow.inner)
+   322	  await attach(page, testInfo, 'failed-and-paused')
+   323	})
+   324	
+   325	test(`[scenario:request-errors] Show an actionable API error rather than silently substituting fixtures (${phase})`, async ({ page }, testInfo) => {
+   326	  // A server failure on the project list: the error is shown with its code and status, and no project appears.
+   327	  let failProjects = true
+   328	  await page.route(url => url.pathname === '/api/projects', async route => {
+   329	    if (failProjects) await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'registry_unavailable', message: 'The project registry could not be read.' } }) })
+   330	    else await route.fallback()
+   331	  })
+   332	  await page.goto(projectsUrl)
+   333	  const error = page.getByTestId('projects-error')
+   334	  await expect(error).toContainText('The project list could not be loaded')
+   335	  await expect(error).toContainText('The project registry could not be read.')
+   336	  await expect(error).toContainText('registry_unavailable')
+   337	  await expect(error).toContainText('HTTP 503')
+   338	  await expect(error).toHaveAttribute('data-error-kind', 'http')
+   339	  await expect(page.getByTestId('projects-list')).toHaveCount(0)
+   340	  await expect(page.getByText(PROJECT.name)).toHaveCount(0)
+   341	  await attach(page, testInfo, 'request-errors')
+   342	  failProjects = false
+   343	  await error.getByRole('button', { name: 'Retry' }).click()
+   344	  await expect(page.getByTestId('projects-list').getByRole('link')).toContainText([PROJECT.name])
+   345	
+   346	  // An unreachable API for the workflows of a project.
+   347	  let dropWorkflows = true
+   348	  await page.route(url => url.pathname === `/api/projects/${PROJECT.project_id}/workflows`, async route => {
+   349	    if (dropWorkflows) await route.abort('connectionrefused')
+   350	    else await route.fallback()
+   351	  })
+   352	  await page.goto(projectUrl(PROJECT.project_id))
+   353	  await expect(page.getByTestId('projects-error')).toContainText('could not be reached')
+   354	  await expect(page.getByTestId('projects-error')).toHaveAttribute('data-error-kind', 'network')
+   355	  await expect(page.getByTestId('workflows-list')).toHaveCount(0)
+   356	  dropWorkflows = false
+   357	  await page.getByTestId('projects-error').getByRole('button', { name: 'Retry' }).click()
+   358	  await expect(page.getByTestId('workflows-list')).toBeVisible()
+   359	
+   360	  // A payload that violates the contract is rejected, not rendered.
+   361	  let corruptRuns = true
+   362	  await page.route(url => url.pathname === `/api/projects/${PROJECT.project_id}/workflows/${WORKFLOW_ID}/runs`, async route => {
+   363	    if (corruptRuns) await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ runs: [{ run_id: 'bogus' }], next_cursor: null }) })
+   364	    else await route.fallback()
+   365	  })
+   366	  await page.goto(workflowUrl(PROJECT.project_id, WORKFLOW_ID))
+   367	  await expect(page.getByTestId('projects-error')).toContainText('does not match the projects contract')
+   368	  await expect(page.getByTestId('projects-error')).toHaveAttribute('data-error-kind', 'malformed')
+   369	  await expect(page.getByTestId('run-list')).toHaveCount(0)
+   370	  corruptRuns = false
+   371	  await page.getByTestId('projects-error').getByRole('button', { name: 'Retry' }).click()
+   372	  await expect(page.getByTestId('run-list')).toBeVisible()
+   373	
+   374	  // Not found, served by this phase's API: an unregistered project, and a run requested under the wrong project.
+   375	  await page.goto(projectUrl('nope-project'))
+   376	  await expect(page.getByTestId('not-found')).toContainText('“nope-project” is not registered')
+   377	  await page.getByTestId('not-found').getByRole('link', { name: 'Go to Projects' }).click()
+   378	  await expect(currentCrumb(page)).toHaveText('Projects')
+   379	  await page.goto(`${workflowUrl(EMPTY_PROJECT.project_id, WORKFLOW_ID)}/runs/${RUN_SUCCEEDED}`)
+   380	  await expect(page.getByTestId('not-found')).toContainText(`“${RUN_SUCCEEDED}” was not found`)
+   381	  await expect(page.getByTestId('run-view')).toHaveCount(0)
+   382	  await page.goto(runUrl(RUN_SUCCEEDED))
+   383	  await expect(page.getByTestId('run-view')).toHaveAttribute('data-run-status', 'succeeded')
+   384	
+   385	  // A malformed Projects link is explained, not guessed.
+   386	  await page.goto('/projects/alpha-project/not-workflows/x')
+   387	  await expect(page.getByRole('alert')).toContainText('This Projects link is invalid')
+   388	  await expect(page.getByTestId('run-view')).toHaveCount(0)
+   389	})
+fixtures.ts
+global-teardown.ts
+harness.ts
+inputs.spec.ts
+mock.ts
+playwright.config.ts
+projects.spec.ts
+review.spec.ts
+seed.ts
+support.ts
+     1	import { defineConfig } from '@playwright/test'
+     2	import { execFileSync } from 'node:child_process'
+     3	import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+     4	import { tmpdir } from 'node:os'
+     5	import { join } from 'node:path'
+     6	import { fileURLToPath } from 'node:url'
+     7	import { ROOT_PREFIX, SKILL_LOCATIONS, verificationPhase } from './harness.ts'
+     8	import { seedCandidate } from './seed.ts'
+     9	
+    10	/**
+    11	 * Dedicated configuration for the Projects viewer scenarios (`features/project-workflows/policy.json`).
+    12	 *
+    13	 * - Its own temporary root (skills fixtures for Pi/Claude and, in candidate mode, the seeded project
+    14	 *   registry and run directories) and its own dynamically chosen API/web ports, so it never touches live
+    15	 *   skills, live project storage or a developer's running servers. `global-teardown.ts` removes the root.
+    16	 * - `WORKFLOW_VERIFICATION_PHASE=worker` (default): the backend has no projects routes; specs mock only
+    17	 *   `/api/projects/**` with the explicit contract fixtures.
+    18	 * - `WORKFLOW_VERIFICATION_PHASE=candidate`: the real combined backend is started with the seeded registry;
+    19	 *   no project success responses are mocked.
+    20	 *
+    21	 * Playwright evaluates this module in the runner and again in every worker process; the root and ports are
+    22	 * prepared once and handed down through the environment.
+    23	 */
+    24	const phase = verificationPhase()
+    25	
+    26	function freePort(): number {
+    27	  const script = "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close()})"
+    28	  return Number(execFileSync(process.execPath, ['-e', script], { encoding: 'utf8' }).trim())
+    29	}
+    30	
+    31	function prepare(): { root: string; apiPort: number; webPort: number; projectsConfig: string | null } {
+    32	  const existing = process.env.MD_MANAGER_PROJECTS_TEST_ROOT
+    33	  if (existing) {
+    34	    return {
+    35	      root: existing,
+    36	      apiPort: Number(process.env.MD_MANAGER_API_PORT),
+    37	      webPort: Number(process.env.MD_MANAGER_WEB_PORT),
+    38	      projectsConfig: process.env.MD_MANAGER_PROJECTS_CONFIG || null,
+    39	    }
+    40	  }
+    41	  const root = mkdtempSync(join(tmpdir(), ROOT_PREFIX))
+    42	  const fixtures = fileURLToPath(new URL('../../fixtures/', import.meta.url))
+    43	  cpSync(join(fixtures, 'pi'), join(root, 'pi-personal'), { recursive: true })
+    44	  cpSync(join(fixtures, 'claude'), join(root, 'claude-personal'), { recursive: true })
+    45	  mkdirSync(join(root, 'pi-package', 'review'), { recursive: true })
+    46	  writeFileSync(join(root, 'pi-package', 'review', 'SKILL.md'), '# Package review skill\n\nInstalled by a package.\n')
+    47	  mkdirSync(join(root, 'claude-plugin', 'review'), { recursive: true })
+    48	  writeFileSync(join(root, 'claude-plugin', 'review', 'SKILL.md'), '# Plugin review skill\n\nInstalled by a plugin.\n')
+    49	  // pi-missing is configured but deliberately not created: an unavailable location, as in the root harness.
+    50	  const sources = { version: 1, locations: SKILL_LOCATIONS.map(({ id, source, label, directory, category }) => ({ id, source, label, path: join(root, directory), category })) }
+    51	  writeFileSync(join(root, 'sources.json'), `${JSON.stringify(sources, null, 2)}\n`)
+    52	  const projectsConfig = phase === 'candidate' ? seedCandidate(join(root, 'projects')) : null
+    53	  let apiPort = freePort()
+    54	  let webPort = freePort()
+    55	  while (webPort === apiPort) webPort = freePort()
+    56	  if (apiPort === webPort) apiPort = freePort()
+    57	  process.env.MD_MANAGER_PROJECTS_TEST_ROOT = root
+    58	  // The root skills helpers read this to locate the seeded location directories.
+    59	  process.env.MD_MANAGER_TEST_ROOT = root
+    60	  process.env.MD_MANAGER_CONFIG = join(root, 'sources.json')
+    61	  process.env.MD_MANAGER_API_PORT = String(apiPort)
+    62	  process.env.MD_MANAGER_WEB_PORT = String(webPort)
+    63	  process.env.WORKFLOW_VERIFICATION_PHASE = phase
+    64	  if (projectsConfig) process.env.MD_MANAGER_PROJECTS_CONFIG = projectsConfig
+    65	  else delete process.env.MD_MANAGER_PROJECTS_CONFIG
+    66	  return { root, apiPort, webPort, projectsConfig }
+    67	}
+    68	
+    69	const { root, apiPort, webPort, projectsConfig } = prepare()
+    70	const baseURL = `http://127.0.0.1:${webPort}`
+    71	
+    72	const apiEnv: Record<string, string> = {
+    73	  MD_MANAGER_CONFIG: join(root, 'sources.json'),
+    74	  MD_MANAGER_FIXTURE_ROOT: '',
+    75	  MD_MANAGER_API_PORT: String(apiPort),
+    76	  MD_MANAGER_WEB_PORT: String(webPort),
+    77	  WORKFLOW_VERIFICATION_PHASE: phase,
+    78	  ...(projectsConfig ? { MD_MANAGER_PROJECTS_CONFIG: projectsConfig } : {}),
+    79	}
+    80	
+    81	export default defineConfig({
+    82	  testDir: '.',
+    83	  testMatch: '**/*.spec.ts',
+    84	  globalTeardown: './global-teardown.ts',
+    85	  outputDir: process.env.MD_MANAGER_PROJECTS_OUTPUT ?? join(process.cwd(), 'test-results', 'project-workflows'),
+    86	  workers: 1,
+    87	  fullyParallel: false,
+    88	  retries: 0,
+    89	  use: {
+    90	    baseURL,
+    91	    browserName: 'chromium',
+    92	    reducedMotion: 'reduce',
+    93	  },
+    94	  webServer: [
+    95	    {
+    96	      command: 'npm run start:api',
+    97	      url: `http://127.0.0.1:${apiPort}/api/entries`,
+    98	      env: apiEnv,
+    99	      reuseExistingServer: false,
+   100	      timeout: 30_000,
+   101	    },
+   102	    {
+   103	      command: 'npm run dev:web',
+   104	      url: baseURL,
+   105	      env: { MD_MANAGER_API_PORT: String(apiPort), MD_MANAGER_WEB_PORT: String(webPort) },
+   106	      reuseExistingServer: false,
+   107	      timeout: 30_000,
+   108	    },
+   109	  ],
+   110	})

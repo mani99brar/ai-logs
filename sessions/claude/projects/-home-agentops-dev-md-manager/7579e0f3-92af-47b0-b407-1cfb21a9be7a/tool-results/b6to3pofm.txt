@@ -1,0 +1,451 @@
+   260	        self.assertEqual(code, 0, err)
+   261	        status = json.loads(out[:out.rindex("}") + 1])
+   262	        self.assertEqual(status["repairs"], [{"n": 1, "status": "applied", "lanes": ["ui"], "commit": fix}])
+   263	        self.assertEqual(status["repair_workspaces"], ["repair-workspace-1"])
+   264	        before = (directory / "run-state.json").read_bytes()
+   265	        export_run(ExportRuntime(directory))
+   266	        self.assertEqual((directory / "run-state.json").read_bytes(), before)
+   267	
+   268	
+   269	class ForkPoint(RepairFixture):
+   270	    """The fork is taken at the freeze boundary, never on the failed head."""
+   271	
+   272	    automatic = False
+   273	
+   274	    def test_repair_forks_at_the_freeze_boundary_and_a_second_repair_forks_from_the_first(self):
+   275	        self.block_at_candidate()
+   276	        with self.graph() as (graph, config):
+   277	            failed = graph.get_state(config).config["configurable"]["checkpoint_id"]
+   278	            boundary = next(item for item in graph.get_state_history(config) if set(item.next) == FAN_OUT).config["configurable"]["checkpoint_id"]
+   279	        first_candidate = self.candidate_commit()
+   280	        fix = self.commit_on(first_candidate, {"ui.txt": "closer"})
+   281	        with patch.object(Pregel, "update_state", autospec=True, side_effect=Pregel.update_state) as update:
+   282	            code, out, err = self.cli("ui", "--commit", fix, "--reason", "first try")
+   283	        self.assertEqual(code, 0, err)
+   284	        self.assertIn(f"{sys.executable} -m workflow retry {self.directory}", out)
+   285	        # Never the bare thread config: the fork point's own config, which carries its checkpoint_id.
+   286	        self.assertEqual(update.call_count, 1)
+   287	        self.assertEqual(update.call_args.args[1]["configurable"]["checkpoint_id"], boundary)
+   288	        self.assertEqual(update.call_args.kwargs["as_node"], "handoff")
+   289	        with self.graph() as (graph, config):
+   290	            head = graph.get_state(config)
+   291	            self.assertEqual(set(head.next), FAN_OUT)
+   292	            self.assertEqual((head.values.get("packets", {}), [task.error for task in head.tasks if task.error]), ({}, []))
+   293	            self.assertEqual((head.metadata["source"], head.parent_config["configurable"]["checkpoint_id"]), ("update", boundary))
+   294	            self.assertEqual(head.values["snapshots"]["ui"]["commit"], self.entries()[0]["lanes"]["ui"]["commit"])
+   295	            self.assertIn(failed, [item.config["configurable"]["checkpoint_id"] for item in graph.get_state_history(config)])
+   296	            first_fork = head.config["configurable"]["checkpoint_id"]
+   297	            self.assertEqual(self.entries()[0]["head_after"], first_fork)
+   298	            mark = len(self.events())
+   299	            with self.assertRaisesRegex(RuntimeError, "Combined candidate failed ui checks"):
+   300	                graph.invoke(None, config)
+   301	        # The candidate ran once, after both verifies, as generation 1.
+   302	        steps = [event["node"] for event in self.events()[mark:]]
+   303	        self.assertEqual(sorted(steps[:4]), ["verify_adapter", "verify_adapter", "verify_ui", "verify_ui"])
+   304	        self.assertEqual(steps[4:], ["candidate_adapter", "candidate_ui"])
+   305	        second_candidate = self.candidate_commit(1)
+   306	        self.assertNotEqual(second_candidate, first_candidate)
+   307	
+   308	        # A fix on the superseded candidate is stale; on the current one it forks from the first repair's fork.
+   309	        stale = self.commit_on(first_candidate, {"ui.txt": "after"})
+   310	        code, _, err = self.cli("ui", "--commit", stale, "--reason", "second try")
+   311	        self.assertEqual(code, 1)
+   312	        self.assertIn("earlier generation", err)
+   313	        fix = self.commit_on(second_candidate, {"ui.txt": "after"})
+   314	        code, out, err = self.cli("ui", "--commit", fix, "--reason", "second try")
+   315	        self.assertEqual(code, 0, err)
+   316	        second = self.entries()[1]
+   317	        self.assertEqual((second["n"], second["fork_from"], second["base_commit"]), (2, first_fork, second_candidate))
+   318	        self.assertEqual(second["attempt_targets"], {"worker:ui": 3, "candidate:adapter": 3, "candidate:ui": 3})
+   319	        with self.graph() as (graph, config):
+   320	            self.assertEqual(graph.get_state(config).parent_config["configurable"]["checkpoint_id"], first_fork)
+   321	            outcome = graph.invoke(None, config)
+   322	        self.assertEqual(outcome["__interrupt__"][0].value["kind"], "independent_review")
+   323	        self.assertEqual(read_json(self.directory / "review-bundle.json")["candidate_commit"], self.candidate_commit(2))
+   324	        summary = read_json(self.directory / "review-bundle.json")["snapshots"]["ui"]["summary"]
+   325	        self.assertIn("Operator repair 1: first try", summary)
+   326	        self.assertIn("Operator repair 2: second try", summary)
+   327	
+   328	    def test_a_head_update_would_check_the_candidate_with_stale_packets_and_is_refused(self):
+   329	        """The rejected alternative: update_state on the failed head schedules the candidate beside the verifies with the
+   330	        new snapshots and the old packets. candidate() refuses to bundle packets of another revision."""
+   331	        self.block_at_candidate()
+   332	        fix = self.commit_on(self.snapshot("ui"), {"ui.txt": "after"})
+   333	        with self.graph() as (graph, config):
+   334	            values = graph.get_state(config).values
+   335	            snapshots = {**values["snapshots"], "ui": {**values["snapshots"]["ui"], "commit": fix}}
+   336	            graph.update_state(config, {"snapshots": snapshots}, as_node="handoff")
+   337	            head = graph.get_state(config)
+   338	            self.assertIn("candidate", head.next)
+   339	            with self.assertRaisesRegex(ValueError, "Worker evidence for ui is not of its snapshot"):
+   340	                self.runtime.candidate(head.values)
+   341	
+   342	
+   343	class WorkerPhaseRepair(RepairFixture):
+   344	    """A lane blocked by its own unit check is repaired on its snapshot and gets a fresh worker attempt."""
+   345	
+   346	    def test_worker_phase_block_is_repaired(self):
+   347	        directory = self.directory
+   348	        self.sessions.edits.update(adapter=("backend.py", "VALUE = 5\n"), ui=("ui.txt", "after"))
+   349	        self.start()
+   350	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "worker/adapter failed identically on attempts 1 and 2"):
+   351	            drive(self.runtime)
+   352	        ui_packet = directory / "verification/worker/ui/1/packet.json"
+   353	        ui_bytes = ui_packet.read_bytes()
+   354	        snapshot = self.snapshot("adapter")
+   355	        self.assertEqual(self.cli("adapter,ui", "--workspace")[0], 1)  # Several lanes need a candidate base.
+   356	        code, out, err = self.cli("adapter", "--workspace")
+   357	        self.assertEqual(code, 0, err)
+   358	        workspace = directory / "repair-workspace-1"
+   359	        self.assertEqual(git(workspace, "rev-parse", "HEAD"), snapshot)
+   360	        brief = (directory / "repair-workspace-1.brief.md").read_text()
+   361	        for expected in ("unit: exit 1", str(directory / "verification/worker/adapter/2/check-0.log"), "backend.py", "-m unittest discover"):
+   362	            self.assertIn(expected, brief)
+   363	        (workspace / "backend.py").write_text("VALUE = 2\n")
+   364	        git(workspace, "commit", "-qam", "adapter: VALUE is 2")
+   365	        fix = git(workspace, "rev-parse", "HEAD")
+   366	        code, out, err = self.cli("adapter", "--commit", fix, "--reason", "VALUE must be 2")
+   367	        self.assertEqual(code, 0, err)
+   368	        [entry] = self.entries()
+   369	        self.assertEqual((entry["base_kind"], entry["base_commit"], entry["expected_candidate_tree"]), ("snapshot", snapshot, None))
+   370	        # A worker-phase block raises no candidate counter: no candidate attempt directory exists yet.
+   371	        self.assertEqual(entry["attempt_targets"], {"worker:adapter": 3})
+   372	        with patch("workflow.automatic.wait_handoffs"):
+   373	            commit = drive(self.runtime)
+   374	        packet = read_json(directory / "verification/worker/adapter/3/packet.json")
+   375	        self.assertEqual((packet["expected"]["output_commit"], packet["gate"]["status"]), (entry["lanes"]["adapter"]["commit"], "passed"))
+   376	        self.assertEqual(ui_packet.read_bytes(), ui_bytes)
+   377	        self.assertFalse((directory / "verification/worker/ui/2").exists())
+   378	        self.assertFalse((directory / "candidate.json").exists())
+   379	        self.assertEqual(read_json(directory / "candidate-1.json")["commit"], commit)
+   380	        self.assertEqual(git(self.repo, "show", "HEAD:backend.py"), "VALUE = 2")
+   381	
+   382	
+   383	class SnapshotBaseAndSpanningFixes(RepairFixture):
+   384	    automatic = False
+   385	
+   386	    def test_lane_snapshot_base(self):
+   387	        self.block_at_candidate()
+   388	        fix = self.commit_on(self.snapshot("ui"), {"ui.txt": "after", "web/page.txt": "new\n"})
+   389	        code, _, err = self.cli("ui", "--commit", fix, "--reason", REASON)
+   390	        self.assertEqual(code, 0, err)
+   391	        [entry] = self.entries()
+   392	        repaired = entry["lanes"]["ui"]["commit"]
+   393	        self.assertEqual((entry["base_kind"], entry["base_commit"], entry["expected_candidate_tree"]), ("snapshot", self.snapshot("ui"), None))
+   394	        self.assertEqual((self.tree(repaired), git(self.repo, "rev-parse", f"{repaired}^")), (self.tree(fix), self.runtime.plan["base_commit"]))
+   395	        changed = git(self.repo, "diff-tree", "-r", "--no-renames", "--name-only", self.runtime.plan["base_commit"], repaired).splitlines()
+   396	        self.assertEqual(entry["lanes"]["ui"]["changed_files"], sorted(changed))
+   397	        self.assertEqual(entry["lanes"]["ui"]["fix_files"], ["ui.txt", "web/page.txt"])
+   398	        with self.graph() as (graph, config):
+   399	            self.assertEqual(graph.invoke(None, config)["__interrupt__"][0].value["kind"], "independent_review")
+   400	
+   401	    def test_one_fix_spanning_two_lanes(self):
+   402	        self.block_at_candidate()
+   403	        fix = self.commit_on(self.candidate_commit(), {"ui.txt": "after", "backend.py": "VALUE = 2  # checked\n"})
+   404	        before = self.untouched()
+   405	        code, _, err = self.cli("ui", "--commit", fix, "--reason", REASON)
+   406	        self.assertEqual(code, 1)
+   407	        self.assertIn("backend.py, owned by lane adapter, which this repair does not name", err)
+   408	        # On a lane snapshot, overlaying base content onto a second lane would discard its work: one lane only.
+   409	        spanning = self.commit_on(self.snapshot("ui"), {"ui.txt": "after", "backend.py": "VALUE = 2\n"})
+   410	        code, _, err = self.cli("adapter,ui", "--commit", spanning, "--reason", REASON)
+   411	        self.assertEqual(code, 1)
+   412	        self.assertIn("one lane", err)
+   413	        self.assertEqual(self.untouched(), before)
+   414	        code, _, err = self.cli("ui,adapter", "--commit", fix, "--reason", REASON)
+   415	        self.assertEqual(code, 0, err)
+   416	        [entry] = self.entries()
+   417	        self.assertEqual(list(entry["lanes"]), ["adapter", "ui"])
+   418	        self.assertEqual([entry["lanes"][lane]["fix_files"] for lane in ("adapter", "ui")], [["backend.py"], ["ui.txt"]])
+   419	        self.assertEqual([entry["lanes"][lane]["changed_files"] for lane in ("adapter", "ui")], [["backend.py"], ["ui.txt"]])
+   420	        with self.graph() as (graph, config):
+   421	            self.assertEqual(graph.invoke(None, config)["__interrupt__"][0].value["kind"], "independent_review")
+   422	        self.assertEqual(self.tree(self.candidate_commit(1)), self.tree(fix))
+   423	
+   424	
+   425	class RefusedCommits(RepairFixture):
+   426	    automatic = False
+   427	
+   428	    def commit_with(self, base: str, change) -> str:
+   429	        path = self.worktree(base)
+   430	        change(path)
+   431	        git(path, "commit", "-qm", "operator fix")
+   432	        return git(path, "rev-parse", "HEAD")
+   433	
+   434	    def test_refused_commits_change_nothing(self):
+   435	        self.block_at_candidate()
+   436	        candidate, base = self.candidate_commit(), self.runtime.plan["base_commit"]
+   437	        good = self.commit_on(candidate, {"ui.txt": "after"})
+   438	
+   439	        def symlink(path):
+   440	            (path / "web").mkdir()
+   441	            (path / "web/link").symlink_to("../ui.txt")
+   442	            git(path, "add", "-A")
+   443	
+   444	        def gitlink(path):
+   445	            git(path, "update-index", "--add", "--cacheinfo", f"160000,{base},web/module")
+   446	
+   447	        cases = {
+   448	            "an unknown sha": (("ui", "--commit", "f" * 40, "--reason", REASON), "is not a commit"),
+   449	            "an unrelated commit": (("ui", "--commit", self.commit_on(base, {"ui.txt": "after"}), "--reason", REASON), "descends from neither"),
+   450	            "the same tree": (("ui", "--commit", candidate, "--reason", REASON), "changes nothing in the ui snapshot"),
+   451	            "an unowned path": (("ui", "--commit", self.commit_on(candidate, {"ui.txt": "after", "notes.txt": "x"}), "--reason", REASON),
+   452	                                "notes.txt, which no lane owns"),
+   453	            "an excluded lane's path": (("ui", "--commit", self.commit_on(candidate, {"ui.txt": "after", "docs/extra.md": "x"}), "--reason", REASON),
+   454	                                        "docs/extra.md, owned by excluded lane docs"),
+   455	            "a symlink": (("ui", "--commit", self.commit_with(candidate, symlink), "--reason", REASON), "Symlink changes"),
+   456	            "a gitlink": (("ui", "--commit", self.commit_with(candidate, gitlink), "--reason", REASON), "Gitlink"),
+   457	            "an unknown lane": (("docs", "--commit", good, "--reason", REASON), "Not a lane of this run: docs"),
+   458	            "a repeated lane": (("ui,ui", "--commit", good, "--reason", REASON), "twice"),
+   459	            "a malformed lane list": (("ui,", "--commit", good, "--reason", REASON), "comma-separated"),
+   460	            "an empty reason": (("ui", "--commit", good, "--reason", "  "), "--reason"),
+   461	            "no reason": (("ui", "--commit", good), "--reason"),
+   462	            "--commit with --workspace": (("ui", "--commit", good, "--reason", REASON, "--workspace"), "exactly one of --commit"),
+   463	            "neither --commit nor --workspace": (("ui", "--reason", REASON), "exactly one of --commit"),
+   464	        }
+   465	        before = self.untouched()
+   466	        for label, (arguments, message) in cases.items():
+   467	            with self.subTest(label):
+   468	                code, out, err = self.cli(*arguments)
+   469	                self.assertEqual(code, 1, out)
+   470	                self.assertIn(f"Blocked: ", err)
+   471	                self.assertIn(message, err)
+   472	                self.assertEqual(self.untouched(), before)
+   473	
+   474	
+   475	class RefusedStates(RepairFixture):
+   476	    def refused(self, message: str, *arguments: str):
+   477	        code, out, err = self.cli(*arguments)
+   478	        self.assertEqual(code, 1, out)
+   479	        self.assertIn(message, err)
+   480	
+   481	    def test_refused_states(self):
+   482	        base = self.runtime.plan["base_commit"]
+   483	        early = ("ui", "--commit", base, "--reason", REASON)
+   484	        with self.subTest("before start"):
+   485	            self.refused("never started", *early)
+   486	            self.assertFalse((self.directory / "pipeline.sqlite").exists())
+   487	        self.start()
+   488	        with self.subTest("at worker_handoff"):
+   489	            self.refused("before freeze", *early)
+   490	        with self.graph() as (graph, config), self.assertRaises(RuntimeError):
+   491	            graph.invoke(Command(resume={"freeze": True}), config)
+   492	        arguments = ("ui", "--commit", self.commit_on(self.candidate_commit(), {"ui.txt": "after"}), "--reason", REASON)
+   493	        before = self.untouched()
+   494	        for name in ("review-bundle.json", "review.json", "integration-intent.json"):
+   495	            with self.subTest(name):
+   496	                (self.directory / name).write_text("{}")
+   497	                self.refused("Reviewers have seen a candidate", *arguments)
+   498	                (self.directory / name).unlink()
+   499	        for lock in ("controller.lock", "automatic-supervisor.lock"):
+   500	            with self.subTest(lock), run_lock(self.directory, lock):
+   501	                self.refused("Another controller owns this run", *arguments)
+   502	        with self.subTest("source moved"):
+   503	            git(self.repo, "commit", "-q", "--allow-empty", "-m", "a fix on the pinned branch")
+   504	            self.refused("moved from the run's base", *arguments)
+   505	            git(self.repo, "reset", "-q", "--hard", base)
+   506	        with self.subTest("source dirty"):
+   507	            (self.repo / "stray.txt").write_text("x")
+   508	            self.refused("uncommitted changes", *arguments)
+   509	            (self.repo / "stray.txt").unlink()
+   510	        with self.subTest("another branch"):
+   511	            git(self.repo, "switch", "-q", "-c", "other")
+   512	            self.refused("not the run's branch feature/repair", *arguments)
+   513	            git(self.repo, "switch", "-q", "feature/repair")
+   514	        with self.subTest("interrupted attempt"):
+   515	            save_json(self.directory / "attempts.json", {"candidate:ui": 2})
+   516	            (self.directory / "verification/candidate/ui/2").mkdir()
+   517	            self.refused("Interrupted check", *arguments)
+   518	            (self.directory / "verification/candidate/ui/2").rmdir()
+   519	        with self.subTest("no blocked packet"):
+   520	            self.refused("not a check verdict", *arguments)
+   521	            (self.directory / "attempts.json").unlink()
+   522	        self.assertEqual(self.untouched(), before)
+   523	        with self.subTest("MAX_REPAIRS"):
+   524	            save_json(self.directory / "repairs.json", {"version": "1.0.0", "repairs": [{"n": n, "status": "applied", "lanes": {}, "attempt_floors": {}}
+   525	                                                                                         for n in range(1, repair.MAX_REPAIRS + 1)]})
+   526	            self.refused("start a revised run", *arguments)
+   527	            (self.directory / "repairs.json").unlink()
+   528	        with self.subTest("a failed launch"):
+   529	            self.prepare("launch-failed")
+   530	            self.sessions.run = lambda node: (_ for _ in ()).throw(RuntimeError("launch failed"))
+   531	            with self.graph() as (graph, config), self.assertRaises(RuntimeError):
+   532	                graph.invoke({"run_id": "launch-failed"}, config)
+   533	            self.refused("use reconcile", *early)
+   534	        with self.subTest("a legacy plan"):
+   535	            self.prepare("legacy")
+   536	            plan = read_json(self.directory / "plan.json")
+   537	            del plan["workers"], plan["excluded_workers"]
+   538	            save_json(self.directory / "plan.json", plan)
+   539	            self.refused("pinned before configured lanes", *early)
+   540	
+   541	
+   542	class CrashRecovery(RepairFixture):
+   543	    def test_crash_at_each_repair_step_is_completed_by_rerunning_it(self):
+   544	        for index, step in enumerate(("commit_snapshots", "save_lanes", "raise_attempts", "fork_run", "finish_repair")):
+   545	            with self.subTest(crash_before=step):
+   546	                self.prepare(f"run-{index}")
+   547	                self.block_at_candidate()
+   548	                fix = self.commit_on(self.candidate_commit(), {"ui.txt": "after"})
+   549	                arguments = ("ui", "--commit", fix, "--reason", REASON)
+   550	                with patch(f"workflow.repair.{step}", side_effect=RuntimeError("injected crash")):
+   551	                    code, _, err = self.cli(*arguments)
+   552	                self.assertEqual(code, 1)
+   553	                self.assertIn("injected crash", err)
+   554	                self.assertEqual(self.entries()[0]["status"], "recorded")
+   555	                prefix = f"refs/workflow-repair/{hashlib.sha256(str(self.directory).encode()).hexdigest()[:16]}/1"
+   556	                crashed = git(self.repo, "for-each-ref", "--format=%(objectname)", f"{prefix}/ui")
+   557	                # The failed branch never resumes with raised counters, and only the identical command completes the repair.
+   558	                with self.assertRaisesRegex(RuntimeError, "Repair 1 is recorded but not applied"):
+   559	                    drive(self.runtime)
+   560	                code, _, err = self.pipeline_cli("retry", str(self.directory))
+   561	                self.assertEqual(code, 1)
+   562	                self.assertIn("Repair 1 is recorded but not applied", err)
+   563	                for other in (("ui", "--commit", fix, "--reason", "another reason"), ("ui", "--workspace")):
+   564	                    code, _, err = self.cli(*other)
+   565	                    self.assertEqual(code, 1)
+   566	                    self.assertIn("Repair 1 is recorded but not applied", err)
+   567	                code, out, err = self.cli(*arguments)
+   568	                self.assertEqual(code, 0, err)
+   569	                [entry] = self.entries()
+   570	                self.assertEqual(entry["status"], "applied")
+   571	                if crashed:
+   572	                    self.assertEqual(entry["lanes"]["ui"]["commit"], crashed)  # The pinned dates make the same commit.
+   573	                self.assertEqual(git(self.repo, "rev-parse", f"{prefix}/ui"), entry["lanes"]["ui"]["commit"])
+   574	                self.assertEqual(read_json(self.directory / "attempts.json"), entry["attempt_targets"])
+   575	                with self.graph() as (graph, config):
+   576	                    forks = [item for item in graph.get_state_history(config) if item.metadata.get("source") == "update"]
+   577	                    self.assertEqual(len(forks), 1)
+   578	                    self.assertEqual(forks[0].config["configurable"]["checkpoint_id"], entry["head_after"])
+   579	                with patch("workflow.automatic.wait_handoffs"):
+   580	                    drive(self.runtime)
+   581	                self.assertEqual(self.tree(git(self.repo, "rev-parse", "HEAD")), self.tree(fix))
+   582	                git(self.repo, "reset", "-q", "--hard", self.runtime.plan["base_commit"])  # The next subtest's run starts from the base again.
+   583	
+   584	
+   585	class IdenticalFailureGuard(unittest.TestCase):
+   586	    """advance_failed_checks compares two failures only when both checked the same revision."""
+   587	
+   588	    def test_identical_failure_guard_compares_only_the_same_revision(self):
+   589	        temp = tempfile.TemporaryDirectory()
+   590	        self.addCleanup(temp.cleanup)
+   591	        root = Path(temp.name)
+   592	        attempts = {"candidate:ui": 3}
+   593	        bumped = []
+   594	        runtime = type("Runtime", (), {})()
+   595	        runtime.directory, runtime.policy, runtime.workers = root, {"max_verification_attempts": 3}, ["ui", "adapter"]
+   596	        runtime.attempt = lambda phase, node: attempts.get(f"{phase}:{node}", 1)
+   597	        runtime.retry_check = lambda phase, node: bumped.append((phase, node))
+   598	        state = type("State", (), {"next": ("candidate",), "tasks": [type("Task", (), {"name": "candidate", "error": "blocked"})()]})()
+   599	        save_json(root / "repairs.json", {"version": "1.0.0", "repairs": [{"n": 1, "status": "applied", "lanes": {}, "attempt_floors": {"candidate:ui": 3}}]})
+   600	        reasons = ["ui-build: exit 1", "Executed check failed: python -c ..."]
+   601	        for attempt, commit in ((2, "a" * 40), (3, "b" * 40)):
+   602	            (root / "verification/candidate/ui" / str(attempt)).mkdir(parents=True)
+   603	            save_json(root / "verification/candidate/ui" / str(attempt) / "packet.json",
+   604	                      {"expected": {"output_commit": commit}, "gate": {"status": "blocked", "reasons": reasons}})
+   605	        # The repaired revision's first failure gets the normal retry, within its own budget.
+   606	        self.assertTrue(advance_failed_checks(runtime, state))
+   607	        self.assertEqual(bumped, [("candidate", "ui")])
+   608	        save_json(root / "verification/candidate/ui/3/packet.json", {"expected": {"output_commit": "a" * 40}, "gate": {"status": "blocked", "reasons": reasons}})
+   609	        with self.assertRaisesRegex(RuntimeError, "candidate/ui failed identically on attempts 2 and 3"):
+   610	            advance_failed_checks(runtime, state)
+   611	
+   612	
+   613	class AttemptBudget(unittest.TestCase):
+   614	    """The attempt limit is per lane, phase and revision: a repair's floor starts its revision's budget."""
+   615	
+   616	    def test_attempt_budget_is_per_revision(self):
+   617	        temp = tempfile.TemporaryDirectory()
+   618	        self.addCleanup(temp.cleanup)
+   619	        root = Path(temp.name)
+   620	        runtime = Pipeline.__new__(Pipeline)
+   621	        runtime.directory, runtime.policy, runtime.workers = root, {"max_verification_attempts": 3}, ["ui"]
+   622	        save_json(root / "repairs.json", {"version": "1.0.0", "repairs": [{"n": 1, "status": "applied", "lanes": {}, "attempt_floors": {"candidate:ui": 3}},
+   623	                                                                          {"n": 2, "status": "recorded", "lanes": {}, "attempt_floors": {"worker:ui": 9}}]})
+   624	        for value in (3, 4, 5):
+   625	            save_json(root / "attempts.json", {"candidate:ui": value})
+   626	            self.assertEqual(runtime.attempt("candidate", "ui"), value)
+   627	        for value in (2, 6):
+   628	            save_json(root / "attempts.json", {"candidate:ui": value})
+   629	            with self.assertRaisesRegex(ValueError, "hard limit"):
+   630	                runtime.attempt("candidate", "ui")
+   631	        save_json(root / "attempts.json", {"candidate:ui": 4, "worker:ui": 3})
+   632	        self.assertEqual(runtime.retry_check("candidate", "ui"), 5)
+   633	        with self.assertRaisesRegex(ValueError, "limit reached"):
+   634	            runtime.retry_check("candidate", "ui")
+   635	        # A key no applied repair floors keeps 1..3; a recorded entry's floors do not count until it is applied.
+   636	        with self.assertRaisesRegex(ValueError, "limit reached"):
+   637	            runtime.retry_check("worker", "ui")
+   638	        (root / "verification/candidate/ui/5").mkdir(parents=True)
+   639	        save_json(root / "verification/candidate/ui/5/packet.json", {"expected": {"output_commit": "c" * 40}, "gate": {"status": "blocked", "reasons": ["x"]}})
+   640	        state = type("State", (), {"next": ("candidate",), "tasks": [type("Task", (), {"name": "candidate", "error": "blocked"})()]})()
+   641	        with self.assertRaisesRegex(RuntimeError, "retry limit exhausted"):
+   642	            advance_failed_checks(runtime, state)
+   643	        save_json(root / "attempts.json", {"candidate:ui": 4})
+   644	        (root / "verification/candidate/ui/5").rename(root / "verification/candidate/ui/4")
+   645	        self.assertTrue(advance_failed_checks(runtime, state))
+   646	        self.assertEqual(read_json(root / "attempts.json")["candidate:ui"], 5)
+   647	
+   648	
+   649	class CandidateGenerations(RepairFixture):
+   650	    automatic = False
+   651	
+   652	    def test_candidate_generation_paths_and_tree_assertion(self):
+   653	        self.block_at_candidate()
+   654	        fix = self.commit_on(self.candidate_commit(), {"ui.txt": "after"})
+   655	        self.assertEqual(self.cli("ui", "--commit", fix, "--reason", REASON)[0], 0)
+   656	        (self.directory / "candidate-1").mkdir()
+   657	        with self.graph() as (graph, config), self.assertRaisesRegex(ValueError, "Partial candidate worktree"):
+   658	            graph.invoke(None, config)
+   659	        (self.directory / "candidate-1").rmdir()
+   660	        journal = read_json(self.directory / "repairs.json")
+   661	        tampered = json.loads(json.dumps(journal))
+   662	        tampered["repairs"][0]["expected_candidate_tree"] = self.tree(self.runtime.plan["base_commit"])
+   663	        save_json(self.directory / "repairs.json", tampered)
+   664	        with self.graph() as (graph, config), self.assertRaisesRegex(ValueError, "differs from the repaired tree"):
+   665	            graph.invoke(None, config)
+   666	        save_json(self.directory / "repairs.json", journal)
+   667	        with self.graph() as (graph, config):
+   668	            self.assertEqual(graph.invoke(None, config)["__interrupt__"][0].value["kind"], "independent_review")
+   669	        self.assertTrue((self.directory / "candidate-1").is_dir())
+   670	        self.assertEqual(read_json(self.directory / "review-bundle.json")["candidate_commit"], self.candidate_commit(1))
+   671	        self.assertEqual(self.tree(self.candidate_commit(1)), self.tree(fix))
+   672	
+   673	
+   674	class RepairCommandLine(RepairFixture):
+   675	    """The real command in its own process: a dry run writes nothing, and nothing ever calls claude."""
+   676	
+   677	    def listing(self) -> dict:
+   678	        return {str(path.relative_to(self.directory)): path.read_bytes() if path.is_file() and not path.is_symlink() else None
+   679	                for path in sorted(self.directory.rglob("*"))}
+   680	
+   681	    def test_repair_cli_launches_nothing(self):
+   682	        self.block_at_candidate()
+   683	        fix = self.commit_on(self.candidate_commit(), {"ui.txt": "after"})
+   684	        bin_directory = self.root / "bin"
+   685	        bin_directory.mkdir()
+   686	        calls = self.root / "claude-calls.log"
+   687	        (bin_directory / "claude").write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\nexit 1\n")
+   688	        (bin_directory / "claude").chmod(0o700)
+   689	        env = {**os.environ, "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}"}
+   690	        for lock in ("controller.lock", "automatic-supervisor.lock"):
+   691	            (self.directory / lock).touch()  # A real run's controllers made them.
+   692	        command = [sys.executable, "-m", "workflow", "repair", str(self.directory), "ui", "--commit", fix, "--reason", REASON]
+   693	        cwd = Path(__file__).resolve().parents[1]
+   694	        before, launches = self.listing(), (self.directory / "fake-launches.log").read_text()
+   695	        result = subprocess.run([*command, "--dry-run"], cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
+   696	        self.assertEqual(result.returncode, 0, result.stderr)
+   697	        self.assertIn("Dry run", result.stdout)
+   698	        self.assertIn("worker:ui 2, candidate:adapter 2, candidate:ui 2", result.stdout)  # One candidate failure: attempt 1 of each.
+   699	        self.assertEqual(self.listing(), before)
+   700	        self.assertEqual(git(self.repo, "for-each-ref", "refs/workflow-repair"), "")
+   701	        result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
+   702	        self.assertEqual(result.returncode, 0, result.stderr)
+   703	        self.assertIn(f"-m workflow automatic {self.directory} --live", result.stdout)
+   704	        self.assertFalse(calls.exists())
+   705	        self.assertEqual((self.directory / "fake-launches.log").read_text(), launches)
+   706	        self.assertEqual(self.entries()[0]["status"], "applied")
+   707	
+   708	
+   709	if __name__ == "__main__":
+   710	    unittest.main()

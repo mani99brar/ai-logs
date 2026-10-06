@@ -1,0 +1,1107 @@
+diff --git a/docs/objectives.md b/docs/objectives.md
+index 7b4e179..676911c 100644
+--- a/docs/objectives.md
++++ b/docs/objectives.md
+@@ -1,6 +1,6 @@
+ # Objective ledger
+ 
+-The pure rubbing ledger of §4 with duel settlement (§11's theft and PvP gold) and §12's recovery caches. `@pirate-sea-race/simulation/objectives` has the state, the operations and the invariant. `@pirate-sea-race/content/objectives` has the types, rubbing ids, timings, the gold rule and the zod validators for source sites and assignments. It is plain integer data with no clocks and no `Math.random`. Time is the world tick (20 per second), supplied by the caller. Positions are integer sub-units, supplied by the caller. Nothing here is wired into `MatchRoom` yet.
++The pure rubbing ledger of §4 with duel settlement (§11's theft and PvP gold), §12's recovery caches and §11's small match economy. `@pirate-sea-race/simulation/objectives` has the state, the operations and the invariant. `@pirate-sea-race/content/objectives` has the types, rubbing ids, timings, the gold and economy rules and the zod validators for source sites and assignments. It is plain integer data with no clocks and no `Math.random`. Time is the world tick (20 per second), supplied by the caller. Positions are integer sub-units, supplied by the caller. Nothing here is wired into `MatchRoom` yet.
+ 
+ ## Content
+ 
+@@ -18,8 +18,12 @@ The pure rubbing ledger of §4 with duel settlement (§11's theft and PvP gold)
+   | Seat reservation | 1200 ticks (60 s) |
+   | Starting gold | 50 |
+   | PvP gold | 20 %, capped at 50 |
++  | Ruin gold, supply cache gold | 40, 25 |
++  | Rumor price, tonic price | 25, 30 |
++  | Tonic duration | 240 ticks (12 s) |
++  | Tonic carry limit | 2 |
+ 
+-  `pvpGoldTransfer` rounds down and never takes more than the loser has.
++  `pvpGoldTransfer` rounds down and never takes more than the loser has. `grantAmount` and `itemPrice` read the economy's amounts. The validator refuses negative amounts, a zero duration and a carry limit below 1.
+ 
+ ## State (`LedgerState`, all covered by `hashState`)
+ 
+@@ -36,11 +40,13 @@ The pure rubbing ledger of §4 with duel settlement (§11's theft and PvP gold)
+   - `gold`;
+   - `status`: `connected`, `disconnected` (with `reservationDeadline`) or `left` (with `exit`, the position its leftover rubbings go to);
+   - `channel`: a collection or cache claim, with `startTick`, `lastTick` and `heldTicks`;
+-  - `freshRumors`: the types lost to theft, a flag for the future rumor system.
++  - `freshRumors`: the types lost to theft, a flag for the future rumor system;
++  - `tonics` (0–2) and `tonicEffect` (the last activation's `startTick` and `endTick`, or null).
+ - `caches`: id, position and creation tick. A cache never despawns and is removed as soon as it is empty.
+ - `duels`: the players, `phase` (`fighting`, `choosing` or `settled`), `result`, `choiceDeadline` and `settlement`. A duel is committed once, and settled duels are kept so that a repeated message finds its result.
+ - `wins`: the last win tick per ordered (winner, loser) pair.
+-- `goldIssued`: the gold brought in by joining players. Settlements only move gold.
++- `goldIssued`: the gold brought in by joining players and minted by grants. Settlements only move gold.
++- `goldSpent`, `grants` and `purchases`: see Economy.
+ 
+ ## Operations
+ 
+@@ -82,7 +88,9 @@ There is no operation to drop, trade, copy or destroy a rubbing.
+ - No player holds two rubbings of one type, counting reserved ones.
+ - No cache is empty.
+ - No player is in two unresolved duels, and nobody channels while disconnected, gone or in a duel.
+-- Gold is non-negative and sums to `goldIssued`.
++- Gold is non-negative, and balances + `goldSpent` = `goldIssued`.
++- Each grant key appears once and pays the rules' amount. Request ids are unique, and the purchases' prices sum to `goldSpent`.
++- Each player carries 0–2 tonics and has one effect slot, so at most one tonic is active. A player who left has neither.
+ - The state is plain safe-integer data.
+ 
+ The tests run every operation on a deeply frozen state and check the invariant after each one. The property tests run 3 seeded matches per preset, 1200 random steps each, about 2700–5100 operations each. The steps cover:
+@@ -92,9 +100,20 @@ The tests run every operation on a deeply frozen state and check the invariant a
+ - choices, wrong choices and timeouts;
+ - replayed messages;
+ - disconnects, returns, expiries, quits and cache claims;
+-- stale requests.
++- stale requests;
++- from a second seeded stream between those steps, so the match around them is unchanged: ruin and supply grants (repeated keys included), purchases (retried and misused request ids included) and tonic use.
+ 
+-The same seed replays to the same `hashState`.
++After every step they also check the gold identity, non-negative gold and the tonic count directly. The same seed replays to the same `hashState`.
++
++## Economy (§11)
++
++The economy is for route choices and recovery, so it only mints gold by rule and only spends it at the shop. Amounts come from `objectiveRules`; the caller never passes one.
++
++- **`grantGold({ playerId, reason, sourceKey, tick })`** mints `ruin` gold (40) once per (player, ruin id) and `supply-cache` gold (25) once per cache id for the whole match. `goldIssued` grows by the amount. The same player repeating a key gets `duplicate`; a cache someone else claimed gets `already-claimed`, with the earlier grant. A player who left gets nothing. The ruin and cache features decide when a grant is earned.
++- **`purchase({ requestId, playerId, item, tick })`** buys a `rumor` (25) or a `tonic` (30). The gold goes to `goldSpent`, not to another player. A request id is unique in the match. Repeating it with the same player and item returns the original purchase with `replayed: true` and the same state, whatever its tick, so a retry never pays twice. Reusing it for anything else is a `duplicate`. The purchase is refused with `insufficient-gold`, `player-in-duel`, `player-disconnected`, `player-left` or, for a third tonic, `tonic-limit`.
++- **`useTonic({ playerId, tick, atSea, grappled })`** spends one tonic and makes it active on ticks `tick` to `tick + 239`: `activeTonic(state, playerId, t)` is true from `startTick` and false from `endTick` = `startTick + 240`. It is refused with `tonic-active`, `no-tonic`, `not-at-sea`, `grappled` (a flag the caller sets from the world), `player-in-duel` or `player-disconnected`. A lost duel keeps the tonics; leaving drops them and ends an active one. The ledger never touches movement: the sailing code reads `activeTonic` and adds its +10 %.
++- **The invariant** becomes balances + `goldSpent` = `goldIssued`.
++- **Rumor flow:** the room first asks the intel module whether a targeted rumor is available for the player (a missing type with a lead). Only then does it call `purchase` with the client's request id. On `ok && !replayed` it asks intel to deliver the rumor under that request id. On `replayed` it resends the rumor already delivered. A rumor that cannot be delivered is never bought.
+ 
+ ## Decisions taken here
+ 
+@@ -104,3 +123,5 @@ The same seed replays to the same `hashState`.
+ - A winner who leaves during the choice window takes nothing.
+ - Both players leaving a fight on the same tick cancel it, in either order. The ledger cannot rely on processing order (§7), so a forfeit waits one tick before it can commit.
+ - Both players stay reserved until the choice window settles, so neither can collect or be challenged during it.
++- Economy grants and purchases check whether the player has left. Grants ignore duels and disconnects, because the reward was earned before. Purchases and tonics refuse disconnected players, as channels do.
++- A repeated purchase id is looked up before the tick check, so a retry still finds its purchase after the clock moved on.
+diff --git a/packages/content/src/objectives/objectives.test.ts b/packages/content/src/objectives/objectives.test.ts
+index 1c5bf8d..25f9e50 100644
+--- a/packages/content/src/objectives/objectives.test.ts
++++ b/packages/content/src/objectives/objectives.test.ts
+@@ -1,6 +1,8 @@
+ import { describe, expect, it } from "vitest";
+ import { rulesPresets } from "../rules.js";
+ import {
++  grantAmount,
++  itemPrice,
+   objectiveRules,
+   presetRubbings,
+   presetRubbingTypes,
+@@ -72,6 +74,32 @@ describe("objective rules (§4, §11, §12)", () => {
+     expect(validateObjectiveRules(objectiveRules).ok).toBe(true);
+   });
+ 
++  it("states the economy of §11: grants, prices, the tonic's 12 seconds and its carry limit", () => {
++    expect(objectiveRules).toMatchObject({
++      ruinGold: 40,
++      supplyCacheGold: 25,
++      rumorPrice: 25,
++      tonicPrice: 30,
++      tonicTicks: 240,
++      tonicCarryLimit: 2,
++    });
++    expect(grantAmount(objectiveRules, "ruin")).toBe(40);
++    expect(grantAmount(objectiveRules, "supply-cache")).toBe(25);
++    expect(itemPrice(objectiveRules, "rumor")).toBe(25);
++    expect(itemPrice(objectiveRules, "tonic")).toBe(30);
++  });
++
++  it("refuses a negative price or grant, a carry limit of 0 and a tonic that never lasts", () => {
++    expect(validateObjectiveRules({ ...objectiveRules, rumorPrice: -1 }).ok).toBe(false);
++    expect(validateObjectiveRules({ ...objectiveRules, tonicPrice: -30 }).ok).toBe(false);
++    expect(validateObjectiveRules({ ...objectiveRules, ruinGold: -40 }).ok).toBe(false);
++    expect(validateObjectiveRules({ ...objectiveRules, tonicCarryLimit: 0 }).ok).toBe(false);
++    expect(validateObjectiveRules({ ...objectiveRules, tonicTicks: 0 }).ok).toBe(false);
++    expect(validateObjectiveRules({ ...objectiveRules, tonicPrice: 2.5 }).ok).toBe(false);
++    const { tonicCarryLimit: _, ...missing } = objectiveRules;
++    expect(validateObjectiveRules(missing).ok).toBe(false);
++  });
++
+   it("refuses malformed rules", () => {
+     expect(validateObjectiveRules({ ...objectiveRules, collectTicks: 0 }).ok).toBe(false);
+     expect(validateObjectiveRules({ ...objectiveRules, pvpGoldPercent: 101 }).ok).toBe(false);
+diff --git a/packages/content/src/objectives/rules.ts b/packages/content/src/objectives/rules.ts
+index dcb4281..e51c365 100644
+--- a/packages/content/src/objectives/rules.ts
++++ b/packages/content/src/objectives/rules.ts
+@@ -24,6 +24,18 @@ export const objectiveRulesSchema = z.strictObject({
+   startingGold: z.int().nonnegative(),
+   /** §12: a disconnected player's seat stays reserved this long. */
+   seatReservationTicks: z.int().positive(),
++  /** §11: gold minted for a fresh ruin completion, once per player per ruin. */
++  ruinGold: z.int().nonnegative(),
++  /** §11: gold minted for a supply cache, one global claim per cache. */
++  supplyCacheGold: z.int().nonnegative(),
++  /** §11: the dockside price of a targeted rumor. */
++  rumorPrice: z.int().nonnegative(),
++  /** §11: the dockside price of a sail tonic. */
++  tonicPrice: z.int().nonnegative(),
++  /** §11: an activated tonic lasts this long. */
++  tonicTicks: z.int().positive(),
++  /** §11: a player carries at most this many tonics. */
++  tonicCarryLimit: z.int().positive(),
+ });
+ 
+ export type ObjectiveRules = z.infer<typeof objectiveRulesSchema>;
+@@ -37,6 +49,12 @@ export const objectiveRules = {
+   repeatWinWindowTicks: 3 * 60 * WORLD_TICKS_PER_SECOND,
+   startingGold: 50,
+   seatReservationTicks: 60 * WORLD_TICKS_PER_SECOND,
++  ruinGold: 40,
++  supplyCacheGold: 25,
++  rumorPrice: 25,
++  tonicPrice: 30,
++  tonicTicks: 12 * WORLD_TICKS_PER_SECOND,
++  tonicCarryLimit: 2,
+ } as const satisfies ObjectiveRules;
+ 
+ export function validateObjectiveRules(candidate: unknown): ValidationResult<ObjectiveRules> {
+@@ -53,3 +71,20 @@ export function pvpGoldTransfer(rules: ObjectiveRules, loserGold: number): numbe
+   const share = Math.floor((loserGold * rules.pvpGoldPercent) / 100);
+   return Math.min(share, rules.pvpGoldCap, loserGold);
+ }
++
++/** Why the rules mint gold (§11): a fresh ruin completion or a supply cache. Nothing else creates gold. */
++export const GOLD_GRANT_REASONS = ["ruin", "supply-cache"] as const;
++export type GoldGrantReason = (typeof GOLD_GRANT_REASONS)[number];
++
++/** What the dockside shop sells in this release (§11); the Haki focus scroll is alpha-only and not here. */
++export const SHOP_ITEMS = ["rumor", "tonic"] as const;
++export type ShopItem = (typeof SHOP_ITEMS)[number];
++
++/** The gold a grant mints; the caller never chooses it. */
++export function grantAmount(rules: ObjectiveRules, reason: GoldGrantReason): number {
++  return reason === "ruin" ? rules.ruinGold : rules.supplyCacheGold;
++}
++
++export function itemPrice(rules: ObjectiveRules, item: ShopItem): number {
++  return item === "rumor" ? rules.rumorPrice : rules.tonicPrice;
++}
+diff --git a/packages/simulation/src/objectives/economy.ts b/packages/simulation/src/objectives/economy.ts
+new file mode 100644
+index 0000000..f5213b4
+--- /dev/null
++++ b/packages/simulation/src/objectives/economy.ts
+@@ -0,0 +1,199 @@
++import {
++  GOLD_GRANT_REASONS,
++  grantAmount,
++  itemPrice,
++  SHOP_ITEMS,
++  type GoldGrantReason,
++  type ShopItem,
++} from "@pirate-sea-race/content/objectives";
++import {
++  atTick,
++  isPlayerId,
++  playerRejection,
++  tickRejection,
++  updatePlayer,
++  type LedgerRejection,
++  type LedgerStep,
++} from "./internal.js";
++import {
++  activeDuelOf,
++  findPlayer,
++  type GoldGrant,
++  type LedgerPlayer,
++  type LedgerState,
++  type PurchaseRecord,
++} from "./state.js";
++
++function isKey(value: unknown): value is string {
++  return typeof value === "string" && value.length > 0;
++}
++
++function playerOf(state: LedgerState, playerId: unknown): LedgerPlayer | null {
++  return typeof playerId === "string" ? (findPlayer(state, playerId) ?? null) : null;
++}
++
++export interface GrantResult {
++  readonly ok: boolean;
++  readonly rejection: LedgerRejection | null;
++  /** The grant made, or for a `duplicate` or `already-claimed` request the earlier grant that holds the key. */
++  readonly grant: GoldGrant | null;
++  /** The player as they now stand, or null for an unknown player. */
++  readonly player: LedgerPlayer | null;
++}
++
++export interface GrantGoldRequest {
++  readonly playerId: string;
++  readonly reason: GoldGrantReason;
++  /** The ruin id for `ruin`; the supply cache's id for `supply-cache`. */
++  readonly sourceKey: string;
++  readonly tick: number;
++}
++
++/** The earlier grant holding this request's key: the same player's for a ruin, anybody's for a supply cache. */
++function grantHolding(state: LedgerState, reason: GoldGrantReason, sourceKey: string, playerId: string): GoldGrant | undefined {
++  return state.grants.find(
++    (grant) => grant.reason === reason && grant.sourceKey === sourceKey && (reason === "supply-cache" || grant.playerId === playerId),
++  );
++}
++
++/**
++ * §11's minted gold: a fresh ruin completion (once per player per ruin) or a supply cache (one global claim). The
++ * amount comes from the rules, and `goldIssued` grows by it. A repeat of the same player's key is a `duplicate`; a
++ * supply cache someone else already claimed is `already-claimed`. A player who left gets nothing.
++ */
++export function grantGold(state: LedgerState, request: GrantGoldRequest): LedgerStep<GrantResult> {
++  const { playerId, reason, sourceKey, tick } = request;
++  const rejected = (rejection: LedgerRejection, grant: GoldGrant | null = null): LedgerStep<GrantResult> => ({
++    state,
++    result: { ok: false, rejection, grant, player: playerOf(state, playerId) },
++  });
++  const bad = tickRejection(state, tick);
++  if (bad) return rejected(bad);
++  if (!GOLD_GRANT_REASONS.includes(reason) || !isKey(sourceKey)) return rejected("invalid-request");
++  const refusal = playerRejection(state, playerId);
++  if (refusal) return rejected(refusal);
++  const earlier = grantHolding(state, reason, sourceKey, playerId);
++  if (earlier) return rejected(earlier.playerId === playerId ? "duplicate" : "already-claimed", earlier);
++  const amount = grantAmount(state.rules, reason);
++  const grant: GoldGrant = { reason, sourceKey, playerId, amount, tick };
++  const next = updatePlayer(
++    { ...atTick(state, tick), grants: [...state.grants, grant], goldIssued: state.goldIssued + amount },
++    playerId,
++    (player) => ({ ...player, gold: player.gold + amount }),
++  );
++  return { state: next, result: { ok: true, rejection: null, grant, player: findPlayer(next, playerId) ?? null } };
++}
++
++export interface PurchaseResult {
++  readonly ok: boolean;
++  readonly rejection: LedgerRejection | null;
++  /** The purchase: the one just made, or the original one for a repeated request id. */
++  readonly purchase: PurchaseRecord | null;
++  /** The request id was already used by this purchase: nothing was charged again. */
++  readonly replayed: boolean;
++}
++
++export interface PurchaseRequest {
++  /** Unique in the match; a retry of the same purchase reuses it. */
++  readonly requestId: string;
++  readonly playerId: string;
++  readonly item: ShopItem;
++  readonly tick: number;
++}
++
++/**
++ * A dockside purchase (§11), at the rules' price. The gold is spent: it leaves the buyer's balance for `goldSpent`.
++ * A tonic goes into the buyer's carried count; a rumor is delivered by the caller after an applied purchase.
++ *
++ * A request id already used returns the original purchase with `replayed` and the same state, whatever the tick,
++ * so a retry never pays twice; reused for another player or item, it is a `duplicate`. Refused while the player is
++ * disconnected, in a duel (reserved) or gone, when gold is short, and for a tonic when they carry the limit already.
++ */
++export function purchase(state: LedgerState, request: PurchaseRequest): LedgerStep<PurchaseResult> {
++  const { requestId, playerId, item, tick } = request;
++  const rejected = (rejection: LedgerRejection): LedgerStep<PurchaseResult> => ({
++    state,
++    result: { ok: false, rejection, purchase: null, replayed: false },
++  });
++  if (!isKey(requestId) || !isPlayerId(playerId) || !SHOP_ITEMS.includes(item)) return rejected("invalid-request");
++  const original = state.purchases.find((record) => record.requestId === requestId);
++  if (original) {
++    if (original.playerId !== playerId || original.item !== item) return rejected("duplicate");
++    return { state, result: { ok: true, rejection: null, purchase: original, replayed: true } };
++  }
++  const bad = tickRejection(state, tick) ?? playerRejection(state, playerId);
++  if (bad) return rejected(bad);
++  const buyer = findPlayer(state, playerId)!;
++  if (buyer.status === "disconnected") return rejected("player-disconnected");
++  if (activeDuelOf(state, playerId)) return rejected("player-in-duel");
++  if (item === "tonic" && buyer.tonics >= state.rules.tonicCarryLimit) return rejected("tonic-limit");
++  const price = itemPrice(state.rules, item);
++  if (buyer.gold < price) return rejected("insufficient-gold");
++  const record: PurchaseRecord = {
++    requestId,
++    playerId,
++    item,
++    price,
++    tick,
++    goldAfter: buyer.gold - price,
++    tonicsAfter: item === "tonic" ? buyer.tonics + 1 : buyer.tonics,
++  };
++  const next = updatePlayer(
++    { ...atTick(state, tick), purchases: [...state.purchases, record], goldSpent: state.goldSpent + price },
++    playerId,
++    (player) => ({ ...player, gold: record.goldAfter, tonics: record.tonicsAfter }),
++  );
++  return { state: next, result: { ok: true, rejection: null, purchase: record, replayed: false } };
++}
++
++export interface TonicResult {
++  readonly ok: boolean;
++  readonly rejection: LedgerRejection | null;
++  /** The player as they now stand, or null for an unknown player. */
++  readonly player: LedgerPlayer | null;
++}
++
++export interface UseTonicRequest {
++  readonly playerId: string;
++  readonly tick: number;
++  /** The player is sailing, not on an island or in a dock interaction. */
++  readonly atSea: boolean;
++  /** The player is being grappled right now (the world knows; the ledger does not). */
++  readonly grappled: boolean;
++}
++
++/** Whether a player's sail tonic is active at `tick`; the sailing code applies its speed bonus (§11). */
++export function activeTonic(state: LedgerState, playerId: string, tick: number): boolean {
++  const effect = findPlayer(state, playerId)?.tonicEffect ?? null;
++  return effect !== null && effect.startTick <= tick && tick < effect.endTick;
++}
++
++/**
++ * Activates one carried tonic at `tick` for `tonicTicks` (§11): active on ticks `tick` to `tick + tonicTicks - 1`.
++ * Refused while one is active (they never stack), in a duel, while disconnected, grappled or not at sea.
++ */
++export function useTonic(state: LedgerState, request: UseTonicRequest): LedgerStep<TonicResult> {
++  const { playerId, tick, atSea, grappled } = request;
++  const rejected = (rejection: LedgerRejection): LedgerStep<TonicResult> => ({
++    state,
++    result: { ok: false, rejection, player: playerOf(state, playerId) },
++  });
++  const bad = tickRejection(state, tick);
++  if (bad) return rejected(bad);
++  if (typeof atSea !== "boolean" || typeof grappled !== "boolean") return rejected("invalid-request");
++  const refusal = playerRejection(state, playerId);
++  if (refusal) return rejected(refusal);
++  const player = findPlayer(state, playerId)!;
++  if (player.status === "disconnected") return rejected("player-disconnected");
++  if (activeDuelOf(state, playerId)) return rejected("player-in-duel");
++  if (grappled) return rejected("grappled");
++  if (!atSea) return rejected("not-at-sea");
++  if (player.tonics === 0) return rejected("no-tonic");
++  if (activeTonic(state, playerId, tick)) return rejected("tonic-active");
++  const next = updatePlayer(atTick(state, tick), playerId, (current) => ({
++    ...current,
++    tonics: current.tonics - 1,
++    tonicEffect: { startTick: tick, endTick: tick + state.rules.tonicTicks },
++  }));
++  return { state: next, result: { ok: true, rejection: null, player: findPlayer(next, playerId) ?? null } };
++}
+diff --git a/packages/simulation/src/objectives/index.ts b/packages/simulation/src/objectives/index.ts
+index dc0d1bf..7a228ca 100644
+--- a/packages/simulation/src/objectives/index.ts
++++ b/packages/simulation/src/objectives/index.ts
+@@ -3,14 +3,17 @@ export * from "./invariant.js";
+ export * from "./channels.js";
+ export * from "./duels.js";
+ export * from "./players.js";
++export * from "./economy.js";
+ export type { LedgerRejection, LedgerStep, Transfer } from "./internal.js";
+ export {
+   presetRubbingTypes,
+   presetRubbings,
+   RUBBING_TYPES,
+   objectiveRules,
++  type GoldGrantReason,
+   type ObjectiveRules,
+   type RubbingType,
++  type ShopItem,
+   type SourceAssignment,
+   type SourceSite,
+ } from "@pirate-sea-race/content/objectives";
+diff --git a/packages/simulation/src/objectives/internal.ts b/packages/simulation/src/objectives/internal.ts
+index 5b0e75a..58df690 100644
+--- a/packages/simulation/src/objectives/internal.ts
++++ b/packages/simulation/src/objectives/internal.ts
+@@ -37,7 +37,14 @@ export type LedgerRejection =
+   | "ineligible-type"
+   | "not-disconnected"
+   | "reservation-active"
+-  | "reservation-expired";
++  | "reservation-expired"
++  | "already-claimed"
++  | "insufficient-gold"
++  | "tonic-limit"
++  | "no-tonic"
++  | "tonic-active"
++  | "not-at-sea"
++  | "grappled";
+ 
+ /** One rubbing move, for §16's transfer record. `revisionAfter` is always `revisionBefore + 1`. */
+ export interface Transfer {
+diff --git a/packages/simulation/src/objectives/invariant.ts b/packages/simulation/src/objectives/invariant.ts
+index 1d25004..5a163d5 100644
+--- a/packages/simulation/src/objectives/invariant.ts
++++ b/packages/simulation/src/objectives/invariant.ts
+@@ -1,5 +1,12 @@
+ import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+-import { presetRubbings, presetRubbingTypes, type RubbingDefinition, type RubbingType } from "@pirate-sea-race/content/objectives";
++import {
++  grantAmount,
++  itemPrice,
++  presetRubbings,
++  presetRubbingTypes,
++  type RubbingDefinition,
++  type RubbingType,
++} from "@pirate-sea-race/content/objectives";
+ import type { LedgerDuel, LedgerPlayer, LedgerState } from "./state.js";
+ 
+ /**
+@@ -63,7 +70,9 @@ function presetFacts(presetId: RulesPresetId) {
+  *   reservation for one of the two players of an unresolved duel;
+  * - no player holds (owns or has reserved) two rubbings of one type;
+  * - no cache is empty; a player in an unresolved duel owns nothing outside it, is in only one, and has no channel;
+- * - gold balances are non-negative integers that sum to the gold players brought in;
++ * - gold balances are non-negative integers that, with the gold spent, sum to the gold issued (purses and grants);
++ * - every grant holds its key once and pays the rules' amount; request ids are unique and the purchases add up to
++ *   the gold spent; a player carries 0 to the carry limit of tonics, one effect at most, and none once gone;
+  * - the state is plain integer data, so `hashState` covers it.
+  */
+ export function checkLedger(state: LedgerState): string[] {
+@@ -164,7 +173,11 @@ export function checkLedger(state: LedgerState): string[] {
+       problems.push(`player ${player.id} has fresh rumors ${player.freshRumors.join(",")}`);
+     }
+   }
+-  if (gold !== state.goldIssued) problems.push(`balances sum to ${gold} gold, but ${state.goldIssued} was issued`);
++  if (state.goldSpent < 0) problems.push(`${state.goldSpent} gold was spent`);
++  if (gold + state.goldSpent !== state.goldIssued) {
++    problems.push(`balances sum to ${gold} gold and ${state.goldSpent} was spent, but ${state.goldIssued} was issued`);
++  }
++  problems.push(...economyProblems(state, players));
+ 
+   for (const duel of state.duels) {
+     if (duel.phase === "fighting") {
+@@ -182,6 +195,38 @@ export function checkLedger(state: LedgerState): string[] {
+   return problems;
+ }
+ 
++/** §11's economy: keyed grants, unique purchases that account for the gold spent, and carried tonics. */
++function economyProblems(state: LedgerState, players: ReadonlyMap<string, LedgerPlayer>): string[] {
++  const problems: string[] = [];
++  const keys = new Set<string>();
++  for (const grant of state.grants) {
++    const key = grant.reason === "ruin" ? `ruin ${grant.sourceKey} for ${grant.playerId}` : `supply cache ${grant.sourceKey}`;
++    if (keys.has(key)) problems.push(`${key} was granted twice`);
++    keys.add(key);
++    if (!players.has(grant.playerId)) problems.push(`${key} went to unknown player ${grant.playerId}`);
++    if (grant.amount !== grantAmount(state.rules, grant.reason)) problems.push(`${key} minted ${grant.amount} gold`);
++  }
++  const requestIds = new Set<string>();
++  let spent = 0;
++  for (const purchase of state.purchases) {
++    if (requestIds.has(purchase.requestId)) problems.push(`request ${purchase.requestId} was charged twice`);
++    requestIds.add(purchase.requestId);
++    if (!players.has(purchase.playerId)) problems.push(`request ${purchase.requestId} was made by unknown player ${purchase.playerId}`);
++    if (purchase.price !== itemPrice(state.rules, purchase.item)) problems.push(`request ${purchase.requestId} cost ${purchase.price} gold`);
++    spent += purchase.price;
++  }
++  if (spent !== state.goldSpent) problems.push(`purchases cost ${spent} gold, but ${state.goldSpent} was spent`);
++  for (const player of state.players) {
++    if (player.tonics < 0 || player.tonics > state.rules.tonicCarryLimit) problems.push(`player ${player.id} carries ${player.tonics} tonics`);
++    const effect = player.tonicEffect;
++    if (effect !== null && (effect.endTick !== effect.startTick + state.rules.tonicTicks || effect.startTick > state.tick)) {
++      problems.push(`player ${player.id} has tonic effect ${JSON.stringify(effect)}`);
++    }
++    if (player.status === "left" && (player.tonics !== 0 || effect !== null)) problems.push(`player ${player.id} left with tonics`);
++  }
++  return problems;
++}
++
+ /** Throws with every violation when the ledger breaks its invariant. */
+ export function assertLedger(state: LedgerState): void {
+   const problems = checkLedger(state);
+diff --git a/packages/simulation/src/objectives/ledger.test.ts b/packages/simulation/src/objectives/ledger.test.ts
+index 2041527..157043a 100644
+--- a/packages/simulation/src/objectives/ledger.test.ts
++++ b/packages/simulation/src/objectives/ledger.test.ts
+@@ -1,6 +1,7 @@
+ import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+ import { describe, expect, it } from "vitest";
+ import {
++  activeTonic,
+   addPlayer,
+   advanceLedger,
+   assertLedger,
+@@ -16,10 +17,13 @@ import {
+   findDuel,
+   findPlayer,
+   findRubbing,
++  grantGold,
+   hashState,
+   heldTypes,
+   holdsAllTypes,
++  objectiveRules,
+   progressChannel,
++  purchase,
+   quitPlayer,
+   reconnectPlayer,
+   reportDuelResult,
+@@ -27,7 +31,9 @@ import {
+   startCacheClaim,
+   startCollect,
+   unlockSource,
++  useTonic,
+   type LedgerState,
++  type ObjectiveRules,
+   type LedgerStep,
+   type RubbingLocation,
+   type SourceSite,
+@@ -57,8 +63,8 @@ class Run {
+   state: LedgerState;
+   now = 1;
+ 
+-  constructor(preset: RulesPresetId, players: readonly string[], seed = 11) {
+-    let state = createLedger({ preset, seed, sites: sites(preset) });
++  constructor(preset: RulesPresetId, players: readonly string[], seed = 11, rules?: ObjectiveRules) {
++    let state = createLedger({ preset, seed, sites: sites(preset), rules });
+     for (const source of state.sources) state = unlockSource(state, { sourceId: source.id, tick: 0 }).state;
+     for (const playerId of players) state = addPlayer(state, { playerId, tick: 0 }).state;
+     assertLedger(state);
+@@ -86,6 +92,16 @@ class Run {
+     return findPlayer(this.state, playerId)!.gold;
+   }
+ 
++  tonics(playerId: string): number {
++    return findPlayer(this.state, playerId)!.tonics;
++  }
++
++  /** §11's gold identity: balances plus gold spent equal gold issued. */
++  expectGoldAccounted(): void {
++    const balances = this.state.players.reduce((sum, entry) => sum + entry.gold, 0);
++    expect(balances + this.state.goldSpent).toBe(this.state.goldIssued);
++  }
++
+   /** Holds interact for the full six seconds from the next tick. */
+   hold(playerId: string, ticks = this.state.rules.collectTicks) {
+     let last;
+@@ -155,6 +171,16 @@ describe("ledger state and content", () => {
+     expect(checkLedger(minted).join("\n")).toMatch(/balances sum/);
+     const emptyCache = { ...state, caches: [{ id: "cache-9", x: 0, y: 0, createdTick: 0 }] };
+     expect(checkLedger(emptyCache).join("\n")).toMatch(/cache cache-9 is empty/);
++    const unspent = { ...state, goldSpent: 5 };
++    expect(checkLedger(unspent).join("\n")).toMatch(/balances sum/);
++    const threeTonics = { ...state, players: state.players.map((entry) => ({ ...entry, tonics: 3 })) };
++    expect(checkLedger(threeTonics).join("\n")).toMatch(/carries 3 tonics/);
++    const grant = { reason: "supply-cache", sourceKey: "s1", playerId: "a", amount: 25, tick: 0 } as const;
++    const twice = { ...state, grants: [grant, { ...grant, playerId: "b" }], goldIssued: state.goldIssued + 50 };
++    expect(checkLedger(twice).join("\n")).toMatch(/supply cache s1 was granted twice/);
++    const bought = { requestId: "r1", playerId: "a", item: "rumor", price: 25, tick: 0, goldAfter: 25, tonicsAfter: 0 } as const;
++    const charged = { ...state, purchases: [bought, bought], goldSpent: 50, goldIssued: state.goldIssued + 50 };
++    expect(checkLedger(charged).join("\n")).toMatch(/request r1 was charged twice/);
+   });
+ });
+ 
+@@ -552,6 +578,212 @@ describe("disconnects, quits and recovery caches (§12)", () => {
+   });
+ });
+ 
++describe("economy: minted gold (§11)", () => {
++  it("grants ruin gold once per player per ruin; a repeat is refused and changes nothing", () => {
++    const run = new Run("slice", ["a", "b"]);
++    const issued = run.state.goldIssued;
++    const first = run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-3", tick: run.now });
++    expect(first).toMatchObject({ ok: true, grant: { reason: "ruin", sourceKey: "ruin-3", playerId: "a", amount: 40 } });
++    expect(run.gold("a")).toBe(90);
++    const repeat = run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-3", tick: ++run.now });
++    expect(repeat).toMatchObject({ ok: false, rejection: "duplicate", grant: first.grant });
++    expect(run.gold("a")).toBe(90);
++    expect(run.do(grantGold, { playerId: "b", reason: "ruin", sourceKey: "ruin-3", tick: run.now }).ok).toBe(true);
++    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-4", tick: run.now }).ok).toBe(true);
++    expect(run.gold("a")).toBe(130);
++    expect(run.gold("b")).toBe(90);
++    expect(run.state.goldIssued).toBe(issued + 3 * 40);
++    run.expectGoldAccounted();
++  });
++
++  it("grants a supply cache once per match, to whoever claims it first", () => {
++    const run = new Run("slice", ["a", "b"]);
++    expect(run.do(grantGold, { playerId: "b", reason: "supply-cache", sourceKey: "supply-1", tick: run.now }).grant?.amount).toBe(25);
++    const late = run.do(grantGold, { playerId: "a", reason: "supply-cache", sourceKey: "supply-1", tick: run.now });
++    expect(late).toMatchObject({ ok: false, rejection: "already-claimed", grant: { playerId: "b" } });
++    expect(run.do(grantGold, { playerId: "b", reason: "supply-cache", sourceKey: "supply-1", tick: run.now }).rejection).toBe("duplicate");
++    // A ruin and a supply cache never share a key.
++    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "supply-1", tick: run.now }).ok).toBe(true);
++    expect([run.gold("a"), run.gold("b"), run.state.goldIssued]).toEqual([90, 75, 165]);
++    run.expectGoldAccounted();
++  });
++
++  it("takes the amounts from the rules, never from the caller, and pays nobody who left", () => {
++    const run = new Run("slice", ["a", "b"], 11, { ...objectiveRules, ruinGold: 7, supplyCacheGold: 3 });
++    const forged = { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: run.now, amount: 1000 } as const;
++    expect(run.do(grantGold, forged).grant?.amount).toBe(7);
++    expect(run.do(grantGold, { playerId: "a", reason: "supply-cache", sourceKey: "s", tick: run.now }).grant?.amount).toBe(3);
++    expect(run.gold("a")).toBe(60);
++    expect(run.do(quitPlayer, { playerId: "b", tick: run.now, position: { x: 0, y: 0 } }).ok).toBe(true);
++    expect(run.do(grantGold, { playerId: "b", reason: "ruin", sourceKey: "ruin-1", tick: run.now }).rejection).toBe("player-left");
++    expect(run.do(grantGold, { playerId: "c", reason: "ruin", sourceKey: "ruin-1", tick: run.now }).rejection).toBe("unknown-player");
++    const bogus = { playerId: "a", reason: "kill", sourceKey: "ruin-9", tick: run.now } as unknown as Parameters<typeof grantGold>[1];
++    expect(run.do(grantGold, bogus).rejection).toBe("invalid-request");
++    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "", tick: run.now }).rejection).toBe("invalid-request");
++    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-9", tick: run.now - 1 }).rejection).toBe("stale-tick");
++    run.expectGoldAccounted();
++  });
++});
++
++describe("economy: purchases (§11, §16)", () => {
++  it("charges the rules' prices and spends the gold rather than moving it", () => {
++    const run = new Run("slice", ["a", "b"]);
++    const rumor = run.do(purchase, { requestId: "r1", playerId: "a", item: "rumor", tick: run.now });
++    expect(rumor).toMatchObject({ ok: true, replayed: false, purchase: { item: "rumor", price: 25, goldAfter: 25, tonicsAfter: 0 } });
++    run.expectGoldAccounted();
++    const tonic = run.do(purchase, { requestId: "r2", playerId: "b", item: "tonic", tick: run.now });
++    expect(tonic).toMatchObject({ ok: true, purchase: { item: "tonic", price: 30, goldAfter: 20, tonicsAfter: 1 } });
++    expect([run.gold("a"), run.gold("b"), run.tonics("b"), run.state.goldSpent, run.state.goldIssued]).toEqual([25, 20, 1, 55, 100]);
++    run.expectGoldAccounted();
++    const priced = new Run("slice", ["a"], 11, { ...objectiveRules, rumorPrice: 9, tonicPrice: 11 });
++    expect(priced.do(purchase, { requestId: "r1", playerId: "a", item: "rumor", tick: 1 }).purchase?.price).toBe(9);
++    expect(priced.do(purchase, { requestId: "r2", playerId: "a", item: "tonic", tick: 1 }).purchase?.price).toBe(11);
++    expect(priced.gold("a")).toBe(30);
++    priced.expectGoldAccounted();
++  });
++
++  it("refuses when gold is short, in a duel, disconnected, gone, or for a third tonic", () => {
++    const run = new Run("slice", ["a", "b", "c"]);
++    const buy = (requestId: string, playerId: string, item: "rumor" | "tonic") =>
++      run.do(purchase, { requestId, playerId, item, tick: run.now });
++    expect(buy("r1", "a", "tonic").ok).toBe(true);
++    expect(buy("r2", "a", "rumor").rejection).toBe("insufficient-gold");
++    expect(run.gold("a")).toBe(20);
++    run.expectGoldAccounted();
++
++    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: run.now }).ok).toBe(true);
++    expect(buy("r3", "a", "tonic").ok).toBe(true);
++    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-2", tick: run.now }).ok).toBe(true);
++    expect(run.gold("a")).toBe(70);
++    expect(buy("r4", "a", "tonic").rejection).toBe("tonic-limit");
++    expect([run.gold("a"), run.tonics("a")]).toEqual([70, 2]);
++    expect(buy("r4", "a", "rumor").ok).toBe(true);
++    run.expectGoldAccounted();
++
++    expect(run.do(reserveDuel, { duelId: "d1", players: ["b", "c"], tick: ++run.now }).ok).toBe(true);
++    expect(buy("r5", "b", "rumor").rejection).toBe("player-in-duel");
++    expect(run.do(reportDuelResult, { duelId: "d1", tick: ++run.now, outcome: "draw" }).ok).toBe(true);
++    expect(buy("r5", "b", "rumor").ok).toBe(true);
++    run.expectGoldAccounted();
++
++    expect(run.do(disconnectPlayer, { playerId: "c", tick: run.now }).ok).toBe(true);
++    expect(buy("r6", "c", "rumor").rejection).toBe("player-disconnected");
++    expect(run.do(quitPlayer, { playerId: "b", tick: run.now, position: { x: 0, y: 0 } }).ok).toBe(true);
++    expect(buy("r7", "b", "rumor").rejection).toBe("player-left");
++    expect(buy("r8", "ghost", "rumor").rejection).toBe("unknown-player");
++    expect(buy("", "a", "rumor").rejection).toBe("invalid-request");
++    expect(run.do(purchase, { requestId: "r9", playerId: "a", item: "scroll" as "rumor", tick: run.now }).rejection).toBe("invalid-request");
++    expect(run.do(purchase, { requestId: "r9", playerId: "a", item: "rumor", tick: run.now - 1 }).rejection).toBe("stale-tick");
++    run.expectGoldAccounted();
++  });
++
++  it("answers a repeated request id with the original purchase, never charging twice, even after other operations", () => {
++    const run = new Run("slice", ["a", "b"]);
++    const original = run.do(purchase, { requestId: "r1", playerId: "a", item: "tonic", tick: run.now });
++    expect(original.ok).toBe(true);
++    const settled = run.state;
++    const retry = run.do(purchase, { requestId: "r1", playerId: "a", item: "tonic", tick: run.now });
++    expect(retry).toEqual({ ...original, replayed: true });
++    expect(run.state).toBe(settled);
++
++    // Other operations in between: a grant, another purchase, a used tonic and a lost duel.
++    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: ++run.now }).ok).toBe(true);
++    expect(run.do(purchase, { requestId: "r2", playerId: "a", item: "rumor", tick: run.now }).ok).toBe(true);
++    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: true, grappled: false }).ok).toBe(true);
++    run.duel("d1", "a", "b", "b");
++    const [gold, tonics, spent] = [run.gold("a"), run.tonics("a"), run.state.goldSpent];
++
++    const before = run.state;
++    const late = run.do(purchase, { requestId: "r1", playerId: "a", item: "tonic", tick: ++run.now });
++    expect(late).toEqual({ ...original, replayed: true });
++    expect(run.state).toBe(before);
++    // A retry carrying an old tick still finds its purchase rather than failing as stale.
++    expect(run.do(purchase, { requestId: "r2", playerId: "a", item: "rumor", tick: 0 }).replayed).toBe(true);
++    expect([run.gold("a"), run.tonics("a"), run.state.goldSpent]).toEqual([gold, tonics, spent]);
++    // The same id reused by another player or for another item is refused, not replayed.
++    expect(run.do(purchase, { requestId: "r1", playerId: "b", item: "tonic", tick: run.now }).rejection).toBe("duplicate");
++    expect(run.do(purchase, { requestId: "r1", playerId: "a", item: "rumor", tick: run.now }).rejection).toBe("duplicate");
++    expect(run.state.purchases.map((record) => record.requestId)).toEqual(["r1", "r2"]);
++    run.expectGoldAccounted();
++  });
++});
++
++describe("economy: sail tonics (§11)", () => {
++  /** A run where `a` carries two tonics and `b` one. */
++  function stocked(): Run {
++    const run = new Run("slice", ["a", "b"]);
++    run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: run.now });
++    for (const [requestId, playerId] of [["r1", "a"], ["r2", "a"], ["r3", "b"]] as const) {
++      expect(run.do(purchase, { requestId, playerId, item: "tonic", tick: run.now }).ok).toBe(true);
++    }
++    return run;
++  }
++
++  it("is active for exactly 12 seconds: from its activation tick to 239 ticks later", () => {
++    const run = stocked();
++    const start = (run.now = 100);
++    expect(run.do(useTonic, { playerId: "a", tick: start, atSea: true, grappled: false }).player?.tonicEffect).toEqual({
++      startTick: 100,
++      endTick: 340,
++    });
++    expect(objectiveRules.tonicTicks).toBe(240);
++    expect(run.tonics("a")).toBe(1);
++    expect(activeTonic(run.state, "a", start - 1)).toBe(false);
++    expect(activeTonic(run.state, "a", start)).toBe(true);
++    expect(activeTonic(run.state, "a", start + 239)).toBe(true);
++    expect(activeTonic(run.state, "a", start + 240)).toBe(false);
++    expect(activeTonic(run.state, "b", start)).toBe(false);
++    expect(activeTonic(run.state, "ghost", start)).toBe(false);
++  });
++
++  it("allows one active at a time, and another once it ends", () => {
++    const run = stocked();
++    expect(run.do(useTonic, { playerId: "a", tick: 10, atSea: true, grappled: false }).ok).toBe(true);
++    expect(run.do(useTonic, { playerId: "a", tick: 10, atSea: true, grappled: false }).rejection).toBe("tonic-active");
++    expect(run.do(useTonic, { playerId: "a", tick: 249, atSea: true, grappled: false }).rejection).toBe("tonic-active");
++    expect(run.tonics("a")).toBe(1);
++    expect(run.do(useTonic, { playerId: "a", tick: 250, atSea: true, grappled: false }).ok).toBe(true);
++    expect(run.tonics("a")).toBe(0);
++    expect(run.do(useTonic, { playerId: "a", tick: 600, atSea: true, grappled: false }).rejection).toBe("no-tonic");
++  });
++
++  it("is refused in a duel, off the sea, while grappled or disconnected", () => {
++    const run = stocked();
++    const use = (atSea: boolean, grappled: boolean, playerId = "a") => run.do(useTonic, { playerId, tick: run.now, atSea, grappled });
++    expect(use(false, false).rejection).toBe("not-at-sea");
++    expect(use(true, true).rejection).toBe("grappled");
++    expect(run.do(reserveDuel, { duelId: "d1", players: ["a", "b"], tick: ++run.now }).ok).toBe(true);
++    expect(use(true, false).rejection).toBe("player-in-duel");
++    expect(run.do(reportDuelResult, { duelId: "d1", tick: ++run.now, outcome: "draw" }).ok).toBe(true);
++    expect(run.do(disconnectPlayer, { playerId: "b", tick: run.now }).ok).toBe(true);
++    expect(use(true, false, "b").rejection).toBe("player-disconnected");
++    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: "yes" as unknown as boolean, grappled: false }).rejection).toBe(
++      "invalid-request",
++    );
++    expect(run.tonics("a")).toBe(2);
++    expect(use(true, false).ok).toBe(true);
++  });
++
++  it("keeps the tonics after a lost duel and drops them, active one included, on leaving", () => {
++    const run = stocked();
++    const gold = run.gold("a");
++    const lost = run.duel("d1", "a", "b", "b");
++    expect(lost.duel?.phase).toBe("settled");
++    expect(run.gold("a")).toBeLessThan(gold);
++    expect(run.tonics("a")).toBe(2);
++    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: true, grappled: false }).ok).toBe(true);
++    expect(run.do(quitPlayer, { playerId: "a", tick: ++run.now, position: { x: 0, y: 0 } }).ok).toBe(true);
++    expect(run.tonics("a")).toBe(0);
++    expect(findPlayer(run.state, "a")!.tonicEffect).toBeNull();
++    expect(activeTonic(run.state, "a", run.now)).toBe(false);
++    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: true, grappled: false }).rejection).toBe("player-left");
++    run.do(disconnectPlayer, { playerId: "b", tick: run.now });
++    expect(run.do(expireReservation, { playerId: "b", tick: run.now + 1200, position: { x: 0, y: 0 } }).ok).toBe(true);
++    expect(run.tonics("b")).toBe(0);
++    run.expectGoldAccounted();
++  });
++});
++
+ describe("requests", () => {
+   it("refuses stale and malformed requests without changing anything", () => {
+     const run = new Run("slice", ["a", "b"]);
+diff --git a/packages/simulation/src/objectives/players.ts b/packages/simulation/src/objectives/players.ts
+index 7e62603..c05f6e3 100644
+--- a/packages/simulation/src/objectives/players.ts
++++ b/packages/simulation/src/objectives/players.ts
+@@ -82,6 +82,8 @@ export function addPlayer(state: LedgerState, request: AddPlayerRequest): Ledger
+     exit: null,
+     channel: null,
+     freshRumors: [],
++    tonics: 0,
++    tonicEffect: null,
+   };
+   const next = { ...atTick(state, tick), players: [...state.players, player], goldIssued: state.goldIssued + gold };
+   return applied(next, playerId, noEffects());
+@@ -159,7 +161,7 @@ export function quitPlayer(state: LedgerState, request: LeaveRequest): LedgerSte
+ }
+ 
+ /**
+- * Removes a player from the match. Outside a duel, everything they hold goes into one cache. In a fight, they forfeit:
++ * Removes a player from the match; their tonics, and any tonic still active, are gone. Outside a duel, everything they hold goes into one cache. In a fight, they forfeit:
+  * the opponent wins and the settlement later sends what the winner does not take into a cache at `position`. As the
+  * loser in a choice window, the same happens when the window settles. As the winner in a choice window, the duel
+  * settles at once and they take nothing, except when that win came from the opponent's forfeit on this same tick:
+@@ -173,6 +175,8 @@ function leave(state: LedgerState, playerId: string, position: Position, tick: n
+     reservationDeadline: null,
+     exit: { x: position.x, y: position.y },
+     channel: null,
++    tonics: 0,
++    tonicEffect: null,
+   }));
+   const duel = activeDuelOf(next, playerId);
+   if (duel === undefined) {
+diff --git a/packages/simulation/src/objectives/property.test.ts b/packages/simulation/src/objectives/property.test.ts
+index d0e8bab..2e11fc6 100644
+--- a/packages/simulation/src/objectives/property.test.ts
++++ b/packages/simulation/src/objectives/property.test.ts
+@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
+ import { nextInt } from "../random.js";
+ import {
+   activeDuelOf,
++  activeTonic,
+   addPlayer,
+   advanceLedger,
+   cacheRubbings,
+@@ -15,9 +16,11 @@ import {
+   expireReservation,
+   findPlayer,
+   findRubbing,
++  grantGold,
+   hashState,
+   heldTypes,
+   progressChannel,
++  purchase,
+   quitPlayer,
+   reconnectPlayer,
+   reportDuelResult,
+@@ -25,6 +28,7 @@ import {
+   startCacheClaim,
+   startCollect,
+   unlockSource,
++  useTonic,
+   type LedgerState,
+   type LedgerStep,
+   type Transfer,
+@@ -65,9 +69,11 @@ interface Outcome {
+ 
+ /**
+  * A seeded random match: players join, collect, get interrupted, duel (won, lost, drawn, cancelled), choose or let
+- * the window lapse, repeat old messages, disconnect, return, expire, quit and claim from caches, mixed with invalid,
+- * duplicate and stale requests. After every operation the invariant holds, a rejected request returned its input
+- * state, and every reported transfer matches where the rubbing now is.
++ * the window lapse, repeat old messages, disconnect, return, expire, quit and claim from caches, earn ruin and supply
++ * gold, buy (and retry buying) rumors and tonics and use tonics, mixed with invalid, duplicate and stale requests.
++ * After every operation the invariant holds, a rejected request returned its input state, every reported transfer
++ * matches where the rubbing now is, gold is accounted for and never negative, and each player carries 0 to 2 tonics
++ * with at most one active.
+  */
+ function simulate(preset: RulesPresetId, seed: number, steps: number, check = true): { state: LedgerState; stats: Stats } {
+   const dice = new Dice(seed ^ 0x5eed);
+@@ -84,6 +90,8 @@ function simulate(preset: RulesPresetId, seed: number, steps: number, check = tr
+   let joined = 0;
+   let duelNumber = 0;
+   const messages: (() => LedgerStep<Outcome>)[] = [];
++  let requestNumber = 0;
++  const bought: { requestId: string; playerId: string; item: "rumor" | "tonic" }[] = [];
+ 
+   const apply = <Q, R extends Outcome>(label: string, op: (s: LedgerState, q: Q) => LedgerStep<R>, request: Q): R => {
+     const before = state;
+@@ -98,6 +106,7 @@ function simulate(preset: RulesPresetId, seed: number, steps: number, check = tr
+     const problems = checkLedger(after);
+     if (problems.length > 0) throw new Error(`seed ${seed}, ${label} ${JSON.stringify(request)}:\n${problems.join("\n")}`);
+     if (!result.ok && after !== before) throw new Error(`${label} was rejected (${result.rejection}) but changed the state`);
++    economyCheck(after, label);
+     const moved = new Set<string>();
+     for (const transfer of result.transfers ?? []) {
+       if (moved.has(transfer.rubbingId)) throw new Error(`${label} moved ${transfer.rubbingId} twice`);
+@@ -112,6 +121,21 @@ function simulate(preset: RulesPresetId, seed: number, steps: number, check = tr
+     return result;
+   };
+ 
++  /** §11's economy after every step, stated directly rather than only through `checkLedger`. */
++  const economyCheck = (after: LedgerState, label: string) => {
++    let balances = 0;
++    for (const player of after.players) {
++      balances += player.gold;
++      // One effect slot per player, so at most one tonic is active: the slot must be the one activation that fits.
++      const effect = player.tonicEffect;
++      const oneEffect = effect === null || effect.endTick - effect.startTick === after.rules.tonicTicks;
++      if (player.gold < 0 || player.tonics < 0 || player.tonics > after.rules.tonicCarryLimit || !oneEffect) {
++        throw new Error(`seed ${seed}, ${label}: player ${player.id} has ${player.gold} gold, ${player.tonics} tonics, ${JSON.stringify(effect)}`);
++      }
++    }
++    if (balances + after.goldSpent !== after.goldIssued) throw new Error(`seed ${seed}, ${label}: gold is not accounted for`);
++  };
++
+   const players = () => state.players.map((player) => player.id);
+   const present = () => state.players.filter((player) => player.status !== "left").map((player) => player.id);
+   /** Mostly a player still in the match; sometimes one who left, or an unknown id. */
+@@ -260,10 +284,67 @@ function simulate(preset: RulesPresetId, seed: number, steps: number, check = tr
+   ];
+   const total = actions.reduce((sum, [weight]) => sum + weight, 0);
+ 
++  /**
++   * §11's economy draws from its own dice between the steps above. Gold and tonics never steer those steps' draws,
++   * so the match around the economy is the same sequence it was before the economy existed.
++   */
++  const shop = new Dice(seed ^ 0xc01d);
++  const shopper = () => {
++    const roll = shop.int(100);
++    if (roll < 88 && present().length > 0) return shop.pick(present());
++    if (roll < 97 && players().length > 0) return shop.pick(players());
++    return "ghost";
++  };
++  const economy: [number, () => void][] = [
++    [4, () => {
++      // Ruins are keyed per player, supply caches once per match; a small pool of keys makes repeats common.
++      const reason = shop.percent(50) ? ("ruin" as const) : ("supply-cache" as const);
++      const sourceKey = reason === "ruin" ? `ruin-${shop.int(4)}` : `supply-${shop.int(4)}`;
++      apply(`grant-${reason}`, grantGold, { playerId: shopper(), reason, sourceKey, tick: now });
++    }],
++    [4, () => {
++      const roll = shop.int(100);
++      if (roll < 25 && bought.length > 0) {
++        // A retry of an earlier purchase: the original result, no charge. Now and then the id is reused wrongly.
++        const earlier = shop.pick(bought);
++        const request = shop.percent(85) ? earlier : { ...earlier, playerId: shopper(), item: shop.pick(["rumor", "tonic"] as const) };
++        const before = state;
++        const result = apply("rebuy", purchase, { ...request, tick: shop.percent(50) ? now : 0 });
++        if (result.replayed) {
++          count("purchase-replayed");
++          expect(state).toBe(before);
++          expect(result.purchase?.requestId).toBe(earlier.requestId);
++        }
++        return;
++      }
++      const item = shop.pick(["rumor", "tonic"] as const);
++      // Tonic buyers are often players who carry one already, so the carry limit is reached.
++      const carrying = state.players.filter((player) => player.tonics > 0).map((player) => player.id);
++      const playerId = item === "tonic" && carrying.length > 0 && shop.percent(50) ? shop.pick(carrying) : shopper();
++      const request = { requestId: `r${++requestNumber}`, playerId, item };
++      const result = apply(`buy-${item}`, purchase, { ...request, tick: now });
++      if (result.ok) bought.push(request);
++    }],
++    [3, () => {
++      const atSea = shop.percent(85);
++      const grappled = shop.percent(10);
++      // Often a player whose tonic is still active, who must not start a second one.
++      const sailing = state.players.filter((player) => activeTonic(state, player.id, now)).map((player) => player.id);
++      const playerId = sailing.length > 0 && shop.percent(40) ? shop.pick(sailing) : shopper();
++      const result = apply("use-tonic", useTonic, { playerId, tick: now, atSea, grappled });
++      if (result.ok && activeTonic(state, playerId, now) && !activeTonic(state, playerId, now + state.rules.tonicTicks)) count("tonic-active");
++    }],
++  ];
++  const economyTotal = economy.reduce((sum, [weight]) => sum + weight, 0);
++
+   for (let step = 0; step < steps; step++) {
+     let roll = dice.int(total);
+     const action = actions.find(([weight]) => (roll -= weight) < 0)!;
+     action[1]();
++    if (shop.percent(40)) {
++      let pick = shop.int(economyTotal);
++      economy.find(([weight]) => (pick -= weight) < 0)![1]();
++    }
+   }
+   for (const duel of state.duels) {
+     if (duel.settlement?.goldSuppressed) count("gold-suppressed");
+@@ -308,6 +389,29 @@ const EXERCISED: [string, string[]][] = [
+   ["recovery caches", ["caches"]],
+   ["fresh-rumor entitlements", ["rumors"]],
+   ["stale requests", ["stale:stale-tick"]],
++  ["ruin gold", ["grant-ruin:ok"]],
++  ["repeated ruin grant", ["grant-ruin:duplicate"]],
++  ["supply cache gold", ["grant-supply-cache:ok"]],
++  ["supply cache claimed by another", ["grant-supply-cache:already-claimed"]],
++  ["repeated supply cache grant", ["grant-supply-cache:duplicate"]],
++  ["grant to a player who left", ["grant-ruin:player-left", "grant-supply-cache:player-left"]],
++  ["rumor bought", ["buy-rumor:ok"]],
++  ["tonic bought", ["buy-tonic:ok"]],
++  ["repeated request id replayed", ["purchase-replayed"]],
++  ["request id reused for another purchase", ["rebuy:duplicate"]],
++  ["short gold", ["buy-rumor:insufficient-gold", "buy-tonic:insufficient-gold"]],
++  ["third tonic", ["buy-tonic:tonic-limit"]],
++  ["purchase in a duel", ["buy-rumor:player-in-duel", "buy-tonic:player-in-duel"]],
++  ["purchase while disconnected", ["buy-rumor:player-disconnected", "buy-tonic:player-disconnected"]],
++  ["purchase after leaving", ["buy-rumor:player-left", "buy-tonic:player-left"]],
++  ["tonic used", ["use-tonic:ok"]],
++  ["tonic active for its duration", ["tonic-active"]],
++  ["second tonic while active", ["use-tonic:tonic-active"]],
++  ["no tonic carried", ["use-tonic:no-tonic"]],
++  ["tonic off the sea", ["use-tonic:not-at-sea"]],
++  ["tonic while grappled", ["use-tonic:grappled"]],
++  ["tonic in a duel", ["use-tonic:player-in-duel"]],
++  ["tonic after leaving", ["use-tonic:player-left"]],
+ ];
+ 
+ describe("ledger property: no rubbing is ever lost or duplicated (§19)", () => {
+diff --git a/packages/simulation/src/objectives/state.ts b/packages/simulation/src/objectives/state.ts
+index b7d55cf..b6bddc9 100644
+--- a/packages/simulation/src/objectives/state.ts
++++ b/packages/simulation/src/objectives/state.ts
+@@ -8,8 +8,10 @@ import {
+   validateObjectiveRules,
+   validateSourceAssignment,
+   validateSourceSites,
++  type GoldGrantReason,
+   type ObjectiveRules,
+   type RubbingType,
++  type ShopItem,
+   type SourceAssignment,
+   type SourceSite,
+ } from "@pirate-sea-race/content/objectives";
+@@ -83,6 +85,40 @@ export interface LedgerPlayer {
+   readonly channel: LedgerChannel | null;
+   /** Types this player lost and is owed a fresh rumor for (§11), in type order. The rumor system reads it. */
+   readonly freshRumors: readonly RubbingType[];
++  /** Sail tonics carried (§11): 0 up to the rules' carry limit. A lost duel keeps them; leaving drops them. */
++  readonly tonics: number;
++  /** The last tonic activated, if any; it is active from `startTick` until just before `endTick`. */
++  readonly tonicEffect: TonicEffect | null;
++}
++
++/** An activated sail tonic: active on the ticks `startTick ≤ tick < endTick`, `endTick = startTick + tonicTicks`. */
++export interface TonicEffect {
++  readonly startTick: number;
++  readonly endTick: number;
++}
++
++/**
++ * Gold the rules minted (§11). Its key makes it once only: a `ruin` grant once per (player, `sourceKey`), a
++ * `supply-cache` grant once per `sourceKey` for the whole match.
++ */
++export interface GoldGrant {
++  readonly reason: GoldGrantReason;
++  readonly sourceKey: string;
++  readonly playerId: string;
++  readonly amount: number;
++  readonly tick: number;
++}
++
++/** A completed dockside purchase, kept under its request id so a retry finds it instead of paying again (§11, §16). */
++export interface PurchaseRecord {
++  readonly requestId: string;
++  readonly playerId: string;
++  readonly item: ShopItem;
++  readonly price: number;
++  readonly tick: number;
++  /** The buyer's gold and tonics right after the purchase. */
++  readonly goldAfter: number;
++  readonly tonicsAfter: number;
+ }
+ 
+ /** A recovery cache (§12). It never despawns; it disappears once empty. Its contents are the rubbings located in it. */
+@@ -153,8 +189,17 @@ export interface LedgerState {
+   readonly duels: readonly LedgerDuel[];
+   readonly wins: readonly WinRecord[];
+   readonly nextCacheNumber: number;
+-  /** Gold players brought in when joining. Settlements only move gold, so the balances always sum to this. */
++  /**
++   * Gold players brought in when joining plus the gold grants minted. Settlements only move gold and purchases spend
++   * it, so the balances plus `goldSpent` always sum to this.
++   */
+   readonly goldIssued: number;
++  /** Gold spent at the shop: it leaves the balances and goes to nobody. */
++  readonly goldSpent: number;
++  /** Every grant made, in order. */
++  readonly grants: readonly GoldGrant[];
++  /** Every completed purchase, in order; request ids are unique in the match. */
++  readonly purchases: readonly PurchaseRecord[];
+ }
+ 
+ /**
+@@ -239,6 +284,9 @@ export function createLedgerFromAssignment(
+     wins: [],
+     nextCacheNumber: 1,
+     goldIssued: 0,
++    goldSpent: 0,
++    grants: [],
++    purchases: [],
+   };
+ }
+ 

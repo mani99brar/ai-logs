@@ -1,0 +1,225 @@
+import { hashState } from "../hash.js";
+import type { FruitKitId } from "@pirate-sea-race/content/fruits";
+import type { FruitChannel, FruitConfig, FruitMeal, FruitPedestal, FruitState } from "./state.js";
+
+/** What the caller knows about one player on this tick. */
+export interface FruitPlayer {
+  readonly playerId: string;
+  /** The pedestal the player stands at (the caller decides reach), or null. */
+  readonly pedestalId: string | null;
+  /** Holding interact on this tick. */
+  readonly holding: boolean;
+  /** Reserved for, or fighting, a duel (§6). */
+  readonly reserved: boolean;
+  /** Disconnected (§12): channels are cancelled. */
+  readonly disconnected: boolean;
+  /** Left the match: they keep their kit, and cannot eat. */
+  readonly left: boolean;
+}
+
+/** One world tick's facts; the order of `players` never matters. A player absent from the list is not holding. */
+export interface FruitTickInput {
+  /** Must be later than the state's tick; a skipped tick is a gap that resets every channel. */
+  readonly tick: number;
+  readonly players: readonly FruitPlayer[];
+}
+
+/** Why a held request cannot eat: the player is gone, busy or fed, or the pedestal is empty. */
+export type FruitRefusalReason = "left" | "disconnected" | "reserved" | "already-eaten" | "empty";
+
+/** Why a channel reset to zero. `taken`: another player ate the fruit first (on an earlier completion, or this tick). */
+export type FruitInterruptReason = "released" | "moved" | "gap" | "taken" | "left" | "disconnected" | "reserved";
+
+/** Something that happened on a tick, for the caller to apply or announce; listed in player id order. */
+export type FruitResult =
+  | { readonly kind: "eat-started"; readonly tick: number; readonly playerId: string; readonly pedestalId: string }
+  /** The channel was lost; `held` is the ticks it had. */
+  | { readonly kind: "eat-interrupted"; readonly tick: number; readonly playerId: string; readonly pedestalId: string; readonly reason: FruitInterruptReason; readonly held: number }
+  /** A request held at a pedestal that cannot start; reported on every tick it is held. */
+  | { readonly kind: "eat-refused"; readonly tick: number; readonly playerId: string; readonly pedestalId: string; readonly reason: FruitRefusalReason }
+  /** The fruit is eaten: `kit` is the player's kit for the rest of the match. */
+  | { readonly kind: "eat-completed"; readonly tick: number; readonly playerId: string; readonly pedestalId: string; readonly kit: FruitKitId }
+  /** A tick not later than the state's: nothing is applied and the very same state comes back. */
+  | { readonly kind: "tick-rejected"; readonly tick: number; readonly lastTick: number };
+
+export interface FruitStepResult {
+  readonly state: FruitState;
+  readonly results: readonly FruitResult[];
+}
+
+/** Lowest id by UTF-16 code units, independent of locale. */
+export function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function requireBoolean(value: unknown, name: string): void {
+  if (typeof value !== "boolean") throw new RangeError(`${name} must be a boolean, got ${String(value)}`);
+}
+
+/** Refuses malformed facts (a caller bug): duplicate or empty ids, unknown pedestals, non-boolean flags. */
+function readPlayers(state: FruitState, input: FruitTickInput): FruitPlayer[] {
+  const pedestalIds = new Set(state.pedestals.map((pedestal) => pedestal.id));
+  const seen = new Set<string>();
+  for (const player of input.players) {
+    if (typeof player.playerId !== "string" || player.playerId.length === 0) throw new RangeError("player ids must be non-empty strings");
+    if (seen.has(player.playerId)) throw new RangeError(`player ${player.playerId} appears twice`);
+    seen.add(player.playerId);
+    if (player.pedestalId !== null && !pedestalIds.has(player.pedestalId)) throw new RangeError(`unknown pedestal ${String(player.pedestalId)}`);
+    for (const flag of ["holding", "reserved", "disconnected", "left"] as const) requireBoolean(player[flag], `${player.playerId}.${flag}`);
+  }
+  return [...input.players].sort((a, b) => compareIds(a.playerId, b.playerId));
+}
+
+/**
+ * One world tick of §9's acquisition rules. A tick not later than the state's is rejected with the very same state.
+ * Otherwise, in a fixed order: (1) a skipped tick resets every channel (`gap`); (2) players, sorted by id, advance,
+ * start, reset or are refused, and channels of players absent from the facts are released; (3) channels that reach
+ * `eatTicks` complete in id order: the first eats the fruit, and every later completer, and every other channel at
+ * that pedestal, is interrupted as `taken`. The input and the state are never mutated.
+ */
+export function stepFruits(config: FruitConfig, state: FruitState, input: FruitTickInput): FruitStepResult {
+  if (typeof input.tick !== "number" || !Number.isSafeInteger(input.tick)) throw new RangeError(`tick must be a safe integer, got ${String(input.tick)}`);
+  if (input.tick <= state.tick) return { state, results: [{ kind: "tick-rejected", tick: input.tick, lastTick: state.tick }] };
+  const players = readPlayers(state, input);
+  const tick = input.tick;
+  const results: FruitResult[] = [];
+  const interrupted = (channel: FruitChannel, reason: FruitInterruptReason): FruitResult => ({
+    kind: "eat-interrupted",
+    tick,
+    playerId: channel.playerId,
+    pedestalId: channel.pedestalId,
+    reason,
+    held: channel.held,
+  });
+
+  const pedestals = new Map(state.pedestals.map((pedestal) => [pedestal.id, pedestal]));
+  const fed = new Set(state.meals.map((meal) => meal.playerId));
+  const previous = new Map(state.channels.map((channel) => [channel.playerId, channel]));
+  const present = new Set(players.map((player) => player.playerId));
+  const gap = tick !== state.tick + 1;
+
+  // Each player's step, and the released channels of absent players, merged in id order.
+  const steps: { playerId: string; results: FruitResult[]; channel: FruitChannel | null }[] = [];
+  for (const channel of state.channels) {
+    if (!present.has(channel.playerId)) steps.push({ playerId: channel.playerId, results: [interrupted(channel, gap ? "gap" : "released")], channel: null });
+  }
+  for (const player of players) {
+    const own: FruitResult[] = [];
+    let channel = previous.get(player.playerId) ?? null;
+    // 1. A skipped tick breaks every channel.
+    if (channel !== null && gap) {
+      own.push(interrupted(channel, "gap"));
+      channel = null;
+    }
+    const target = player.holding ? player.pedestalId : null;
+    if (target === null) {
+      if (channel !== null) own.push(interrupted(channel, "released"));
+      steps.push({ playerId: player.playerId, results: own, channel: null });
+      continue;
+    }
+    if (channel !== null && channel.pedestalId !== target) {
+      own.push(interrupted(channel, "moved"));
+      channel = null;
+    }
+    const pedestal = pedestals.get(target)!;
+    const refusal: FruitRefusalReason | null = player.left
+      ? "left"
+      : player.disconnected
+        ? "disconnected"
+        : player.reserved
+          ? "reserved"
+          : fed.has(player.playerId)
+            ? "already-eaten"
+            : pedestal.eatenBy !== null
+              ? "empty"
+              : null;
+    if (refusal !== null) {
+      // A live channel can only meet the player's own state here: a fed player or an empty pedestal has none.
+      if (channel !== null) own.push(interrupted(channel, refusal as FruitInterruptReason));
+      else own.push({ kind: "eat-refused", tick, playerId: player.playerId, pedestalId: target, reason: refusal });
+      steps.push({ playerId: player.playerId, results: own, channel: null });
+      continue;
+    }
+    if (channel !== null) {
+      channel = { ...channel, lastTick: tick, held: channel.held + 1 };
+    } else {
+      channel = { playerId: player.playerId, pedestalId: target, startTick: tick, lastTick: tick, held: 1 };
+      own.push({ kind: "eat-started", tick, playerId: player.playerId, pedestalId: target });
+    }
+    steps.push({ playerId: player.playerId, results: own, channel });
+  }
+  steps.sort((a, b) => compareIds(a.playerId, b.playerId));
+  for (const step of steps) results.push(...step.results);
+
+  // 2. Completions in id order: the lowest id eats; the rest at that pedestal find it taken.
+  const meals: FruitMeal[] = [...state.meals];
+  let channels = steps.flatMap((step) => (step.channel === null ? [] : [step.channel]));
+  for (const channel of channels) {
+    if (channel.held < config.eatTicks) continue;
+    const pedestal = pedestals.get(channel.pedestalId)!;
+    if (pedestal.eatenBy !== null) continue;
+    pedestals.set(pedestal.id, { ...pedestal, eatenBy: channel.playerId });
+    meals.push({ playerId: channel.playerId, pedestalId: pedestal.id, kit: pedestal.kit, tick });
+    results.push({ kind: "eat-completed", tick, playerId: channel.playerId, pedestalId: pedestal.id, kit: pedestal.kit });
+  }
+  const eatenNow = new Set(meals.slice(state.meals.length).map((meal) => meal.pedestalId));
+  const eaters = new Set(meals.slice(state.meals.length).map((meal) => meal.playerId));
+  channels = channels.filter((channel) => {
+    if (eaters.has(channel.playerId)) return false;
+    if (!eatenNow.has(channel.pedestalId)) return true;
+    results.push(interrupted(channel, "taken"));
+    return false;
+  });
+
+  meals.sort((a, b) => compareIds(a.playerId, b.playerId));
+  const next: FruitState = {
+    tick,
+    pedestals: state.pedestals.map((pedestal) => pedestals.get(pedestal.id)!),
+    channels,
+    meals,
+  };
+  return { state: next, results };
+}
+
+export interface FruitReplay {
+  readonly state: FruitState;
+  readonly results: readonly FruitResult[];
+  readonly hash: string;
+}
+
+/** Steps a sequence of ticks from a state, collecting every result; `hash` is the final state's `hashState`. */
+export function replayFruits(config: FruitConfig, state: FruitState, inputs: readonly FruitTickInput[]): FruitReplay {
+  let current = state;
+  const results: FruitResult[] = [];
+  for (const input of inputs) {
+    const stepped = stepFruits(config, current, input);
+    current = stepped.state;
+    results.push(...stepped.results);
+  }
+  return { state: current, results, hash: hashState(current) };
+}
+
+/** Invariant violations of a fruit state, empty when it is consistent. */
+export function checkFruitState(state: FruitState): string[] {
+  const issues: string[] = [];
+  const pedestals = new Map<string, FruitPedestal>(state.pedestals.map((pedestal) => [pedestal.id, pedestal]));
+  const eatenPedestals = new Set<string>();
+  const fedPlayers = new Set<string>();
+  for (const meal of state.meals) {
+    if (fedPlayers.has(meal.playerId)) issues.push(`player ${meal.playerId} ate twice`);
+    fedPlayers.add(meal.playerId);
+    if (eatenPedestals.has(meal.pedestalId)) issues.push(`pedestal ${meal.pedestalId} was eaten twice`);
+    eatenPedestals.add(meal.pedestalId);
+    const pedestal = pedestals.get(meal.pedestalId);
+    if (pedestal === undefined) issues.push(`meal at unknown pedestal ${meal.pedestalId}`);
+    else if (pedestal.eatenBy !== meal.playerId || pedestal.kit !== meal.kit) issues.push(`pedestal ${meal.pedestalId} disagrees with ${meal.playerId}'s meal`);
+  }
+  const full = state.pedestals.filter((pedestal) => pedestal.eatenBy === null).length;
+  if (state.meals.length + full !== state.pedestals.length) issues.push(`${state.meals.length} meals + ${full} full pedestals != ${state.pedestals.length} pedestals`);
+  for (const channel of state.channels) {
+    if (fedPlayers.has(channel.playerId)) issues.push(`fed player ${channel.playerId} is still eating`);
+    if (pedestals.get(channel.pedestalId)?.eatenBy !== null) issues.push(`channel at empty or unknown pedestal ${channel.pedestalId}`);
+    if (channel.held !== channel.lastTick - channel.startTick + 1) issues.push(`channel of ${channel.playerId} skipped a tick`);
+  }
+  return issues;
+}

@@ -1,0 +1,655 @@
+import { WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import { parseRevealMessage, startRefusedMessageSchema, type RevealMessage, type StartRefusedMessage } from "@pirate-sea-race/protocol";
+import { compassToward, secondsUntil, typeName, type HudLine } from "./hud.js";
+
+/**
+ * The match flow on the page (§2, §5): the lobby, the ready countdown, the timer, the reveals' banners, the route to
+ * the final island, the claim and the results screen. The functions here are pure (tests call them without a DOM);
+ * `renderFlow` writes them into the page.
+ */
+
+/** A seat as the page names it: "Player 2", with "you" and "host" where they apply. */
+export function seatLabel(seat: number, self: number, host: number): string {
+  const tags = [seat === self ? "you" : "", seat === host ? "host" : ""].filter((tag) => tag !== "");
+  return `Player ${seat}${tags.length > 0 ? ` (${tags.join(", ")})` : ""}`;
+}
+
+/** Minutes and seconds of world ticks, rounded up to the second: 42 000 ticks is "35:00". */
+export function clockText(ticks: number): string {
+  const seconds = Math.max(0, Math.ceil(ticks / WORLD_STEPS_PER_SECOND));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+/** What the lobby shows (§2): the players by seat, whether this player may start, and why not. */
+export interface LobbyModel {
+  readonly players: readonly { readonly seat: number; readonly label: string }[];
+  /** The Start button is shown to the host only, and enabled with enough players. */
+  readonly showStart: boolean;
+  readonly canStart: boolean;
+  readonly hint: string;
+}
+
+export interface LobbyState {
+  readonly phase: string;
+  readonly seats: readonly number[];
+  readonly hostSeat: number;
+  readonly seat: number;
+  readonly minPlayers: number;
+  readonly readyEndsAt: number;
+  readonly worldTick: number;
+}
+
+export function lobbyModel(state: LobbyState): LobbyModel {
+  const seats = [...state.seats].sort((a, b) => a - b);
+  const players = seats.map((seat) => ({ seat, label: seatLabel(seat, state.seat, state.hostSeat) }));
+  const host = state.seat !== 0 && state.seat === state.hostSeat;
+  const enough = seats.length >= state.minPlayers;
+  if (state.phase === "ready") {
+    const seconds = secondsUntil(state.readyEndsAt, state.worldTick);
+    return { players, showStart: false, canStart: false, hint: `Setting sail in ${seconds} s: the arena loads meanwhile` };
+  }
+  let hint: string;
+  if (!enough) hint = `Waiting for players: ${state.minPlayers} or more start a match. Share the code.`;
+  else if (host) hint = "Everyone aboard? Start the match.";
+  else hint = "Waiting for the host to start the match.";
+  return { players, showStart: host, canStart: host && enough && state.phase === "lobby", hint };
+}
+
+/** Why the host's start was refused, as the lobby says it. */
+export function startRefusalText(reason: StartRefusedMessage["reason"]): string {
+  switch (reason) {
+    case "too-few":
+      return "A private match needs at least two players to start.";
+    case "not-host":
+      return "Only the host can start the match.";
+    default:
+      return "This match starts when its seats fill.";
+  }
+}
+
+/** The lobby's line for the server's refusal of a start, or undefined for a message that is not one. */
+export function startRefusalLine(message: unknown): string | undefined {
+  const refusal = startRefusedMessageSchema.safeParse(message);
+  return refusal.success ? startRefusalText(refusal.data.reason) : undefined;
+}
+
+/** The server's refusal of a start, shown in the lobby; anything that is not one is ignored. */
+export function showStartRefusal(message: unknown, show: (line: string) => void): void {
+  const line = startRefusalLine(message);
+  if (line !== undefined) show(line);
+}
+
+/** A reveal from the server, shown as its banner; anything that is not one is ignored. */
+export function showReveal(message: unknown, show: (banner: Banner) => void): void {
+  const reveal = parseRevealMessage(message);
+  if (reveal !== undefined) show(revealBanner(reveal));
+}
+
+/** The phase as the HUD names it. */
+export function phaseText(phase: string): string {
+  switch (phase) {
+    case "lobby":
+      return "Lobby";
+    case "ready":
+      return "Ready check";
+    case "departure":
+      return "Departure (protected)";
+    case "exploration":
+      return "Exploration";
+    case "ended":
+      return "Match over";
+    default:
+      return "";
+  }
+}
+
+/**
+ * The match timer (§2): the full duration in the lobby and the ready check, counting down from control start, frozen
+ * at the end. `urgent` in the last minute.
+ */
+export function timerLine(state: { readonly phase: string; readonly remainingTicks: number }): HudLine {
+  const text = clockText(state.remainingTicks);
+  if (state.phase === "lobby" || state.phase === "ready") return { text, state: "waiting" };
+  if (state.phase === "ended") return { text, state: "ended" };
+  return { text, state: state.remainingTicks <= 60 * WORLD_STEPS_PER_SECOND ? "urgent" : "running" };
+}
+
+/** A reveal as a banner for everyone who receives it (§2, §5): a headline, a detail line and a tone for styling. */
+export interface Banner {
+  readonly kind: RevealMessage["kind"];
+  readonly title: string;
+  readonly detail: string;
+  readonly tone: "treasure" | "warning" | "info";
+}
+
+export function revealBanner(reveal: RevealMessage): Banner {
+  switch (reveal.kind) {
+    case "final-sector":
+      return { kind: reveal.kind, title: "A full set of rubbings exists!", detail: `The treasure lies in ${reveal.name}. Every ship is heading there.`, tone: "treasure" };
+    case "final-route":
+      return {
+        kind: reveal.kind,
+        title: reveal.restored ? "Your set is whole again" : "You hold every rubbing!",
+        detail: "Your compass points to the final island. Stop inside the treasure circle and hold E to claim it.",
+        tone: "treasure",
+      };
+    case "final-route-inactive":
+      return { kind: reveal.kind, title: "You lost a rubbing", detail: "Your route to the treasure is inactive until your set is whole again.", tone: "warning" };
+    case "sector-reveal": {
+      const sources = reveal.sources.map((sector) => sector.name);
+      const caches = reveal.caches.map((sector) => sector.name);
+      const parts = [sources.length > 0 ? `unclaimed rubbings in ${sources.join(", ")}` : "no unclaimed rubbing left", caches.length > 0 ? `recovery caches in ${caches.join(", ")}` : ""];
+      return { kind: reveal.kind, title: "Minute 20: the charts are out", detail: `${capitalise(parts.filter((part) => part !== "").join("; "))}.`, tone: "info" };
+    }
+    case "carrier-report": {
+      const carriers = reveal.carriers.map((carrier) => `${typeName(carrier.type)} in ${carrier.name}`);
+      return { kind: reveal.kind, title: "Carriers sighted", detail: carriers.length > 0 ? `${carriers.join(", ")}.` : "No rubbing is being carried.", tone: "info" };
+    }
+  }
+}
+
+function capitalise(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** This player's route and claim, from their private status (§5). */
+export interface ClaimStatus {
+  readonly fullSet: boolean;
+  readonly routeKnown: boolean;
+  readonly routeActive: boolean;
+  readonly routeX: number;
+  readonly routeY: number;
+  readonly claim: string;
+  readonly claimHeld: number;
+  readonly claimTotal: number;
+  readonly claimInterrupt: string;
+  readonly claimInterruptAt: number;
+}
+
+/** The compass to the final island: the direction and distance in tiles, and the bearing in radians for the arrow. */
+export interface RouteLine extends HudLine {
+  /** Radians from east, clockwise (y grows south), or undefined without an active route. */
+  readonly bearing?: number;
+  readonly distanceTiles?: number;
+}
+
+export function routeLine(claim: ClaimStatus | undefined, own: { x: number; y: number } | undefined, subUnitsPerTile: number): RouteLine {
+  if (claim === undefined || !claim.routeKnown) return { text: "", state: "none" };
+  if (!claim.routeActive) return { text: "Route inactive: win back the rubbing you lost", state: "inactive" };
+  if (own === undefined) return { text: "Treasure route active", state: "active" };
+  const target = { x: claim.routeX, y: claim.routeY };
+  const distanceTiles = Math.round(Math.hypot(target.x - own.x, target.y - own.y) / subUnitsPerTile);
+  const bearing = Math.atan2(target.y - own.y, target.x - own.x);
+  const text = distanceTiles === 0 ? "Treasure: right here" : `Treasure: ${distanceTiles} tiles ${compassToward(own, target)}`;
+  return { text, state: "active", bearing, distanceTiles };
+}
+
+const INTERRUPTS: Readonly<Record<string, string>> = {
+  duel: "a rival grappled you",
+  disconnected: "you disconnected",
+  ineligible: "you no longer hold every rubbing",
+  moved: "you moved",
+  released: "you let go of E",
+  deadline: "time ran out",
+};
+
+/** How recent a reset must be (in world ticks) for the claim line to still say why. */
+const INTERRUPT_SHOWN_TICKS = 5 * WORLD_STEPS_PER_SECOND;
+
+/**
+ * The claim (§5): what to do, the channel's seconds left, or why it reset; `risk` is the explicit warning while the
+ * channel runs or can start. `progress` is 0 to 1.
+ */
+export function claimLines(
+  claim: ClaimStatus | undefined,
+  context: { readonly inCircle: boolean; readonly speed: number; readonly worldTick: number; readonly phase: string; readonly rivalClaiming?: boolean },
+): { readonly claim: HudLine; readonly risk: HudLine; readonly progress: number } {
+  const none = { claim: { text: "", state: "none" }, risk: { text: "", state: "none" }, progress: 0 };
+  if (claim === undefined || context.phase === "ended") return none;
+  // §5: a claim in sight warns everyone who sees it; interrupting it takes a grapple.
+  if (context.rivalClaiming === true && claim.claim !== "channel" && claim.claim !== "waiting") {
+    return { claim: { text: "A rival is claiming the treasure! Grapple them before the channel completes", state: "rival" }, risk: none.risk, progress: 0 };
+  }
+  const risk = { text: "Any rival in range can interrupt you with a grapple", state: "risk" };
+  if (claim.claim === "channel") {
+    const seconds = Math.max(0, Math.ceil((claim.claimTotal - claim.claimHeld) / WORLD_STEPS_PER_SECOND));
+    return {
+      claim: { text: `Claiming the treasure: keep holding E, ${seconds} s left`, state: "channel", seconds },
+      risk,
+      progress: claim.claimTotal === 0 ? 0 : Math.min(1, claim.claimHeld / claim.claimTotal),
+    };
+  }
+  if (claim.claim === "waiting") return { claim: { text: "Another claim is under way: interrupt it or wait", state: "waiting" }, risk, progress: 0 };
+  const interrupted = claim.claimInterrupt !== "" && context.worldTick - claim.claimInterruptAt <= INTERRUPT_SHOWN_TICKS;
+  if (interrupted) {
+    return { claim: { text: `Claim interrupted: ${INTERRUPTS[claim.claimInterrupt] ?? claim.claimInterrupt}. Progress lost.`, state: `interrupted:${claim.claimInterrupt}` }, risk: none.risk, progress: 0 };
+  }
+  if (!claim.routeKnown || !claim.routeActive || !claim.fullSet) return none;
+  if (!context.inCircle) return { claim: { text: "Sail into the treasure circle to claim", state: "route" }, risk: none.risk, progress: 0 };
+  if (context.speed !== 0) return { claim: { text: "Stop inside the circle, then hold E for ten seconds", state: "slow" }, risk, progress: 0 };
+  return { claim: { text: "Hold E to claim the treasure (ten seconds)", state: "ready" }, risk, progress: 0 };
+}
+
+/** One row of the results screen. */
+export interface ResultRow {
+  readonly seat: number;
+  readonly label: string;
+  readonly winner: boolean;
+  readonly left: boolean;
+  readonly cells: readonly number[];
+}
+
+export const RESULT_COLUMNS = ["Rubbings", "Thefts", "Lost", "Duels won", "Duels lost", "Duels drawn", "Gold", "Caches", "Islands"] as const;
+
+export interface ResultsState {
+  readonly endReason: string;
+  readonly winnerSeat: number;
+  readonly seat: number;
+  readonly hostSeat: number;
+  readonly lines: readonly {
+    readonly seat: number;
+    readonly winner: boolean;
+    readonly left: boolean;
+    readonly collected: number;
+    readonly thefts: number;
+    readonly lost: number;
+    readonly duelsWon: number;
+    readonly duelsLost: number;
+    readonly duelsDrawn: number;
+    readonly gold: number;
+    readonly cachesClaimed: number;
+    readonly islandsVisited: number;
+  }[];
+}
+
+/** The results screen (§2): the headline (the winner, or no winner and why) and each player's accomplishments. */
+export function resultsModel(state: ResultsState): { readonly headline: string; readonly detail: string; readonly rows: readonly ResultRow[] } | undefined {
+  if (state.endReason === "") return undefined;
+  let headline: string;
+  let detail: string;
+  switch (state.endReason) {
+    case "claim":
+      headline = state.winnerSeat === state.seat ? "You claimed the treasure!" : `Player ${state.winnerSeat} claimed the treasure`;
+      detail = state.winnerSeat === state.seat ? "The One Piece is yours. Victory." : "The race is over.";
+      break;
+    case "deadline":
+      headline = "No winner (time ran out)";
+      detail = "Nobody claimed the treasure before the deadline.";
+      break;
+    case "abandoned":
+      headline = "No winner (everyone left)";
+      detail = "The match was abandoned.";
+      break;
+    default:
+      headline = "No winner (match aborted)";
+      detail = "A server fault stopped the match. No result counts against anyone.";
+  }
+  const rows = state.lines.map((line) => ({
+    seat: line.seat,
+    label: seatLabel(line.seat, state.seat, 0) + (line.left ? " (left)" : ""),
+    winner: line.winner,
+    left: line.left,
+    cells: [line.collected, line.thefts, line.lost, line.duelsWon, line.duelsLost, line.duelsDrawn, line.gold, line.cachesClaimed, line.islandsVisited],
+  }));
+  return { headline, detail, rows };
+}
+
+/** Everything the flow's part of the page shows, read from the synced state and this player's status. */
+export interface FlowModel {
+  readonly code: string;
+  /** Another ship in sight is channelling the claim. */
+  readonly rivalClaiming: boolean;
+  readonly lobby: LobbyState;
+  readonly remainingTicks: number;
+  readonly finalSector: string;
+  readonly claim: ClaimStatus | undefined;
+  readonly own: { readonly x: number; readonly y: number; readonly speed: number } | undefined;
+  readonly treasureRadius: number;
+  readonly subUnitsPerTile: number;
+  readonly results: ResultsState;
+}
+
+/** Whether a position is inside the treasure circle around a route's point (the edge counts, as on the server). */
+export function insideCircle(claim: ClaimStatus | undefined, own: { x: number; y: number } | undefined, radius: number): boolean {
+  if (claim === undefined || !claim.routeKnown || own === undefined) return false;
+  const dx = own.x - claim.routeX;
+  const dy = own.y - claim.routeY;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
+/** What the compass says while no route is known: shown, but inactive. */
+export const NO_ROUTE_TEXT = "No treasure route yet: hold every rubbing type to learn it";
+
+/** The compass to the final island as the page shows it. */
+export interface CompassView {
+  /** Hidden outside play (the lobby, the ready check, the results); shown, inactive, while no route is known. */
+  readonly hidden: boolean;
+  /** The route's state: "none" (no route known), "inactive" (a type lost) or "active". */
+  readonly state: string;
+  /** Whether the arrow points anywhere: an active route only. */
+  readonly active: boolean;
+  /** Radians for the arrow (0 without an active route). */
+  readonly bearing: number;
+  /** Tiles to the treasure, with an active route and a known position only. */
+  readonly distance: string | undefined;
+  readonly text: string;
+}
+
+/** Everything the flow's part of the page shows, element by element: `applyFlow` writes it without deciding anything. */
+export interface FlowView {
+  readonly phase: HudLine;
+  readonly timer: HudLine;
+  readonly remaining: string;
+  readonly sector: string;
+  readonly lobby: {
+    readonly hidden: boolean;
+    /** The lobby takes the purse's place until the match starts. */
+    readonly purseHidden: boolean;
+    readonly code: string;
+    readonly players: readonly { readonly seat: number; readonly label: string }[];
+    readonly startHidden: boolean;
+    readonly startDisabled: boolean;
+    /** With the ready check's seconds left in `seconds`. */
+    readonly hint: HudLine;
+  };
+  readonly route: HudLine;
+  readonly compass: CompassView;
+  readonly claim: {
+    readonly panelHidden: boolean;
+    readonly text: HudLine;
+    readonly risk: HudLine;
+    readonly progressHidden: boolean;
+    readonly progress: number;
+    readonly held: string;
+    readonly total: string;
+  };
+  readonly results: {
+    readonly hidden: boolean;
+    readonly reason: string;
+    readonly winnerSeat: string;
+    readonly headline: string;
+    readonly detail: string;
+    /** Each row's cells as shown: the player (with a trophy for the winner), then the accomplishments. */
+    readonly rows: readonly { readonly seat: string; readonly winner: string; readonly cells: readonly string[] }[];
+  };
+}
+
+/** The flow's part of the page (§2, §5): the lobby, the clock bar, the compass, the claim panel and the results screen. */
+export function flowView(model: FlowModel): FlowView {
+  const { lobby } = model;
+  const inLobby = lobby.phase === "lobby" || lobby.phase === "ready";
+  const playing = lobby.phase === "departure" || lobby.phase === "exploration";
+  const shown = lobbyModel(lobby);
+  const route = routeLine(model.claim, model.own, model.subUnitsPerTile);
+  const claim = claimLines(model.claim, {
+    inCircle: insideCircle(model.claim, model.own, model.treasureRadius),
+    speed: model.own?.speed ?? 0,
+    worldTick: lobby.worldTick,
+    phase: lobby.phase,
+    rivalClaiming: model.rivalClaiming,
+  });
+  const results = resultsModel(model.results);
+  return {
+    phase: { text: phaseText(lobby.phase), state: lobby.phase },
+    timer: timerLine({ phase: lobby.phase, remainingTicks: model.remainingTicks }),
+    remaining: String(model.remainingTicks),
+    sector: model.finalSector === "" ? "" : `Treasure sector: ${model.finalSector}`,
+    lobby: {
+      hidden: !inLobby,
+      purseHidden: inLobby,
+      code: model.code,
+      players: shown.players,
+      startHidden: !shown.showStart,
+      startDisabled: !shown.canStart,
+      hint: lobby.phase === "ready" ? { text: shown.hint, state: lobby.phase, seconds: secondsUntil(lobby.readyEndsAt, lobby.worldTick) } : { text: shown.hint, state: lobby.phase },
+    },
+    route,
+    compass: {
+      hidden: !playing,
+      state: route.state,
+      active: route.state === "active",
+      bearing: route.bearing ?? 0,
+      distance: route.distanceTiles === undefined ? undefined : String(route.distanceTiles),
+      text: route.state === "none" ? NO_ROUTE_TEXT : route.text,
+    },
+    claim: {
+      panelHidden: claim.claim.state === "none",
+      text: claim.claim,
+      risk: claim.risk,
+      progressHidden: claim.claim.state !== "channel",
+      progress: claim.progress,
+      held: String(model.claim?.claimHeld ?? 0),
+      total: String(model.claim?.claimTotal ?? 0),
+    },
+    results: {
+      hidden: results === undefined,
+      reason: model.results.endReason,
+      winnerSeat: String(model.results.winnerSeat),
+      headline: results?.headline ?? "",
+      detail: results?.detail ?? "",
+      rows: (results?.rows ?? []).map((row) => ({
+        seat: String(row.seat),
+        winner: String(row.winner),
+        cells: [row.winner ? `${row.label} 🏆` : row.label, ...row.cells.map(String)],
+      })),
+    },
+  };
+}
+
+/** A player's own status as the flow reads it from the synced state (any field may be missing before the first patch). */
+export interface FlowStatusSnapshot {
+  readonly seat?: number;
+  readonly fullSet?: boolean;
+  readonly routeKnown?: boolean;
+  readonly routeActive?: boolean;
+  readonly routeX?: number;
+  readonly routeY?: number;
+  readonly claim?: string;
+  readonly claimHeld?: number;
+  readonly claimTotal?: number;
+  readonly claimInterrupt?: string;
+  readonly claimInterruptAt?: number;
+}
+
+/** The synced state as the flow reads it: public fields, the ships in view, and this player's own status (§16). */
+export interface FlowSnapshot {
+  readonly code: string;
+  readonly worldTick: number;
+  readonly phase?: string;
+  readonly hostSeat?: number;
+  readonly minPlayers?: number;
+  readonly readyEndsAt?: number;
+  readonly remainingTicks?: number;
+  readonly finalSector?: string;
+  readonly treasureRadius?: number;
+  readonly endReason?: string;
+  readonly winnerSeat?: number;
+  readonly roster?: { values(): Iterable<{ readonly seat: number }> };
+  readonly results?: Iterable<ResultsState["lines"][number]>;
+  readonly status?: { get(id: string): FlowStatusSnapshot | undefined };
+  readonly ships?: { values(): Iterable<{ readonly id: string; readonly x: number; readonly y: number; readonly speed: number; readonly claiming?: boolean; readonly claimHeld?: number }> };
+}
+
+/** The ships in view channelling the claim (§5: nearby players are warned), with the ticks each has held. */
+export function claimingShipsOf(state: FlowSnapshot): Map<string, number> {
+  const claiming = new Map<string, number>();
+  for (const ship of state.ships?.values() ?? []) if (ship.claiming === true) claiming.set(ship.id, ship.claimHeld ?? 0);
+  return claiming;
+}
+
+/** The flow's model from the synced state (public) and this player's own status (private, §16). */
+export function flowModelOf(state: FlowSnapshot, selfId: string, subUnitsPerTile: number): FlowModel {
+  const status = state.status?.get(selfId);
+  const own = [...(state.ships?.values() ?? [])].find((ship) => ship.id === selfId);
+  const claim: ClaimStatus | undefined =
+    status === undefined
+      ? undefined
+      : {
+          fullSet: status.fullSet === true,
+          routeKnown: status.routeKnown === true,
+          routeActive: status.routeActive === true,
+          routeX: status.routeX ?? 0,
+          routeY: status.routeY ?? 0,
+          claim: status.claim ?? "",
+          claimHeld: status.claimHeld ?? 0,
+          claimTotal: status.claimTotal ?? 0,
+          claimInterrupt: status.claimInterrupt ?? "",
+          claimInterruptAt: status.claimInterruptAt ?? 0,
+        };
+  return {
+    code: state.code,
+    rivalClaiming: [...claimingShipsOf(state).keys()].some((id) => id !== selfId),
+    lobby: {
+      phase: state.phase ?? "",
+      seats: [...(state.roster?.values() ?? [])].map((entry) => entry.seat),
+      hostSeat: state.hostSeat ?? 0,
+      seat: status?.seat ?? 0,
+      minPlayers: state.minPlayers ?? 2,
+      readyEndsAt: state.readyEndsAt ?? 0,
+      worldTick: state.worldTick,
+    },
+    remainingTicks: state.remainingTicks ?? 0,
+    finalSector: state.finalSector ?? "",
+    claim,
+    own: own === undefined ? undefined : { x: own.x, y: own.y, speed: own.speed },
+    treasureRadius: state.treasureRadius ?? 0,
+    subUnitsPerTile,
+    results: {
+      endReason: state.endReason ?? "",
+      winnerSeat: state.winnerSeat ?? 0,
+      seat: status?.seat ?? 0,
+      hostSeat: state.hostSeat ?? 0,
+      lines: [...(state.results ?? [])],
+    },
+  };
+}
+
+function field(root: ParentNode, id: string): HTMLElement {
+  const element = root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  if (element === null) throw new Error(`missing flow field ${id}`);
+  return element;
+}
+
+/** Sets a data attribute, or removes it for undefined. */
+function data(element: HTMLElement, name: string, value: string | undefined): void {
+  if (value === undefined) delete element.dataset[name];
+  else element.dataset[name] = value;
+}
+
+function write(element: HTMLElement, line: HudLine): void {
+  element.textContent = line.text;
+  element.dataset["state"] = line.state;
+  data(element, "seconds", line.seconds === undefined ? undefined : String(line.seconds));
+}
+
+/** Rebuilds an element's children only when their content changed (`key`), so a list is not redrawn every frame. */
+function rebuild(element: HTMLElement, key: string, children: () => Node[]): void {
+  if (element.dataset["built"] === key) return;
+  element.dataset["built"] = key;
+  element.replaceChildren(...children());
+}
+
+function cell(tag: "th" | "td", text: string): HTMLTableCellElement {
+  const element = document.createElement(tag);
+  element.textContent = text;
+  return element;
+}
+
+/** Writes the flow's view into the page: every decision is `flowView`'s, this only copies it. */
+export function renderFlow(root: ParentNode, model: FlowModel): void {
+  applyFlow(root, flowView(model));
+}
+
+export function applyFlow(root: ParentNode, view: FlowView): void {
+  write(field(root, "flow-phase"), view.phase);
+  const timer = field(root, "match-timer");
+  write(timer, view.timer);
+  timer.dataset["remaining"] = view.remaining;
+  field(root, "flow-sector").textContent = view.sector;
+
+  field(root, "lobby").hidden = view.lobby.hidden;
+  root.querySelectorAll<HTMLElement>("#purse").forEach((purse) => (purse.hidden = view.lobby.purseHidden));
+  field(root, "lobby-code").textContent = view.lobby.code;
+  const list = field(root, "lobby-players");
+  list.dataset["players"] = view.lobby.players.map((player) => player.label).join("|");
+  rebuild(list, list.dataset["players"], () =>
+    view.lobby.players.map((player) => {
+      const item = document.createElement("li");
+      item.dataset["seat"] = String(player.seat);
+      item.textContent = player.label;
+      return item;
+    }),
+  );
+  const start = field(root, "start-match") as HTMLButtonElement;
+  start.hidden = view.lobby.startHidden;
+  start.disabled = view.lobby.startDisabled;
+  write(field(root, "lobby-hint"), view.lobby.hint);
+
+  write(field(root, "hud-route"), view.route);
+  const compass = field(root, "compass");
+  compass.hidden = view.compass.hidden;
+  compass.dataset["state"] = view.compass.state;
+  compass.dataset["active"] = String(view.compass.active);
+  compass.style.setProperty("--bearing", `${view.compass.bearing}rad`);
+  data(compass, "distance", view.compass.distance);
+  field(root, "compass-text").textContent = view.compass.text;
+
+  field(root, "claim-panel").hidden = view.claim.panelHidden;
+  write(field(root, "claim-text"), view.claim.text);
+  write(field(root, "claim-risk"), view.claim.risk);
+  const bar = field(root, "claim-progress");
+  bar.hidden = view.claim.progressHidden;
+  bar.style.setProperty("--progress", String(view.claim.progress));
+  bar.dataset["held"] = view.claim.held;
+  bar.dataset["total"] = view.claim.total;
+
+  const screen = field(root, "results");
+  screen.hidden = view.results.hidden;
+  screen.dataset["reason"] = view.results.reason;
+  screen.dataset["winnerSeat"] = view.results.winnerSeat;
+  field(root, "results-headline").textContent = view.results.headline;
+  field(root, "results-detail").textContent = view.results.detail;
+  const table = field(root, "results-table");
+  table.dataset["rows"] = JSON.stringify(view.results.rows);
+  rebuild(table.querySelector("thead")!, "head", () => [headRow()]);
+  rebuild(table.querySelector("tbody")!, table.dataset["rows"], () =>
+    view.results.rows.map((row) => {
+      const line = document.createElement("tr");
+      line.dataset["seat"] = row.seat;
+      line.dataset["winner"] = row.winner;
+      line.append(...row.cells.map((value) => cell("td", value)));
+      return line;
+    }),
+  );
+}
+
+function headRow(): HTMLTableRowElement {
+  const head = document.createElement("tr");
+  for (const title of ["Player", ...RESULT_COLUMNS]) {
+    const header = cell("th", title);
+    header.scope = "col";
+    head.append(header);
+  }
+  return head;
+}
+
+/** How long a reveal's banner stays up. */
+export const BANNER_MS = 7000;
+
+/** Shows a reveal's banner over the sea for a while, and adds it to the page's list of reveals. */
+export function showBanner(root: ParentNode, banner: Banner, timers: { hide?: number }): void {
+  const element = field(root, "banner");
+  element.hidden = false;
+  element.dataset["kind"] = banner.kind;
+  element.dataset["tone"] = banner.tone;
+  field(root, "banner-title").textContent = banner.title;
+  field(root, "banner-detail").textContent = banner.detail;
+  if (timers.hide !== undefined) window.clearTimeout(timers.hide);
+  timers.hide = window.setTimeout(() => {
+    element.hidden = true;
+  }, BANNER_MS);
+  const entry = document.createElement("li");
+  entry.dataset["kind"] = banner.kind;
+  entry.textContent = `${banner.title} ${banner.detail}`;
+  field(root, "reveal-log").append(entry);
+}

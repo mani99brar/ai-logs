@@ -1,0 +1,752 @@
+import { test, expect, type Page } from '@playwright/test'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { waitForApi } from './helpers.ts'
+
+/**
+ * Rendering tests use uniquely named scratch files under fixtures/pi/ that are removed in afterEach,
+ * even on failure. Documents are opened by direct link, so no listing refresh is needed.
+ */
+const fixtureRoot = fileURLToPath(new URL('../fixtures/', import.meta.url))
+const created: string[] = []
+
+async function scratchFile(name: string, content: string): Promise<{ path: string; url: string }> {
+  const folder = `scratch-render-${randomUUID().slice(0, 8)}`
+  const directory = join(fixtureRoot, 'pi', folder)
+  created.push(directory)
+  await mkdir(directory, { recursive: true })
+  await writeFile(join(directory, name), content)
+  const path = `${folder}/${name}`
+  return { path, url: `/file/Pi/${path.split('/').map(encodeURIComponent).join('/')}` }
+}
+
+// A 1×1 transparent PNG, served for intercepted HTTPS image requests.
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64')
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+
+test.afterEach(async () => {
+  for (const path of created.splice(0)) await rm(path, { recursive: true, force: true })
+})
+
+function tabs(page: Page) {
+  return {
+    rendered: page.getByRole('tab', { name: 'Rendered' }),
+    source: page.getByRole('tab', { name: 'Source' }),
+    panel: page.getByRole('tabpanel'),
+    sourceText: () => page.getByTestId('document-source').evaluate(element => element.textContent),
+  }
+}
+
+async function openDocument(page: Page, url: string) {
+  await page.goto(url)
+  await expect(page.getByTestId('document-view').locator('header').getByRole('heading', { level: 2 })).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Rendered' })).toHaveAttribute('aria-selected', 'true')
+}
+
+test('GFM: tables, task lists, strikethrough, autolinks and fenced code render; Source is exact', async ({ page }) => {
+  const content = [
+    '# Title',
+    '',
+    'Intro with ~~struck~~ text and https://example.com/auto autolink.',
+    '',
+    '| Name | Value |',
+    '| --- | --- |',
+    '| alpha | 1 |',
+    '| beta | 2 |',
+    '',
+    '- [x] done item',
+    '- [ ] open item',
+    '',
+    '1. first',
+    '2. second',
+    '',
+    '```ts',
+    'const answer = 42',
+    '  return answer',
+    '```',
+    '',
+    '> quoted',
+    '',
+  ].join('\n')
+  const file = await scratchFile('gfm.md', content)
+  await openDocument(page, file.url)
+  const { rendered, source, panel, sourceText } = tabs(page)
+
+  await expect(panel.getByRole('heading', { level: 1, name: 'Title' })).toBeVisible()
+  await expect(panel.locator('del')).toHaveText('struck')
+  await expect(panel.getByRole('link', { name: 'https://example.com/auto' })).toHaveAttribute('href', 'https://example.com/auto')
+  await expect(panel.getByRole('table')).toBeVisible()
+  await expect(panel.getByRole('columnheader', { name: 'Value' })).toBeVisible()
+  await expect(panel.getByRole('cell', { name: 'beta' })).toBeVisible()
+  const checkboxes = panel.getByRole('checkbox')
+  await expect(checkboxes).toHaveCount(2)
+  await expect(checkboxes.nth(0)).toBeChecked()
+  await expect(checkboxes.nth(1)).not.toBeChecked()
+  await expect(checkboxes.nth(0)).toBeDisabled()
+  await expect(panel.getByRole('listitem').filter({ hasText: 'second' })).toBeVisible()
+  await expect(panel.locator('pre code')).toHaveText('const answer = 42\n  return answer\n')
+  await expect(panel.locator('blockquote')).toHaveText('quoted')
+  // The Markdown is rendered, not shown as text.
+  await expect(panel).not.toContainText('| ---')
+  await expect(panel).not.toContainText('```')
+
+  // Switching tabs neither refetches nor changes the document identity.
+  const fileRequests: string[] = []
+  page.on('request', request => { if (request.url().includes('/api/file')) fileRequests.push(request.url()) })
+  await source.click()
+  await expect(source).toHaveAttribute('aria-selected', 'true')
+  await expect(rendered).toHaveAttribute('aria-selected', 'false')
+  expect(await sourceText()).toBe(content)
+  await expect(page).toHaveURL(file.url)
+  await rendered.click()
+  await expect(rendered).toHaveAttribute('aria-selected', 'true')
+  await expect(panel.getByRole('table')).toBeVisible()
+  expect(fileRequests).toEqual([])
+})
+
+test('Source preserves leading/trailing whitespace, CRLF, tabs and frontmatter exactly', async ({ page }) => {
+  const content = '\n\n---\r\nname: keep-me\r\n---\r\n\t# Not a heading because of the tab\r\n   \r\ntrailing spaces   \r\n\r\n\r\n'
+  const file = await scratchFile('exact.md', content)
+  await openDocument(page, file.url)
+  const { source, sourceText, panel } = tabs(page)
+  await source.click()
+  expect(await sourceText()).toBe(content)
+  await expect(panel).not.toContainText('This file is empty')
+})
+
+test('an empty file shows an explicit message and an exactly empty Source', async ({ page }) => {
+  const file = await scratchFile('empty.md', '')
+  await openDocument(page, file.url)
+  const { source, sourceText, panel } = tabs(page)
+  await expect(panel).toContainText('This file is empty')
+  await expect(page.getByTestId('document-source')).toHaveCount(0)
+  await source.click()
+  await expect(panel).toContainText('This file is empty')
+  expect(await sourceText()).toBe('')
+
+  // The committed empty fixture behaves the same way.
+  await openDocument(page, '/file/Claude/empty.md')
+  await expect(page.getByRole('tabpanel')).toContainText('This file is empty')
+})
+
+test('tabs are keyboard operable with a roving tab stop and expose selection state', async ({ page }) => {
+  const file = await scratchFile('tabs.md', '# Tabs\n\nBody text.\n')
+  await openDocument(page, file.url)
+  const { rendered, source, panel } = tabs(page)
+  await expect(page.getByRole('tablist', { name: 'Document view' })).toBeVisible()
+  await expect(rendered).toHaveAttribute('tabindex', '0')
+  await expect(source).toHaveAttribute('tabindex', '-1')
+
+  await rendered.focus()
+  await page.keyboard.press('ArrowRight')
+  await expect(source).toBeFocused()
+  await expect(source).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByTestId('document-source')).toBeVisible()
+  await expect(panel).toHaveAttribute('aria-labelledby', await source.getAttribute('id') ?? '')
+  await expect(panel.getByRole('heading', { name: 'Tabs', exact: true })).toHaveCount(0)
+  await page.keyboard.press('ArrowLeft')
+  await expect(rendered).toBeFocused()
+  await expect(rendered).toHaveAttribute('aria-selected', 'true')
+  await expect(panel.getByRole('heading', { name: 'Tabs', exact: true })).toBeVisible()
+  await page.keyboard.press('End')
+  await expect(source).toBeFocused()
+  await page.keyboard.press('Home')
+  await expect(rendered).toBeFocused()
+  // Only the selected tab is in the Tab order; Tab leaves the tablist.
+  await page.keyboard.press('Tab')
+  await expect(source).not.toBeFocused()
+  await expect(rendered).not.toBeFocused()
+
+  // Enter/Space on a tab also select it (native button semantics).
+  await source.focus()
+  await page.keyboard.press('Enter')
+  await expect(source).toHaveAttribute('aria-selected', 'true')
+})
+
+test('links: external links open in a new tab with noopener; relative and unsafe links are inert', async ({ page }) => {
+  const content = [
+    'External: [Example](https://example.com/page) and [Plain](http://example.com/plain).',
+    '',
+    'Relative: [Other](./other.md) and [Sibling](../workflow.md) and [Anchor](#title).',
+    '',
+    'Unsafe: [Evil](javascript:window.__pwned=1) and [Data](data:text/html,hi).',
+    '',
+  ].join('\n')
+  const file = await scratchFile('links.md', content)
+  await openDocument(page, file.url)
+  const panel = page.getByRole('tabpanel')
+
+  const external = panel.getByRole('link', { name: 'Example' })
+  await expect(external).toHaveAttribute('href', 'https://example.com/page')
+  await expect(external).toHaveAttribute('target', '_blank')
+  await expect(external).toHaveAttribute('rel', /\bnoopener\b/)
+  await expect(panel.getByRole('link', { name: 'Plain' })).toHaveAttribute('target', '_blank')
+
+  // Relative document links are visible text but not links, and activating them does nothing.
+  const requests: string[] = []
+  page.on('request', request => requests.push(request.url()))
+  for (const name of ['Other', 'Sibling', 'Anchor', 'Evil', 'Data']) {
+    await expect(panel.getByRole('link', { name })).toHaveCount(0)
+    await expect(panel.getByText(name, { exact: true })).toBeVisible()
+    await panel.getByText(name, { exact: true }).click()
+    await expect(page).toHaveURL(file.url)
+  }
+  expect(requests.filter(url => url.includes('/api/') || url.includes('other.md') || url.includes('workflow.md'))).toEqual([])
+  expect(await page.evaluate('window.__pwned')).toBeUndefined()
+  await expect(page.getByTestId('document-view').locator('header').getByRole('heading', { level: 2 })).toHaveText('links.md')
+})
+
+test('images: HTTPS images load; relative images show an accessible unavailable state without fetching', async ({ page }) => {
+  const imageRequests: string[] = []
+  await page.route('https://images.example/**', route => {
+    imageRequests.push(route.request().url())
+    return route.fulfill({ status: 200, contentType: 'image/png', body: PNG })
+  })
+  const content = [
+    '![Remote diagram](https://images.example/pic.png)',
+    '',
+    '![Local diagram](./assets/pic.png)',
+    '',
+    '![Rooted diagram](/assets/rooted.png)',
+    '',
+  ].join('\n')
+  const file = await scratchFile('images.md', content)
+  const requests: string[] = []
+  page.on('request', request => { if (request.resourceType() === 'image') requests.push(request.url()) })
+  await openDocument(page, file.url)
+  const panel = page.getByRole('tabpanel')
+
+  const remote = panel.getByRole('img', { name: 'Remote diagram' })
+  await expect(remote).toBeVisible()
+  await expect(remote).toHaveAttribute('src', 'https://images.example/pic.png')
+  await expect.poll(() => remote.evaluate(element => (element as unknown as { naturalWidth: number }).naturalWidth)).toBe(1)
+  expect(imageRequests).toEqual(['https://images.example/pic.png'])
+
+  for (const name of ['Local diagram', 'Rooted diagram']) {
+    const unavailable = panel.getByRole('img', { name: new RegExp(`^${name}.*unavailable`) })
+    await expect(unavailable).toBeVisible()
+    await expect(unavailable).not.toHaveAttribute('src', /.+/)
+  }
+  // The only image request is the remote one; relative images are never resolved against the app.
+  expect(requests).toEqual(['https://images.example/pic.png'])
+})
+
+test('raw HTML is shown as literal text and never interpreted or executed', async ({ page }) => {
+  const content = [
+    '# Raw',
+    '',
+    '<div id="raw-element" class="raw">block element</div>',
+    '',
+    'Inline <span id="raw-inline">span</span> text.',
+    '',
+    '<img src="x" onerror="window.__xss = 1">',
+    '',
+    '<script>window.__xss = 2</script>',
+    '',
+    '<a href="javascript:window.__xss = 3">raw link</a>',
+    '',
+  ].join('\n')
+  const file = await scratchFile('raw-html.md', content)
+  await openDocument(page, file.url)
+  const panel = page.getByRole('tabpanel')
+
+  await expect(panel).toContainText('<div id="raw-element" class="raw">block element</div>')
+  await expect(panel).toContainText('<span id="raw-inline">span</span>')
+  await expect(panel).toContainText('<img src="x" onerror="window.__xss = 1">')
+  await expect(panel).toContainText('<script>window.__xss = 2</script>')
+  await expect(panel).toContainText('<a href="javascript:window.__xss = 3">raw link</a>')
+  await expect(panel.locator('#raw-element')).toHaveCount(0)
+  await expect(panel.locator('#raw-inline')).toHaveCount(0)
+  await expect(panel.locator('img')).toHaveCount(0)
+  await expect(panel.locator('script')).toHaveCount(0)
+  await expect(panel.getByRole('link')).toHaveCount(0)
+  expect(await page.evaluate('window.__xss')).toBeUndefined()
+})
+
+test('narrow screens and dark mode: wide tables and code scroll inside the document, not the page', async ({ page }) => {
+  const content = [
+    '# Narrow',
+    '',
+    '| ' + Array.from({ length: 8 }, (_, i) => `column-${i}-with-a-long-name`).join(' | ') + ' |',
+    '| ' + Array.from({ length: 8 }, () => '---').join(' | ') + ' |',
+    '| ' + Array.from({ length: 8 }, (_, i) => `value-${i}`).join(' | ') + ' |',
+    '',
+    '```',
+    'a-very-long-unbroken-line-of-code-' + 'x'.repeat(200),
+    '```',
+    '',
+    'averyveryverylongunbrokenword' + 'y'.repeat(120),
+    '',
+  ].join('\n')
+  const file = await scratchFile('narrow.md', content)
+  await page.setViewportSize({ width: 360, height: 640 })
+  await page.emulateMedia({ colorScheme: 'dark' })
+  await openDocument(page, file.url)
+  for (const name of ['Refresh', 'Back to folder']) await expect(page.getByRole('button', { name })).toBeInViewport()
+  await expect(page.getByRole('tab', { name: 'Source' })).toBeInViewport()
+  const overflow = () => page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+  expect(await overflow()).toBeLessThanOrEqual(0)
+  await page.getByRole('tab', { name: 'Source' }).click()
+  await expect(page.getByTestId('document-source')).toBeVisible()
+  expect(await overflow()).toBeLessThanOrEqual(0)
+  // Dark theme applies to the document surfaces (not the light default).
+  const sourceBackground = () => page.evaluate("getComputedStyle(document.querySelector('[data-testid=document-source]')).backgroundColor")
+  const background = await sourceBackground()
+  expect(background).toBe('rgb(38, 46, 55)')
+  await page.emulateMedia({ colorScheme: 'light' })
+  const lightBackground = await sourceBackground()
+  expect(lightBackground).toBe('rgb(236, 239, 243)')
+})
+import { test, expect, type Page, type Route } from '@playwright/test'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { currentCrumb, expandButton, node, nodeBody, openGraph, visibleNodeIds, waitForApi } from './helpers.ts'
+
+const fixtureRoot = fileURLToPath(new URL('../fixtures/', import.meta.url))
+const created: string[] = []
+
+async function scratchFolder(source: 'pi' | 'claude', name: string) {
+  const directory = join(fixtureRoot, source, name)
+  created.push(directory)
+  await mkdir(directory, { recursive: true })
+  return directory
+}
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+
+test.afterEach(async () => {
+  for (const path of created.splice(0)) await rm(path, { recursive: true, force: true })
+})
+
+function documentView(page: Page) {
+  return page.getByTestId('document-view')
+}
+
+function heading(page: Page) {
+  return documentView(page).locator('header').getByRole('heading', { level: 2 })
+}
+
+function backToFolder(page: Page) {
+  return page.getByRole('button', { name: 'Back to folder' })
+}
+
+test('missing files explain themselves; a deleted file fails on reopen without losing the browsing context', async ({ page }) => {
+  await page.goto('/file/Pi/does-not-exist.md')
+  await expect(heading(page)).toHaveText('does-not-exist.md')
+  await expect(page.getByRole('alert')).toContainText('does-not-exist.md was not found in Pi or is unavailable')
+  await expect(page.getByRole('status')).toContainText('does-not-exist.md was not found.')
+  await expect(page.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+  await backToFolder(page).click()
+  await expect(page).toHaveURL('/Pi')
+  await expect(currentCrumb(page)).toHaveText('Pi')
+
+  // A file that exists when opened but is deleted later.
+  const folder = `scratch-missing-${randomUUID().slice(0, 8)}`
+  const directory = await scratchFolder('claude', folder)
+  await writeFile(join(directory, 'gone.md'), '# Still here\n')
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByRole('status')).toContainText('Refreshed')
+  await expandButton(page, 'Claude').click()
+  await expandButton(page, folder).click()
+  await page.getByRole('button', { name: 'Fit' }).click()
+  const idsBefore = await visibleNodeIds(page)
+  await nodeBody(page, `Claude/${folder}/gone.md`).click()
+  await expect(page.getByRole('tabpanel')).toContainText('Still here')
+
+  await rm(join(directory, 'gone.md'))
+  await backToFolder(page).click()
+  await expect(page).toHaveURL('/Pi')
+  const pending: Route[] = []
+  await page.route('**/api/file?*', route => { pending.push(route) })
+  await nodeBody(page, `Claude/${folder}/gone.md`).click()
+  await expect(documentView(page)).toHaveAttribute('aria-busy', 'true')
+  await expect(documentView(page)).not.toHaveAttribute('data-hash')
+  await expect(page.getByRole('tabpanel')).not.toContainText('Still here')
+  await expect.poll(() => pending.length).toBe(1)
+  await pending[0].continue()
+  await expect(page).toHaveURL(`/file/Claude/${folder}/gone.md`)
+  await expect(page.getByRole('alert')).toContainText('gone.md was not found in Claude or is unavailable')
+  await expect(page.getByRole('tabpanel')).not.toContainText('Still here')
+  // The failure did not destroy the saved browsing context.
+  await backToFolder(page).click()
+  await expect(page).toHaveURL('/Pi')
+  expect(await visibleNodeIds(page)).toEqual(idsBefore)
+  await expect(nodeBody(page, `Claude/${folder}/gone.md`)).toBeFocused()
+})
+
+test('invalid links: malformed encoding, unknown sources and server-rejected paths', async ({ page }) => {
+  await page.goto('/file/Pi/%E0%A4%A')
+  await expect(page.getByRole('alert')).toContainText('This link is invalid')
+  await page.reload()
+  await expect(page.getByRole('alert')).toContainText('This link is invalid')
+  await expect(documentView(page)).toHaveCount(0)
+  await expect(page.getByRole('link', { name: 'Go to the Pi root' })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Go to the Claude root' })).toBeVisible()
+  await page.getByRole('alert').getByRole('link', { name: 'Home' }).click()
+  await expect(page).toHaveURL('/')
+  await expect(page.getByRole('alert')).toHaveCount(0)
+
+  await page.goto('/file/Nope/review.md')
+  await expect(page.getByRole('alert')).toContainText('Source “Nope” does not exist')
+  await expect(documentView(page)).toHaveCount(0)
+
+  // Well-formed in the URL but rejected by the API validator.
+  await page.goto('/file/Pi/a%5Cb.md')
+  await expect(heading(page)).toHaveText('a\\b.md')
+  await expect(page.getByRole('alert')).toContainText('The link to a\\b.md is invalid')
+  await backToFolder(page).click()
+  await expect(page).toHaveURL('/Pi')
+})
+
+test('API and network failures offer Retry and Back to folder; a successful retry replaces the error with the document and hash', async ({ page, request }) => {
+  let mode: 'server-error' | 'network-error' | 'ok' = 'server-error'
+  await page.route('**/api/file?*', async route => {
+    try {
+      if (mode === 'server-error') await route.fulfill({ status: 500, json: { error: 'The file could not be read. Check that it is readable, then retry.' } })
+      else if (mode === 'network-error') await route.abort()
+      else await route.continue()
+    } catch {
+      // The page may have cancelled the request.
+    }
+  })
+  await openGraph(page)
+  await expandButton(page, 'Pi').click()
+  await nodeBody(page, 'Pi/workflow.md').click()
+  await expect(page.getByRole('alert')).toContainText('workflow.md could not be loaded. The file could not be read.')
+  await expect(page.getByRole('status')).toContainText('Loading workflow.md failed.')
+  await expect(page.getByRole('tabpanel')).not.toContainText('Sample Pi workflow')
+
+  mode = 'network-error'
+  await page.getByRole('button', { name: 'Retry' }).click()
+  await expect(page.getByRole('alert')).toContainText('The API could not be reached')
+
+  mode = 'ok'
+  await page.getByRole('button', { name: 'Retry' }).click()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  const expected = await (await request.get('/api/file?source=Pi&path=workflow.md')).json()
+  await expect(documentView(page)).toHaveAttribute('data-hash', expected.hash)
+  await expect(page.getByRole('status')).toContainText('Loaded workflow.md.')
+
+  // Back to folder from the error state also works and restores the graph.
+  mode = 'server-error'
+  await backToFolder(page).click()
+  await nodeBody(page, 'Pi/skills').click()
+  await expandButton(page, 'skills').click()
+  await nodeBody(page, 'Pi/skills/review.md').click()
+  await expect(page.getByRole('alert')).toContainText('review.md could not be loaded')
+  await backToFolder(page).click()
+  await expect(page).toHaveURL('/Pi/skills')
+  await expect(node(page, 'Pi/skills/review.md')).toBeVisible()
+  await expect(nodeBody(page, 'Pi/skills/review.md')).toBeFocused()
+})
+
+test('loading is announced and navigating away while loading returns to browsing cleanly', async ({ page }) => {
+  const pending: Route[] = []
+  await page.route('**/api/file?*', route => { pending.push(route) })
+  await openGraph(page, '/Claude')
+  await nodeBody(page, 'Claude/empty.md').click()
+  await expect(page.getByRole('status')).toContainText('Loading empty.md.')
+  await expect(page.getByRole('tabpanel')).toContainText('Loading empty.md')
+  await expect(documentView(page)).toHaveAttribute('aria-busy', 'true')
+  await expect(page.getByRole('alert')).toHaveCount(0)
+
+  // Breadcrumb navigation during loading returns to browsing.
+  await page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'Claude' }).click()
+  await expect(page).toHaveURL('/Claude')
+  await expect(documentView(page)).toHaveCount(0)
+  await expect(page.locator('.graph-canvas')).toBeVisible()
+  for (const route of pending.splice(0)) {
+    try { await route.fulfill({ status: 200, json: { source: 'Claude', path: 'empty.md', content: 'late', hash: 'x' } }) } catch { /* cancelled */ }
+  }
+  await expect(documentView(page)).toHaveCount(0)
+  await expect(page).toHaveURL('/Claude')
+
+  // Once responses flow again, opening works and announces completion.
+  await page.unroute('**/api/file?*')
+  await nodeBody(page, 'Claude/empty.md').click()
+  await expect(page.getByRole('tabpanel')).toContainText('This file is empty')
+  await expect(page.getByRole('status')).toContainText('Loaded empty.md.')
+  await expect(documentView(page)).toHaveAttribute('aria-busy', 'false')
+})
+
+test('a Markdown file over 100 KB stays responsive: render, tab switches and Back to folder', async ({ page }) => {
+  const folder = `scratch-large-doc-${randomUUID().slice(0, 8)}`
+  const directory = await scratchFolder('pi', folder)
+  const sections: string[] = ['# Large document', '']
+  for (let i = 0; i < 200; i += 1) {
+    sections.push(
+      `## Section ${i}`,
+      '',
+      `Paragraph ${i} with **bold**, _italic_, \`code\` and a [link](https://example.com/${i}). `.repeat(4),
+      '',
+      `- item ${i}.1`,
+      `- item ${i}.2`,
+      `  - nested ${i}.2.1`,
+      '- [ ] task ${i}',
+      '',
+      '```ts',
+      `export function section${i}(value: number): number {`,
+      `  return value * ${i} + 1`,
+      '}',
+      '```',
+      '',
+      '| Key | Value | Note |',
+      '| --- | ---: | --- |',
+      `| alpha-${i} | ${i * 10} | first row |`,
+      `| beta-${i} | ${i * 20} | second row |`,
+      '',
+    )
+  }
+  const content = sections.join('\n')
+  expect(Buffer.byteLength(content)).toBeGreaterThan(100 * 1024)
+  await writeFile(join(directory, 'large.md'), content)
+
+  await openGraph(page, `/Pi/${folder}`)
+  await expect(node(page, `Pi/${folder}/large.md`)).toBeVisible()
+  const responded = page.waitForResponse(response => response.url().includes('/api/file') && response.status() === 200)
+  await nodeBody(page, `Pi/${folder}/large.md`).click()
+  await responded
+  const respondedAt = Date.now()
+  await expect(page.getByRole('tabpanel').getByRole('heading', { level: 2, name: 'Section 159' })).toBeAttached()
+  await expect(page.getByRole('tabpanel').getByRole('heading', { level: 1, name: 'Large document' })).toBeVisible()
+  expect(Date.now() - respondedAt).toBeLessThan(5_000)
+
+  const toSource = Date.now()
+  await page.getByRole('tab', { name: 'Source' }).click()
+  await expect(page.getByTestId('document-source')).toBeVisible()
+  expect(await page.getByTestId('document-source').evaluate(element => element.textContent?.length)).toBe(content.length)
+  expect(Date.now() - toSource).toBeLessThan(2_000)
+
+  const toRendered = Date.now()
+  await page.getByRole('tab', { name: 'Rendered' }).click()
+  await expect(page.getByRole('tabpanel').getByRole('heading', { level: 1, name: 'Large document' })).toBeVisible()
+  expect(Date.now() - toRendered).toBeLessThan(2_000)
+
+  const toFolder = Date.now()
+  await backToFolder(page).click()
+  await expect(page.locator('.graph-canvas')).toBeVisible()
+  await expect(nodeBody(page, `Pi/${folder}/large.md`)).toBeFocused()
+  expect(Date.now() - toFolder).toBeLessThan(2_000)
+})
+import { test, expect } from '@playwright/test'
+import { expandButton, collapseButton, node, nodeBody, openGraph, visibleNodeIds, viewTransform, dragNode, waitForApi } from './helpers.ts'
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+
+for (const initial of ['ready', 'error'] as const) {
+  test(`same file reopened after ${initial} starts fresh with no old content or hash`, async ({ page }) => {
+    if (initial === 'error') await page.route('**/api/file?*', route => route.fulfill({ status: 500, json: { error: 'old error' } }))
+    await openGraph(page, '/Pi')
+    await nodeBody(page, 'Pi/workflow.md').click()
+    if (initial === 'ready') await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+    else await expect(page.getByRole('alert')).toContainText('old error')
+    await page.getByRole('button', { name: 'Back to folder' }).click()
+    await page.unroute('**/api/file?*')
+    await page.route('**/api/file?*', () => { /* held until page closes */ })
+    await nodeBody(page, 'Pi/workflow.md').click()
+    await expect(page.getByTestId('document-view')).toHaveAttribute('aria-busy', 'true')
+    await expect(page.getByTestId('document-view')).not.toHaveAttribute('data-hash')
+    await expect(page.getByRole('tabpanel')).toContainText('Loading workflow.md')
+    await expect(page.getByRole('tabpanel')).not.toContainText('Sample Pi workflow')
+    await expect(page.getByRole('alert')).toHaveCount(0)
+  })
+}
+
+for (const entry of ['direct', 'reload', 'retry'] as const) {
+  test(`${entry} announces loading in the live region`, async ({ page }) => {
+    if (entry === 'retry') {
+      await page.route('**/api/file?*', route => route.fulfill({ status: 500, json: { error: 'try again' } }))
+      await page.goto('/file/Pi/workflow.md')
+      await expect(page.getByRole('alert')).toBeVisible()
+      await page.unroute('**/api/file?*')
+    } else if (entry === 'reload') {
+      await page.goto('/file/Pi/workflow.md')
+      await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+    }
+    await page.route('**/api/file?*', () => { /* deliberately pending */ })
+    if (entry === 'retry') await page.getByRole('button', { name: 'Retry' }).click()
+    else if (entry === 'reload') await page.reload()
+    else await page.goto('/file/Pi/workflow.md')
+    await expect(page.getByRole('status')).toHaveText('Loading workflow.md.')
+    await expect(page.getByTestId('document-view')).toHaveAttribute('aria-busy', 'true')
+  })
+}
+
+test('malformed direct link and reload render the invalid-link UI', async ({ page }) => {
+  await page.goto('/file/Pi/%E0%A4%A')
+  await expect(page.getByRole('alert')).toContainText('This link is invalid')
+  await page.reload()
+  await expect(page.getByRole('alert')).toContainText('This link is invalid')
+  await expect(page.getByRole('link', { name: 'Go to the Pi root' })).toBeVisible()
+})
+
+test('browser Back restores focus without reopening a collapsed selected folder or moving the viewport', async ({ page }) => {
+  await openGraph(page, '/Pi/skills')
+  await collapseButton(page, 'skills').click()
+  await expandButton(page, 'Claude').click()
+  await page.getByRole('button', { name: 'Zoom out' }).click()
+  await nodeBody(page, 'Claude/workflow.md').focus()
+  const view = await viewTransform(page)
+  const ids = await visibleNodeIds(page)
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Claude workflow')
+  await page.goBack()
+  await expect(page).toHaveURL('/Pi/skills')
+  await expect(nodeBody(page, 'Claude/workflow.md')).toBeFocused()
+  expect(await visibleNodeIds(page)).toEqual(ids)
+  expect(await viewTransform(page)).toEqual(view)
+  await expect(expandButton(page, 'skills')).toBeVisible()
+})
+
+test('repeated document URLs keep independent origin selection, mode, expansion, positions, pins and viewport', async ({ page }) => {
+  await openGraph(page)
+  await expandButton(page, 'Pi').click()
+  await expandButton(page, 'skills').click()
+  await dragNode(page, 'Pi/workflow.md', 45, 30)
+  await page.getByRole('button', { name: 'Zoom out' }).click()
+  const ids = await visibleNodeIds(page)
+  const view = await viewTransform(page)
+  const positions = await page.locator('.graph-canvas .node').evaluateAll(nodes => nodes.map(node => [node.getAttribute('data-node-id'), node.getAttribute('transform')]))
+  await nodeBody(page, 'Pi/workflow.md').click()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await nodeBody(page, 'Pi/workflow.md').focus()
+  await page.keyboard.press('p')
+  await collapseButton(page, 'skills').click()
+  await page.getByRole('button', { name: 'Outline' }).click()
+  const outline = page.getByRole('navigation', { name: 'Directory outline' })
+  await outline.getByRole('button', { name: /Claude\s*, source folder/ }).click()
+  await outline.locator('[data-node-id="Pi/workflow.md"] .outline-name').click()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await page.goBack() // /Claude origin of the second opening
+  await expect(outline).toBeVisible()
+  await expect(outline.locator('[data-node-id="Pi/workflow.md"] .outline-name')).toBeFocused()
+  await page.goBack() // browsing Home after first return
+  await page.goBack() // first document opening, same URL
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await expect(page).toHaveURL('/')
+  await expect(page.locator('.graph-canvas')).toBeVisible()
+  expect(await visibleNodeIds(page)).toEqual(ids)
+  expect(await viewTransform(page)).toEqual(view)
+  await expect(node(page, 'Pi/workflow.md')).toHaveClass(/is-pinned/)
+  expect(await page.locator('.graph-canvas .node').evaluateAll(nodes => nodes.map(node => [node.getAttribute('data-node-id'), node.getAttribute('transform')]))).toEqual(positions)
+  await expect(nodeBody(page, 'Pi/workflow.md')).toBeFocused()
+})
+import { test, expect } from '@playwright/test'
+import { nodeBody, openGraph, waitForApi } from './helpers.ts'
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+
+for (const returnAction of ['button', 'history'] as const) {
+  test(`return via ${returnAction} survives a listing deletion while the graph is unmounted`, async ({ page }) => {
+    const errors: string[] = []
+    page.on('pageerror', error => errors.push(error.message))
+    await openGraph(page, '/Pi')
+    await page.getByRole('button', { name: 'Expand Claude', exact: true }).click()
+    await expect(nodeBody(page, 'Pi/workflow.md')).toBeVisible()
+    await page.getByRole('button', { name: 'Outline', exact: true }).click()
+    // Simulate the post-deletion listing without modifying a committed fixture.
+    await page.route('**/api/entries', async route => {
+      const response = await route.fetch()
+      const body = await response.json() as { entries: Array<{ source: string; path: string }> }
+      await route.fulfill({ json: { entries: body.entries.filter(entry => !(entry.source === 'Pi' && entry.path === 'workflow.md')) } })
+    })
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+    const outline = page.getByRole('navigation', { name: 'Directory outline' })
+    await expect(outline.locator('[data-node-id="Pi/workflow.md"]')).toHaveCount(0)
+    const remaining = outline.locator('[data-node-id="Claude/workflow.md"] .outline-name')
+    await remaining.click()
+    await expect(page.getByRole('tabpanel')).toContainText('Sample Claude workflow')
+    if (returnAction === 'button') await page.getByRole('button', { name: 'Back to folder' }).click()
+    else await page.goBack()
+    await expect(outline).toBeVisible()
+    await expect(remaining).toBeFocused()
+    await page.getByRole('button', { name: 'Outline', exact: true }).click()
+    await expect(nodeBody(page, 'Claude/workflow.md')).toBeVisible()
+    await expect(nodeBody(page, 'Pi/workflow.md')).toHaveCount(0)
+    expect(errors).toEqual([])
+  })
+}
+
+test('reload discards the document origin even when history.state contains a prior browsing snapshot', async ({ page }) => {
+  await openGraph(page, '/Claude')
+  await page.getByRole('button', { name: 'Expand Pi', exact: true }).click()
+  await nodeBody(page, 'Pi/workflow.md').click()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await page.reload()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await expect(page).toHaveURL('/Pi')
+})
+
+test('native Back saves the departing browsing entry and Forward restores its latest mode and expansion', async ({ page }) => {
+  await openGraph(page, '/Pi')
+  await nodeBody(page, 'Pi/workflow.md').click()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await page.getByRole('button', { name: 'Outline', exact: true }).click()
+  const outline = page.getByRole('navigation', { name: 'Directory outline' })
+  await outline.getByRole('button', { name: 'Expand skills', exact: true }).click()
+  await page.goBack()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Pi workflow')
+  await page.goForward()
+  await expect(outline).toBeVisible()
+  await expect(outline.getByRole('button', { name: 'Collapse skills', exact: true })).toBeVisible()
+})
+
+test('historical outline origin restores its own scroll, focus and expansion after another origin changes them', async ({ page }) => {
+  await page.setViewportSize({ width: 600, height: 420 })
+  await openGraph(page, '/Claude')
+  await page.getByRole('button', { name: 'Outline', exact: true }).click()
+  const outline = page.getByRole('navigation', { name: 'Directory outline' })
+  await outline.getByRole('button', { name: 'Expand Pi', exact: true }).click()
+  await outline.getByRole('button', { name: 'Expand skills', exact: true }).click()
+  await outline.getByRole('button', { name: 'Expand subagents', exact: true }).click()
+  const file = outline.locator('[data-node-id="Claude/workflow.md"] .outline-name')
+  await file.focus()
+  await outline.evaluate(element => { element.scrollTop = element.scrollHeight })
+  const scroll = await outline.evaluate(element => element.scrollTop)
+  expect(scroll).toBeGreaterThan(0)
+  await file.press('Enter')
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Claude workflow')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await outline.getByRole('button', { name: 'Collapse Pi', exact: true }).click()
+  await outline.evaluate(element => { element.scrollTop = 0 })
+  await outline.locator('[data-node-id="Pi"] > .outline-row > .outline-name').click()
+  await file.click()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Claude workflow')
+  await page.goBack()
+  await expect(page).toHaveURL('/Pi')
+  await page.goBack()
+  await expect(page).toHaveURL('/Claude')
+  await page.goBack()
+  await expect(page.getByRole('tabpanel')).toContainText('Sample Claude workflow')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await expect(page).toHaveURL('/Claude')
+  await expect(file).toBeFocused()
+  await expect(outline.getByRole('button', { name: 'Collapse Pi', exact: true })).toBeVisible()
+  expect(await outline.evaluate(element => element.scrollTop)).toBe(scroll)
+})
+
+test('Back between browsing entries restores each graph viewport, and Forward retains changes made before native Back', async ({ page }) => {
+  await openGraph(page, '/Pi')
+  const graphView = () => page.locator('.graph-canvas > g').getAttribute('transform')
+  const first = await graphView()
+  await nodeBody(page, 'Claude').click()
+  await page.getByRole('button', { name: 'Zoom out' }).click()
+  const second = await graphView()
+  expect(second).not.toBe(first)
+  await page.goBack()
+  await expect(page).toHaveURL('/Pi')
+  await expect(page.locator('.graph-canvas > g')).toHaveAttribute('transform', first!)
+  await page.goForward()
+  await expect(page).toHaveURL('/Claude')
+  await expect(page.locator('.graph-canvas > g')).toHaveAttribute('transform', second!)
+})

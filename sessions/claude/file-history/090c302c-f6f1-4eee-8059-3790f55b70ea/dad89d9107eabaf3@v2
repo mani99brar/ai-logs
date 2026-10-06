@@ -1,0 +1,290 @@
+import {
+  JOURNAL_LOG_LIMIT,
+  type JournalEntry,
+  type JournalMessage,
+  type RevealMessage,
+  type RumorRefusalName,
+  type RumorResultMessage,
+} from "@pirate-sea-race/protocol";
+import type { IntelMessageBody } from "@pirate-sea-race/simulation/intel";
+import { purchase, type LedgerState, type RubbingType } from "@pirate-sea-race/simulation/objectives";
+
+/**
+ * Intel in the room (§3, §11, §13, §16): how the intel module's messages reach players, each player's journal log,
+ * and the book of targeted rumor purchases. Plain data and small classes, no Colyseus: `MatchRoom` owns the timing.
+ */
+
+/** An intel message as the room delivers it: one of §2 and §5's reveals, or a lead for the player's journal. */
+export type DeliveredIntel = { readonly channel: "reveal"; readonly message: RevealMessage } | { readonly channel: "journal"; readonly message: JournalMessage };
+
+/**
+ * Every intel message kind, as the message the room sends. Each field is copied by name, so nothing the intel module
+ * might add to a body (an id, a position) rides along; the protocol's strict schemas say the same on the client.
+ */
+export function intelMessageOf(body: IntelMessageBody): DeliveredIntel {
+  switch (body.kind) {
+    case "final-sector":
+      return { channel: "reveal", message: { kind: body.kind, tick: body.tick, sector: body.sector, name: body.name } };
+    case "final-route":
+      return { channel: "reveal", message: { kind: body.kind, tick: body.tick, x: body.x, y: body.y, restored: body.restored } };
+    case "final-route-inactive":
+      return { channel: "reveal", message: { kind: body.kind, tick: body.tick } };
+    case "sector-reveal":
+      return {
+        channel: "reveal",
+        message: {
+          kind: body.kind,
+          tick: body.tick,
+          sources: body.sources.map(({ sector, name }) => ({ sector, name })),
+          caches: body.caches.map(({ sector, name }) => ({ sector, name })),
+        },
+      };
+    case "carrier-report":
+      return {
+        channel: "reveal",
+        message: { kind: body.kind, tick: body.tick, seenTick: body.seenTick, carriers: body.carriers.map(({ sector, name, type }) => ({ sector, name, type })) },
+      };
+    case "rumor": {
+      const target = body.target;
+      return {
+        channel: "journal",
+        message: {
+          kind: body.kind,
+          tick: body.tick,
+          entry: body.entry,
+          type: body.type,
+          reason: body.reason,
+          target: target.kind === "island" ? { kind: "island", island: target.island, name: target.name } : { kind: "sector", sector: target.sector, name: target.name },
+        },
+      };
+    }
+    case "carrier-sighting":
+      return {
+        channel: "journal",
+        message: {
+          kind: body.kind,
+          tick: body.tick,
+          seenTick: body.seenTick,
+          sightings: body.sightings.map(({ type, reason, sector, name }) => ({ type, reason, sector, name })),
+        },
+      };
+    case "no-lead":
+      return { channel: "journal", message: { kind: body.kind, tick: body.tick, type: body.type, reason: body.reason } };
+    case "rumor-stale":
+    case "rumor-resolved":
+      return { channel: "journal", message: { kind: body.kind, tick: body.tick, entry: body.entry, type: body.type } };
+  }
+}
+
+/** A journal entry and, for a rumor, the intel module's entry number (which its stale and resolved notices name). */
+interface LoggedEntry {
+  entry: JournalEntry;
+  readonly rumor: number | null;
+}
+
+interface PlayerLog {
+  entries: LoggedEntry[];
+  next: number;
+}
+
+/**
+ * Each player's journal (§3, §13), kept by the room because the intel module's journal holds neither sightings nor
+ * no-lead notices, nor which lead followed a stale one. Fed by every lead the player receives; the last
+ * `JOURNAL_LOG_LIMIT` entries are kept. A rumor's status follows the intel module's notices (`rumor-stale`,
+ * `rumor-resolved`); a stale entry is marked replaced by the next lead of its type the player gets, whatever that
+ * lead's reason (a free lead may come instead of a replacement, or a deferred sighting later).
+ */
+export class JournalLog {
+  private readonly logs = new Map<string, PlayerLog>();
+
+  private logOf(playerId: string): PlayerLog {
+    let log = this.logs.get(playerId);
+    if (log === undefined) {
+      log = { entries: [], next: 1 };
+      this.logs.set(playerId, log);
+    }
+    return log;
+  }
+
+  /** One lead or notice this player received. */
+  record(playerId: string, message: JournalMessage): void {
+    const log = this.logOf(playerId);
+    switch (message.kind) {
+      case "rumor": {
+        const target = message.target;
+        this.add(log, message.type, message.entry, {
+          kind: target.kind,
+          type: message.type,
+          target: target.name,
+          island: target.kind === "island" ? target.island : -1,
+          sector: target.kind === "sector" ? target.sector : -1,
+          reason: message.reason,
+          tick: message.tick,
+          seenTick: 0,
+        });
+        break;
+      }
+      case "carrier-sighting":
+        for (const sighting of message.sightings) {
+          this.add(log, sighting.type, null, {
+            kind: "sighting",
+            type: sighting.type,
+            target: sighting.name,
+            island: -1,
+            sector: sighting.sector,
+            reason: sighting.reason,
+            tick: message.tick,
+            seenTick: message.seenTick,
+          });
+        }
+        break;
+      case "no-lead":
+        this.add(log, message.type, null, { kind: "no-lead", type: message.type, target: "", island: -1, sector: -1, reason: message.reason, tick: message.tick, seenTick: 0 });
+        break;
+      case "rumor-stale":
+      case "rumor-resolved": {
+        const logged = log.entries.find((each) => each.rumor === message.entry);
+        if (logged === undefined) return;
+        logged.entry = { ...logged.entry, status: message.kind === "rumor-stale" ? "stale" : "resolved" };
+        break;
+      }
+    }
+  }
+
+  private add(log: PlayerLog, type: RubbingType, rumor: number | null, fields: Omit<JournalEntry, "n" | "status" | "replacedBy">): void {
+    const n = log.next++;
+    for (const logged of log.entries) {
+      if (logged.entry.type === type && logged.entry.status === "stale" && logged.entry.replacedBy === 0) logged.entry = { ...logged.entry, replacedBy: n };
+    }
+    log.entries.push({ entry: { n, ...fields, status: "active", replacedBy: 0 }, rumor });
+    if (log.entries.length > JOURNAL_LOG_LIMIT) log.entries.shift();
+  }
+
+  /** This player's entries, oldest first. */
+  entries(playerId: string): JournalEntry[] {
+    return (this.logs.get(playerId)?.entries ?? []).map((logged) => logged.entry);
+  }
+
+  forget(playerId: string): void {
+    this.logs.delete(playerId);
+  }
+}
+
+/** A purchase request waiting for its world tick. */
+export interface PendingRumor {
+  readonly requestId: string;
+  readonly type: RubbingType;
+}
+
+/** How the room decided a request: bought, with the lead it delivered (resent on a retry), or refused with a reason. */
+export type RumorDecision =
+  | { readonly outcome: "bought"; readonly type: RubbingType; readonly price: number; readonly lead: JournalMessage }
+  | { readonly outcome: "refused"; readonly type: RubbingType; readonly reason: RumorRefusalName };
+
+/** What a new request gets: merged into the pending one with its id (one answer for both), `busy`, or a place. */
+export type RumorArrival = "merged" | "busy" | "queued";
+
+/** At most this many requests wait per player; more are refused `busy` and kept nowhere. */
+export const MAX_PENDING_RUMORS = 2;
+/** The refusals kept per player for replays, as the ledger keeps its own (the oldest goes first). */
+export const KEPT_RUMOR_REFUSALS = 16;
+
+interface PlayerBook {
+  readonly pending: PendingRumor[];
+  /** Every bought request id, never evicted (purchases are bounded by gold). */
+  readonly bought: Map<string, RumorDecision>;
+  /** The last `KEPT_RUMOR_REFUSALS` refused request ids, oldest first. */
+  readonly refused: Map<string, RumorDecision>;
+}
+
+/**
+ * The book of targeted rumor purchases (§11, §16). Requests arrive between ticks; the room answers a request id this
+ * player already had decided from `decided` before anything else; one still pending is merged into it (no second place,
+ * one answer); at most `MAX_PENDING_RUMORS` wait per player. The room takes at most one per player per tick, oldest first.
+ */
+export class RumorBook {
+  private readonly books = new Map<string, PlayerBook>();
+
+  private bookOf(playerId: string): PlayerBook {
+    let book = this.books.get(playerId);
+    if (book === undefined) {
+      book = { pending: [], bought: new Map(), refused: new Map() };
+      this.books.set(playerId, book);
+    }
+    return book;
+  }
+
+  /** The room's earlier decision on this (player, request id), if it kept one. */
+  decided(playerId: string, requestId: string): RumorDecision | undefined {
+    const book = this.books.get(playerId);
+    return book?.bought.get(requestId) ?? book?.refused.get(requestId);
+  }
+
+  /** A request arrives whose id this player has no decision for (the caller replays those first). */
+  arrive(playerId: string, request: PendingRumor): RumorArrival {
+    const book = this.bookOf(playerId);
+    if (book.pending.some((each) => each.requestId === request.requestId)) return "merged";
+    if (book.pending.length >= MAX_PENDING_RUMORS) return "busy";
+    book.pending.push({ requestId: request.requestId, type: request.type });
+    return "queued";
+  }
+
+  /** The players with a request waiting. */
+  waiting(): string[] {
+    return [...this.books].filter(([, book]) => book.pending.length > 0).map(([id]) => id);
+  }
+
+  /** This player's oldest waiting request, taken off the queue. */
+  take(playerId: string): PendingRumor | undefined {
+    return this.books.get(playerId)?.pending.shift();
+  }
+
+  pendingCount(playerId: string): number {
+    return this.books.get(playerId)?.pending.length ?? 0;
+  }
+
+  /** Keeps a decision for replays. */
+  decide(playerId: string, requestId: string, decision: RumorDecision): void {
+    const book = this.bookOf(playerId);
+    if (decision.outcome === "bought") {
+      book.bought.set(requestId, decision);
+      return;
+    }
+    book.refused.set(requestId, decision);
+    if (book.refused.size > KEPT_RUMOR_REFUSALS) book.refused.delete(book.refused.keys().next().value!);
+  }
+
+  forget(playerId: string): void {
+    this.books.delete(playerId);
+  }
+}
+
+/** The intel module's request id for a player's request: its ids are global, the ledger's and the client's per player. */
+export const intelRequestId = (playerId: string, requestId: string): string => `${playerId}:${requestId}`;
+
+/** The lead a delivered targeted request bought: the rumor or the sighting message of its type sent to that player. */
+export function boughtLead(sent: readonly JournalMessage[], type: RubbingType): JournalMessage | undefined {
+  return sent.find(
+    (message) =>
+      (message.kind === "rumor" && message.type === type && message.reason === "targeted") ||
+      (message.kind === "carrier-sighting" && message.sightings.some((sighting) => sighting.type === type && sighting.reason === "targeted")),
+  );
+}
+
+/** The answer to a purchase request, as its player receives it; `replayed` when it answers an id already decided. */
+export function rumorResult(requestId: string, decision: RumorDecision, replayed: boolean): RumorResultMessage {
+  return decision.outcome === "bought"
+    ? { requestId, type: decision.type, outcome: "bought", price: decision.price, replayed }
+    : { requestId, type: decision.type, outcome: "refused", reason: decision.reason, replayed };
+}
+
+/**
+ * Charges a delivered targeted lead (§11): the ledger's `purchase` of a rumor under the client's request id. The room
+ * checked the ledger's state on this same tick and nothing moved that player's gold since, so a refusal (or a replay:
+ * the room answers every decided id itself) is a broken invariant, and it throws: the world tick faults (§12).
+ */
+export function chargeRumor(ledger: LedgerState, playerId: string, requestId: string, tick: number): { readonly state: LedgerState; readonly price: number } {
+  const bought = purchase(ledger, { requestId, playerId, item: "rumor", tick });
+  if (!bought.result.ok || bought.result.replayed) throw new Error(`the ledger refused a delivered rumor (${playerId}, ${requestId}): ${bought.result.rejection ?? "replayed"}`);
+  return { state: bought.state, price: bought.result.purchase!.price };
+}

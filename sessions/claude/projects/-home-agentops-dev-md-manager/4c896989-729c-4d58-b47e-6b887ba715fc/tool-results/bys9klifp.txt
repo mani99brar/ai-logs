@@ -1,0 +1,518 @@
+diff --git a/workflow/interactive.py b/workflow/interactive.py
+index 9b71f11..505f5db 100644
+--- a/workflow/interactive.py
++++ b/workflow/interactive.py
+@@ -20,6 +20,11 @@ from .live import SessionState
+ from .observer import herdr
+ from .sessions import ClaudeSessions, NODES, git, plan_digest, prepare, read_json, run_lock, save_json
+ 
++# The reviewer is a third native session with the workers' lifecycle and its own read-only worktree.
++REVIEW_NODE = "review"
++SESSION_NODES = (*NODES, REVIEW_NODE)
++PANE_LABELS = {"ui": "ui", "adapter": "adapter", REVIEW_NODE: "reviewer"}
++
+ 
+ class InteractiveSessions(ClaudeSessions):
+     """Native Claude background sessions, not print-mode jobs or Herdr-owned agents."""
+@@ -33,10 +38,16 @@ class InteractiveSessions(ClaudeSessions):
+         return rows
+ 
+     def launch_name(self, node: str) -> str:
+-        return f"workflow-{self.plan['run_id']}-{node}"
++        return f"workflow-{self.plan['run_id']}-{PANE_LABELS[node]}"
++
++    def worktree_of(self, node: str) -> Path:
++        if node == REVIEW_NODE:
++            return self.directory / "review-worktree"
++        return Path(self.plan["nodes"][node]["worktree"])
+ 
+     def locate(self, node: str, rows: list[dict]) -> dict | None:
+-        info = self.plan["nodes"][node]
++        if node not in SESSION_NODES:
++            raise ValueError("Unknown session node")
+         path = self.directory / f"{node}.interactive.json"
+         if not path.exists():
+             return None
+@@ -60,7 +71,7 @@ class InteractiveSessions(ClaudeSessions):
+         if len(matches) != 1:
+             raise RuntimeError("Ambiguous Claude session identity")
+         row = matches[0]
+-        if row.get("kind") != "background" or Path(row.get("cwd", "")).resolve() != Path(info["worktree"]).resolve() or row.get("name") != self.launch_name(node):
++        if row.get("kind") != "background" or Path(row.get("cwd", "")).resolve() != self.worktree_of(node).resolve() or row.get("name") != self.launch_name(node):
+             raise RuntimeError("Claude session identity/worktree mismatch")
+         if receipt.get("background_id") and row.get("sessionId") != receipt.get("session_id"):
+             raise RuntimeError("Native Claude UUID changed; refusing attachment")
+@@ -103,34 +114,90 @@ class InteractiveSessions(ClaudeSessions):
+                 raise RuntimeError("No exact matching background session after launch")
+             time.sleep(1)
+ 
++    def reconcile(self, node: str) -> dict:
++        """Bind an existing launch intent to its exact surviving session; never launch again from here."""
++        path = self.directory / f"{node}.interactive.json"
++        receipt = read_json(path)
++        if receipt["plan_digest"] != plan_digest(self.plan):
++            raise RuntimeError("Plan changed; refusing session reuse")
++        row = self.locate(node, self.inventory())
++        if row is None:
++            raise RuntimeError("Existing launch cannot be reconciled; no automatic relaunch")
++        receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"], native_started_at=row.get("startedAt"))
++        receipt.pop("error", None)
++        save_json(path, receipt)
++        return receipt
++
++    def launch(self, node: str, cwd: Path, command: list[str], receipt: dict) -> dict:
++        """Journal intent, run the short `claude --bg` helper once, then bind the row it created."""
++        path = self.directory / f"{node}.interactive.json"
++        # Native IDs do not exist until launch. Reject conflicting terminal names.
++        if any(row.get("name") == self.launch_name(node) for row in self.inventory()):
++            raise RuntimeError("Unowned session already exists with this launch name")
++        receipt.update(node_id=node, session_id=None, plan_digest=plan_digest(self.plan), worktree=str(cwd),
++                       status="launching", attempt=1, launcher_invocations=1,
++                       launch_requested_at=datetime.now(timezone.utc).isoformat())
++        save_json(path, receipt)
++        env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
++        try:
++            # This command creates Claude's own persistent terminal, then exits.
++            # Killing this short helper is NOT evidence that the session stopped.
++            with (self.directory / f"{node}.launch.log").open("w") as log:
++                try:
++                    result = subprocess.run(command, cwd=cwd, env=env, stdout=log,
++                                            stderr=subprocess.STDOUT, text=True, timeout=self.timeout)
++                finally:
++                    log.flush()
++                    os.fsync(log.fileno())
++            if result.returncode != 0:
++                raise RuntimeError(f"Claude background launch exited {result.returncode}; inspect launch log")
++            row = self.settle(node)
++            receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"], native_started_at=row.get("startedAt"))
++        except BaseException as error:
++            receipt.update(status="needs_reconciliation", error=str(error))
++            raise
++        finally:
++            save_json(path, receipt)
++        return receipt
++
++    def run_reviewer(self, prompt: str, completion_path: Path) -> dict:
++        """Reviewer session: read-only tools, plus Write allow-listed to its one completion file.
++
++        Permission mode `dontAsk` denies anything that would prompt, so every write except the
++        allow-listed completion file is refused; the worktree and evidence are re-hashed after the
++        review regardless. The run directory is an added directory so packets and the diff are readable.
++        File-write rules are spelled `Edit(//absolute/path)`: Write follows Edit rules, and a
++        `Write(...)` rule is ignored (observed live on CLI 2.1.278, where it left the reviewer unable to
++        deliver its verdict).
++        """
++        if self.plan.get("mode") != "interactive" or not self.plan.get("automatic"):
++            raise ValueError("Expected an automatic interactive plan")
++        if (self.directory / f"{REVIEW_NODE}.interactive.json").exists():
++            return self.reconcile(REVIEW_NODE)
++        cwd = self.worktree_of(REVIEW_NODE)
++        if not cwd.is_dir():
++            raise RuntimeError("Review worktree missing; the review node creates it before launching")
++        if git(cwd, "status", "--porcelain"):
++            raise RuntimeError("Review worktree is not clean")
++        command = [self.executable, "--bg", "--name", self.launch_name(REVIEW_NODE),
++                   "--safe-mode", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
++                   "--add-dir", str(self.directory), "--tools", "Read,Glob,Grep,Write",
++                   "--allowedTools", f"Edit(//{completion_path.resolve().as_posix().lstrip('/')})",
++                   "--permission-mode", "dontAsk", prompt]
++        receipt = {"launch_token": None, "base_commit": self.plan["base_commit"], "role": "reviewer",
++                   "tools": "Read,Glob,Grep,Write(completion file only)", "completion_file": str(completion_path)}
++        return self.launch(REVIEW_NODE, cwd, command, receipt)
++
+     def run(self, node: str) -> dict:
+         if node not in NODES or self.plan.get("mode") != "interactive":
+             raise ValueError("Expected an interactive worker plan")
+         info = self.plan["nodes"][node]
+-        path = self.directory / f"{node}.interactive.json"
+-        digest = plan_digest(self.plan)
+-        if path.exists():
+-            receipt = read_json(path)
+-            if receipt["plan_digest"] != digest:
+-                raise RuntimeError("Plan changed; refusing session reuse")
+-            row = self.locate(node, self.inventory())
+-            if row is None:
+-                raise RuntimeError("Existing launch cannot be reconciled; no automatic relaunch")
+-            receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"], native_started_at=row.get("startedAt"))
+-            receipt.pop("error", None)
+-            save_json(path, receipt)
+-            return receipt
++        if (self.directory / f"{node}.interactive.json").exists():
++            return self.reconcile(node)
+         cwd = Path(info["worktree"])
+         if git(cwd, "rev-parse", "HEAD") != self.plan["base_commit"] or git(cwd, "status", "--porcelain"):
+             raise RuntimeError("Worktree changed since preparation")
+-        # Native IDs do not exist until launch. Reject conflicting terminal names.
+-        if any(row.get("name") == self.launch_name(node) for row in self.inventory()):
+-            raise RuntimeError("Unowned session already exists with this launch name")
+-        receipt = {"node_id": node, "session_id": None, "launch_token": info["session_id"], "plan_digest": digest,
+-                   "worktree": str(cwd), "base_commit": self.plan["base_commit"],
+-                   "status": "launching", "attempt": 1, "launcher_invocations": 1,
+-                   "launch_requested_at": datetime.now(timezone.utc).isoformat()}
+-        save_json(path, receipt)
++        receipt = {"launch_token": info["session_id"], "base_commit": self.plan["base_commit"]}
+         automatic = bool(self.plan.get("automatic"))
+         if automatic:
+             from .automatic import validate_automatic
+@@ -151,32 +218,16 @@ class InteractiveSessions(ClaudeSessions):
+         if automatic:
+             command.append("--dangerously-skip-permissions")
+         command.append(prompt)
+-        env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+-        try:
+-            # This command creates Claude's own persistent terminal, then exits.
+-            # Killing this short helper is NOT evidence that the session stopped.
+-            with (self.directory / f"{node}.launch.log").open("w") as log:
+-                try:
+-                    result = subprocess.run(command, cwd=cwd, env=env, stdout=log,
+-                                            stderr=subprocess.STDOUT, text=True, timeout=self.timeout)
+-                finally:
+-                    log.flush()
+-                    os.fsync(log.fileno())
+-            if result.returncode != 0:
+-                raise RuntimeError(f"Claude background launch exited {result.returncode}; inspect launch log")
+-            row = self.settle(node)
+-            receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"], native_started_at=row.get("startedAt"))
+-        except BaseException as error:
+-            receipt.update(status="needs_reconciliation", error=str(error))
+-            raise
+-        finally:
+-            save_json(path, receipt)
+-        return receipt
++        return self.launch(node, cwd, command, receipt)
++
++    def launched_nodes(self) -> tuple[str, ...]:
++        """Workers always; the reviewer once the review node has journalled its launch."""
++        return SESSION_NODES if (self.directory / f"{REVIEW_NODE}.interactive.json").exists() else NODES
+ 
+     def status(self) -> dict:
+         rows = self.inventory()
+         result = {}
+-        for node in NODES:
++        for node in self.launched_nodes():
+             path = self.directory / f"{node}.interactive.json"
+             row = self.locate(node, rows)
+             result[node] = {"receipt": read_json(path) if path.exists() else None,
+@@ -232,7 +283,8 @@ def attach_panels(sessions: InteractiveSessions, reuse_observers: Path | None =
+     if mapping_path.exists():
+         raise RuntimeError("Terminal mappings already exist; use attach-one inside an available terminal to reconnect")
+     rows = sessions.inventory()
+-    for node in NODES:
++    nodes = sessions.launched_nodes()
++    for node in nodes:
+         receipt = read_json(directory / f"{node}.interactive.json")
+         if receipt["plan_digest"] != plan_digest(sessions.plan) or sessions.locate(node, rows) is None:
+             raise RuntimeError("Cannot attach an unverified/missing session")
+@@ -264,18 +316,56 @@ def attach_panels(sessions: InteractiveSessions, reuse_observers: Path | None =
+                         "--label", f"Workflow: {directory.name}", "--no-focus")["result"]
+         mapping = {"ui": {"pane_id": created["root_pane"]["pane_id"], "tab_id": created["tab"]["tab_id"], "mode": "allocated"}}
+         save_json(mapping_path, mapping)
+-        split = herdr("pane", "split", "--pane", mapping["ui"]["pane_id"], "--direction", "right", "--cwd", str(source), "--no-focus")["result"]
+-        mapping["adapter"] = {"pane_id": split["pane"]["pane_id"], "tab_id": created["tab"]["tab_id"], "mode": "allocated"}
+-        save_json(mapping_path, mapping)
++        previous = "ui"
++        for node in nodes[1:]:
++            split = herdr("pane", "split", "--pane", mapping[previous]["pane_id"], "--direction", "right", "--cwd", str(source), "--no-focus")["result"]
++            mapping[node] = {"pane_id": split["pane"]["pane_id"], "tab_id": created["tab"]["tab_id"], "mode": "allocated"}
++            save_json(mapping_path, mapping)
++            previous = node
+     for node, entry in mapping.items():
+-        require_shell(entry["pane_id"])
+-        herdr("pane", "rename", entry["pane_id"], f"Claude: {node}")
+-        # Re-check identity in the actual attachment process immediately before exec.
+-        command = shlex.join([sys.executable, "-m", "workflow.interactive", "attach-one", str(directory), "--node", node])
+-        command = f"cd {shlex.quote(str(source))} && {command}"
+-        entry.update(mode="attach_requested", session_id=sessions.locate(node, rows)["sessionId"])
+-        save_json(mapping_path, mapping)
+-        herdr("pane", "run", entry["pane_id"], command)
++        send_attach(sessions, mapping_path, mapping, node, rows)
++    return mapping
++
++
++def send_attach(sessions: InteractiveSessions, mapping_path: Path, mapping: dict, node: str, rows: list[dict]) -> None:
++    source = Path(__file__).resolve().parents[1]
++    entry = mapping[node]
++    require_shell(entry["pane_id"])
++    herdr("pane", "rename", entry["pane_id"], f"Claude: {PANE_LABELS[node]}")
++    # Re-check identity in the actual attachment process immediately before exec.
++    command = shlex.join([sys.executable, "-m", "workflow.interactive", "attach-one", str(sessions.directory), "--node", node])
++    command = f"cd {shlex.quote(str(source))} && {command}"
++    entry.update(mode="attach_requested", session_id=sessions.locate(node, rows)["sessionId"])
++    save_json(mapping_path, mapping)
++    herdr("pane", "run", entry["pane_id"], command)
++
++
++def attach_reviewer_pane(sessions: InteractiveSessions) -> dict | None:
++    """Add `Claude: reviewer` to the run's existing workflow tab when the review node launches.
++
++    Returns None when the run has no terminal mapping (started without Herdr). A pane that already
++    exists for the reviewer is left alone; the mapping journal prevents duplicate attachments.
++    """
++    directory = sessions.directory
++    mapping_path = directory / "terminals.json"
++    if not mapping_path.exists():
++        return None
++    mapping = read_json(mapping_path)
++    if REVIEW_NODE in mapping:
++        return mapping
++    if set(mapping) != set(NODES):
++        raise RuntimeError("Terminal mapping is partial; reconnect the workers before adding the reviewer pane")
++    rows = sessions.inventory()
++    if sessions.locate(REVIEW_NODE, rows) is None:
++        raise RuntimeError("Cannot attach an unverified/missing reviewer session")
++    source = Path(__file__).resolve().parents[1]
++    anchor = herdr("pane", "get", mapping["adapter"]["pane_id"])["result"]["pane"]
++    if anchor["tab_id"] != mapping["adapter"]["tab_id"]:
++        raise RuntimeError("Adapter pane moved out of the workflow tab; refusing to split it")
++    split = herdr("pane", "split", "--pane", mapping["adapter"]["pane_id"], "--direction", "right", "--cwd", str(source), "--no-focus")["result"]
++    mapping[REVIEW_NODE] = {"pane_id": split["pane"]["pane_id"], "tab_id": mapping["adapter"]["tab_id"], "mode": "allocated"}
++    save_json(mapping_path, mapping)
++    send_attach(sessions, mapping_path, mapping, REVIEW_NODE, rows)
+     return mapping
+ 
+ 
+@@ -291,7 +381,7 @@ def main():
+     parser.add_argument("--live", action="store_true")
+     parser.add_argument("--herdr", action="store_true")
+     parser.add_argument("--reuse-observers", type=Path)
+-    parser.add_argument("--node", choices=NODES)
++    parser.add_argument("--node", choices=SESSION_NODES)
+     args = parser.parse_args()
+     directory = args.directory.resolve()
+     try:
+@@ -319,7 +409,7 @@ def main():
+             row = sessions.locate(args.node, sessions.inventory())
+             if row is None:
+                 raise RuntimeError("Session unavailable; refusing implicit restart")
+-            os.chdir(sessions.plan["nodes"][args.node]["worktree"])
++            os.chdir(sessions.worktree_of(args.node))
+             os.execvp(sessions.executable, [sessions.executable, "attach", row["id"]])
+         with run_lock(directory):
+             if args.action == "attach":
+diff --git a/workflow/pipeline.py b/workflow/pipeline.py
+index ddd3459..8c9d15f 100644
+--- a/workflow/pipeline.py
++++ b/workflow/pipeline.py
+@@ -27,6 +27,23 @@ from .sessions import NODES, git, prepare, read_json, run_lock, save_json
+ from .verification import owns, policy_digest, safe_path, validate_policy
+ 
+ 
++FINDING_KEYS = {"severity", "message", "disposition"}
++# Slice A reviewers add these so findings can be linked to the worker task they concern. Reviews
++# recorded before then omit them; both shapes remain valid review records.
++FINDING_LINK_KEYS = {"worker": {"ui", "adapter", "both", "none"}, "requirement": None}
++
++
++def validate_finding(finding: dict) -> None:
++    if not isinstance(finding, dict) or not FINDING_KEYS <= set(finding) or set(finding) - FINDING_KEYS - set(FINDING_LINK_KEYS):
++        raise ValueError("Malformed review finding")
++    if finding["severity"] not in {"P0", "P1", "P2"} or finding["disposition"] not in {"open", "resolved", "accepted"} or not isinstance(finding["message"], str) or not finding["message"].strip():
++        raise ValueError("Malformed review finding")
++    if "worker" in finding and finding["worker"] not in FINDING_LINK_KEYS["worker"]:
++        raise ValueError("Malformed review finding worker")
++    if "requirement" in finding and finding["requirement"] is not None and (not isinstance(finding["requirement"], str) or not finding["requirement"].strip()):
++        raise ValueError("Malformed review finding requirement")
++
++
+ def validate_pipeline_policy(policy: dict) -> dict:
+     validate_policy(policy)
+     if {worker["node_id"]: worker["role"] for worker in policy["workers"]} != {"ui": "frontend", "adapter": "backend"}:
+@@ -109,34 +126,39 @@ class Pipeline:
+         self.event(node, "interactive", "Awaiting explicit completion signal; idle is not acceptance")
+         return receipt
+ 
+-    def stop_workers(self):
++    def stop_session(self, node: str) -> dict:
+         """Persist native identity before stopping. Never signal guessed/reused PIDs."""
++        marker = self.directory / f"{node}.stop.json"
++        if marker.exists():
++            intent = read_json(marker)
++        else:
++            row = self.sessions.locate(node, self.sessions.inventory())
++            if row is None:
++                raise RuntimeError(f"{node} session missing before stop; reconcile before continuing")
++            intent = {"background_id": row["id"], "session_id": row["sessionId"], "pid": row["pid"], "stopped": False}
++            save_json(marker, intent)
++        if not intent["stopped"]:
++            rows = self.sessions.inventory()
++            matching = [row for row in rows if row.get("sessionId") == intent["session_id"] and row.get("pid")]
++            if matching:
++                row = self.sessions.locate(node, rows)
++                if row is None or row["id"] != intent["background_id"] or row["pid"] != intent["pid"]:
++                    raise RuntimeError(f"Native {node} identity changed after stop intent; reconcile manually")
++                result = subprocess.run([self.sessions.executable, "stop", intent["background_id"]], capture_output=True, text=True, timeout=20)
++                if result.returncode != 0:
++                    raise RuntimeError(f"Stop failed for {node}; inspect native session before retrying")
++            # Recover stop-before-receipt without issuing another stop command.
++            rows = self.sessions.inventory()
++            if any(row.get("sessionId") == intent["session_id"] and row.get("pid") for row in rows) or pid_alive(intent["pid"]):
++                raise RuntimeError(f"{node} termination is not established; retry after reconciliation")
++            intent["stopped"] = True
++            intent["stopped_at"] = now()
++            save_json(marker, intent)
++        return intent
++
++    def stop_workers(self):
+         for node in NODES:
+-            marker = self.directory / f"{node}.stop.json"
+-            if marker.exists():
+-                intent = read_json(marker)
+-            else:
+-                row = self.sessions.locate(node, self.sessions.inventory())
+-                if row is None:
+-                    raise RuntimeError("Worker missing before freeze; reconcile before snapshotting")
+-                intent = {"background_id": row["id"], "session_id": row["sessionId"], "pid": row["pid"], "stopped": False}
+-                save_json(marker, intent)
+-            if not intent["stopped"]:
+-                rows = self.sessions.inventory()
+-                matching = [row for row in rows if row.get("sessionId") == intent["session_id"] and row.get("pid")]
+-                if matching:
+-                    row = self.sessions.locate(node, rows)
+-                    if row is None or row["id"] != intent["background_id"] or row["pid"] != intent["pid"]:
+-                        raise RuntimeError("Native worker identity changed after stop intent; reconcile manually")
+-                    result = subprocess.run([self.sessions.executable, "stop", intent["background_id"]], capture_output=True, text=True, timeout=20)
+-                    if result.returncode != 0:
+-                        raise RuntimeError(f"Stop failed for {node}; inspect native session before retrying")
+-                # Recover stop-before-receipt without issuing another stop command.
+-                rows = self.sessions.inventory()
+-                if any(row.get("sessionId") == intent["session_id"] and row.get("pid") for row in rows) or pid_alive(intent["pid"]):
+-                    raise RuntimeError("Worker termination is not established; retry freeze after reconciliation")
+-                intent["stopped"] = True
+-                save_json(marker, intent)
++            self.stop_session(node)
+         stopped_ids = {read_json(self.directory / f"{node}.stop.json")["session_id"] for node in NODES}
+         if any(row.get("sessionId") in stopped_ids and row.get("pid") for row in self.sessions.inventory()):
+             raise RuntimeError("A stopped worker was restarted; reconcile before snapshot capture")
+@@ -315,8 +337,7 @@ class Pipeline:
+         if review["verdict"] != "approved" or not isinstance(review["findings"], list):
+             raise ValueError("Review is not approved")
+         for finding in review["findings"]:
+-            if not isinstance(finding, dict) or set(finding) != {"severity", "message", "disposition"} or finding["severity"] not in {"P0", "P1", "P2"} or finding["disposition"] not in {"open", "resolved", "accepted"} or not isinstance(finding["message"], str) or not finding["message"].strip():
+-                raise ValueError("Malformed review finding")
++            validate_finding(finding)
+             if finding["severity"] in {"P0", "P1"} and finding["disposition"] != "resolved":
+                 raise ValueError("Unresolved blocking review finding")
+ 
+@@ -397,6 +418,64 @@ def build_pipeline(checkpointer, runtime: Pipeline):
+     return graph.compile(checkpointer=checkpointer)
+ 
+ 
++def validate_review_record(directory: Path, plan: dict, review: dict) -> None:
++    """Structural validation of a persisted review for either verdict, without touching worktrees.
++
++    The bundle file's own hash is checked when it is present; packet paths are not re-resolved, so a
++    copied run directory (without worktrees) validates the same way as the original.
++    """
++    required = {"run_id", "bundle_sha256", "candidate_commit", "reviewer", "independent", "verdict", "findings"}
++    if not isinstance(review, dict) or set(review) != required or review["run_id"] != plan["run_id"]:
++        raise ValueError("review.json is not a review record for this run")
++    if not re.fullmatch(r"[a-f0-9]{64}", str(review["bundle_sha256"])) or not re.fullmatch(r"[a-f0-9]{40}", str(review["candidate_commit"])):
++        raise ValueError("review.json has malformed evidence references")
++    if review["independent"] is not True or not isinstance(review["reviewer"], str) or not review["reviewer"].strip():
++        raise ValueError("review.json lacks an independent reviewer identity")
++    if review["verdict"] not in {"approved", "blocked"} or not isinstance(review["findings"], list):
++        raise ValueError("review.json has no recognised verdict; refusing to export it")
++    for finding in review["findings"]:
++        validate_finding(finding)
++        if review["verdict"] == "approved" and finding["severity"] in {"P0", "P1"} and finding["disposition"] != "resolved":
++            raise ValueError("Unresolved blocking review finding")
++    bundle_path = directory / "review-bundle.json"
++    if bundle_path.exists():
++        bundle = read_json(bundle_path)
++        if digest_file(bundle_path) != review["bundle_sha256"] or bundle.get("candidate_commit") != review["candidate_commit"]:
++            raise ValueError("Review must reference this exact run, bundle hash and candidate")
++
++
++def export_run(directory: Path) -> Path:
++    """Rebuild `run-state.json` under the current export version from persisted run files.
++
++    Launches nothing, binds no sessions and changes no evidence, so it also works on a copy of a run
++    directory. A run whose plan, policy or review record fails validation is refused rather than
++    exported with a fabricated section.
++    """
++    from types import SimpleNamespace
++    directory = directory.resolve()
++    plan = read_json(directory / "plan.json")
++    if "automatic" in plan:
++        from .automatic import validate_automatic
++        validate_automatic(plan)
++    if set(plan.get("nodes", {})) != set(NODES) or not plan.get("base_commit"):
++        raise ValueError("plan.json is not a two-worker pipeline plan")
++    policy = validate_pipeline_policy(read_json(directory / "policy.json"))
++    if plan.get("policy_sha256") != policy_digest(policy):
++        raise ValueError("Pinned policy changed")
++    runtime = SimpleNamespace(directory=directory, plan=plan, policy=policy)
++    review_path = directory / "review.json"
++    if review_path.exists():
++        validate_review_record(directory, plan, read_json(review_path))
++    checkpoints = directory / "pipeline.sqlite"
++    if checkpoints.exists():
++        with SqliteSaver.from_conn_string(str(checkpoints)) as saver:
++            state = build_pipeline(saver, runtime).get_state({"configurable": {"thread_id": plan["run_id"]}})
++    else:
++        state = SimpleNamespace(values={}, next=("launch_ui", "launch_adapter"), tasks=[])
++    export_state(runtime, state)
++    return directory / "run-state.json"
++
++
+ def report(runtime: Pipeline, state) -> Path:
+     """Escaped local results viewer, generated on every CLI boundary; no server needed."""
+     export_state(runtime, state)
+@@ -447,7 +526,7 @@ def report(runtime: Pipeline, state) -> Path:
+ 
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("action", choices=["preflight", "prepare", "start", "automatic", "automatic-step", "attach", "freeze", "retry", "reconcile", "review", "approve", "status"])
++    parser.add_argument("action", choices=["preflight", "prepare", "start", "automatic", "automatic-step", "attach", "freeze", "retry", "reconcile", "review", "approve", "status", "export"])
+     parser.add_argument("directory", type=Path)
+     parser.add_argument("--repo", type=Path, default=Path.cwd())
+     parser.add_argument("--policy", type=Path)
+@@ -456,7 +535,9 @@ def main():
+     parser.add_argument("--live", action="store_true")
+     parser.add_argument("--automatic", action="store_true", help="Prepare run-scoped permission bypass and automatic feature-branch completion")
+     parser.add_argument("--worker-timeout-seconds", type=int, help="Automatic mode: deadline per worker from launch until its completion signal (default 4h)")
+-    parser.add_argument("--review-timeout-seconds", type=int, help="Automatic mode: reviewer process timeout (default 30m)")
++    parser.add_argument("--review-timeout-seconds", type=int, help="Automatic mode: reviewer session timeout from launch (default 30m)")
++    parser.add_argument("--reviewer-transport", choices=["native", "print"], help="Automatic mode: native attachable reviewer session (default) or headless print mode")
++    parser.add_argument("--feature", help="Committed feature name (features/<name>) recorded in the plan for the reviewer's requirements")
+     parser.add_argument("--herdr", action="store_true")
+     parser.add_argument("--ui-handoff", type=Path)
+     parser.add_argument("--adapter-handoff", type=Path)
+@@ -481,7 +562,7 @@ def main():
+             help_text = subprocess.check_output(["claude", "--help"], text=True, timeout=15)
+             required_flags = ["--bg", "--safe-mode", "--tools", "--permission-mode"]
+             if args.automatic:
+-                required_flags += ["--dangerously-skip-permissions", "--json-schema", "--print", "--permission-prompts", "--add-dir"]
++                required_flags += ["--dangerously-skip-permissions", "--json-schema", "--print", "--permission-prompts", "--add-dir", "--allowedTools"]
+             if not all(flag in help_text for flag in required_flags):
+                 raise ValueError("Installed Claude CLI lacks required flags")
+             auth = json.loads(subprocess.check_output(["claude", "auth", "status"], text=True, timeout=15))
+@@ -505,11 +586,15 @@ def main():
+                 tasks[worker["node_id"]] += "\nApproved ownership and checks:\n" + json.dumps(worker)
+             plan = prepare(directory, args.repo, "HEAD", tasks, True)
+             plan.update(mode="interactive", policy_sha256=policy_digest(policy), created_at=now(), source_branch=git(args.repo.resolve(), "symbolic-ref", "--short", "HEAD"))
++            if args.feature:
++                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.feature):
++                    parser.error("--feature must be a plain feature directory name")
++                plan["feature"] = args.feature
+             if args.automatic:
+                 from .automatic import automatic_settings
+-                plan["automatic"] = automatic_settings(args.worker_timeout_seconds, args.review_timeout_seconds)
+-            elif args.worker_timeout_seconds or args.review_timeout_seconds:
+-                parser.error("Timeouts apply to --automatic runs only; manual runs have operator-controlled lifetimes")
++                plan["automatic"] = automatic_settings(args.worker_timeout_seconds, args.review_timeout_seconds, args.reviewer_transport)
++            elif args.worker_timeout_seconds or args.review_timeout_seconds or args.reviewer_transport:
++                parser.error("Timeouts and reviewer transport apply to --automatic runs only; manual runs have operator-controlled lifetimes")
+             save_json(directory / "policy.json", policy)
+             save_json(directory / "plan.json", plan)
+             from types import SimpleNamespace
+@@ -524,6 +609,9 @@ def main():
+             print(f"Automatic run reached a verified feature branch. Evidence: {directory / 'report.html'}. No main merge or push.")
+             return
+         with run_lock(directory):
++            if args.action == "export":
++                print(f"Exported {export_run(directory)}")
++                return
+             runtime = Pipeline(directory)
+             if args.action == "automatic-step":
+                 if not args.live:

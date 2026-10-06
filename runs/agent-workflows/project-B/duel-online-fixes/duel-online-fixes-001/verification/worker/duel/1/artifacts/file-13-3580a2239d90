@@ -1,0 +1,322 @@
+import { Room } from "@colyseus/sdk";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DUEL_INPUT, duelistMoveset } from "@pirate-sea-race/content/moves";
+import { DuelMessageType, type DuelProbe } from "@pirate-sea-race/protocol";
+import { createDuelState, defaultDuelConfig, duelInput, stepDuel, type DuelState } from "@pirate-sea-race/simulation/duel";
+import { DuelRollback, type DuelFeedEvent } from "@pirate-sea-race/simulation/netcode";
+import { applyDevLatency, DelayLine, devLatencyFromQuery, type DelaySource } from "./devLatency.js";
+import { ArenaFlashes, PendingDuelEvents } from "./duelEvents.js";
+import { renderDuelHud, resultText, roundClock, type DuelHudModel } from "./duelHud.js";
+import { duelBits, DuelKeyboard } from "./duelKeyboard.js";
+
+describe("duel keyboard", () => {
+  it("maps §8's keys: WASD or arrows, J, K, U, I and Shift", () => {
+    expect(duelBits(["KeyA", "ArrowRight", "KeyW", "ArrowDown"])).toBe(DUEL_INPUT.left | DUEL_INPUT.right | DUEL_INPUT.up | DUEL_INPUT.down);
+    expect(duelBits(["KeyJ", "KeyK", "KeyU", "KeyI", "ShiftRight"])).toBe(
+      DUEL_INPUT.light | DUEL_INPUT.heavy | DUEL_INPUT.special1 | DUEL_INPUT.special2 | DUEL_INPUT.dash,
+    );
+    expect(duelBits(["KeyE", "Space"])).toBe(0);
+  });
+
+  it("keeps a tap released before any frame was tagged until one is", () => {
+    const keyboard = new DuelKeyboard(new EventTarget() as unknown as Window);
+    keyboard.press("KeyJ");
+    keyboard.release("KeyJ");
+    expect(keyboard.bits()).toBe(DUEL_INPUT.light);
+    expect(keyboard.bits()).toBe(DUEL_INPUT.light);
+    keyboard.framesTagged();
+    expect(keyboard.bits()).toBe(0);
+    // A held key stays in after the frame that took it.
+    keyboard.press("KeyD");
+    keyboard.framesTagged();
+    expect(keyboard.bits()).toBe(DUEL_INPUT.right);
+  });
+});
+
+describe("duel HUD", () => {
+  it("counts the round clock down to 0 on the round's last frame, then shows overtime", () => {
+    expect(roundClock(0, 3600, 600)).toEqual({ seconds: 60, overtime: false });
+    expect(roundClock(3599, 3600, 600)).toEqual({ seconds: 1, overtime: false });
+    expect(roundClock(3600, 3600, 600)).toEqual({ seconds: 0, overtime: false });
+    expect(roundClock(3601, 3600, 600)).toEqual({ seconds: 10, overtime: true });
+    expect(roundClock(4200, 3600, 600)).toEqual({ seconds: 0, overtime: true });
+  });
+
+  it("words the result", () => {
+    expect(resultText(0, "timeout")).toBe("Player 1 wins by time");
+    expect(resultText(1, "forfeit")).toBe("Player 2 wins by forfeit");
+    expect(resultText(-1, "double-ko")).toBe("Draw (double KO)");
+    expect(resultText(-1, "forfeit")).toBe("Both forfeit: no winner");
+  });
+
+  it("shows both fighters' stamina from the confirmed state, as a number and a filled share", () => {
+    const { rules } = duelistMoveset;
+    // Player one dashes: the confirmed state after the frame has spent the dash's stamina.
+    const dashed = stepDuel(defaultDuelConfig, createDuelState(defaultDuelConfig), [duelInput("dash"), 0]);
+    expect(dashed.fighters[0].stamina).toBe(rules.maxStamina - rules.dashStaminaCost);
+    const hud = fakeHud();
+    renderDuelHud(hud.root, hudModel(dashed));
+    expect(hud.field("duel-stamina-0").dataset["value"]).toBe(String(rules.maxStamina - rules.dashStaminaCost));
+    expect(hud.field("duel-stamina-0").style.getPropertyValue("--fill")).toBe(`${(100 * (rules.maxStamina - rules.dashStaminaCost)) / rules.maxStamina}%`);
+    expect(hud.field("duel-stamina-1").dataset["value"]).toBe(String(rules.maxStamina));
+    expect(hud.field("duel-stamina-1").style.getPropertyValue("--fill")).toBe("100%");
+    // The HUD follows the state it is given: a later confirmed state with regenerated stamina redraws the bar.
+    const later = { ...dashed, fighters: [{ ...dashed.fighters[0], stamina: 93 }, dashed.fighters[1]] as const };
+    renderDuelHud(hud.root, hudModel(later as DuelState));
+    expect(hud.field("duel-stamina-0").dataset["value"]).toBe("93");
+    expect(hud.field("duel-stamina-0").style.getPropertyValue("--fill")).toBe("93%");
+  });
+});
+
+/** The fields of the duel HUD without a DOM: each `[data-testid]` lookup gets a recording stand-in. */
+function fakeHud() {
+  interface FakeField {
+    textContent: string;
+    hidden: boolean;
+    readonly dataset: Record<string, string>;
+    readonly style: { setProperty(name: string, value: string): void; getPropertyValue(name: string): string };
+  }
+  const fields = new Map<string, FakeField>();
+  const field = (id: string): FakeField => {
+    let found = fields.get(id);
+    if (found === undefined) {
+      const properties = new Map<string, string>();
+      found = {
+        textContent: "",
+        hidden: false,
+        dataset: {},
+        style: { setProperty: (name, value) => properties.set(name, value), getPropertyValue: (name) => properties.get(name) ?? "" },
+      };
+      fields.set(id, found);
+    }
+    return found;
+  };
+  const root = { querySelector: (selector: string) => field(/data-testid="([^"]+)"/.exec(selector)![1]!) } as unknown as ParentNode;
+  return { root, field };
+}
+
+function hudModel(confirmed: DuelState): DuelHudModel {
+  const { rules } = duelistMoveset;
+  return {
+    code: "ABC123",
+    practice: true,
+    phase: "fighting",
+    status: "connected",
+    self: 0,
+    countdown: 0,
+    connected: [true, true],
+    confirmed,
+    maxHealth: rules.maxHealth,
+    maxStamina: rules.maxStamina,
+    roundFrames: rules.roundFrames,
+    overtimeFrames: rules.overtimeFrames,
+    rttMs: 0,
+    inputDelay: 3,
+    corrections: 0,
+    result: undefined,
+  };
+}
+
+describe("duel events in the view", () => {
+  const J = duelInput("light");
+  /** Player two one jab from a KO, 40 px from player one. */
+  function nearKo(): DuelState {
+    const { arena } = duelistMoveset;
+    const centre = arena.width / 2;
+    const state = createDuelState(defaultDuelConfig, { x: [centre - 20 * arena.subPixelsPerPixel, centre + 20 * arena.subPixelsPerPixel] });
+    return { ...state, fighters: [state.fighters[0], { ...state.fighters[1], health: 45 }] };
+  }
+
+  it("shows a hit and a KO once in the pending buffer and the arena, although a correction re-simulates them", () => {
+    const rollback = new DuelRollback(defaultDuelConfig, 0, nearKo());
+    const pending = new PendingDuelEvents();
+    const arena = new ArenaFlashes();
+    const drawn: string[] = [];
+    const buffered: DuelFeedEvent[] = [];
+    // The client collects every tick; the arena draws every third tick (a slow render).
+    const tick = (frame: number) => {
+      rollback.stepTo(frame);
+      const fresh = rollback.drainEvents();
+      buffered.push(...fresh);
+      pending.collect(fresh);
+      if (frame % 3 === 0) for (const flash of arena.add(pending.drain(), frame * 16)) drawn.push(flash.id);
+    };
+    rollback.setLocalInput(1, J);
+    for (let frame = 1; frame <= 30; frame++) tick(frame);
+    const ko = buffered.find((event) => event.result !== null)!;
+    expect(ko.result).toMatchObject({ winner: 0, reason: "ko" });
+    // The opponent pressed dash on the KO frame: the server's pairs differ there and every frame is stepped again.
+    rollback.applyBundle({ frame: ko.frame, inputs: Array.from({ length: ko.frame }, (_, index) => [index === 0 ? J : 0, index === ko.frame - 1 ? duelInput("dash") : 0] as const) });
+    expect(rollback.stats.corrections).toBe(1);
+    for (let frame = 31; frame <= 60; frame++) tick(frame);
+
+    const ids = [`${ko.frame}:hit:0:jab`, `${ko.frame}:result:ko`];
+    expect(buffered.map((event) => event.id)).toEqual(ids);
+    expect(drawn).toEqual(ids);
+    expect(arena.current.map((flash) => [flash.text, flash.over])).toEqual([
+      ["-45", 1],
+      ["K.O.", "centre"],
+    ]);
+  });
+
+  it("draws an event reported again once, and lets flashes expire", () => {
+    const arena = new ArenaFlashes();
+    const hit: DuelFeedEvent = { id: "9:hit:0:jab", frame: 9, event: { kind: "hit", attacker: 0, moveId: "jab", damage: 45 }, result: null };
+    expect(arena.add([hit, hit], 100)).toHaveLength(1);
+    expect(arena.add([hit], 200)).toEqual([]);
+    expect(arena.expire(549)).toEqual([]);
+    expect(arena.expire(550).map((flash) => flash.id)).toEqual([hit.id]);
+    expect(arena.add([hit], 600)).toEqual([]);
+  });
+
+  it("keeps the newest events for an arena that is not drawing (a hidden tab), each once", () => {
+    const pending = new PendingDuelEvents(4);
+    const event = (frame: number): DuelFeedEvent => ({ id: `${frame}:block:1:jab`, frame, event: { kind: "block", attacker: 1, moveId: "jab", damage: 0 }, result: null });
+    pending.collect([event(1), event(2), event(3)]);
+    pending.collect([event(4), event(5)]);
+    expect(pending.drain().map((fresh) => fresh.frame)).toEqual([2, 3, 4, 5]);
+    expect(pending.drain()).toEqual([]);
+  });
+});
+
+describe("dev latency setting", () => {
+  it("reads a round trip and jitter from the query string, and nothing otherwise", () => {
+    expect(devLatencyFromQuery("?rtt=80&jitter=20")).toEqual({ rttMs: 80, jitterMs: 20 });
+    expect(devLatencyFromQuery("?rtt=150")).toEqual({ rttMs: 150, jitterMs: 0 });
+    expect(devLatencyFromQuery("")).toBeUndefined();
+    expect(devLatencyFromQuery("?rtt=abc")).toBeUndefined();
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The fake clock, and jitter draws taken from `draws` in turn (then from a seeded generator). */
+  function source(draws: number[] = []): DelaySource {
+    // mulberry32, seeded.
+    let seed = 7;
+    const seeded = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
+    };
+    return { now: () => Date.now(), random: () => draws.shift() ?? seeded() };
+  }
+
+  it("delays each item by half the round trip, give or take half the jitter", () => {
+    const line = new DelayLine({ rttMs: 80, jitterMs: 20 }, source([0.5, 0, 0.999999]));
+    const arrived: [string, number][] = [];
+    const start = Date.now();
+    line.push(() => arrived.push(["middle", Date.now() - start]));
+    vi.advanceTimersByTime(100);
+    line.push(() => arrived.push(["earliest", Date.now() - start - 100]));
+    vi.advanceTimersByTime(100);
+    line.push(() => arrived.push(["latest", Date.now() - start - 200]));
+    vi.advanceTimersByTime(29);
+    expect(arrived).toEqual([
+      ["middle", 40],
+      ["earliest", 30],
+    ]);
+    vi.advanceTimersByTime(100);
+    expect(arrived.at(-1)).toEqual(["latest", 50]);
+  });
+
+  it("never reorders: an item drawn earlier than the one before it waits for it", () => {
+    // The first item draws the most delay (50 ms), the second the least (30 ms), 5 ms later.
+    const line = new DelayLine({ rttMs: 80, jitterMs: 20 }, source([0.999999, 0]));
+    const arrived: [number, number][] = [];
+    const start = Date.now();
+    line.push(() => arrived.push([1, Date.now() - start]));
+    vi.advanceTimersByTime(5);
+    line.push(() => arrived.push([2, Date.now() - start]));
+    vi.advanceTimersByTime(100);
+    expect(arrived).toEqual([
+      [1, 50],
+      [2, 50],
+    ]);
+  });
+
+  it("keeps every delay of a long burst within the jitter bounds and in order", () => {
+    const line = new DelayLine({ rttMs: 80, jitterMs: 20 }, source());
+    const delays: number[] = [];
+    const order: number[] = [];
+    for (let index = 0; index < 500; index++) {
+      const sentAt = Date.now();
+      line.push(() => {
+        delays.push(Date.now() - sentAt);
+        order.push(index);
+      });
+      vi.advanceTimersByTime(index % 3);
+    }
+    vi.advanceTimersByTime(1000);
+    expect(order).toEqual(Array.from({ length: 500 }, (_, index) => index));
+    expect(Math.min(...delays)).toBeGreaterThanOrEqual(30);
+    expect(Math.max(...delays)).toBeLessThanOrEqual(50);
+    // Jitter does spread them: some near each bound.
+    expect(delays.some((delay) => delay < 34)).toBe(true);
+    expect(delays.some((delay) => delay > 46)).toBe(true);
+  });
+
+  /** A real SDK room on a stand-in socket: what it sends is recorded, and `deliver` hands it a frame from the server. */
+  function roomOnFakeSocket() {
+    const room = new Room("duel");
+    const sent: { bytes: Uint8Array; at: number }[] = [];
+    const transport = { send: (data: Uint8Array) => sent.push({ bytes: new Uint8Array(data), at: Date.now() }) };
+    const connection = { transport, events: {} as { onmessage?: (event: unknown) => void }, isOpen: true, send: (data: Uint8Array) => connection.transport.send(data) };
+    connection.events.onmessage = (event) => (room as unknown as { onMessageCallback(event: unknown): void }).onMessageCallback(event);
+    (room as unknown as { connection: unknown }).connection = connection;
+    const deliver = (bytes: Uint8Array) => connection.events.onmessage!({ data: bytes.slice().buffer });
+    return { room, sent, deliver };
+  }
+
+  /** The bytes of a server message of `type`, framed as the SDK frames room messages. */
+  function frame(type: string, payload: unknown): Uint8Array {
+    const encoder = roomOnFakeSocket();
+    encoder.room.send(type, payload);
+    return encoder.sent[0]!.bytes;
+  }
+
+  it("delays the room's socket both ways, the round-trip probes included, and keeps each direction in order", () => {
+    const { room, sent, deliver } = roomOnFakeSocket();
+    applyDevLatency(room, { rttMs: 80, jitterMs: 20 }, source([0.5, 0.5, 0.5, 0.999999, 0]));
+    const probes: [DuelProbe, number][] = [];
+    const bundles: [number, number][] = [];
+    room.onMessage(DuelMessageType.Probe, (probe: DuelProbe) => probes.push([probe, Date.now()]));
+    room.onMessage(DuelMessageType.Frames, (bundle: { frame: number }) => bundles.push([bundle.frame, Date.now()]));
+    const start = Date.now();
+
+    // A probe from the server, and the client's echo of it: each is half the round trip late.
+    deliver(frame(DuelMessageType.Probe, { id: 1, frame: -60, rtt: 0 }));
+    expect(probes).toEqual([]);
+    vi.advanceTimersByTime(39);
+    expect(probes).toEqual([]);
+    vi.advanceTimersByTime(1);
+    expect(probes).toEqual([[{ id: 1, frame: -60, rtt: 0 }, start + 40]]);
+    room.send(DuelMessageType.Probe, { id: 1 });
+    expect(sent).toEqual([]);
+    vi.advanceTimersByTime(40);
+    expect(sent.map((item) => item.at - start)).toEqual([80]);
+    // It is the echo itself, unchanged, and it leaves a full round trip after the probe left the server.
+    expect(sent[0]!.bytes).toEqual(frame(DuelMessageType.Probe, { id: 1 }));
+
+    // Input goes out delayed too.
+    room.send(DuelMessageType.Input, { seq: 1, frame: 4, inputs: [0, 0, 0, 16] });
+    vi.advanceTimersByTime(40);
+    expect(sent.map((item) => item.at - start)).toEqual([80, 120]);
+
+    // Two bundles 5 ms apart, the first with the most jitter, the second with the least: they arrive in order.
+    deliver(frame(DuelMessageType.Frames, { frame: 3, inputs: [], substituted: 0 }));
+    vi.advanceTimersByTime(5);
+    deliver(frame(DuelMessageType.Frames, { frame: 6, inputs: [], substituted: 0 }));
+    vi.advanceTimersByTime(100);
+    expect(bundles).toEqual([
+      [3, start + 170],
+      [6, start + 170],
+    ]);
+  });
+});

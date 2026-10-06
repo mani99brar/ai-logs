@@ -1,0 +1,661 @@
+     1	import { useCallback, useEffect, useState } from 'react'
+     2	import {
+     3	  fetchReviewResult,
+     4	  isBlockingFinding,
+     5	  isNotRecorded,
+     6	  NOT_RECORDED,
+     7	  paths,
+     8	  scopedReviewPath,
+     9	  type ReviewFinding,
+    10	  type ReviewResult,
+    11	  type RunDetail,
+    12	  type RunInputs,
+    13	  type RunScope,
+    14	} from './api.ts'
+    15	import { findingsForFile, runLanes, workerGroupOf, workerGroups, workerWording } from './findings.ts'
+    16	import { useRunCapturedFiles } from './files.ts'
+    17	import { AppLink, ErrorPanel, LoadingPanel } from './panels.tsx'
+    18	import { blockedByWording, outcomeWording, severityCounts, type Reviewer } from './reviewers.ts'
+    19	import { runPathname } from './routes.ts'
+    20	import { formatTime, reviewSummary, shortRevision } from './status.ts'
+    21	import { useResource, type Resource } from './useResource.ts'
+    22	
+    23	type SnapshotNode = RunDetail['snapshot']['nodes'][number]
+    24	type DefinitionNode = RunDetail['definition']['nodes'][number]
+    25	type Lane = ReviewFinding['requirement_found_in'][number]
+    26	type Disposition = ReviewFinding['disposition']
+    27	type GroupBy = 'disposition' | 'worker' | 'reviewer'
+    28	/** A reviewer id, or null for every reviewer. */
+    29	type ReviewerFilter = string | null
+    30	
+    31	type Props = {
+    32	  scope: RunScope
+    33	  node: SnapshotNode
+    34	  definitionNodes: DefinitionNode[]
+    35	  /** Every node's state in the run: the launch nodes' results name the captured files a finding can link to. */
+    36	  snapshotNodes: SnapshotNode[]
+    37	  /** The run's inputs, used only to name the graph node that launched a lane; the review itself never needs them. */
+    38	  inputs: Resource<RunInputs | null>
+    39	  refreshToken: number
+    40	  onNavigate: (pathname: string) => void
+    41	  /** Opens a worker's task with the quoted requirement highlighted (the run view navigates and hands the quote over). */
+    42	  onOpenRequirement: (nodeId: string, quote: string) => void
+    43	  /** Opens a captured file's panel on the launch node that shows it (the run view navigates and hands the path over). */
+    44	  onOpenFile: (nodeId: string, path: string) => void
+    45	  /** Reports the served review's transport, so the node can say whether its reviewers ran as sessions or print jobs. */
+    46	  onTransport?: (transport: ReviewResult['reviewer']['transport']) => void
+    47	}
+    48	
+    49	const TRANSPORT_WORDING: Record<Reviewer['transport'], string> = {
+    50	  native: 'native session',
+    51	  print: 'print-mode session',
+    52	  manual: 'operator-supplied review',
+    53	}
+    54	const DISPOSITIONS: readonly Disposition[] = ['open', 'resolved', 'accepted']
+    55	const DISPOSITION_LABEL: Record<Disposition, string> = { open: 'Open', resolved: 'Resolved', accepted: 'Accepted' }
+    56	/** The graph node that launched a lane: from the inputs when loaded, else `launch_<lane>` when the pinned graph has it, else the lane itself. */
+    57	function launchNodeFor(lane: Lane, definitionNodes: DefinitionNode[], inputs: Resource<RunInputs | null>): string {
+    58	  if (inputs.status === 'ready' && inputs.data !== null) {
+    59	    const worker = inputs.data.workers.find(candidate => candidate.node_id === lane)
+    60	    if (worker) return worker.launch_node_id
+    61	  }
+    62	  return definitionNodes.some(candidate => candidate.node_id === `launch_${lane}`) ? `launch_${lane}` : lane
+    63	}
+    64	
+    65	type RowProps = Pick<Props, 'scope' | 'definitionNodes' | 'inputs' | 'onOpenRequirement' | 'onOpenFile'> & {
+    66	  finding: ReviewFinding
+    67	  /** The run's captured files by path, with the launch node that shows each. */
+    68	  capturedFiles: Map<string, string>
+    69	}
+    70	
+    71	function FindingRow({ finding, scope, definitionNodes, inputs, onOpenRequirement, onOpenFile, capturedFiles }: RowProps) {
+    72	  const blocking = isBlockingFinding(finding)
+    73	  // A finding links to every captured file its message names verbatim; the review result itself records no location.
+    74	  const files = [...capturedFiles].filter(([path]) => findingsForFile([finding], path).length > 0)
+    75	  return (
+    76	    <tr
+    77	      data-testid="finding"
+    78	      data-severity={finding.severity}
+    79	      data-disposition={finding.disposition}
+    80	      data-worker={finding.worker ?? 'unrecorded'}
+    81	      data-reviewer={finding.reviewer}
+    82	      className={blocking ? 'finding-blocking' : undefined}
+    83	    >
+    84	      <td><span className="finding-severity">{finding.severity}</span>{blocking && <span className="visually-hidden"> (blocks integration)</span>}</td>
+    85	      <td>
+    86	        {finding.message}
+    87	        {files.map(([path, nodeId]) => (
+    88	          <AppLink
+    89	            key={path}
+    90	            href={runPathname(scope.projectId, scope.workflowId, scope.runId, nodeId)}
+    91	            onNavigate={() => onOpenFile(nodeId, path)}
+    92	            className="finding-file-link"
+    93	            data-testid="finding-file-link"
+    94	            data-path={path}
+    95	            style={{ display: 'block' }}
+    96	          >
+    97	            Open the captured {path}
+    98	          </AppLink>
+    99	        ))}
+   100	      </td>
+   101	      <td>{finding.worker === null ? <span className="projects-muted">not recorded</span> : workerWording(finding.worker)}</td>
+   102	      <td data-testid="finding-reviewer">{finding.reviewer}</td>
+   103	      <td>
+   104	        {finding.requirement === null ? '—' : (
+   105	          <>
+   106	            <q data-testid="finding-requirement">{finding.requirement}</q>
+   107	            {finding.requirement_found_in.length === 0 ? (
+   108	              <span className="projects-muted finding-task-note" data-testid="finding-task-unlinked">not found verbatim in the task</span>
+   109	            ) : finding.requirement_found_in.map(lane => {
+   110	              const nodeId = launchNodeFor(lane, definitionNodes, inputs)
+   111	              const quote = finding.requirement!
+   112	              return (
+   113	                <AppLink
+   114	                  key={lane}
+   115	                  href={runPathname(scope.projectId, scope.workflowId, scope.runId, nodeId)}
+   116	                  onNavigate={() => onOpenRequirement(nodeId, quote)}
+   117	                  className="finding-task-link"
+   118	                  data-testid="finding-task-link"
+   119	                  data-lane={lane}
+   120	                >
+   121	                  Open in the {lane} task
+   122	                </AppLink>
+   123	              )
+   124	            })}
+   125	          </>
+   126	        )}
+   127	      </td>
+   128	    </tr>
+   129	  )
+   130	}
+   131	
+   132	/** A reviewer's own verdict; a reviewer superseded before deciding, still pending, or blocked by the deadline or a rejected file has none. */
+   133	function ReviewerVerdict({ verdict }: { verdict: Reviewer['verdict'] }) {
+   134	  if (verdict === null) return <span className="projects-muted" data-testid="reviewer-verdict" data-status="none">No verdict</span>
+   135	  const approved = verdict === 'approved'
+   136	  return (
+   137	    <span className={`status-badge ${approved ? 'status-succeeded' : 'status-failed'}`} data-testid="reviewer-verdict" data-status={verdict}>
+   138	      <span>{approved ? 'Approved' : 'Blocked'}</span>
+   139	    </span>
+   140	  )
+   141	}
+   142	
+   143	/** One entry per reviewer of the run, in declared order: id, own verdict, how it ended (with its blocking reason), finding counts by severity and its times. */
+   144	function ReviewerStrip({ reviewers }: { reviewers: readonly Reviewer[] }) {
+   145	  return (
+   146	    <section className="evidence-section reviewer-strip" aria-labelledby="review-reviewers-title" data-testid="reviewer-strip" data-count={reviewers.length}>
+   147	      <h4 id="review-reviewers-title">Reviewers ({reviewers.length})</h4>
+   148	      <ul className="evidence-list reviewer-list">
+   149	        {reviewers.map(reviewer => (
+   150	          <li key={reviewer.reviewer_id} data-testid="reviewer-entry" data-reviewer={reviewer.reviewer_id} data-status={reviewer.status} data-verdict={reviewer.verdict ?? 'none'}>
+   151	            <p>
+   152	              <strong data-testid="reviewer-id">{reviewer.reviewer_id}</strong>{' '}
+   153	              <ReviewerVerdict verdict={reviewer.verdict} />{' '}
+   154	              <span data-testid="reviewer-status">{outcomeWording(reviewer)}</span>
+   155	            </p>
+   156	            <p className="projects-muted">
+   157	              <span data-testid="reviewer-counts">{severityCounts(reviewer.findings)}</span>
+   158	              {reviewer.launched_at !== null && <> · launched {formatTime(reviewer.launched_at)}</>}
+   159	              {reviewer.accepted_at !== null && <> · file accepted {formatTime(reviewer.accepted_at)}</>}
+   160	            </p>
+   161	          </li>
+   162	        ))}
+   163	      </ul>
+   164	    </section>
+   165	  )
+   166	}
+   167	
+   168	const UNLISTED_REVIEWER = 'unlisted'
+   169	
+   170	/**
+   171	 * One group per reviewer of the run in declared order, labelled with its id, its own verdict and its severity counts, then a
+   172	 * guard group for findings whose reviewer the run does not list (the contract forbids it, so it stays hidden when empty).
+   173	 */
+   174	function reviewerGroups(reviewers: readonly Reviewer[], visible: readonly ReviewFinding[]) {
+   175	  const ids = new Set(reviewers.map(reviewer => reviewer.reviewer_id))
+   176	  const verdictWording = (verdict: Reviewer['verdict']) => (verdict === null ? 'no verdict' : verdict === 'approved' ? 'approved' : 'blocked')
+   177	  return [
+   178	    ...reviewers.map(reviewer => ({
+   179	      key: `reviewer-${reviewer.reviewer_id}`,
+   180	      label: `${reviewer.reviewer_id} · ${verdictWording(reviewer.verdict)} · ${severityCounts(reviewer.findings)}`,
+   181	      attributes: { 'data-reviewer-group': reviewer.reviewer_id, 'data-verdict': reviewer.verdict ?? 'none' },
+   182	      findings: visible.filter(finding => finding.reviewer === reviewer.reviewer_id),
+   183	    })),
+   184	    {
+   185	      key: `reviewer-${UNLISTED_REVIEWER}`,
+   186	      label: 'Reviewer not listed for this run',
+   187	      attributes: { 'data-reviewer-group': UNLISTED_REVIEWER, 'data-verdict': 'none' },
+   188	      findings: visible.filter(finding => !ids.has(finding.reviewer)),
+   189	    },
+   190	  ]
+   191	}
+   192	
+   193	function ReviewResultView({ review, scope, definitionNodes, snapshotNodes, inputs, refreshToken, onNavigate, onOpenRequirement, onOpenFile, onTransport }: { review: ReviewResult } & Omit<Props, 'node'>) {
+   194	  const approved = review.verdict === 'approved'
+   195	  const reviewers = review.reviewers
+   196	  const several = reviewers.length > 1
+   197	  const blockedBy = blockedByWording(review)
+   198	  const candidateNode = definitionNodes.some(candidate => candidate.node_id === 'candidate') ? 'candidate' : null
+   199	  const bundle = <code title={review.bundle_sha256}>{shortRevision(review.bundle_sha256)}</code>
+   200	  // Like every other artifact link, the diff is only ever fetched through this run's own artifact route by its ID.
+   201	  const diffHref = review.diff === null ? null : paths.artifact(scope, review.diff.artifact_id)
+   202	  const diffScoped = review.diff !== null && review.diff.uri === diffHref
+   203	  // Several reviewers read best as one group each; a single reviewer's findings group by disposition.
+   204	  const [groupBy, setGroupBy] = useState<GroupBy>(several ? 'reviewer' : 'disposition')
+   205	  const [reviewerFilter, setReviewerFilter] = useState<ReviewerFilter>(null)
+   206	  const lanes = runLanes(definitionNodes, inputs)
+   207	  const capturedFiles = useRunCapturedFiles(scope, snapshotNodes, refreshToken)
+   208	  const transport = review.reviewer.transport
+   209	  useEffect(() => { onTransport?.(transport) }, [onTransport, transport])
+   210	  // The filter narrows the union to one reviewer's findings; grouping then applies to what is left.
+   211	  const visible = reviewerFilter === null ? review.findings : review.findings.filter(finding => finding.reviewer === reviewerFilter)
+   212	  const countFor = (reviewerId: string) => review.findings.filter(finding => finding.reviewer === reviewerId).length
+   213	  const groups = groupBy === 'disposition'
+   214	    ? DISPOSITIONS.map(disposition => ({ key: disposition, label: DISPOSITION_LABEL[disposition], attributes: { 'data-disposition': disposition }, findings: visible.filter(finding => finding.disposition === disposition) }))
+   215	    : groupBy === 'reviewer'
+   216	      ? reviewerGroups(reviewers, visible)
+   217	      : workerGroups(lanes, visible).map(group => ({ ...group, attributes: { 'data-worker-group': group.key }, findings: visible.filter(finding => workerGroupOf(finding) === group.key) }))
+   218	  const populated = groups.filter(group => group.findings.length > 0)
+   219	  return (
+   220	    <div className="review-result" data-testid="review-result" data-verdict={review.verdict} data-reviewer-count={reviewers.length}>
+   221	      <p className="review-verdict-line">
+   222	        <span className={`status-badge ${approved ? 'status-succeeded' : 'status-failed'}`} data-testid="review-verdict" data-status={review.verdict}>
+   223	          <span>{approved ? 'Approved' : 'Blocked'}</span>
+   224	        </span>
+   225	        <span className="projects-muted">
+   226	          Combined verdict of {several ? `${reviewers.length} reviewers` : 'the one reviewer'} for review attempt {review.attempt}: every reviewer must approve; approval and integration are separate nodes.
+   227	        </span>
+   228	      </p>
+   229	      {blockedBy !== null && <p className="projects-error-inline" role="status" data-testid="review-blocked-by">{blockedBy}</p>}
+   230	      <p className="review-summary" data-testid="review-summary">{reviewSummary(review)}</p>
+   231	      <dl className="projects-facts">
+   232	        <div>
+   233	          <dt>{several ? 'Reviewers' : 'Reviewer'}</dt>
+   234	          <dd data-testid="review-reviewer">
+   235	            {reviewers.map((reviewer, index) => (
+   236	              <span key={reviewer.reviewer_id} data-reviewer={reviewer.reviewer_id}>
+   237	                {index > 0 && ', '}
+   238	                {several && `${reviewer.reviewer_id}: `}{reviewer.session_id ? <code>{reviewer.session_id}</code> : <span className="projects-muted">no session recorded</span>} · {TRANSPORT_WORDING[reviewer.transport]}
+   239	              </span>
+   240	            ))}
+   241	            {several ? '; independent of every worker lane and of one another' : ', independent of every worker lane'}
+   242	          </dd>
+   243	        </div>
+   244	        <div><dt>Reviewed at</dt><dd>{formatTime(review.reviewed_at)}</dd></div>
+   245	        <div>
+   246	          <dt>Bundle reviewed</dt>
+   247	          <dd data-testid="review-bundle">
+   248	            {candidateNode === null ? bundle : (
+   249	              <AppLink href={runPathname(scope.projectId, scope.workflowId, scope.runId, candidateNode)} onNavigate={onNavigate} title="Open the candidate node this bundle was built from">{bundle}</AppLink>
+   250	            )}
+   251	            {' '}· candidate commit <code title={review.candidate_commit}>{shortRevision(review.candidate_commit)}</code>
+   252	          </dd>
+   253	        </div>
+   254	        <div>
+   255	          <dt>Diff the {several ? 'reviewers' : 'reviewer'} saw</dt>
+   256	          <dd data-testid="review-diff">
+   257	            {review.diff === null ? 'No diff artifact was recorded.' : diffScoped && diffHref !== null ? (
+   258	              <>
+   259	                <a href={diffHref} target="_blank" rel="noopener noreferrer">Open {review.diff.artifact_id}</a>
+   260	                {' '}<span className="projects-muted">(plain text, new tab) · sha256 {review.diff.sha256.slice(0, 12)}…</span>
+   261	              </>
+   262	            ) : (
+   263	              <span className="projects-error-inline" role="alert">The diff link <code>{review.diff.uri}</code> is outside this run's artifact route and was not linked.</span>
+   264	            )}
+   265	          </dd>
+   266	        </div>
+   267	      </dl>
+   268	
+   269	      <ReviewerStrip reviewers={reviewers} />
+   270	
+   271	      <section className="evidence-section" aria-labelledby="review-findings-title" data-testid="review-findings" data-group-by={groupBy} data-reviewer-filter={reviewerFilter ?? 'all'}>
+   272	        <div className="review-findings-head">
+   273	          <h4 id="review-findings-title">Findings</h4>
+   274	          {review.findings.length > 0 && (
+   275	            <>
+   276	              <div className="review-group-toggle" role="group" aria-label="Show findings from">
+   277	                <span className="projects-muted">Reviewer</span>
+   278	                <button type="button" className="button button-small" aria-pressed={reviewerFilter === null} data-testid="filter-reviewer" data-reviewer="all" onClick={() => setReviewerFilter(null)}>All ({review.findings.length})</button>
+   279	                {reviewers.map(reviewer => (
+   280	                  <button
+   281	                    key={reviewer.reviewer_id}
+   282	                    type="button"
+   283	                    className="button button-small"
+   284	                    aria-pressed={reviewerFilter === reviewer.reviewer_id}
+   285	                    data-testid="filter-reviewer"
+   286	                    data-reviewer={reviewer.reviewer_id}
+   287	                    onClick={() => setReviewerFilter(reviewer.reviewer_id)}
+   288	                  >
+   289	                    {reviewer.reviewer_id} ({countFor(reviewer.reviewer_id)})
+   290	                  </button>
+   291	                ))}
+   292	              </div>
+   293	              <div className="review-group-toggle" role="group" aria-label="Group findings by">
+   294	                <span className="projects-muted">Group by</span>
+   295	                <button type="button" className="button button-small" aria-pressed={groupBy === 'disposition'} data-testid="group-by-disposition" onClick={() => setGroupBy('disposition')}>Disposition</button>
+   296	                <button type="button" className="button button-small" aria-pressed={groupBy === 'worker'} data-testid="group-by-worker" onClick={() => setGroupBy('worker')}>Worker</button>
+   297	                <button type="button" className="button button-small" aria-pressed={groupBy === 'reviewer'} data-testid="group-by-reviewer" onClick={() => setGroupBy('reviewer')}>Reviewer</button>
+   298	              </div>
+   299	            </>
+   300	          )}
+   301	        </div>
+   302	        {populated.length === 0 ? (
+   303	          <p className="projects-muted" data-testid="findings-empty">
+   304	            {reviewerFilter !== null ? `Reviewer ${reviewerFilter} recorded no findings.` : several ? 'No reviewer recorded a finding.' : 'The reviewer recorded no findings.'}
+   305	          </p>
+   306	        ) : populated.map(group => (
+   307	          <section key={group.key} className="finding-group" {...group.attributes} aria-labelledby={`findings-${group.key}`}>
+   308	            <h5 id={`findings-${group.key}`}>{group.label} ({group.findings.length})</h5>
+   309	            <div className="table-wrap">
+   310	              <table className="findings-table">
+   311	                <thead>
+   312	                  <tr><th scope="col">Severity</th><th scope="col">Message</th><th scope="col">Worker</th><th scope="col">Reviewer</th><th scope="col">Requirement</th></tr>
+   313	                </thead>
+   314	                <tbody>
+   315	                  {group.findings.map((finding, index) => (
+   316	                    <FindingRow key={`${group.key}-${index}`} finding={finding} scope={scope} definitionNodes={definitionNodes} inputs={inputs} onOpenRequirement={onOpenRequirement} onOpenFile={onOpenFile} capturedFiles={capturedFiles} />
+   317	                  ))}
+   318	                </tbody>
+   319	              </table>
+   320	            </div>
+   321	          </section>
+   322	        ))}
+   323	        <p className="projects-muted">
+   324	          A finding links to a captured file only where its message names the file's path verbatim. Blocking means an unresolved P0 or P1 finding from any reviewer; a quote links only where the task text contains it verbatim. Workers are the lanes this run had{lanes.length > 0 ? ` (${lanes.join(', ')})` : ''}; “multiple workers” covers findings that concern more than one lane. Reviewer names the reviewer that raised the finding; the same finding raised by several reviewers is listed once per reviewer, never merged.
+   325	        </p>
+   326	      </section>
+   327	    </div>
+   328	  )
+   329	}
+   330	
+   331	/**
+   332	 * The Result section of a review node: the persisted combined verdict, every reviewer's identity and outcome, the bundle,
+   333	 * the unioned findings and the diff. A run whose export predates review results (404 REVIEW_NOT_FOUND) is a "not recorded"
+   334	 * state, not an error.
+   335	 */
+   336	export function ReviewPanel({ scope, node, definitionNodes, snapshotNodes, inputs, refreshToken, onNavigate, onOpenRequirement, onOpenFile, onTransport }: Props) {
+   337	  // The snapshot links the recorded review; an older export has no link, so the first attempt is asked for once the node ran.
+   338	  const reviewPath = node.result_uri !== null
+   339	    ? scopedReviewPath(scope, node.result_uri)
+   340	    : node.status === 'pending' ? null : paths.review(scope, Math.max(node.attempt, 1))
+   341	  const unscoped = node.result_uri !== null && reviewPath === null
+   342	  const load = useCallback((signal: AbortSignal) => fetchReviewResult(scope, reviewPath!, signal), [scope, reviewPath])
+   343	  // The fallback path before a review is recorded equals the linked one after, so the key also names what the node shows.
+   344	  const { state, reload } = useResource(reviewPath === null ? null : `${reviewPath}|${node.result_uri ?? node.status}`, load, refreshToken)
+   345	  const none = (
+   346	    <p className="projects-muted" data-testid="review-none">
+   347	      No review recorded for this run: either the review has not happened or the run's export predates review results (re-export it with the workflow CLI).
+   348	    </p>
+   349	  )
+   350	  if (unscoped) {
+   351	    return (
+   352	      <p className="projects-error-inline" role="alert" data-testid="result-unscoped">
+   353	        The review link <code>{node.result_uri}</code> is outside this run's reviews route and was not fetched.
+   354	      </p>
+   355	    )
+   356	  }
+   357	  if (reviewPath === null) return none
+   358	  if (state.status === 'loading' || state.status === 'idle') return <LoadingPanel>Loading the recorded review…</LoadingPanel>
+   359	  if (state.status === 'error') {
+   360	    if (isNotRecorded(state.error, NOT_RECORDED.review)) return none
+   361	    return <ErrorPanel error={state.error} what="The recorded review" onRetry={reload} />
+   362	  }
+   363	  return (
+   364	    <ReviewResultView
+   365	      review={state.data}
+   366	      scope={scope}
+   367	      definitionNodes={definitionNodes}
+   368	      snapshotNodes={snapshotNodes}
+   369	      inputs={inputs}
+   370	      refreshToken={refreshToken}
+   371	      onNavigate={onNavigate}
+   372	      onOpenRequirement={onOpenRequirement}
+   373	      onOpenFile={onOpenFile}
+   374	      onTransport={onTransport}
+   375	    />
+   376	  )
+   377	}
+   378	import type { RunInputs } from './api.ts'
+   379	import { ErrorPanel, LoadingPanel } from './panels.tsx'
+   380	import { formatTime } from './status.ts'
+   381	import type { Resource } from './useResource.ts'
+   382	
+   383	type Challenge = NonNullable<RunInputs['challenge']>
+   384	type Concern = Challenge['concerns'][number]
+   385	
+   386	const SEVERITIES: readonly Concern['severity'][] = ['P0', 'P1', 'P2']
+   387	
+   388	const STATUS_WORDING: Record<Challenge['status'], string> = {
+   389	  passed: 'Passed: no P0 or P1 concern, so the workers were launched.',
+   390	  paused: 'Paused: a P0 or P1 concern stopped the run before any worker was launched. The operator edits the feature files and resumes, or accepts the challenge with a reason, through the workflow CLI.',
+   391	  accepted: 'Accepted: the operator overrode the concerns with the reason below, and the workers were launched.',
+   392	  disabled: 'Disabled: the feature turned the challenge off, so nothing was challenged.',
+   393	}
+   394	
+   395	const KIND_WORDING: Record<Concern['kind'], string> = {
+   396	  assumption: 'fragile assumption',
+   397	  failure_mode: 'likely failure mode',
+   398	  complexity: 'complexity',
+   399	  other: 'other',
+   400	}
+   401	
+   402	/**
+   403	 * The design challenge node's page (PRD_PORTABLE_WORKFLOW 4.5 and 4.8): the outcome, the concerns grouped by severity with
+   404	 * their consequences, the strongest simpler alternative, the cheap experiment, the attempts and the operator's accepted
+   405	 * reason. It is read from the run inputs, which pin the latest `challenge.json`.
+   406	 */
+   407	export function ChallengePanel({ inputs, onRetry }: { inputs: Resource<RunInputs | null>; onRetry: () => void }) {
+   408	  if (inputs.status === 'loading' || inputs.status === 'idle') return <LoadingPanel>Loading the design challenge…</LoadingPanel>
+   409	  if (inputs.status === 'error') return <ErrorPanel error={inputs.error} what="The run inputs" onRetry={onRetry} />
+   410	  const challenge = inputs.data?.challenge ?? null
+   411	  if (challenge === null) {
+   412	    return <p className="projects-muted" data-testid="challenge-none">No design challenge was recorded for this run.</p>
+   413	  }
+   414	  return (
+   415	    <div className="challenge" data-testid="challenge" data-challenge-status={challenge.status}>
+   416	      <dl className="projects-facts">
+   417	        <div><dt>Outcome</dt><dd data-testid="challenge-status"><strong>{challenge.status}</strong> — {STATUS_WORDING[challenge.status]}</dd></div>
+   418	        <div>
+   419	          <dt>Attempts</dt>
+   420	          <dd data-testid="challenge-attempts">
+   421	            {challenge.attempts} {challenge.attempts === 1 ? 'attempt' : 'attempts'}; this is attempt {challenge.attempt}
+   422	            {challenge.attempts > 1 && <span className="projects-muted"> (earlier attempts are kept in the run directory)</span>}
+   423	          </dd>
+   424	        </div>
+   425	        <div><dt>Session</dt><dd>{challenge.session_id ? <code>{challenge.session_id}</code> : 'No session recorded'}</dd></div>
+   426	        <div><dt>Decided</dt><dd>{challenge.decided_at ? formatTime(challenge.decided_at) : 'Not recorded'}</dd></div>
+   427	      </dl>
+   428	
+   429	      {challenge.accepted_reason !== null && (
+   430	        <section className="evidence-section" aria-labelledby="challenge-accepted-title" data-testid="challenge-accepted">
+   431	          <h4 id="challenge-accepted-title">Accepted by the operator</h4>
+   432	          <p className="worker-summary">{challenge.accepted_reason}</p>
+   433	        </section>
+   434	      )}
+   435	
+   436	      <section className="evidence-section" aria-labelledby="challenge-concerns-title" data-testid="challenge-concerns">
+   437	        <h4 id="challenge-concerns-title">Concerns</h4>
+   438	        {challenge.concerns.length === 0 ? (
+   439	          <p className="projects-muted">The challenge raised no concerns.</p>
+   440	        ) : SEVERITIES.filter(severity => challenge.concerns.some(concern => concern.severity === severity)).map(severity => {
+   441	          const concerns = challenge.concerns.filter(concern => concern.severity === severity)
+   442	          return (
+   443	            <div key={severity} className="challenge-severity" data-testid="challenge-severity" data-severity={severity}>
+   444	              <h5>{severity}{severity === 'P2' ? '' : ' (pauses the run unless accepted)'} · {concerns.length} {concerns.length === 1 ? 'concern' : 'concerns'}</h5>
+   445	              <ul className="evidence-list">
+   446	                {concerns.map((concern, index) => (
+   447	                  <li key={index} data-testid="challenge-concern" data-severity={concern.severity} data-kind={concern.kind}>
+   448	                    <p><span className="finding-severity">{concern.severity}</span> <span className="projects-muted">{KIND_WORDING[concern.kind]}</span> — {concern.message}</p>
+   449	                    <p data-testid="challenge-consequence"><strong>Consequence:</strong> {concern.consequence}</p>
+   450	                  </li>
+   451	                ))}
+   452	              </ul>
+   453	            </div>
+   454	          )
+   455	        })}
+   456	      </section>
+   457	
+   458	      <section className="evidence-section" aria-labelledby="challenge-alternative-title" data-testid="challenge-alternative">
+   459	        <h4 id="challenge-alternative-title">Strongest simpler alternative</h4>
+   460	        <p>{challenge.simpler_alternative}</p>
+   461	      </section>
+   462	      <section className="evidence-section" aria-labelledby="challenge-experiment-title" data-testid="challenge-experiment">
+   463	        <h4 id="challenge-experiment-title">Cheap experiment that could change the choice</h4>
+   464	        <p>{challenge.cheap_experiment}</p>
+   465	      </section>
+   466	    </div>
+   467	  )
+   468	}
+   469	import { Markdown } from '../document/Markdown.tsx'
+   470	import type { RunInputs, RunScope } from './api.ts'
+   471	import { AppLink, ErrorPanel, LoadingPanel } from './panels.tsx'
+   472	import { runPathname } from './routes.ts'
+   473	import { deadlinesLabel, formatDuration, shortRevision } from './status.ts'
+   474	import type { Resource } from './useResource.ts'
+   475	
+   476	type Props = {
+   477	  scope: RunScope
+   478	  inputs: Resource<RunInputs | null>
+   479	  onRetry: () => void
+   480	  onNavigate: (pathname: string) => void
+   481	  panelId: string
+   482	  tabId: string
+   483	}
+   484	
+   485	export const INPUTS_NONE_SENTENCE = 'Inputs not recorded for this run (the export predates run inputs; re-export it with the workflow CLI).'
+   486	
+   487	export const DECISIONS_NONE_SENTENCE = 'No decisions.md was recorded for this run (its feature predates the guardrails, or the export predates decisions).'
+   488	
+   489	/** The Assignment tab: what the run was asked to do, pinned from its own files, with the feature's decisions and each worker's task rendered as inert Markdown. */
+   490	export function AssignmentPanel({ scope, inputs, onRetry, onNavigate, panelId, tabId }: Props) {
+   491	  let content: React.ReactNode
+   492	  if (inputs.status === 'loading' || inputs.status === 'idle') content = <LoadingPanel>Loading the run inputs…</LoadingPanel>
+   493	  else if (inputs.status === 'error') content = <ErrorPanel error={inputs.error} what="The run inputs" onRetry={onRetry} />
+   494	  else if (inputs.data === null) content = <p className="projects-muted" data-testid="assignment-inputs-none">{INPUTS_NONE_SENTENCE}</p>
+   495	  else {
+   496	    const data = inputs.data
+   497	    content = (
+   498	      <>
+   499	        <dl className="projects-facts">
+   500	          <div><dt>Feature</dt><dd>{data.feature}</dd></div>
+   501	          <div><dt>Source branch</dt><dd>{data.source_branch === null ? 'None recorded' : <code>{data.source_branch}</code>}</dd></div>
+   502	          <div><dt>Base commit</dt><dd><code title={data.base_commit}>{shortRevision(data.base_commit)}</code></dd></div>
+   503	          <div><dt>Mode</dt><dd>{data.mode}</dd></div>
+   504	          {data.automatic && (
+   505	            <>
+   506	              <div><dt>Deadlines</dt><dd>{deadlinesLabel(data.automatic)}</dd></div>
+   507	              <div><dt>Permission mode</dt><dd><code>{data.automatic.permission_mode}</code></dd></div>
+   508	              <div><dt>Finish</dt><dd>{data.automatic.finish}</dd></div>
+   509	              <div><dt>Reviewer transport</dt><dd data-testid="assignment-reviewer-transport">{data.automatic.reviewer_transport ?? <span className="projects-muted">not pinned (the run predates the setting)</span>}</dd></div>
+   510	            </>
+   511	          )}
+   512	          <div><dt>Attempt cap</dt><dd>{data.max_verification_attempts} per lane and phase</dd></div>
+   513	          <div>
+   514	            <dt>Lanes</dt>
+   515	            <dd data-testid="assignment-lanes">
+   516	              <span data-testid="assignment-selected-workers">{data.selected_workers.length === 0 ? 'none recorded' : data.selected_workers.join(', ')}</span>
+   517	              {' '}<span className="projects-muted">({data.selected_workers.length} {data.selected_workers.length === 1 ? 'worker lane' : 'worker lanes'} in this run)</span>
+   518	              {data.excluded_workers.length > 0 && (
+   519	                <> · <span className="projects-muted">declared but not selected: </span><span data-testid="assignment-excluded-workers">{data.excluded_workers.join(', ')}</span></>
+   520	              )}
+   521	            </dd>
+   522	          </div>
+   523	        </dl>
+   524	
+   525	        <section className="assignment-decisions" data-testid="assignment-decisions" aria-labelledby="assignment-decisions-title">
+   526	          <h4 id="assignment-decisions-title">Decisions</h4>
+   527	          {data.decisions === null ? (
+   528	            <p className="projects-muted" data-testid="assignment-decisions-none">{DECISIONS_NONE_SENTENCE}</p>
+   529	          ) : (
+   530	            <>
+   531	              <p className="projects-muted">The feature's <code>decisions.md</code> as pinned at prepare; every worker and reviewer prompt included it. Links and images in it are shown as text.</p>
+   532	              <div className="task-rendered" data-testid="assignment-decisions-rendered"><Markdown content={data.decisions} inert /></div>
+   533	            </>
+   534	          )}
+   535	        </section>
+   536	
+   537	        <h4 id="assignment-setup-title">Setup commands</h4>
+   538	        {data.setup.length === 0 ? (
+   539	          <p className="projects-muted" data-testid="assignment-setup">No setup commands were pinned.</p>
+   540	        ) : (
+   541	          <ul className="evidence-list" data-testid="assignment-setup" aria-labelledby="assignment-setup-title">
+   542	            {data.setup.map((step, index) => (
+   543	              <li key={index}><code>{step.command}</code> <span className="projects-muted">· timeout {formatDuration(step.timeout_seconds)}</span></li>
+   544	            ))}
+   545	          </ul>
+   546	        )}
+   547	
+   548	        {data.workers.map(worker => (
+   549	          <section key={worker.node_id} className="assignment-worker" data-testid="assignment-worker" data-worker={worker.node_id} aria-labelledby={`assignment-worker-${worker.node_id}`}>
+   550	            <h4 id={`assignment-worker-${worker.node_id}`}>
+   551	              Worker {worker.node_id} ({worker.role}) · launched by{' '}
+   552	              <AppLink href={runPathname(scope.projectId, scope.workflowId, scope.runId, worker.launch_node_id)} onNavigate={onNavigate}>{worker.launch_node_id}</AppLink>
+   553	            </h4>
+   554	            <div className="task-rendered" data-testid="assignment-task"><Markdown content={worker.task.text} inert /></div>
+   555	            {worker.task.truncated && <p className="projects-notice" role="note">The task text was truncated by the viewer API; the marker at its end says how many characters were left out.</p>}
+   556	            <h5 id={`assignment-owned-${worker.node_id}`}>Owned paths</h5>
+   557	            {worker.owned_paths.length === 0 ? <p className="projects-muted">No owned paths were pinned.</p> : (
+   558	              <ul className="evidence-list evidence-files" aria-labelledby={`assignment-owned-${worker.node_id}`}>
+   559	                {worker.owned_paths.map(path => <li key={path}><code>{path}</code></li>)}
+   560	              </ul>
+   561	            )}
+   562	            <h5 id={`assignment-checks-${worker.node_id}`}>Required checks</h5>
+   563	            <p className="projects-muted" data-testid="assignment-required-kinds">
+   564	              Required check kinds: {worker.required_check_kinds.length === 0 ? 'none pinned' : worker.required_check_kinds.join(', ')}
+   565	            </p>
+   566	            {worker.checks.length === 0 ? <p className="projects-muted">No checks were required.</p> : (
+   567	              <ul className="evidence-list" aria-labelledby={`assignment-checks-${worker.node_id}`}>
+   568	                {worker.checks.map(check => (
+   569	                  <li key={check.id}>
+   570	                    <code>{check.command}</code>
+   571	                    <span className="projects-muted"> · {check.id} · {check.kind} · timeout {formatDuration(check.timeout_seconds)}</span>
+   572	                    {check.scenarios.length > 0 && (
+   573	                      <ul className="evidence-list assignment-scenarios">
+   574	                        {check.scenarios.map(scenario => <li key={scenario.id}><code>{scenario.id}</code> — {scenario.description}</li>)}
+   575	                      </ul>
+   576	                    )}
+   577	                  </li>
+   578	                ))}
+   579	              </ul>
+   580	            )}
+   581	          </section>
+   582	        ))}
+   583	      </>
+   584	    )
+   585	  }
+   586	  return (
+   587	    <section role="tabpanel" id={panelId} aria-labelledby={tabId} className="assignment" data-testid="assignment">
+   588	      <h3>Assignment</h3>
+   589	      <p className="projects-muted">What this run was asked to do, pinned from its own plan, policy and receipts. Nothing here can be changed from the viewer.</p>
+   590	      {content}
+   591	    </section>
+   592	  )
+   593	}
+   594	import type { AnchorHTMLAttributes, ReactNode } from 'react'
+   595	import { describeApiError, ProjectsApiError } from './api.ts'
+   596	import { RUN_STATUS_MEANING, STATUS_LABEL, type RunStatus } from './status.ts'
+   597	
+   598	export function StatusBadge({ status, explain = false }: { status: RunStatus; explain?: boolean }) {
+   599	  return (
+   600	    <span className={`status-badge status-${status}`} data-status={status}>
+   601	      <span>{STATUS_LABEL[status]}</span>
+   602	      {explain && <span className="visually-hidden">. {RUN_STATUS_MEANING[status]}</span>}
+   603	    </span>
+   604	  )
+   605	}
+   606	
+   607	export function LoadingPanel({ children }: { children: ReactNode }) {
+   608	  return <p className="projects-loading" aria-busy="true">{children}</p>
+   609	}
+   610	
+   611	/** A failed request: what failed, why, and what the reader can do. Never replaced by sample data. */
+   612	export function ErrorPanel({ error, what, onRetry, children }: { error: unknown; what: string; onRetry?: () => void; children?: ReactNode }) {
+   613	  const api = error instanceof ProjectsApiError ? error : null
+   614	  return (
+   615	    <div className="projects-error" role="alert" data-testid="projects-error" data-error-kind={api?.kind ?? 'unknown'}>
+   616	      <p><strong>{what} could not be loaded.</strong> {describeApiError(error)}</p>
+   617	      {api?.kind === 'http' && api.status !== null && api.status >= 500 && <p>The server reported a failure; nothing was substituted for the missing data. Retry once it has recovered.</p>}
+   618	      {api?.kind === 'malformed' && <p>The response was rejected rather than rendered, because it might be incomplete or from an incompatible server version.</p>}
+   619	      {api && <p className="projects-error-path">Request: <code>{api.path}</code></p>}
+   620	      <div className="projects-actions">
+   621	        {onRetry && <button type="button" className="button" onClick={onRetry}>Retry</button>}
+   622	        {children}
+   623	      </div>
+   624	    </div>
+   625	  )
+   626	}
+   627	
+   628	export function EmptyPanel({ title, children, testId }: { title: string; children?: ReactNode; testId?: string }) {
+   629	  return (
+   630	    <div className="projects-empty" data-testid={testId}>
+   631	      <p><strong>{title}</strong></p>
+   632	      {children}
+   633	    </div>
+   634	  )
+   635	}
+   636	
+   637	type AppLinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href' | 'onClick'> & {
+   638	  href: string
+   639	  onNavigate: (pathname: string) => void
+   640	  children: ReactNode
+   641	  current?: boolean
+   642	}
+   643	
+   644	/** A link that navigates inside the app through history rather than reloading. Other anchor attributes (title, data-*) pass through. */
+   645	export function AppLink({ href, onNavigate, className, children, current = false, ...rest }: AppLinkProps) {
+   646	  return (
+   647	    <a
+   648	      {...rest}
+   649	      href={href}
+   650	      className={className}
+   651	      aria-current={current ? 'page' : undefined}
+   652	      onClick={event => {
+   653	        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return
+   654	        event.preventDefault()
+   655	        onNavigate(href)
+   656	      }}
+   657	    >
+   658	      {children}
+   659	    </a>
+   660	  )
+   661	}

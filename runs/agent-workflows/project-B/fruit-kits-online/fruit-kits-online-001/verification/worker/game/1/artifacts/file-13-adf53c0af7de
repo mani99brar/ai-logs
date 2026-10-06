@@ -1,0 +1,222 @@
+import {
+  duelFrameBundleSchema,
+  DuelMessageType,
+  duelProbeSchema,
+  parseDuelKits,
+  type DuelPracticeMessage,
+  type DuelProbeReply,
+  type DuelRoomPhase,
+  type DummyBehaviour,
+} from "@pirate-sea-race/protocol";
+import { createDuelState, defaultDuelConfig, type DuelState, type PlayerIndex } from "@pirate-sea-race/simulation/duel";
+import { DuelClientSession, type DuelFeedEvent } from "@pirate-sea-race/simulation/netcode";
+import type { ArenaSource } from "./arenaScene.js";
+import { PendingDuelEvents } from "./duelEvents.js";
+import { renderDuelHud, resultText, type DuelConnectionStatus } from "./duelHud.js";
+import { DuelKeyboard } from "./duelKeyboard.js";
+import type { DuelLobby, DuelTransport } from "./duelTransport.js";
+
+/** The client ticks this often: far finer than a frame, and independent of the display's refresh rate. */
+const TICK_MS = 4;
+/** The HUD is redrawn this often. */
+const HUD_MS = 50;
+/** Tick intervals kept for diagnostics: the last 2000 (about eight seconds of fight at 4 ms). */
+const INTERVAL_SAMPLES = 2000;
+
+const { rules } = defaultDuelConfig.moveset;
+
+/**
+ * One browser's duel, over a standalone duel room or inside a match room (the `DuelTransport` seam): the duel's
+ * messages feed a `DuelClientSession` (the same rollback core the headless test client runs), a 4 ms timer ticks it
+ * with the keyboard's input and sends what it returns, the arena draws the predicted state, and the HUD shows the
+ * confirmed one. `window.__duel` exposes read-only diagnostics for tests. `dispose` stops it (a duel at sea ends).
+ */
+export class DuelClient implements ArenaSource {
+  private session: DuelClientSession | undefined;
+  private status: DuelConnectionStatus = "connected";
+  private boxes = false;
+  private readonly keyboard: DuelKeyboard;
+  private readonly timers: number[] = [];
+  private readonly unsubscribe: (() => void)[] = [];
+  private readonly pendingEvents = new PendingDuelEvents();
+  /** Milliseconds between consecutive ticks while the fight runs: how responsive the client's tick is on this machine. */
+  private readonly intervals: number[] = [];
+  private lastTickAt: number | undefined;
+
+  constructor(
+    private readonly transport: DuelTransport,
+    private readonly hud: HTMLElement,
+  ) {
+    this.keyboard = new DuelKeyboard(window);
+    this.unsubscribe.push(
+      transport.onMessage(DuelMessageType.Probe, (message: unknown) => {
+        const probe = duelProbeSchema.safeParse(message);
+        if (!probe.success) return;
+        transport.send(DuelMessageType.Probe, { id: probe.data.id } satisfies DuelProbeReply);
+        this.ensureSession()?.receiveProbe(probe.data, performance.now());
+      }),
+      transport.onMessage(DuelMessageType.Frames, (message: unknown) => {
+        const bundle = duelFrameBundleSchema.safeParse(message);
+        if (bundle.success) this.ensureSession()?.receiveBundle(bundle.data, performance.now());
+      }),
+      transport.onDrop(() => {
+        this.status = "reconnecting";
+      }),
+      transport.onReconnect(() => {
+        this.status = "connected";
+      }),
+      transport.onLeave(() => {
+        this.status = "disconnected";
+        this.renderHud();
+        this.stopTimers();
+      }),
+    );
+    this.timers.push(window.setInterval(() => this.tick(), TICK_MS));
+    this.timers.push(window.setInterval(() => this.renderHud(), HUD_MS));
+    (window as unknown as { __duel: unknown }).__duel = {
+      stats: () => this.session?.stats,
+      frame: () => this.session?.frame,
+      confirmedFrame: () => this.session?.rollback.confirmedFrame,
+      lastTaggedFrame: () => this.session?.lastTaggedFrame,
+      /** Milliseconds between consecutive client ticks during the fight (the last INTERVAL_SAMPLES). */
+      tickIntervals: () => [...this.intervals],
+      /** The input bits this client tagged for frames `from` to `to` (0 where none was). */
+      taggedInputs: (from: number, to: number) =>
+        Array.from({ length: Math.max(0, to - from + 1) }, (_, index) => this.session?.rollback.localInput(from + index) ?? 0),
+    };
+  }
+
+  /** The developer toggle for hurtboxes and hitboxes. */
+  setShowBoxes(show: boolean): void {
+    this.boxes = show;
+  }
+
+  /** Practice rooms: the dummy idles or guards. */
+  setDummy(dummy: DummyBehaviour): void {
+    this.transport.send(DuelMessageType.Practice, { dummy } satisfies DuelPracticeMessage);
+  }
+
+  /** The arena is up: at sea the fight waits for both fighters to say so (§6). */
+  ready(): void {
+    this.transport.ready();
+  }
+
+  /** Stops the timers, the keyboard and the subscriptions: this duel is over and its view is gone. */
+  dispose(): void {
+    this.stopTimers();
+    this.keyboard.dispose();
+    for (const unsubscribe of this.unsubscribe.splice(0)) unsubscribe();
+  }
+
+  state(): DuelState | undefined {
+    return this.session?.state;
+  }
+
+  drainEvents(): DuelFeedEvent[] {
+    this.collectEvents();
+    return this.pendingEvents.drain();
+  }
+
+  stateAt(frame: number): DuelState | undefined {
+    return this.session?.rollback.stateAt(frame);
+  }
+
+  showBoxes(): boolean {
+    return this.boxes;
+  }
+
+  banner(): string {
+    const lobby = this.transport.lobby();
+    if (lobby === undefined) return "";
+    if (lobby.phase === "waiting") return lobby.practice ? "" : "Waiting for an opponent";
+    if (lobby.phase === "countdown") return String(Math.max(1, Math.ceil(lobby.countdown / 60)));
+    if (lobby.phase === "over") return resultText(lobby.winner, lobby.reason);
+    return (this.session?.frame ?? 0) < 45 ? "FIGHT" : "";
+  }
+
+  private get self(): PlayerIndex | undefined {
+    const seats = this.transport.lobby()?.seats;
+    const seat = seats === undefined ? undefined : [...seats].find((entry) => entry.sessionId === this.transport.sessionId);
+    return seat === undefined ? undefined : (seat.slot as PlayerIndex);
+  }
+
+  /**
+   * The session, created once the lobby is known. At sea it is dropped while the duel waits for a fighter who is still
+   * loading after the countdown, so the fight's clock starts from the fight's own frames, not from a paused countdown.
+   */
+  private ensureSession(): DuelClientSession | undefined {
+    const lobby = this.transport.lobby();
+    if (lobby?.phase === "waiting") this.session = undefined;
+    if (this.session !== undefined) return this.session;
+    const self = this.self;
+    const kits = parseDuelKits(lobby?.kits);
+    if (lobby === undefined || lobby.phase === "waiting" || self === undefined || kits === undefined) return undefined;
+    // §9: both fighters' kits are part of the frame-0 state, as the server created it, so the hashes agree.
+    this.session = new DuelClientSession({ config: defaultDuelConfig, player: self, initial: createDuelState(defaultDuelConfig, { seed: lobby.seed, kits }) });
+    return this.session;
+  }
+
+  private tick(): void {
+    const now = performance.now();
+    if (this.transport.lobby()?.phase === "fighting") {
+      if (this.lastTickAt !== undefined) {
+        this.intervals.push(now - this.lastTickAt);
+        if (this.intervals.length > INTERVAL_SAMPLES) this.intervals.shift();
+      }
+      this.lastTickAt = now;
+    } else this.lastTickAt = undefined;
+    const session = this.ensureSession();
+    if (session === undefined) return;
+    // Once the result is in, nothing the player presses matters any more, but the final bundle is still stepped, so
+    // the HUD's health, clock and result end on the server's last frame.
+    const lobby = this.transport.lobby();
+    if (lobby?.phase === "over") {
+      session.finish();
+      this.collectEvents();
+      return;
+    }
+    const delay = lobby?.inputDelay ?? 0;
+    if (delay > 0) session.inputDelay = delay;
+    const tagged = session.lastTaggedFrame;
+    const message = session.tick(performance.now(), this.keyboard.bits());
+    if (session.lastTaggedFrame > tagged) this.keyboard.framesTagged();
+    if (message !== undefined) this.transport.send(DuelMessageType.Input, message);
+    this.collectEvents();
+  }
+
+  /** Events are drained every tick, so none is lost while the arena is not drawing (a hidden tab). */
+  private collectEvents(): void {
+    this.pendingEvents.collect(this.session?.drainEvents() ?? []);
+  }
+
+  private stopTimers(): void {
+    for (const timer of this.timers.splice(0)) window.clearInterval(timer);
+  }
+
+  private renderHud(): void {
+    const lobby: DuelLobby | undefined = this.transport.lobby();
+    const self = this.self;
+    if (lobby === undefined || self === undefined) return;
+    const session = this.session;
+    const seats = [...lobby.seats];
+    const connected = [0, 1].map((slot) => seats.find((seat) => seat.slot === slot)?.connected ?? false) as [boolean, boolean];
+    renderDuelHud(this.hud, {
+      code: lobby.code,
+      practice: lobby.practice,
+      phase: lobby.phase as DuelRoomPhase,
+      status: this.status,
+      self,
+      countdown: lobby.countdown,
+      connected,
+      confirmed: session?.confirmedState ?? createDuelState(defaultDuelConfig, { seed: lobby.seed, kits: parseDuelKits(lobby.kits) ?? ["duelist", "duelist"] }),
+      maxHealth: rules.maxHealth,
+      maxStamina: rules.maxStamina,
+      roundFrames: rules.roundFrames,
+      overtimeFrames: rules.overtimeFrames,
+      rttMs: session?.rttMs ?? 0,
+      inputDelay: lobby.inputDelay,
+      corrections: session?.stats.corrections ?? 0,
+      result: lobby.phase === "over" ? { winner: lobby.winner, reason: lobby.reason } : undefined,
+    });
+  }
+}

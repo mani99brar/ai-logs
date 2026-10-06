@@ -1,0 +1,174 @@
+import { z } from "zod";
+import { encodedSize } from "./input.js";
+
+/**
+ * The ruin messages (protocol v8, §3 and §16). Every regular island's rubbings are locked behind its ruin. A player
+ * moored at the island opens it (R) and gets its clue, then answers; the server alone knows the answer and judges it.
+ * Whether an island is unlocked travels in the synced state; the clue and the verdict are messages to one player.
+ */
+export const RuinMessageType = {
+  /** Client → server: open the ruin of the island this player is moored at (`OpenRuinMessage`). */
+  Open: "open-ruin",
+  /** Client → server: an answer to the ruin this player has open (`AnswerRuinMessage`). */
+  Answer: "answer-ruin",
+  /** Server → client: the clue of the ruin the player opened, to that player only (`RuinClueMessage`). */
+  Clue: "ruin-clue",
+  /** Server → client: the verdict on one answer, to its sender only (`RuinResultMessage`). */
+  Result: "ruin-result",
+} as const;
+
+/**
+ * The carved symbols of a sequence ruin in their display order, and the compass moves of a navigation answer (content's
+ * `RUIN_SYMBOLS` and `RUIN_MOVES`, which the protocol does not depend on). A server unit test keeps them equal.
+ */
+export const RUIN_SYMBOL_NAMES = ["sun", "moon", "tide", "storm", "anchor", "skull"] as const;
+export const RUIN_MOVE_NAMES = ["N", "E", "S", "W"] as const;
+/** The hint relations of a sequence tablet (the ruins module's `SequenceRelation`). */
+export const RUIN_RELATION_NAMES = ["absent", "present", "at", "not-at", "right-after", "right-before", "after", "before"] as const;
+export const RUIN_KIND_NAMES = ["sequence", "navigation"] as const;
+
+export type RuinSymbolName = (typeof RUIN_SYMBOL_NAMES)[number];
+export type RuinMoveName = (typeof RUIN_MOVE_NAMES)[number];
+export type RuinKindName = (typeof RUIN_KIND_NAMES)[number];
+
+/** The longest navigation answer the server reads (the ruins module refuses more than a 4 × 4 grid's 16 moves). */
+export const MAX_RUIN_MOVES = 16;
+/** The largest answer accepted, measured as its JSON encoding. The longest valid one is under 200 bytes. */
+export const MAX_ANSWER_RUIN_BYTES = 256;
+/** The largest open request accepted. A valid one is `{}`. */
+export const MAX_OPEN_RUIN_BYTES = 16;
+/** Ruin messages (opens and answers together) a client may send per second before the server drops the rest. */
+export const MAX_RUIN_MESSAGES_PER_SECOND = 8;
+
+/** An open request carries nothing: the server knows where the sender is moored. */
+export const openRuinMessageSchema = z.strictObject({});
+export type OpenRuinMessage = z.infer<typeof openRuinMessageSchema>;
+
+/**
+ * An answer to the ruin the sender has open: the client's request id (a repeat of an id gets the first verdict again,
+ * and is never judged twice) and the attempt, three symbols in order or a string of compass moves.
+ */
+export const answerRuinMessageSchema = z.strictObject({
+  requestId: z.string().regex(/^[A-Za-z0-9_-]{1,32}$/),
+  attempt: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("sequence"), symbols: z.array(z.enum(RUIN_SYMBOL_NAMES)).min(1).max(RUIN_SYMBOL_NAMES.length) }),
+    z.strictObject({ kind: z.literal("navigation"), moves: z.array(z.enum(RUIN_MOVE_NAMES)).min(1).max(MAX_RUIN_MOVES) }),
+  ]),
+});
+export type AnswerRuinMessage = z.infer<typeof answerRuinMessageSchema>;
+export type RuinAttemptMessage = AnswerRuinMessage["attempt"];
+
+/** Validates an untrusted open request: its size, then its schema. */
+export function validateOpenRuinMessage(message: unknown): OpenRuinMessage | undefined {
+  const size = encodedSize(message);
+  if (size === undefined || size > MAX_OPEN_RUIN_BYTES) return undefined;
+  const parsed = openRuinMessageSchema.safeParse(message);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Validates an untrusted answer: its size, then its schema. */
+export function validateAnswerRuinMessage(message: unknown): AnswerRuinMessage | undefined {
+  const size = encodedSize(message);
+  if (size === undefined || size > MAX_ANSWER_RUIN_BYTES) return undefined;
+  const parsed = answerRuinMessageSchema.safeParse(message);
+  return parsed.success ? parsed.data : undefined;
+}
+
+const cellSchema = z.strictObject({ x: z.int().min(0), y: z.int().min(0) });
+
+/** A ruin's clue as the site shows it (the ruins module's `clueFor`): never the answer, never how long it is to walk. */
+export const ruinClueSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("sequence"),
+    length: z.int().positive(),
+    tablets: z
+      .array(
+        z.strictObject({
+          symbol: z.enum(RUIN_SYMBOL_NAMES),
+          hint: z.strictObject({ relation: z.enum(RUIN_RELATION_NAMES), other: z.enum(RUIN_SYMBOL_NAMES).nullable(), position: z.int().min(0).nullable() }),
+        }),
+      )
+      .max(RUIN_SYMBOL_NAMES.length),
+  }),
+  z.strictObject({ kind: z.literal("navigation"), size: z.int().positive(), start: cellSchema, goal: cellSchema, blocked: z.array(cellSchema).max(64) }),
+]);
+export type RuinClueMessage = z.infer<typeof ruinClueSchema>;
+
+/**
+ * The clue of the ruin the player opened, to that player only (§16): the island, the clue, the world tick before which
+ * their answers are refused (a lockout outlives leaving and reopening; 0 when never locked out) and whether they
+ * already solved it.
+ */
+export const ruinClueMessageSchema = z.strictObject({
+  island: z.int().min(0),
+  clue: ruinClueSchema,
+  lockedUntil: z.int().min(0),
+  solved: z.boolean(),
+});
+export type RuinOpenedMessage = z.infer<typeof ruinClueMessageSchema>;
+
+/**
+ * The verdict on one answer, to its sender only: `solved`, `wrong` (locked out until `lockedUntil`), or `refused` with
+ * the rules' reason (no open ruin, locked out, already solved, a malformed attempt…). `gold` is what this answer paid
+ * (40 on a first solve, else 0), and `unlocked` is true when this answer was the ruin's first solve.
+ */
+export const RUIN_OUTCOMES = ["solved", "wrong", "refused"] as const;
+export const ruinResultMessageSchema = z.strictObject({
+  requestId: z.string().min(1).max(32),
+  island: z.int().min(-1),
+  outcome: z.enum(RUIN_OUTCOMES),
+  reason: z.string().max(32).nullable(),
+  lockedUntil: z.int().min(0),
+  gold: z.int().min(0),
+  unlocked: z.boolean(),
+});
+export type RuinResultMessage = z.infer<typeof ruinResultMessageSchema>;
+
+/** Parses a clue the server sent, or undefined when it is not one. */
+export function parseRuinClueMessage(message: unknown): RuinOpenedMessage | undefined {
+  const parsed = ruinClueMessageSchema.safeParse(message);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Parses a verdict the server sent, or undefined when it is not one. */
+export function parseRuinResultMessage(message: unknown): RuinResultMessage | undefined {
+  const parsed = ruinResultMessageSchema.safeParse(message);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * Test-only ruins (protocol v8), so a scenario can pin what it meets. The dev and test entry reads them (never the
+ * production `main`); they are off unless the variable is set. Comma-separated `island=setting` pairs, where the island
+ * is its number or `*` for every island not named, and the setting is `open` (the island's sources are unlocked from
+ * the start, as if someone had solved its ruin) or a ruin kind, `sequence` or `navigation` (the ruin stays locked and
+ * the server deals the ruins from a seed, still derived from the master secret, that gives the island that kind). For
+ * example `*=open` or `0=sequence,1=navigation`.
+ */
+export const TEST_RUINS_ENV = "PIRATE_SEA_RACE_TEST_RUINS";
+export const TEST_RUIN_SETTINGS = ["open", ...RUIN_KIND_NAMES] as const;
+export type TestRuinSetting = (typeof TEST_RUIN_SETTINGS)[number];
+/** By island number (as a string), or `*` for the rest. */
+export type TestRuins = Readonly<Record<string, TestRuinSetting>>;
+
+export const testRuinsSchema = z.record(z.string().regex(/^(?:\*|\d{1,2})$/), z.enum(TEST_RUIN_SETTINGS)) satisfies z.ZodType<TestRuins>;
+
+/** Parses test-only ruins, or undefined when a pair is malformed or an island is named twice. */
+export function parseTestRuins(text: string): TestRuins | undefined {
+  const ruins: Record<string, TestRuinSetting> = {};
+  for (const pair of text.split(",")) {
+    const match = /^\s*(\*|\d{1,2})=([a-z]+)\s*$/.exec(pair);
+    if (match === null) return undefined;
+    const [, island, setting] = match as unknown as [string, string, string];
+    if (!(TEST_RUIN_SETTINGS as readonly string[]).includes(setting) || island in ruins) return undefined;
+    ruins[island] = setting as TestRuinSetting;
+  }
+  return ruins;
+}
+
+/**
+ * Test-only: ruins for the next match the server creates only, instead of the server's own (`TEST_RUINS_ENV`), so one
+ * browser scenario can meet a locked ruin of a pinned kind while the others play with open islands. Offered only with
+ * the test placement setting, like the placement route; the next match to be created takes them and clears them. The
+ * body is a `TestRuins` object, for example `{ "0": "sequence" }`.
+ */
+export const TEST_NEXT_MATCH_RUINS_PATH = "/__test/next-match-ruins";

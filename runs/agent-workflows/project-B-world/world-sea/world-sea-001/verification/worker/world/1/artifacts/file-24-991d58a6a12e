@@ -1,0 +1,220 @@
+import { describe, expect, it } from "vitest";
+import tiledSource from "../../../assets/source/maps/slice-sea.tmj?raw";
+import generatedModule from "./maps/sliceSea.ts?raw";
+import { sliceSeaSource } from "./maps/sliceSea.js";
+import { privateMatch, rulesPresets } from "./rules.js";
+import { ENGAGEMENT_RANGE_TILES, shipTuning, SIGHT_RADIUS_TILES, travelTargets } from "./sailing.js";
+import { seaMap, spawnSlots } from "./sea.js";
+import { createSeaMap, dockLabel, insideIsland, Terrain, terrainAt, type SeaMapSource } from "./seaMap.js";
+import { seaPathCosts, validateSeaMap } from "./seaValidation.js";
+import { convertTiledMap, formatSeaMapModule, type TiledMap } from "./tiledMap.js";
+
+const SOURCE_PATH = "assets/source/maps/slice-sea.tmj";
+
+describe("map pipeline", () => {
+  it("keeps the generated module in step with the Tiled source map (run `npm run map:build` after editing it)", () => {
+    const converted = convertTiledMap("slice-sea", JSON.parse(tiledSource));
+    if (!converted.ok) throw new Error(converted.issues.join("\n"));
+    expect(converted.value).toEqual(sliceSeaSource);
+    expect(formatSeaMapModule(converted.value, "sliceSeaSource", SOURCE_PATH)).toBe(generatedModule);
+  });
+
+  const tiled = (): TiledMap => JSON.parse(tiledSource) as TiledMap;
+  const issuesOf = (candidate: unknown) => {
+    const result = convertTiledMap("broken", candidate);
+    return result.ok ? [] : result.issues;
+  };
+
+  it("refuses maps outside the documented Tiled subset", () => {
+    const infinite = { ...tiled(), infinite: true };
+    const extraLayer = { ...tiled(), layers: [...tiled().layers, { type: "imagelayer", name: "art" }] };
+    const bigTiles = { ...tiled(), tilewidth: 32 };
+    for (const broken of [infinite, extraLayer, bigTiles, "not a map"]) expect(issuesOf(broken).length).toBeGreaterThan(0);
+  });
+
+  it("refuses an empty cell, a tile without a terrain type, and flipped tiles", () => {
+    for (const gid of [0, 9, 0x80000002]) {
+      const map = tiled();
+      map.layers[0].data[5] = gid;
+      expect(issuesOf(map).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("refuses badly authored objects", () => {
+    const edit = (change: (objects: TiledMap["layers"][1]["objects"]) => void) => {
+      const map = tiled();
+      change(map.layers[1].objects);
+      return issuesOf(map);
+    };
+    const island = (objects: TiledMap["layers"][1]["objects"]) => objects.find((object) => object.type === "island")!;
+    const spawn = (objects: TiledMap["layers"][1]["objects"]) => objects.find((object) => object.type === "spawn")!;
+    expect(edit((objects) => void (island(objects).x += 3))).toEqual([expect.stringMatching(/tile boundaries/)]);
+    expect(edit((objects) => void (island(objects).properties = [{ name: "theme", type: "string", value: "candy" }]))).toEqual([
+      expect.stringMatching(/theme must be one of/),
+    ]);
+    expect(edit((objects) => void spawn(objects).properties!.push({ name: "loot", type: "int", value: 3 }))).toEqual([
+      expect.stringMatching(/unknown property "loot"/),
+    ]);
+    expect(edit((objects) => void (spawn(objects).properties = [{ name: "slot", type: "int", value: 0 }]))).toEqual([
+      expect.stringMatching(/facing must be one of/),
+    ]);
+    const repeated = edit((objects) => void spawn(objects).properties!.forEach((entry) => entry.name === "slot" && (entry.value = 5)));
+    expect(repeated).toEqual(["spawns: slots must run 0, 1, 2… without gaps or repeats (found 1, 2, 3, 4, 5, 5, 6, 7)"]);
+  });
+});
+
+/** The slice map with some tiles changed: `edits` maps "x,y" to a terrain character. */
+function editedMap(edits: Record<string, string>, change: Partial<SeaMapSource> = {}): SeaMapSource {
+  const rows = sliceSeaSource.rows.map((row, tileY) =>
+    [...row].map((char, tileX) => edits[`${tileX},${tileY}`] ?? char).join(""),
+  );
+  return { ...sliceSeaSource, rows, ...change };
+}
+
+function issuesFor(source: SeaMapSource, tuning = shipTuning): string[] {
+  const result = validateSeaMap(createSeaMap(source), tuning);
+  return result.ok ? [] : result.issues;
+}
+
+/** Every tile of a rectangle, as edits. */
+function fill(tileX: number, tileY: number, width: number, height: number, char: string): Record<string, string> {
+  const edits: Record<string, string> = {};
+  for (let y = tileY; y < tileY + height; y++) for (let x = tileX; x < tileX + width; x++) edits[`${x},${y}`] = char;
+  return edits;
+}
+
+describe("the slice sea", () => {
+  it("passes every map validator", () => {
+    const result = validateSeaMap(seaMap, shipTuning);
+    if (!result.ok) throw new Error(result.issues.join("\n"));
+  });
+
+  it("has four small islands, each with a dock beside its land, shoals, and eight outer-sea spawn slots", () => {
+    expect(seaMap.islands).toHaveLength(rulesPresets.slice.islands);
+    expect(seaMap.islands).toHaveLength(4);
+    seaMap.islands.forEach((island, index) => {
+      expect(seaMap.docks.filter((dock) => dock.island === index).length).toBeGreaterThanOrEqual(1);
+      expect(island.widthTiles * island.heightTiles).toBeLessThanOrEqual(16 * 16);
+    });
+    expect(seaMap.terrain.filter((kind) => kind === Terrain.Shoal).length).toBeGreaterThan(0);
+    expect(spawnSlots).toHaveLength(privateMatch.maxPlayers);
+    expect(new Set(spawnSlots.map((slot) => `${slot.tileX},${slot.tileY}`)).size).toBe(8);
+    for (const slot of spawnSlots) {
+      expect(terrainAt(seaMap, slot.tileX, slot.tileY)).toBe(Terrain.Sea);
+      expect(seaMap.islands.some((island) => insideIsland(island, slot.tileX, slot.tileY))).toBe(false);
+    }
+    expect(dockLabel(seaMap, 0)).toMatch(/^[A-Z][a-z]+ [A-Z][a-z]+, [a-z-]+ dock$/);
+  });
+
+  it("meets the travel-time targets at full speed", () => {
+    const result = validateSeaMap(seaMap, shipTuning);
+    if (!result.ok) throw new Error(result.issues.join("\n"));
+    const { nearestIsland, longestCrossing, firstDock } = result.value;
+    expect(nearestIsland).toHaveLength(4);
+    for (const entry of nearestIsland) {
+      expect(entry.seconds).toBeGreaterThanOrEqual(20);
+      expect(entry.seconds).toBeLessThanOrEqual(40);
+    }
+    expect(longestCrossing.seconds).toBeLessThanOrEqual(90);
+    for (const entry of firstDock) expect(entry.seconds).toBeLessThanOrEqual(travelTargets.firstDockMaxSeconds);
+  });
+
+  it("starts adjacent spawn slots out of engagement range, and sees further than it engages", () => {
+    expect(SIGHT_RADIUS_TILES).toBeGreaterThan(ENGAGEMENT_RANGE_TILES);
+    spawnSlots.forEach((slot, index) => {
+      const next = spawnSlots[(index + 1) % spawnSlots.length]!;
+      const dx = next.tileX - slot.tileX;
+      const dy = next.tileY - slot.tileY;
+      expect(dx * dx + dy * dy).toBeGreaterThan(ENGAGEMENT_RANGE_TILES * ENGAGEMENT_RANGE_TILES);
+    });
+  });
+
+  it("reaches every dock and spawn slot by sea", () => {
+    const [first] = spawnSlots;
+    const costs = seaPathCosts(seaMap, first!.tileX, first!.tileY);
+    for (const point of [...seaMap.docks, ...spawnSlots]) {
+      expect(costs[point.tileY * seaMap.widthTiles + point.tileX]).toBeLessThan(Number.MAX_SAFE_INTEGER);
+    }
+  });
+});
+
+describe("map validators fail on a broken map", () => {
+  const palm = seaMap.islands[0]!;
+  const palmDocks = seaMap.docks.filter((dock) => dock.island === 0);
+
+  it("an island without a dock", () => {
+    const edits = Object.fromEntries(palmDocks.map((dock) => [`${dock.tileX},${dock.tileY}`, "."]));
+    expect(issuesFor(editedMap(edits))).toContain(`${palm.name}: no dock`);
+  });
+
+  it("a dock away from its island's land", () => {
+    const dock = palmDocks[0]!;
+    const island = seaMap.islands[0]!;
+    // A dock tile in the island rectangle's corner, which touches only sea.
+    const corner = `${island.tileX + island.widthTiles - 1},${island.tileY + island.heightTiles - 1}`;
+    expect(issuesFor(editedMap({ [corner]: "D", [`${dock.tileX},${dock.tileY}`]: "D" }))).toEqual([
+      expect.stringMatching(/not beside Palm Key's land/),
+    ]);
+  });
+
+  it("a fifth island, or land outside every island", () => {
+    const extra = { name: "Extra Isle", theme: "mist" as const, tileX: 100, tileY: 70, widthTiles: 3, heightTiles: 3 };
+    const withFifth = editedMap({ ...fill(100, 70, 2, 2, "#"), "102,71": "D" }, { islands: [...sliceSeaSource.islands, extra] });
+    expect(issuesFor(withFifth)).toContain("5 islands, not 4");
+    expect(issuesFor(editedMap(fill(100, 70, 2, 2, "#")))).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^land at 100,70 lies in 0 island rectangles/)]),
+    );
+  });
+
+  it("a large island", () => {
+    const islands = sliceSeaSource.islands.map((island, index) => (index === 0 ? { ...island, widthTiles: 20 } : island));
+    expect(issuesFor({ ...sliceSeaSource, islands })).toEqual(expect.arrayContaining([expect.stringMatching(/not a small island/)]));
+  });
+
+  it("no shoals", () => {
+    const rows = sliceSeaSource.rows.map((row) => row.replaceAll("%", "."));
+    expect(issuesFor({ ...sliceSeaSource, rows })).toContain("no shoals");
+  });
+
+  it("a dock walled in by shoals", () => {
+    const dock = palmDocks.find((each) => each.side === "S")!;
+    // A shoal ring two tiles out, from land edge to land edge.
+    const ring = {
+      ...fill(dock.tileX - 3, dock.tileY + 2, 7, 1, "%"),
+      ...fill(dock.tileX - 3, dock.tileY - 1, 1, 3, "%"),
+      ...fill(dock.tileX + 3, dock.tileY - 1, 1, 3, "%"),
+    };
+    const otherDocks = Object.fromEntries(palmDocks.filter((each) => each !== dock).map((each) => [`${each.tileX},${each.tileY}`, "."]));
+    const issues = issuesFor(editedMap({ ...ring, ...otherDocks }));
+    expect(issues).toEqual([expect.stringMatching(/Palm Key S dock at \d+,\d+: not reachable by sea/)]);
+  });
+
+  it("a sea cut in two", () => {
+    const issues = issuesFor(editedMap(fill(0, 104 - 3, sliceSeaSource.widthTiles, 1, "%")));
+    expect(issues.some((issue) => /not reachable by sea/.test(issue))).toBe(true);
+  });
+
+  it("spawn slots in engagement range, on land, inside the archipelago or missing", () => {
+    const moved = (index: number, tileX: number, tileY: number) =>
+      editedMap({}, { spawnSlots: sliceSeaSource.spawnSlots.map((slot, each) => (each === index ? { ...slot, tileX, tileY } : slot)) });
+    const [zero] = sliceSeaSource.spawnSlots;
+    expect(issuesFor(moved(1, zero!.tileX + 4, zero!.tileY + 4))).toEqual([expect.stringMatching(/slot 0 .*within engagement range of slot 1/)]);
+    expect(issuesFor(moved(1, palm.tileX + 5, palm.tileY + 4))).toEqual(
+      expect.arrayContaining([expect.stringMatching(/not on open sea/), expect.stringMatching(/inside the archipelago/)]),
+    );
+    expect(issuesFor(moved(1, 110, 70))).toEqual([expect.stringMatching(/inside the archipelago, not on the outer sea/)]);
+    expect(issuesFor(editedMap({}, { spawnSlots: sliceSeaSource.spawnSlots.slice(1) }))).toContain("7 spawn slots, not 8");
+  });
+
+  it("islands too close or crossings too long for the ship's speed", () => {
+    const fast = issuesFor(sliceSeaSource, { ...shipTuning, maxSpeed: 2 * shipTuning.maxSpeed });
+    expect(fast.filter((issue) => /nearest island, .* outside 20–40 s/.test(issue))).toHaveLength(4);
+    const slow = issuesFor(sliceSeaSource, { ...shipTuning, maxSpeed: shipTuning.maxSpeed / 2 });
+    expect(slow).toEqual(expect.arrayContaining([expect.stringMatching(/takes [\d.]+ s, over 90 s/)]));
+  });
+
+  it("a spawn slot far from every dock", () => {
+    const slow = issuesFor(sliceSeaSource, { ...shipTuning, maxSpeed: shipTuning.maxSpeed / 3 });
+    expect(slow).toEqual(expect.arrayContaining([expect.stringMatching(/spawn slot \d: the nearest dock is [\d.]+ s away, over 40 s/)]));
+  });
+});

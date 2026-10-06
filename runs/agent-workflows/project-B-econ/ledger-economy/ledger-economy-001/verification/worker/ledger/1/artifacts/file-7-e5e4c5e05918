@@ -1,0 +1,812 @@
+import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+import { describe, expect, it } from "vitest";
+import {
+  activeTonic,
+  addPlayer,
+  advanceLedger,
+  assertLedger,
+  assignSources,
+  cacheRubbings,
+  cancelChannel,
+  checkLedger,
+  chooseTheft,
+  createLedger,
+  disconnectPlayer,
+  eligibleTheftTypes,
+  expireReservation,
+  findDuel,
+  findPlayer,
+  findRubbing,
+  grantGold,
+  hashState,
+  heldTypes,
+  holdsAllTypes,
+  objectiveRules,
+  progressChannel,
+  purchase,
+  quitPlayer,
+  reconnectPlayer,
+  reportDuelResult,
+  reserveDuel,
+  startCacheClaim,
+  startCollect,
+  unlockSource,
+  useTonic,
+  type LedgerState,
+  type ObjectiveRules,
+  type LedgerStep,
+  type RubbingLocation,
+  type SourceSite,
+} from "./index.js";
+
+function sites(preset: RulesPresetId): SourceSite[] {
+  const { islands, sourcesPerIsland } = rulesPresets[preset];
+  return Array.from({ length: islands * sourcesPerIsland }, (_, index) => ({
+    island: Math.floor(index / sourcesPerIsland),
+    x: 1000 * index,
+    y: 500,
+  }));
+}
+
+/** Freezes a state deeply, so any operation that writes into its input throws. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+/**
+ * A ledger under test: every operation runs on a frozen state, the invariant is checked after it, and a rejected
+ * request must hand back the very state it was given.
+ */
+class Run {
+  state: LedgerState;
+  now = 1;
+
+  constructor(preset: RulesPresetId, players: readonly string[], seed = 11, rules?: ObjectiveRules) {
+    let state = createLedger({ preset, seed, sites: sites(preset), rules });
+    for (const source of state.sources) state = unlockSource(state, { sourceId: source.id, tick: 0 }).state;
+    for (const playerId of players) state = addPlayer(state, { playerId, tick: 0 }).state;
+    assertLedger(state);
+    this.state = deepFreeze(state);
+  }
+
+  do<Q, R extends { readonly ok: boolean }>(op: (state: LedgerState, request: Q) => LedgerStep<R>, request: Q): R {
+    const before = this.state;
+    const { state, result } = op(before, request);
+    assertLedger(state);
+    if (!result.ok) expect(state).toBe(before);
+    this.state = deepFreeze(state);
+    return result;
+  }
+
+  where(rubbingId: string): RubbingLocation {
+    return findRubbing(this.state, rubbingId)!.location;
+  }
+
+  sourceOf(rubbingId: string): string {
+    return this.state.sources.find((source) => source.rubbingId === rubbingId)!.id;
+  }
+
+  gold(playerId: string): number {
+    return findPlayer(this.state, playerId)!.gold;
+  }
+
+  tonics(playerId: string): number {
+    return findPlayer(this.state, playerId)!.tonics;
+  }
+
+  /** §11's gold identity: balances plus gold spent equal gold issued. */
+  expectGoldAccounted(): void {
+    const balances = this.state.players.reduce((sum, entry) => sum + entry.gold, 0);
+    expect(balances + this.state.goldSpent).toBe(this.state.goldIssued);
+  }
+
+  /** Holds interact for the full six seconds from the next tick. */
+  hold(playerId: string, ticks = this.state.rules.collectTicks) {
+    let last;
+    for (let index = 0; index < ticks; index++) last = this.do(progressChannel, { playerId, tick: ++this.now });
+    return last!;
+  }
+
+  collect(playerId: string, rubbingId: string): void {
+    expect(this.do(startCollect, { playerId, sourceId: this.sourceOf(rubbingId), tick: this.now }).status).toBe("started");
+    expect(this.hold(playerId).status).toBe("collected");
+    expect(this.where(rubbingId)).toEqual({ kind: "player", playerId });
+  }
+
+  duel(duelId: string, a: string, b: string, winner: string | null) {
+    expect(this.do(reserveDuel, { duelId, players: [a, b], tick: ++this.now }).ok).toBe(true);
+    return this.do(
+      reportDuelResult,
+      winner === null ? { duelId, tick: ++this.now, outcome: "draw" } : { duelId, tick: ++this.now, outcome: "win", winner },
+    );
+  }
+}
+
+const player = (playerId: string): RubbingLocation => ({ kind: "player", playerId });
+
+describe("ledger state and content", () => {
+  it("seals the slice's 8 and the alpha's 12 rubbings, one per source, all locked at first", () => {
+    for (const [preset, count] of [["slice", 8], ["alpha", 12]] as const) {
+      const state = createLedger({ preset, seed: 3, sites: sites(preset) });
+      assertLedger(state);
+      expect(state.rubbings).toHaveLength(count);
+      expect(state.sources.every((source) => !source.unlocked)).toBe(true);
+      for (const rubbing of state.rubbings) {
+        const source = state.sources.find((candidate) => candidate.rubbingId === rubbing.id)!;
+        expect(rubbing.location).toEqual({ kind: "source", sourceId: source.id });
+        expect(rubbing.type).toBe(source.type);
+      }
+    }
+  });
+
+  it("deals the rubbings onto islands from the seed alone", () => {
+    const deal = (seed: number) => assignSources("alpha", sites("alpha"), seed).assignment.sources.map((source) => source.rubbingId);
+    expect(deal(5)).toEqual(deal(5));
+    const deals = new Set([1, 2, 3, 4, 5, 6].map((seed) => deal(seed).join(",")));
+    expect(deals.size).toBeGreaterThan(1);
+    expect(() => assignSources("slice", sites("alpha"), 1)).toThrow(/invalid source sites/);
+  });
+
+  it("finds every broken rule in a corrupted state", () => {
+    const run = new Run("slice", ["a", "b"]);
+    run.collect("a", "sun-1");
+    const state = run.state;
+    const duplicated = { ...state, rubbings: [...state.rubbings, state.rubbings[0]!] };
+    expect(checkLedger(duplicated).join("\n")).toMatch(/present 2 times/);
+    const lost = { ...state, rubbings: state.rubbings.slice(1) };
+    expect(checkLedger(lost).join("\n")).toMatch(/present 0 times/);
+    const twoSuns = {
+      ...state,
+      rubbings: state.rubbings.map((rubbing) => (rubbing.id === "sun-2" ? { ...rubbing, location: player("a") } : rubbing)),
+    };
+    expect(checkLedger(twoSuns).join("\n")).toMatch(/holds two sun/);
+    const nowhere = {
+      ...state,
+      rubbings: state.rubbings.map((rubbing) => (rubbing.id === "moon-1" ? { ...rubbing, location: player("ghost") } : rubbing)),
+    };
+    expect(checkLedger(nowhere).join("\n")).toMatch(/unknown player ghost/);
+    const minted = { ...state, players: state.players.map((entry) => ({ ...entry, gold: entry.gold + 1 })) };
+    expect(checkLedger(minted).join("\n")).toMatch(/balances sum/);
+    const emptyCache = { ...state, caches: [{ id: "cache-9", x: 0, y: 0, createdTick: 0 }] };
+    expect(checkLedger(emptyCache).join("\n")).toMatch(/cache cache-9 is empty/);
+    const unspent = { ...state, goldSpent: 5 };
+    expect(checkLedger(unspent).join("\n")).toMatch(/balances sum/);
+    const threeTonics = { ...state, players: state.players.map((entry) => ({ ...entry, tonics: 3 })) };
+    expect(checkLedger(threeTonics).join("\n")).toMatch(/carries 3 tonics/);
+    const grant = { reason: "supply-cache", sourceKey: "s1", playerId: "a", amount: 25, tick: 0 } as const;
+    const twice = { ...state, grants: [grant, { ...grant, playerId: "b" }], goldIssued: state.goldIssued + 50 };
+    expect(checkLedger(twice).join("\n")).toMatch(/supply cache s1 was granted twice/);
+    const bought = { requestId: "r1", playerId: "a", item: "rumor", price: 25, tick: 0, goldAfter: 25, tonicsAfter: 0 } as const;
+    const charged = { ...state, purchases: [bought, bought], goldSpent: 50, goldIssued: state.goldIssued + 50 };
+    expect(checkLedger(charged).join("\n")).toMatch(/request r1 was charged twice/);
+  });
+});
+
+describe("collection (§4)", () => {
+  it("takes six uninterrupted seconds at an unlocked source", () => {
+    const run = new Run("slice", ["a"]);
+    const sourceId = run.sourceOf("moon-2");
+    expect(run.do(startCollect, { playerId: "a", sourceId, tick: run.now }).status).toBe("started");
+    expect(run.hold("a", 119).status).toBe("held");
+    expect(run.where("moon-2").kind).toBe("source");
+    const done = run.do(progressChannel, { playerId: "a", tick: ++run.now });
+    expect(done).toMatchObject({ status: "collected", rubbingId: "moon-2", channel: null });
+    expect(done.transfers).toEqual([
+      { rubbingId: "moon-2", from: { kind: "source", sourceId }, to: player("a"), revisionBefore: 0, revisionAfter: 1 },
+    ]);
+    expect(run.do(progressChannel, { playerId: "a", tick: ++run.now }).rejection).toBe("no-channel");
+  });
+
+  it("resets progress on an interruption and ends it on cancel", () => {
+    const run = new Run("slice", ["a"]);
+    const sourceId = run.sourceOf("sun-1");
+    run.do(startCollect, { playerId: "a", sourceId, tick: run.now });
+    run.hold("a", 100);
+    run.now += 2;
+    const reset = run.do(progressChannel, { playerId: "a", tick: run.now });
+    expect(reset.status).toBe("reset");
+    expect(reset.channel).toMatchObject({ heldTicks: 0, startTick: run.now });
+    expect(run.hold("a", 119).status).toBe("held");
+    expect(run.do(cancelChannel, { playerId: "a", tick: run.now }).status).toBe("cancelled");
+    expect(run.do(progressChannel, { playerId: "a", tick: ++run.now }).rejection).toBe("no-channel");
+    expect(run.where("sun-1").kind).toBe("source");
+    expect(run.do(cancelChannel, { playerId: "a", tick: run.now }).rejection).toBe("no-channel");
+  });
+
+  it("ignores duplicate starts and stale progress", () => {
+    const run = new Run("slice", ["a"]);
+    const sourceId = run.sourceOf("sun-1");
+    run.do(startCollect, { playerId: "a", sourceId, tick: run.now });
+    run.hold("a", 10);
+    expect(run.do(startCollect, { playerId: "a", sourceId, tick: run.now }).rejection).toBe("duplicate");
+    expect(run.do(progressChannel, { playerId: "a", tick: run.now }).rejection).toBe("duplicate");
+    expect(run.do(progressChannel, { playerId: "a", tick: run.now - 3 }).rejection).toBe("stale-tick");
+    expect(findPlayer(run.state, "a")!.channel!.heldTicks).toBe(10);
+  });
+
+  it("refuses a locked source, an emptied one, and a type the player holds, which stays sealed", () => {
+    const run = new Run("slice", ["a", "b"]);
+    const locked = createLedger({ preset: "slice", seed: 11, sites: sites("slice") });
+    const withPlayer = addPlayer(locked, { playerId: "a", tick: 0 }).state;
+    expect(startCollect(withPlayer, { playerId: "a", sourceId: locked.sources[0]!.id, tick: 0 }).result.rejection).toBe("source-locked");
+
+    run.collect("a", "sun-1");
+    const refused = run.do(startCollect, { playerId: "a", sourceId: run.sourceOf("sun-2"), tick: run.now });
+    expect(refused.rejection).toBe("type-held");
+    expect(run.where("sun-2").kind).toBe("source");
+    expect(run.do(startCollect, { playerId: "b", sourceId: run.sourceOf("sun-1"), tick: run.now }).rejection).toBe("source-empty");
+    expect(run.do(startCollect, { playerId: "b", sourceId: "source-99-0", tick: run.now }).rejection).toBe("unknown-source");
+    expect(run.do(startCollect, { playerId: "ghost", sourceId: run.sourceOf("sun-2"), tick: run.now }).rejection).toBe("unknown-player");
+  });
+
+  it("gives a contested source to the first player to finish only", () => {
+    const run = new Run("slice", ["a", "b"]);
+    const sourceId = run.sourceOf("moon-1");
+    run.do(startCollect, { playerId: "a", sourceId, tick: run.now });
+    run.do(startCollect, { playerId: "b", sourceId, tick: run.now });
+    for (let tick = 1; tick <= 120; tick++) {
+      run.now++;
+      const first = run.do(progressChannel, { playerId: "b", tick: run.now });
+      const second = run.do(progressChannel, { playerId: "a", tick: run.now });
+      if (tick === 120) {
+        expect(first.status).toBe("collected");
+        expect(second).toMatchObject({ status: "failed", failure: "source-empty" });
+      }
+    }
+    expect(run.where("moon-1")).toEqual(player("b"));
+    expect(heldTypes(run.state, "a")).toEqual([]);
+  });
+
+  it("reports whether a player holds every type", () => {
+    const run = new Run("slice", ["a"]);
+    run.collect("a", "sun-3");
+    expect(holdsAllTypes(run.state, "a")).toBe(false);
+    run.collect("a", "moon-4");
+    expect(holdsAllTypes(run.state, "a")).toBe(true);
+  });
+});
+
+describe("duel settlement (§4, §11)", () => {
+  it("reserves both inventories, cancels channels and blocks collection until settled", () => {
+    const run = new Run("slice", ["a", "b"]);
+    run.collect("a", "sun-1");
+    run.do(startCollect, { playerId: "b", sourceId: run.sourceOf("moon-1"), tick: run.now });
+    run.hold("b", 5);
+    const reserved = run.do(reserveDuel, { duelId: "d1", players: ["a", "b"], tick: ++run.now });
+    expect(reserved.duel).toMatchObject({ phase: "fighting", players: ["a", "b"] });
+    expect(run.where("sun-1")).toEqual({ kind: "duel", duelId: "d1", playerId: "a" });
+    expect(findPlayer(run.state, "b")!.channel).toBeNull();
+    expect(run.do(startCollect, { playerId: "b", sourceId: run.sourceOf("moon-1"), tick: run.now }).rejection).toBe("player-in-duel");
+    expect(run.do(reserveDuel, { duelId: "d1", players: ["a", "b"], tick: run.now }).rejection).toBe("duplicate");
+    expect(run.do(reserveDuel, { duelId: "d2", players: ["b", "a"], tick: run.now }).rejection).toBe("player-in-duel");
+    expect(run.do(reserveDuel, { duelId: "d3", players: ["a", "a"], tick: run.now }).rejection).toBe("same-player");
+  });
+
+  it("lets the winner choose an eligible type within the window, once", () => {
+    const run = new Run("alpha", ["a", "b"]);
+    run.collect("b", "sun-1");
+    run.collect("b", "moon-1");
+    run.collect("a", "moon-2");
+    const decided = run.duel("d1", "a", "b", "a");
+    expect(decided.duel).toMatchObject({ phase: "choosing", choiceDeadline: run.now + 100 });
+    expect(eligibleTheftTypes(run.state, "d1")).toEqual(["sun"]);
+
+    expect(run.do(chooseTheft, { duelId: "d1", playerId: "b", type: "sun", tick: run.now }).rejection).toBe("not-winner");
+    expect(run.do(chooseTheft, { duelId: "d1", playerId: "a", type: "moon", tick: run.now }).rejection).toBe("ineligible-type");
+    const chosen = run.do(chooseTheft, { duelId: "d1", playerId: "a", type: "sun", tick: run.now + 99 });
+    expect(chosen.duel!.settlement).toMatchObject({ stolenRubbingId: "sun-1", choice: "winner", gold: 10, goldSuppressed: false });
+    expect(run.where("sun-1")).toEqual(player("a"));
+    expect(run.where("moon-1")).toEqual(player("b"));
+    expect(run.where("moon-2")).toEqual(player("a"));
+    expect([run.gold("a"), run.gold("b")]).toEqual([60, 40]);
+    expect(findPlayer(run.state, "b")!.freshRumors).toEqual(["sun"]);
+
+    const settled = run.state;
+    for (const repeat of [
+      () => run.do(chooseTheft, { duelId: "d1", playerId: "a", type: "sun", tick: run.now + 99 }),
+      () => run.do(reportDuelResult, { duelId: "d1", tick: run.now + 99, outcome: "win", winner: "b" }),
+      () => run.do(reportDuelResult, { duelId: "d1", tick: run.now + 99, outcome: "draw" }),
+      () => run.do(advanceLedger, { tick: run.now + 500 }),
+    ]) {
+      const result = repeat();
+      if ("duel" in result) expect(result).toMatchObject({ rejection: "already-resolved", duel: { phase: "settled" } });
+    }
+    expect(run.state.rubbings).toEqual(settled.rubbings);
+    expect(run.state.players).toEqual(settled.players);
+  });
+
+  it("refuses a choice after the window and defaults to the type with the fewest free sources", () => {
+    const run = new Run("alpha", ["a", "b", "c"]);
+    run.collect("b", "sun-1");
+    run.collect("b", "moon-1");
+    run.collect("b", "tide-1");
+    run.collect("c", "tide-2");
+    run.duel("d1", "a", "b", "a");
+    const deadline = findDuel(run.state, "d1")!.choiceDeadline!;
+    expect(run.do(advanceLedger, { tick: deadline - 1 }).settled).toEqual([]);
+    expect(run.do(chooseTheft, { duelId: "d1", playerId: "a", type: "sun", tick: deadline }).rejection).toBe("choice-window-closed");
+    const expired = run.do(advanceLedger, { tick: deadline });
+    expect(expired.settled.map((duel) => duel.settlement)).toMatchObject([{ stolenType: "tide", choice: "default" }]);
+    expect(run.where("tide-1")).toEqual(player("a"));
+  });
+
+  it("breaks a default tie by the fixed type order", () => {
+    const run = new Run("alpha", ["a", "b"]);
+    run.collect("b", "tide-1");
+    run.collect("b", "sun-1");
+    run.collect("b", "moon-1");
+    run.collect("a", "moon-2");
+    run.duel("d1", "a", "b", "a");
+    run.do(advanceLedger, { tick: run.now + 100 });
+    expect(findDuel(run.state, "d1")!.settlement).toMatchObject({ stolenType: "sun", choice: "default" });
+  });
+
+  it("moves no rubbing but still gold when no type is eligible", () => {
+    const run = new Run("slice", ["a", "b"]);
+    run.collect("a", "sun-1");
+    run.collect("b", "sun-2");
+    const result = run.duel("d1", "a", "b", "a");
+    expect(result.duel).toMatchObject({ phase: "settled", settlement: { stolenRubbingId: null, choice: "none", gold: 10 } });
+    expect(run.where("sun-1")).toEqual(player("a"));
+    expect(run.where("sun-2")).toEqual(player("b"));
+    expect(findPlayer(run.state, "b")!.freshRumors).toEqual([]);
+  });
+
+  it("moves nothing on a draw or a same-tick double forfeit", () => {
+    const run = new Run("slice", ["a", "b"]);
+    run.collect("a", "sun-1");
+    run.collect("b", "moon-1");
+    const before = { rubbings: run.state.rubbings.map((rubbing) => [rubbing.id, rubbing.location]), gold: [run.gold("a"), run.gold("b")] };
+    expect(run.duel("d1", "a", "b", null).duel).toMatchObject({ phase: "settled", settlement: { gold: 0, choice: "none" } });
+    run.do(reserveDuel, { duelId: "d2", players: ["a", "b"], tick: ++run.now });
+    run.do(reportDuelResult, { duelId: "d2", tick: ++run.now, outcome: "cancelled" });
+    expect(run.state.rubbings.map((rubbing) => [rubbing.id, rubbing.location])).toEqual(before.rubbings);
+    expect([run.gold("a"), run.gold("b")]).toEqual(before.gold);
+    expect(run.do(reportDuelResult, { duelId: "nope", tick: run.now, outcome: "draw" }).rejection).toBe("unknown-duel");
+    expect(run.do(reportDuelResult, { duelId: "d2", tick: run.now, outcome: "win", winner: "a" }).rejection).toBe("already-resolved");
+  });
+
+  it("rounds gold down, caps it at 50 and never takes more than the loser has", () => {
+    const cases: [number, number][] = [[57, 11], [4, 0], [400, 50], [0, 0]];
+    cases.forEach(([loserGold, taken], index) => {
+      let state = createLedger({ preset: "slice", seed: index, sites: sites("slice") });
+      state = addPlayer(state, { playerId: "w", tick: 0 }).state;
+      state = addPlayer(state, { playerId: "l", tick: 0, gold: loserGold }).state;
+      state = reserveDuel(state, { duelId: "d", players: ["w", "l"], tick: 1 }).state;
+      state = reportDuelResult(state, { duelId: "d", tick: 2, outcome: "win", winner: "w" }).state;
+      assertLedger(state);
+      expect(findPlayer(state, "l")!.gold).toBe(loserGold - taken);
+      expect(findPlayer(state, "w")!.gold).toBe(50 + taken);
+    });
+  });
+
+  it("suppresses gold for a repeated win within three minutes, but theft still applies", () => {
+    const run = new Run("slice", ["a", "b"]);
+    run.collect("b", "sun-1");
+    run.duel("d1", "a", "b", "a");
+    run.do(chooseTheft, { duelId: "d1", playerId: "a", type: "sun", tick: run.now });
+    expect(findDuel(run.state, "d1")!.settlement).toMatchObject({ gold: 10, goldSuppressed: false });
+    run.collect("b", "moon-1");
+    run.duel("d2", "b", "a", "a");
+    run.do(chooseTheft, { duelId: "d2", playerId: "a", type: "moon", tick: run.now });
+    expect(findDuel(run.state, "d2")!.settlement).toMatchObject({ stolenType: "moon", gold: 0, goldSuppressed: true });
+    expect([run.gold("a"), run.gold("b")]).toEqual([60, 40]);
+
+    // The window runs from the previous win, paid or not: 3599 ticks later is still inside it, 3600 is not.
+    run.now = findDuel(run.state, "d2")!.result!.tick + 3597;
+    run.duel("d3", "a", "b", "a");
+    expect(findDuel(run.state, "d3")!.result!.tick - findDuel(run.state, "d2")!.result!.tick).toBe(3599);
+    expect(findDuel(run.state, "d3")!.settlement).toMatchObject({ gold: 0, goldSuppressed: true });
+    run.now += 3598;
+    run.duel("d4", "a", "b", "a");
+    expect(findDuel(run.state, "d4")!.result!.tick - findDuel(run.state, "d3")!.result!.tick).toBe(3600);
+    expect(findDuel(run.state, "d4")!.settlement).toMatchObject({ gold: 8, goldSuppressed: false });
+    expect([run.gold("a"), run.gold("b")]).toEqual([68, 32]);
+
+    // Suppression is per ordered pair: b's first win over a pays.
+    run.duel("d5", "b", "a", "b");
+    run.do(advanceLedger, { tick: run.now + 100 });
+    expect(findDuel(run.state, "d5")!.settlement).toMatchObject({ stolenType: "sun", choice: "default", gold: 13, goldSuppressed: false });
+  });
+});
+
+describe("disconnects, quits and recovery caches (§12)", () => {
+  it("drops a quitting player's rubbings into one cache at the given position", () => {
+    const run = new Run("slice", ["a", "b"]);
+    run.collect("a", "sun-1");
+    run.collect("a", "moon-1");
+    const quit = run.do(quitPlayer, { playerId: "a", tick: run.now, position: { x: 7, y: 9 } });
+    expect(quit.cacheIds).toEqual(["cache-1"]);
+    expect(run.state.caches).toEqual([{ id: "cache-1", x: 7, y: 9, createdTick: run.now }]);
+    expect(cacheRubbings(run.state, "cache-1").map((rubbing) => rubbing.id)).toEqual(["moon-1", "sun-1"]);
+    expect(run.do(quitPlayer, { playerId: "a", tick: run.now, position: { x: 0, y: 0 } }).rejection).toBe("player-left");
+    expect(run.do(startCollect, { playerId: "a", sourceId: run.sourceOf("sun-2"), tick: run.now }).rejection).toBe("player-left");
+    expect(run.do(addPlayer, { playerId: "a", tick: run.now }).rejection).toBe("duplicate");
+  });
+
+  it("opens no cache for a player who held nothing", () => {
+    const run = new Run("slice", ["a"]);
+    expect(run.do(quitPlayer, { playerId: "a", tick: run.now, position: { x: 0, y: 0 } }).cacheIds).toEqual([]);
+    expect(run.state.caches).toEqual([]);
+  });
+
+  it("keeps a disconnected seat for 60 seconds, then caches what the player holds", () => {
+    const run = new Run("slice", ["a"]);
+    run.collect("a", "sun-1");
+    run.do(startCollect, { playerId: "a", sourceId: run.sourceOf("moon-1"), tick: run.now });
+    const gone = run.do(disconnectPlayer, { playerId: "a", tick: ++run.now });
+    const deadline = run.now + 1200;
+    expect(gone.player).toMatchObject({ status: "disconnected", reservationDeadline: deadline, channel: null });
+    expect(run.do(disconnectPlayer, { playerId: "a", tick: run.now + 5 }).rejection).toBe("duplicate");
+    expect(run.do(startCollect, { playerId: "a", sourceId: run.sourceOf("moon-1"), tick: run.now }).rejection).toBe("player-disconnected");
+    expect(run.do(expireReservation, { playerId: "a", tick: deadline - 1, position: { x: 1, y: 1 } }).rejection).toBe("reservation-active");
+    expect(run.do(reconnectPlayer, { playerId: "a", tick: deadline - 1 }).player!.status).toBe("connected");
+    expect(run.do(reconnectPlayer, { playerId: "a", tick: deadline - 1 }).rejection).toBe("not-disconnected");
+
+    run.do(disconnectPlayer, { playerId: "a", tick: deadline });
+    expect(run.do(reconnectPlayer, { playerId: "a", tick: deadline + 1200 }).rejection).toBe("reservation-expired");
+    const expired = run.do(expireReservation, { playerId: "a", tick: deadline + 1200, position: { x: 3, y: 4 } });
+    expect(expired.player!.status).toBe("left");
+    expect(run.where("sun-1")).toEqual({ kind: "cache", cacheId: expired.cacheIds[0] });
+  });
+
+  it("transfers a disconnected loser's rubbing first, keeps the deadline, and caches only the rest", () => {
+    const run = new Run("alpha", ["a", "b"]);
+    run.collect("b", "sun-1");
+    run.collect("b", "moon-1");
+    run.do(disconnectPlayer, { playerId: "b", tick: ++run.now });
+    const deadline = findPlayer(run.state, "b")!.reservationDeadline!;
+    run.duel("d1", "a", "b", "a");
+    run.do(chooseTheft, { duelId: "d1", playerId: "a", type: "moon", tick: run.now });
+    expect(findPlayer(run.state, "b")).toMatchObject({ status: "disconnected", reservationDeadline: deadline });
+    const expired = run.do(expireReservation, { playerId: "b", tick: deadline, position: { x: 50, y: 60 } });
+    expect(cacheRubbings(run.state, expired.cacheIds[0]!).map((rubbing) => rubbing.id)).toEqual(["sun-1"]);
+    expect(run.where("moon-1")).toEqual(player("a"));
+  });
+
+  it("forfeits a fight on quit: the opponent steals, the rest goes into a cache", () => {
+    const run = new Run("alpha", ["a", "b"]);
+    run.collect("b", "sun-1");
+    run.collect("b", "moon-1");
+    run.do(reserveDuel, { duelId: "d1", players: ["a", "b"], tick: ++run.now });
+    const quit = run.do(quitPlayer, { playerId: "b", tick: ++run.now, position: { x: 5, y: 5 } });
+    expect(quit.duel).toMatchObject({ phase: "choosing", result: { winner: "a", loser: "b", forfeit: true } });
+    expect(run.state.caches).toEqual([]);
+    expect(run.do(reportDuelResult, { duelId: "d1", tick: run.now, outcome: "win", winner: "b" }).rejection).toBe("already-resolved");
+    run.do(chooseTheft, { duelId: "d1", playerId: "a", type: "moon", tick: run.now });
+    expect(run.where("moon-1")).toEqual(player("a"));
+    expect(run.where("sun-1")).toMatchObject({ kind: "cache" });
+    expect(run.state.caches[0]).toMatchObject({ x: 5, y: 5 });
+  });
+
+  it("settles at once, taking nothing, when the winner quits during the choice", () => {
+    const run = new Run("alpha", ["a", "b"]);
+    run.collect("a", "tide-1");
+    run.collect("b", "sun-1");
+    run.duel("d1", "a", "b", "a");
+    const quit = run.do(quitPlayer, { playerId: "a", tick: ++run.now, position: { x: 8, y: 8 } });
+    expect(quit.duel!.settlement).toMatchObject({ stolenRubbingId: null, gold: 0, choice: "none" });
+    expect(run.where("sun-1")).toEqual(player("b"));
+    expect(run.where("tide-1")).toMatchObject({ kind: "cache" });
+    expect([run.gold("a"), run.gold("b")]).toEqual([50, 50]);
+  });
+
+  it("cancels a fight both players leave on the same tick, whatever order the leaves arrive in (§12)", () => {
+    // With a type to steal (b holds sun, a lacks it) and without one (both hold only sun): in the second case the
+    // first forfeit alone would move gold, so an order-dependent ledger would show up in the balances.
+    for (const [aHolds, bHolds] of [["tide-1", "sun-1"], ["sun-1", "sun-2"]] as const) {
+      const outcomes = (["a", "b"] as const).map((first) => {
+        const run = new Run("alpha", ["a", "b"]);
+        run.collect("a", aHolds);
+        run.collect("b", bHolds);
+        run.do(reserveDuel, { duelId: "d1", players: ["a", "b"], tick: ++run.now });
+        const exits = { a: { x: 1, y: 0 }, b: { x: 2, y: 0 } };
+        const tick = ++run.now;
+        const second = first === "a" ? "b" : "a";
+        run.do(quitPlayer, { playerId: first, tick, position: exits[first] });
+        run.do(quitPlayer, { playerId: second, tick, position: exits[second] });
+        run.now++;
+        run.do(advanceLedger, { tick: run.now });
+        expect(findDuel(run.state, "d1")).toMatchObject({
+          phase: "settled",
+          result: { outcome: "cancelled", winner: null, loser: null, forfeit: true, tick },
+          settlement: { stolenRubbingId: null, choice: "none", gold: 0 },
+        });
+        expect([run.gold("a"), run.gold("b")]).toEqual([50, 50]);
+        expect(run.state.wins).toEqual([]);
+        expect(run.state.caches.map((cache) => [cache.x, cacheRubbings(run.state, cache.id).map((rubbing) => rubbing.id)])).toEqual([
+          [1, [aHolds]],
+          [2, [bHolds]],
+        ]);
+        return hashState(run.state);
+      });
+      expect(outcomes[0]).toBe(outcomes[1]);
+    }
+  });
+
+  it("still settles a forfeit when the other player leaves on a later tick", () => {
+    const run = new Run("alpha", ["a", "b"]);
+    run.collect("a", "sun-1");
+    run.collect("b", "sun-2");
+    run.do(reserveDuel, { duelId: "d1", players: ["a", "b"], tick: ++run.now });
+    const forfeit = run.do(quitPlayer, { playerId: "b", tick: ++run.now, position: { x: 2, y: 0 } });
+    // Nothing is eligible, so the window lasts one tick: the opponent could still have left on the same tick.
+    expect(forfeit.duel).toMatchObject({ phase: "choosing", choiceDeadline: run.now + 1, result: { winner: "a", forfeit: true } });
+    expect([run.gold("a"), run.gold("b")]).toEqual([50, 50]);
+    run.do(advanceLedger, { tick: ++run.now });
+    expect(findDuel(run.state, "d1")).toMatchObject({ phase: "settled", result: { outcome: "win" }, settlement: { gold: 10 } });
+    expect([run.gold("a"), run.gold("b")]).toEqual([60, 40]);
+    run.do(quitPlayer, { playerId: "a", tick: ++run.now, position: { x: 1, y: 0 } });
+    expect(findDuel(run.state, "d1")!.result).toMatchObject({ outcome: "win", winner: "a" });
+  });
+
+  it("lets only a player missing the type claim a cached rubbing, one per interaction, until the cache is gone", () => {
+    const run = new Run("slice", ["a", "b", "c"]);
+    run.collect("a", "sun-1");
+    run.collect("a", "moon-1");
+    run.collect("b", "sun-2");
+    const cacheId = run.do(quitPlayer, { playerId: "a", tick: run.now, position: { x: 0, y: 0 } }).cacheIds[0]!;
+    expect(run.do(startCacheClaim, { playerId: "b", cacheId, rubbingId: "sun-1", tick: run.now }).rejection).toBe("type-held");
+    expect(run.do(startCacheClaim, { playerId: "b", cacheId, rubbingId: "sun-3", tick: run.now }).rejection).toBe("not-in-cache");
+    expect(run.do(startCacheClaim, { playerId: "b", cacheId: "cache-9", rubbingId: "moon-1", tick: run.now }).rejection).toBe("unknown-cache");
+    run.do(startCacheClaim, { playerId: "b", cacheId, rubbingId: "moon-1", tick: run.now });
+    expect(run.hold("b", 120)).toMatchObject({ status: "claimed", rubbingId: "moon-1" });
+    expect(run.state.caches).toHaveLength(1);
+    run.do(startCacheClaim, { playerId: "c", cacheId, rubbingId: "sun-1", tick: run.now });
+    expect(run.hold("c", 120).status).toBe("claimed");
+    expect(run.state.caches).toEqual([]);
+    expect(run.where("sun-1")).toEqual(player("c"));
+  });
+
+  it("never gives one cached rubbing to two players claiming it at once, whatever the order", () => {
+    for (const order of [["b", "c"], ["c", "b"]] as const) {
+      const run = new Run("slice", ["a", "b", "c"]);
+      run.collect("a", "moon-1");
+      const cacheId = run.do(quitPlayer, { playerId: "a", tick: run.now, position: { x: 0, y: 0 } }).cacheIds[0]!;
+      for (const playerId of order) run.do(startCacheClaim, { playerId, cacheId, rubbingId: "moon-1", tick: run.now });
+      const outcomes: string[] = [];
+      for (let tick = 1; tick <= 120; tick++) {
+        run.now++;
+        for (const playerId of order) outcomes.push(run.do(progressChannel, { playerId, tick: run.now }).status!);
+      }
+      expect(outcomes.slice(-2)).toEqual(["claimed", "failed"]);
+      expect(run.where("moon-1")).toEqual(player(order[0]));
+      expect(heldTypes(run.state, order[1])).toEqual([]);
+    }
+  });
+});
+
+describe("economy: minted gold (§11)", () => {
+  it("grants ruin gold once per player per ruin; a repeat is refused and changes nothing", () => {
+    const run = new Run("slice", ["a", "b"]);
+    const issued = run.state.goldIssued;
+    const first = run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-3", tick: run.now });
+    expect(first).toMatchObject({ ok: true, grant: { reason: "ruin", sourceKey: "ruin-3", playerId: "a", amount: 40 } });
+    expect(run.gold("a")).toBe(90);
+    const repeat = run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-3", tick: ++run.now });
+    expect(repeat).toMatchObject({ ok: false, rejection: "duplicate", grant: first.grant });
+    expect(run.gold("a")).toBe(90);
+    expect(run.do(grantGold, { playerId: "b", reason: "ruin", sourceKey: "ruin-3", tick: run.now }).ok).toBe(true);
+    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-4", tick: run.now }).ok).toBe(true);
+    expect(run.gold("a")).toBe(130);
+    expect(run.gold("b")).toBe(90);
+    expect(run.state.goldIssued).toBe(issued + 3 * 40);
+    run.expectGoldAccounted();
+  });
+
+  it("grants a supply cache once per match, to whoever claims it first", () => {
+    const run = new Run("slice", ["a", "b"]);
+    expect(run.do(grantGold, { playerId: "b", reason: "supply-cache", sourceKey: "supply-1", tick: run.now }).grant?.amount).toBe(25);
+    const late = run.do(grantGold, { playerId: "a", reason: "supply-cache", sourceKey: "supply-1", tick: run.now });
+    expect(late).toMatchObject({ ok: false, rejection: "already-claimed", grant: { playerId: "b" } });
+    expect(run.do(grantGold, { playerId: "b", reason: "supply-cache", sourceKey: "supply-1", tick: run.now }).rejection).toBe("duplicate");
+    // A ruin and a supply cache never share a key.
+    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "supply-1", tick: run.now }).ok).toBe(true);
+    expect([run.gold("a"), run.gold("b"), run.state.goldIssued]).toEqual([90, 75, 165]);
+    run.expectGoldAccounted();
+  });
+
+  it("takes the amounts from the rules, never from the caller, and pays nobody who left", () => {
+    const run = new Run("slice", ["a", "b"], 11, { ...objectiveRules, ruinGold: 7, supplyCacheGold: 3 });
+    const forged = { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: run.now, amount: 1000 } as const;
+    expect(run.do(grantGold, forged).grant?.amount).toBe(7);
+    expect(run.do(grantGold, { playerId: "a", reason: "supply-cache", sourceKey: "s", tick: run.now }).grant?.amount).toBe(3);
+    expect(run.gold("a")).toBe(60);
+    expect(run.do(quitPlayer, { playerId: "b", tick: run.now, position: { x: 0, y: 0 } }).ok).toBe(true);
+    expect(run.do(grantGold, { playerId: "b", reason: "ruin", sourceKey: "ruin-1", tick: run.now }).rejection).toBe("player-left");
+    expect(run.do(grantGold, { playerId: "c", reason: "ruin", sourceKey: "ruin-1", tick: run.now }).rejection).toBe("unknown-player");
+    const bogus = { playerId: "a", reason: "kill", sourceKey: "ruin-9", tick: run.now } as unknown as Parameters<typeof grantGold>[1];
+    expect(run.do(grantGold, bogus).rejection).toBe("invalid-request");
+    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "", tick: run.now }).rejection).toBe("invalid-request");
+    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-9", tick: run.now - 1 }).rejection).toBe("stale-tick");
+    run.expectGoldAccounted();
+  });
+});
+
+describe("economy: purchases (§11, §16)", () => {
+  it("charges the rules' prices and spends the gold rather than moving it", () => {
+    const run = new Run("slice", ["a", "b"]);
+    const rumor = run.do(purchase, { requestId: "r1", playerId: "a", item: "rumor", tick: run.now });
+    expect(rumor).toMatchObject({ ok: true, replayed: false, purchase: { item: "rumor", price: 25, goldAfter: 25, tonicsAfter: 0 } });
+    run.expectGoldAccounted();
+    const tonic = run.do(purchase, { requestId: "r2", playerId: "b", item: "tonic", tick: run.now });
+    expect(tonic).toMatchObject({ ok: true, purchase: { item: "tonic", price: 30, goldAfter: 20, tonicsAfter: 1 } });
+    expect([run.gold("a"), run.gold("b"), run.tonics("b"), run.state.goldSpent, run.state.goldIssued]).toEqual([25, 20, 1, 55, 100]);
+    run.expectGoldAccounted();
+    const priced = new Run("slice", ["a"], 11, { ...objectiveRules, rumorPrice: 9, tonicPrice: 11 });
+    expect(priced.do(purchase, { requestId: "r1", playerId: "a", item: "rumor", tick: 1 }).purchase?.price).toBe(9);
+    expect(priced.do(purchase, { requestId: "r2", playerId: "a", item: "tonic", tick: 1 }).purchase?.price).toBe(11);
+    expect(priced.gold("a")).toBe(30);
+    priced.expectGoldAccounted();
+  });
+
+  it("refuses when gold is short, in a duel, disconnected, gone, or for a third tonic", () => {
+    const run = new Run("slice", ["a", "b", "c"]);
+    const buy = (requestId: string, playerId: string, item: "rumor" | "tonic") =>
+      run.do(purchase, { requestId, playerId, item, tick: run.now });
+    expect(buy("r1", "a", "tonic").ok).toBe(true);
+    expect(buy("r2", "a", "rumor").rejection).toBe("insufficient-gold");
+    expect(run.gold("a")).toBe(20);
+    run.expectGoldAccounted();
+
+    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: run.now }).ok).toBe(true);
+    expect(buy("r3", "a", "tonic").ok).toBe(true);
+    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-2", tick: run.now }).ok).toBe(true);
+    expect(run.gold("a")).toBe(70);
+    expect(buy("r4", "a", "tonic").rejection).toBe("tonic-limit");
+    expect([run.gold("a"), run.tonics("a")]).toEqual([70, 2]);
+    expect(buy("r4", "a", "rumor").ok).toBe(true);
+    run.expectGoldAccounted();
+
+    expect(run.do(reserveDuel, { duelId: "d1", players: ["b", "c"], tick: ++run.now }).ok).toBe(true);
+    expect(buy("r5", "b", "rumor").rejection).toBe("player-in-duel");
+    expect(run.do(reportDuelResult, { duelId: "d1", tick: ++run.now, outcome: "draw" }).ok).toBe(true);
+    expect(buy("r5", "b", "rumor").ok).toBe(true);
+    run.expectGoldAccounted();
+
+    expect(run.do(disconnectPlayer, { playerId: "c", tick: run.now }).ok).toBe(true);
+    expect(buy("r6", "c", "rumor").rejection).toBe("player-disconnected");
+    expect(run.do(quitPlayer, { playerId: "b", tick: run.now, position: { x: 0, y: 0 } }).ok).toBe(true);
+    expect(buy("r7", "b", "rumor").rejection).toBe("player-left");
+    expect(buy("r8", "ghost", "rumor").rejection).toBe("unknown-player");
+    expect(buy("", "a", "rumor").rejection).toBe("invalid-request");
+    expect(run.do(purchase, { requestId: "r9", playerId: "a", item: "scroll" as "rumor", tick: run.now }).rejection).toBe("invalid-request");
+    expect(run.do(purchase, { requestId: "r9", playerId: "a", item: "rumor", tick: run.now - 1 }).rejection).toBe("stale-tick");
+    run.expectGoldAccounted();
+  });
+
+  it("answers a repeated request id with the original purchase, never charging twice, even after other operations", () => {
+    const run = new Run("slice", ["a", "b"]);
+    const original = run.do(purchase, { requestId: "r1", playerId: "a", item: "tonic", tick: run.now });
+    expect(original.ok).toBe(true);
+    const settled = run.state;
+    const retry = run.do(purchase, { requestId: "r1", playerId: "a", item: "tonic", tick: run.now });
+    expect(retry).toEqual({ ...original, replayed: true });
+    expect(run.state).toBe(settled);
+
+    // Other operations in between: a grant, another purchase, a used tonic and a lost duel.
+    expect(run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: ++run.now }).ok).toBe(true);
+    expect(run.do(purchase, { requestId: "r2", playerId: "a", item: "rumor", tick: run.now }).ok).toBe(true);
+    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: true, grappled: false }).ok).toBe(true);
+    run.duel("d1", "a", "b", "b");
+    const [gold, tonics, spent] = [run.gold("a"), run.tonics("a"), run.state.goldSpent];
+
+    const before = run.state;
+    const late = run.do(purchase, { requestId: "r1", playerId: "a", item: "tonic", tick: ++run.now });
+    expect(late).toEqual({ ...original, replayed: true });
+    expect(run.state).toBe(before);
+    // A retry carrying an old tick still finds its purchase rather than failing as stale.
+    expect(run.do(purchase, { requestId: "r2", playerId: "a", item: "rumor", tick: 0 }).replayed).toBe(true);
+    expect([run.gold("a"), run.tonics("a"), run.state.goldSpent]).toEqual([gold, tonics, spent]);
+    // The same id reused by another player or for another item is refused, not replayed.
+    expect(run.do(purchase, { requestId: "r1", playerId: "b", item: "tonic", tick: run.now }).rejection).toBe("duplicate");
+    expect(run.do(purchase, { requestId: "r1", playerId: "a", item: "rumor", tick: run.now }).rejection).toBe("duplicate");
+    expect(run.state.purchases.map((record) => record.requestId)).toEqual(["r1", "r2"]);
+    run.expectGoldAccounted();
+  });
+});
+
+describe("economy: sail tonics (§11)", () => {
+  /** A run where `a` carries two tonics and `b` one. */
+  function stocked(): Run {
+    const run = new Run("slice", ["a", "b"]);
+    run.do(grantGold, { playerId: "a", reason: "ruin", sourceKey: "ruin-1", tick: run.now });
+    for (const [requestId, playerId] of [["r1", "a"], ["r2", "a"], ["r3", "b"]] as const) {
+      expect(run.do(purchase, { requestId, playerId, item: "tonic", tick: run.now }).ok).toBe(true);
+    }
+    return run;
+  }
+
+  it("is active for exactly 12 seconds: from its activation tick to 239 ticks later", () => {
+    const run = stocked();
+    const start = (run.now = 100);
+    expect(run.do(useTonic, { playerId: "a", tick: start, atSea: true, grappled: false }).player?.tonicEffect).toEqual({
+      startTick: 100,
+      endTick: 340,
+    });
+    expect(objectiveRules.tonicTicks).toBe(240);
+    expect(run.tonics("a")).toBe(1);
+    expect(activeTonic(run.state, "a", start - 1)).toBe(false);
+    expect(activeTonic(run.state, "a", start)).toBe(true);
+    expect(activeTonic(run.state, "a", start + 239)).toBe(true);
+    expect(activeTonic(run.state, "a", start + 240)).toBe(false);
+    expect(activeTonic(run.state, "b", start)).toBe(false);
+    expect(activeTonic(run.state, "ghost", start)).toBe(false);
+  });
+
+  it("allows one active at a time, and another once it ends", () => {
+    const run = stocked();
+    expect(run.do(useTonic, { playerId: "a", tick: 10, atSea: true, grappled: false }).ok).toBe(true);
+    expect(run.do(useTonic, { playerId: "a", tick: 10, atSea: true, grappled: false }).rejection).toBe("tonic-active");
+    expect(run.do(useTonic, { playerId: "a", tick: 249, atSea: true, grappled: false }).rejection).toBe("tonic-active");
+    expect(run.tonics("a")).toBe(1);
+    expect(run.do(useTonic, { playerId: "a", tick: 250, atSea: true, grappled: false }).ok).toBe(true);
+    expect(run.tonics("a")).toBe(0);
+    expect(run.do(useTonic, { playerId: "a", tick: 600, atSea: true, grappled: false }).rejection).toBe("no-tonic");
+  });
+
+  it("is refused in a duel, off the sea, while grappled or disconnected", () => {
+    const run = stocked();
+    const use = (atSea: boolean, grappled: boolean, playerId = "a") => run.do(useTonic, { playerId, tick: run.now, atSea, grappled });
+    expect(use(false, false).rejection).toBe("not-at-sea");
+    expect(use(true, true).rejection).toBe("grappled");
+    expect(run.do(reserveDuel, { duelId: "d1", players: ["a", "b"], tick: ++run.now }).ok).toBe(true);
+    expect(use(true, false).rejection).toBe("player-in-duel");
+    expect(run.do(reportDuelResult, { duelId: "d1", tick: ++run.now, outcome: "draw" }).ok).toBe(true);
+    expect(run.do(disconnectPlayer, { playerId: "b", tick: run.now }).ok).toBe(true);
+    expect(use(true, false, "b").rejection).toBe("player-disconnected");
+    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: "yes" as unknown as boolean, grappled: false }).rejection).toBe(
+      "invalid-request",
+    );
+    expect(run.tonics("a")).toBe(2);
+    expect(use(true, false).ok).toBe(true);
+  });
+
+  it("keeps the tonics after a lost duel and drops them, active one included, on leaving", () => {
+    const run = stocked();
+    const gold = run.gold("a");
+    const lost = run.duel("d1", "a", "b", "b");
+    expect(lost.duel?.phase).toBe("settled");
+    expect(run.gold("a")).toBeLessThan(gold);
+    expect(run.tonics("a")).toBe(2);
+    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: true, grappled: false }).ok).toBe(true);
+    expect(run.do(quitPlayer, { playerId: "a", tick: ++run.now, position: { x: 0, y: 0 } }).ok).toBe(true);
+    expect(run.tonics("a")).toBe(0);
+    expect(findPlayer(run.state, "a")!.tonicEffect).toBeNull();
+    expect(activeTonic(run.state, "a", run.now)).toBe(false);
+    expect(run.do(useTonic, { playerId: "a", tick: run.now, atSea: true, grappled: false }).rejection).toBe("player-left");
+    run.do(disconnectPlayer, { playerId: "b", tick: run.now });
+    expect(run.do(expireReservation, { playerId: "b", tick: run.now + 1200, position: { x: 0, y: 0 } }).ok).toBe(true);
+    expect(run.tonics("b")).toBe(0);
+    run.expectGoldAccounted();
+  });
+});
+
+describe("requests", () => {
+  it("refuses stale and malformed requests without changing anything", () => {
+    const run = new Run("slice", ["a", "b"]);
+    run.do(advanceLedger, { tick: 50 });
+    expect(run.do(addPlayer, { playerId: "c", tick: 49 }).rejection).toBe("stale-tick");
+    expect(run.do(advanceLedger, { tick: 10 }).rejection).toBe("stale-tick");
+    expect(run.do(addPlayer, { playerId: "c", tick: 50.5 }).rejection).toBe("invalid-request");
+    expect(run.do(addPlayer, { playerId: "", tick: 50 }).rejection).toBe("invalid-request");
+    expect(run.do(addPlayer, { playerId: "c", tick: 50, gold: -1 }).rejection).toBe("invalid-request");
+    expect(run.do(quitPlayer, { playerId: "a", tick: 50, position: { x: 0.5, y: 0 } }).rejection).toBe("invalid-request");
+    expect(run.do(unlockSource, { sourceId: run.state.sources[0]!.id, tick: 50 }).rejection).toBe("duplicate");
+    expect(run.do(unlockSource, { sourceId: "nope", tick: 50 }).rejection).toBe("unknown-source");
+  });
+
+  it("never writes into its input and hashes equal states equally", () => {
+    const a = new Run("alpha", ["a", "b"]);
+    const b = new Run("alpha", ["a", "b"]);
+    for (const run of [a, b]) {
+      run.collect("a", "storm-2");
+      run.duel("d1", "b", "a", "b");
+      run.do(advanceLedger, { tick: run.now + 100 });
+    }
+    expect(hashState(a.state)).toBe(hashState(b.state));
+    expect(Object.isFrozen(a.state.rubbings[0])).toBe(true);
+  });
+});

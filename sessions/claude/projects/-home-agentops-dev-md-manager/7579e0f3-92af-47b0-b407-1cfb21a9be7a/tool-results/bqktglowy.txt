@@ -1,0 +1,431 @@
+commit 791535b0cbf672ab0b9d116db8afbef7e0103115
+Author: Mani Brar <mani99brar@gmail.com>
+Date:   Wed Sep 23 23:26:49 2026 +0000
+
+    workflow: repair a frozen lane with an operator's fix commit, before review
+    
+    workflow-guardrails-001 ended blocked at the combined candidate: the ui lane's
+    browser evidence failed twice identically, frozen snapshots cannot change, and
+    the only way on was a new run. The hand finish committed the fix on the pinned
+    source branch, which moves HEAD off the base that integration requires and puts
+    the fix outside every gate.
+    
+    `python -m workflow repair "$RUN" <lane>[,<lane>] --commit <sha> --reason ...`
+    (lane-repair-design.md, version 1) turns a fix commit made on the failing
+    candidate or on the lane's snapshot into a new snapshot per named lane: the
+    snapshot plus the fix's files the lane owns, checked with freeze's ownership
+    rules (now Pipeline.check_ownership), committed with the base as parent and the
+    recorded time as date so a rerun makes the same commit. It journals every step
+    in repairs.json (S1-S6, each idempotent: a crash is completed by rerunning the
+    identical command, and drive() and retry refuse meanwhile), raises the attempt
+    counters past the existing evidence with per-revision floors, and forks the
+    checkpoint at the freeze boundary with fork.config. Updating the failed head
+    instead would schedule the candidate beside the verifies with the new snapshots
+    and the old packets. It launches nothing, runs no check and never invokes the
+    graph: automatic --live (or retry for a manual run) re-verifies the repaired
+    lane, rechecks the others, checks a new candidate generation (candidate-<g>)
+    for every lane and only then reaches review, whose prompt names the repair.
+    `--workspace` makes a detached worktree at the right base with a brief of the
+    blocking reasons, so nobody commits on the source branch again.
+    
+    Around it: the attempt limit counts per lane, phase and revision; the
+    identical-failure guard compares only attempts of the same revision and now
+    leaves a `controller blocked` event instead of ending the timeline at
+    "controller running"; candidate() refuses worker packets of another revision
+    and a candidate that differs from a repaired candidate's tree.
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+ workflow/README.md      |   4 +-
+ workflow/RUNBOOK.md     |  36 ++-
+diff --git a/workflow/README.md b/workflow/README.md
+index 63e6438..556380a 100644
+--- a/workflow/README.md
++++ b/workflow/README.md
+@@ -20,6 +20,7 @@ PY="$HOME/dev/md-manager/.venv/bin/python"   # run from md-manager's checkout, o
+ | `$PY -m workflow <action> "$RUN"` | one pipeline step: `preflight`, `prepare`, `start`, `automatic`, `freeze`, `review`, `approve`, `retry`, `reconcile`, `attach`, `status`, `export` |
+ | `$PY -m workflow resume "$RUN" [--accept-challenge "<reason>"] [--herdr]` | 2.2.0: commits the edited feature files on the run's branch and reruns a paused design challenge on them, or accepts it with a reason; then launches the workers (and supervises an automatic run) |
+ | `$PY -m workflow answer "$RUN" <lane> "<text>" [--no-herdr]` | 2.2.0: answers a worker's question, restarts its deadline and types the answer into its pane |
++| `$PY -m workflow repair "$RUN" <lane>[,<lane>] --workspace`, then `--commit <sha> --reason "<text>" [--dry-run]` | after freeze and before review: a detached worktree at the failing candidate or lane snapshot, then that fix commit as new lane snapshots with the checkpoint forked at the freeze boundary; launches nothing and runs no check, `automatic --live` (or `retry`) re-verifies (RUNBOOK "Blocked after freeze: repair a lane") |
+ | `$PY -m workflow check-report <feature-dir or policy.json> <lane> <report.json> [--all]` | checks a Playwright JSON report against the lane's browser scenarios with the verifier's own rules; exits 1 on any problem (a browser lane's pinned task spells out the command it runs before completing) |
+ | `$PY -m workflow.interactive attach-one "$RUN" --node <node>` | reconnects one native session in the current terminal (what the Herdr panes run) |
+ 
+@@ -84,7 +85,7 @@ npx --no-install playwright install chromium
+ npm run test:contracts
+ ```
+ 
+-The tests use fake workers and reviewers with real Git worktrees, checks, checkpoints and headless Chromium; they make no Claude model calls. `test_portable.py` covers the portable-workflow scenarios, `test_guardrails.py` the guardrail scenarios (with a fake challenge job and a fake Herdr), `test_browser_rules.py` `check-report` and the browser scenario rules; `testdata/` holds copies of finished features' files the tests read.
++The tests use fake workers and reviewers with real Git worktrees, checks, checkpoints and headless Chromium; they make no Claude model calls. `test_portable.py` covers the portable-workflow scenarios, `test_guardrails.py` the guardrail scenarios (with a fake challenge job and a fake Herdr), `test_browser_rules.py` `check-report` and the browser scenario rules, `test_repair.py` lane repair; `testdata/` holds copies of finished features' files the tests read.
+ 
+ ## Files
+ 
+@@ -94,6 +95,7 @@ The tests use fake workers and reviewers with real Git worktrees, checks, checkp
+ - `sessions.py`: run preparation (one worktree per selected lane), lane id rules, receipts, locking, and the `claude` process helpers (`run_claude`, `popen_claude`: the auto-updater off, an update in progress waited out) with the stale-process warning.
+ - `interactive.py`: native `claude --bg` launches, Herdr panes (one per lane, reviewers to their right), reconciliation, `attach-one`. `herdr.py`: the Herdr CLI helper.
+ - `pipeline.py`: the supervised graph over the plan's lanes, freeze/ownership, verification, candidate, review, approval, integration and the CLI.
++- `repair.py`: `repair`, lane repair after freeze: `repairs.json`, the deterministic snapshot commits, the attempt floors, the checkpoint fork at the freeze boundary and `--workspace`.
+ - `automatic.py`: unattended supervision, completion signals, the native/print reviewers (one per declared reviewer, unanimous verdict); `prompts/review.md` is the built-in brief, `prompts/reviewers/` the bundled ones.
+ - `verification.py`, `checks.py`: policy validation against the bundled `contracts/workflow/` schemas and isolated check execution; `checks.py` also holds the browser scenario rules that the verifier and `check-report` share.
+ - `export_state.py`: the versioned `run-state.json` export (1.5.0).
+diff --git a/workflow/RUNBOOK.md b/workflow/RUNBOOK.md
+index dd6f1db..283a12a 100644
+--- a/workflow/RUNBOOK.md
++++ b/workflow/RUNBOOK.md
+@@ -31,7 +31,7 @@ This performs preflight, creates a feature branch (not main) in the target, prep
+ 
+ Before launching, `launch` refuses: a feature directory with a `TODO:` placeholder left in a file `init` writes (each is named; see the README), a `feature.json` at version 1.0.0 (rewrite it as 2.x with `workers: [{node_id, task}]`), lanes that differ from the policy's, a missing or empty task or brief file, a reviewer `prompt` naming an unknown bundled brief (`builtin:<id>`), a run directory inside the target, and an existing run directory. For a 2.2.0 feature it also refuses a task without non-empty `## Goal`, `## Acceptance` and `## Stop` sections (naming the file and the headings), a missing or empty `decisions.md`, and a `prd` that does not exist in the target. None of these touches Git. A 2.0.0 or 2.1.0 feature launches as before and prints `Note: feature.json 2.1.0: no guardrail is enforced ...` with the migration steps (the dry run also reports it under `guardrails`).
+ 
+-A policy may declare a `failure_drill`: a deliberate first verification failure of one lane, retried explicitly ("Status, failures and recovery"). Every lane/phase has a hard limit of three verification attempts. Automatic mode adds persisted per-worker deadlines (default 4 hours, `--worker-timeout-seconds`) enforced by the running supervisor and a reviewer deadline (default 30 minutes, `--review-timeout-seconds`, counted from the reviewer's launch). Interrupting the supervisor leaves the workers running and the run resumable, and so does Claude Code itself being unavailable (exit 75, see "Status, failures and recovery"); only deadline expiry, a worker that writes `status: blocked`, or a missing native session stops them. A worker whose native state is `blocked` (its turn ended on a question, a permission prompt or a refusal the harness could not continue past) is not a failure: the controller records one `interactive` event naming the lane, keeps the other lanes running and waits until that worker's deadline, so the operator can answer in its pane. It does not impose token caps or automatically repair code. Manual mode retains operator-controlled worker lifetimes. The independent review runs as a third native session by default; `--reviewer-transport print` keeps the headless `claude --print` reviewer for environments without Herdr (see "Automatic mode: the review step").
++A policy may declare a `failure_drill`: a deliberate first verification failure of one lane, retried explicitly ("Status, failures and recovery"). Every lane/phase has a hard limit of three verification attempts per revision (a lane repair starts a new one). Automatic mode adds persisted per-worker deadlines (default 4 hours, `--worker-timeout-seconds`) enforced by the running supervisor and a reviewer deadline (default 30 minutes, `--review-timeout-seconds`, counted from the reviewer's launch). Interrupting the supervisor leaves the workers running and the run resumable, and so does Claude Code itself being unavailable (exit 75, see "Status, failures and recovery"); only deadline expiry, a worker that writes `status: blocked`, or a missing native session stops them. A worker whose native state is `blocked` (its turn ended on a question, a permission prompt or a refusal the harness could not continue past) is not a failure: the controller records one `interactive` event naming the lane, keeps the other lanes running and waits until that worker's deadline, so the operator can answer in its pane. It does not impose token caps or automatically repair code. Manual mode retains operator-controlled worker lifetimes. The independent review runs as a third native session by default; `--reviewer-transport print` keeps the headless `claude --print` reviewer for environments without Herdr (see "Automatic mode: the review step").
+ 
+ ## Guardrails (feature.json 2.2.0)
+ 
+@@ -87,7 +87,7 @@ npm run test:contracts
+ 
+ `workflow.run_tests` runs each test class in its own process, as many at a time as there are CPUs (`--jobs N` or `WORKFLOW_TEST_JOBS` to change it), and prints one unittest summary the verifier parses like a plain run; on 4 cores it takes about 3.5 minutes instead of 9.5. Use it as a policy check's argv (`["<venv>/bin/python", "-m", "workflow.run_tests"]`) so the verifier runs the suite in parallel too. A failed class's output is echoed indented, stdout and stderr in the order they were written, with the captured output of a failed command (a `CalledProcessError`'s stderr, such as git's reason for exit 128) noted under its exception line; only the runner's own final summary is counted. Test classes must not share state outside their own temporary directories.
+ 
+-The tests use fake workers, a fake reviewer session and mocked native lifecycle controls. `workflow.test_lanes` covers lanes from configuration: a three-lane run, a one-lane run, a pinned subset, excluded-lane ownership, refused selections, required check kinds, reserved ids, retrying any lane, a skipped drill, finding attribution per lane, the refused 1.0.0 feature file and the export of a run recorded before configured lanes. `workflow.test_portable` covers targets other than md-manager (PRD_PORTABLE_WORKFLOW section 6): `--repo`, the cwd rule, feature scanning, a target without `contracts/`, md-manager's unchanged commands, the registry entry (plus concurrent launches, a symlinked registry, aliased runs roots and subset launches), `init`, placeholders, the bundled briefs and prompts free of md-manager wording. `workflow.test_guardrails` covers the slice 2 controller scenarios of the same section: outcome-brief headings, required decisions, a passing and a pausing design challenge with `resume` and `--accept-challenge`, every failing challenge job (exit status, error result, wrong session, missing or malformed output, deadline, missing CLI, changed worktree, a checkout that cannot be created), lanes named like run files (`plan`, `policy`), completion evidence, worker questions with `answer` through a fake Herdr, a failed `answer` delivery and its retry, and the 1.5.0 export seam. `workflow.test_browser_rules` covers `check-report` on synthetic Playwright reports, the worker-phase gate on scenario evidence (with a stand-in for `playwright test`) and the rules in the pinned and `init` task texts. The end-to-end test uses real temporary Git worktrees, Python unit tests, headless Chromium, screenshot files, review/approval interrupts and a fast-forward of a **temporary test repository**. It makes no Claude model calls. A second test injects a check failure, reopens checkpoints and verifies that only the failed verification attempt reruns. The automatic tests run once with the native reviewer protocol and once with the print-mode fallback, each with the single built-in reviewer and with two declared reviewers, including a controller interrupted while waiting for the reviewers and every rejected completion file; `ParallelReviewerScenarios` covers PRD_PARALLEL_REVIEWERS section 6 (two approve, one blocks, a P1 anywhere, one times out, a file naming the other reviewer, a shared session UUID, an interrupted second launch) and `test_lanes` the manual import per reviewer.
++The tests use fake workers, a fake reviewer session and mocked native lifecycle controls. `workflow.test_lanes` covers lanes from configuration: a three-lane run, a one-lane run, a pinned subset, excluded-lane ownership, refused selections, required check kinds, reserved ids, retrying any lane, a skipped drill, finding attribution per lane, the refused 1.0.0 feature file and the export of a run recorded before configured lanes. `workflow.test_portable` covers targets other than md-manager (PRD_PORTABLE_WORKFLOW section 6): `--repo`, the cwd rule, feature scanning, a target without `contracts/`, md-manager's unchanged commands, the registry entry (plus concurrent launches, a symlinked registry, aliased runs roots and subset launches), `init`, placeholders, the bundled briefs and prompts free of md-manager wording. `workflow.test_guardrails` covers the slice 2 controller scenarios of the same section: outcome-brief headings, required decisions, a passing and a pausing design challenge with `resume` and `--accept-challenge`, every failing challenge job (exit status, error result, wrong session, missing or malformed output, deadline, missing CLI, changed worktree, a checkout that cannot be created), lanes named like run files (`plan`, `policy`), completion evidence, worker questions with `answer` through a fake Herdr, a failed `answer` delivery and its retry, and the 1.5.0 export seam. `workflow.test_browser_rules` covers `check-report` on synthetic Playwright reports, the worker-phase gate on scenario evidence (with a stand-in for `playwright test`) and the rules in the pinned and `init` task texts. The end-to-end test uses real temporary Git worktrees, Python unit tests, headless Chromium, screenshot files, review/approval interrupts and a fast-forward of a **temporary test repository**. It makes no Claude model calls. A second test injects a check failure, reopens checkpoints and verifies that only the failed verification attempt reruns. `workflow.test_repair` covers lane repair after freeze without Playwright: a candidate blocked twice identically and repaired on the candidate through to the feature branch, a worker-phase block repaired on the lane snapshot, the fork point (never the failed head, a second repair forking from the first), fixes spanning lanes, every refusal, a crash after each apply step completed by rerunning, the per-revision attempt budget and the candidate generations. The automatic tests run once with the native reviewer protocol and once with the print-mode fallback, each with the single built-in reviewer and with two declared reviewers, including a controller interrupted while waiting for the reviewers and every rejected completion file; `ParallelReviewerScenarios` covers PRD_PARALLEL_REVIEWERS section 6 (two approve, one blocks, a P1 anywhere, one times out, a file naming the other reviewer, a shared session UUID, an interrupted second launch) and `test_lanes` the manual import per reviewer.
+ 
+ ## 1. Define and commit the feature contract
+ 
+@@ -277,13 +277,13 @@ Status refreshes `report.html`. It is a local snapshot viewer, not a live multi-
+ 
+ Export rebuilds `run-state.json` from the run directory under the current export version (1.5.0: the `review` and `inputs` sections the Projects viewer reads, the lane list, one `reviewers` entry per reviewer, and the guardrails: `inputs.decisions`, `inputs.challenge` with `attempts`, the completion's version, evidence and unrecorded question, and `inputs.workers.<lane>.questions`, null and `[]` for runs without them). A run recorded before configured lanes keeps its stored graph definition (same node ids, same labels), reports `ui` and `adapter` as its selected lanes and carries its launch receipts and packet paths under `values.lanes` and `values.packets`. It takes the controller lock, reads the persisted checkpoint without invoking any node, constructs no sessions (a copied run whose worktrees are gone still exports), launches nothing, and refuses a run whose `plan.json`, pinned policy or `review.json` fail validation. Unchanged content does not bump `updated_at`. Run it on runs recorded before a newer export version, such as project-workflows-001, so the viewer shows their review and inputs.
+ 
+-- **Failed verification:** inspect its packet/log. Attempts default to a hard limit of three per lane/phase; policy v1.1.0 and later can explicitly set `max_verification_attempts`. For a transient check/environment failure at the same immutable revision, explicitly retry only that lane (`--node` accepts any lane of the run and nothing else):
++- **Failed verification:** inspect its packet/log. Attempts default to a hard limit of three per lane, phase and revision (a lane repair starts a new revision, see below); policy v1.1.0 and later can explicitly set `max_verification_attempts`. For a transient check/environment failure at the same immutable revision, explicitly retry only that lane (`--node` accepts any lane of the run and nothing else):
+   `python -m workflow retry "$RUN" --phase worker --node adapter`.
+ - **Failed combined check:** use `--phase candidate --node <lane>`. Already successful candidate checks are reused after artifact validation.
+ - **Worktree creation failed:** the error ends with Git's own message. `cannot lock` or `.lock': File exists` after the retries means another Git process holds that lock file, or a crashed one left it behind: make sure none is running, delete the named `.lock` file, then retry the step as above.
+ - **Failure after stopping/snapshotting or integrating:** `retry "$RUN"` resumes only failed graph steps; it never launches a new Claude worker. Stop-intent recovery checks whether the prior stop already completed before issuing another native stop.
+ - **Ambiguous startup:** inspect receipts/native inventory, then `reconcile "$RUN"`. It only permits existing durable launch intents and exact surviving sessions; no new native process is launched during reconciliation. Missing proof remains blocked.
+-- **Changed code/policy:** create a new run. Do not modify frozen snapshots/evidence and reuse approvals.
++- **Changed code:** before review, `repair` (below); after review started, create a new run. **Changed policy:** create a new run. Do not modify frozen snapshots/evidence and reuse approvals.
+ - **Partial candidate/worktree allocation:** preserve and inspect it. Automatic destructive cleanup or speculative Git conflict resolution is intentionally unavailable.
+ - **Claude Code unavailable (exit 75):** an update replacing the `claude` binary, or its background service restarting, is not a verdict on any session. Every `claude` call the controller makes waits it out for 60 seconds: a launch, a print job or a stop is repeated only when its exec failed (nothing ran, so none ever starts twice), and the `claude agents --json` listing, which only reads, is asked again every 2 seconds while it fails, prints no list or hangs (each 15-second timeout counts against the 60). After that the automatic controller stops nothing: it records an `interrupted` event naming the cause, and `automatic` (also `launch --automatic` and `resume`) exits 75 with the resume command and any stale Claude processes to restart (its `automatic-step` child exits 69, EX_UNAVAILABLE, which the supervisor turns into that 75; 75 from a step still means a checkpoint persisted). Once `claude --version` works, run `"$PY" -m workflow automatic "$RUN" --live`: it waits for the same sessions again (a review interrupted this way re-enters its node once, rebinding the running reviewers); nothing is relaunched. A deadline, a `blocked` completion, a rejected file or a missing session still stops the sessions.
+ - **Usage exhausted:** workers stay at the manual terminal/handoff boundary. Preserve their receipts/worktrees, record the decision, and ask the owner to wait or approve a new plan/provider. The system never switches to another payment/provider mode or replays an opaque Claude workflow automatically.
+@@ -292,6 +292,28 @@ Export rebuilds `run-state.json` from the run directory under the current export
+ 
+ Lanes are configuration, not a fixed pair: the tests exercise one, two and three. Selective check recovery is tested independently of Claude's own workflow-relaunch semantics.
+ 
++### Blocked after freeze: repair a lane
++
++A check verdict after freeze is final for the frozen code: a retry reruns the same revision, and two identical failures stop the run (`controller blocked`, `failed identically on attempts 1 and 2`). When the cause is the code and no reviewer has seen a candidate (no `review-bundle.json`), `repair` turns a fix commit you make into new snapshots of the lanes it concerns, instead of a new run. It launches no session, runs no check and never invokes the graph. workflow-guardrails-001 ended this way: the ui lane's `[scenario:inert-markdown]` test attached its two screenshots under other names than `screenshot:inert-markdown`, and the candidate refused it twice identically. With `repair`:
++
++```bash
++"$PY" -m workflow repair "$RUN" ui --workspace
++# edit in $RUN/repair-workspace-1 (a detached checkout of the failing candidate), then commit there, never on the source branch
++git -C "$RUN/repair-workspace-1" commit -am "ui: exactly one screenshot:inert-markdown"
++"$PY" -m workflow repair "$RUN" ui --commit $(git -C "$RUN/repair-workspace-1" rev-parse HEAD) \
++    --reason "the verifier requires exactly one screenshot:inert-markdown attachment" --dry-run     # prints what it would do
++"$PY" -m workflow repair "$RUN" ui --commit ... --reason "..."                                     # the same without --dry-run applies it
++"$PY" -m workflow automatic "$RUN" --live                                                          # a manual run: "$PY" -m workflow retry "$RUN"
++```
++
++- **The base.** After a candidate block the workspace is the failing combined candidate (`candidate.json`, or `candidate-<g>.json` after earlier repairs), so a lane that cannot build alone (001's ui lane needed the controller lane's contract fields) is fixed where it failed; a fix there may span lanes (`repair "$RUN" ui,controller`), and each lane gets the fix's files it owns. After a `verify_<lane>` block the workspace is that lane's snapshot, and the repair names that one lane. `repair-workspace-<m>.brief.md` lists the blocked step and attempt, every gate reason verbatim, the failing packet, logs and browser reports, the lanes' owned paths and check commands, the browser evidence rules for a lane with a browser check, and the exact `--commit` command.
++- **What `--commit` checks.** The commit descends from the current candidate or from the named lane's snapshot, changes only paths the named lanes own (never an excluded lane's), adds no symlink or gitlink and changes something. The source checkout must still be on the run's branch, at the base commit and clean, as integration requires: a fix committed there is refused (commit it in a workspace instead; moving the branch back is your decision).
++- **What it records.** `repairs.json` (the repair, first `recorded`, then `applied`), one commit per lane (its snapshot plus the fix's files it owns, parent the base, dated at the recorded time; ref `refs/workflow-repair/<hash>/<n>/<lane>`, the fix itself `.../source_commit`), `repair-<n>.diff` (the change per lane), the raised `attempts.json`, the timeline events (`verify_<lane>` and `candidate` paused, `controller` running) and one new checkpoint. `snapshots.json`, `plan.json`, `candidate.json`, every packet and every lane worktree stay as they were. The lane keeps its worker's session as its identity; the snapshot's summary and `repair` object, the timeline and every reviewer's prompt (with the path of `repair-<n>.diff`) name the repair and its reason.
++- **What the graph does next.** The checkpoint is forked at the freeze boundary (after `handoff`, before the verifies; never the failed head), so the continuation re-verifies every lane: the repaired lane at a new worker attempt, the others by rechecking their packets, then a new candidate generation (`candidate-<n>.json`, `candidate-<n>/`) checked by every lane at new attempts, and only then review. A candidate built after a repair on the candidate must have exactly the fix commit's tree. `automatic --live` is the only continuation of an automatic run: `freeze` and `retry` would run its review node in the CLI process.
++- **Attempts.** The limit counts per lane, phase and revision: the repair starts the repaired lanes' worker attempts and the candidate attempts of every lane that has some past the existing ones, and the three attempts count from there. Two identical failures stop the run only when both checked the same revision. At most three repairs per run.
++- **Refused** (exit 1, `Blocked:`, nothing written): a run not stopped at a check verdict after freeze (`reconcile` a launch; `retry` an infrastructure failure or an interrupted check), a lane blocked before freeze (an automatic run then needs a new run), a started review, a held lock, a moved, dirty or switched source checkout, a fourth repair and a plan without configured lanes. An applied repair is not replaced: check it with `--dry-run` first.
++- **Crash.** While a repair is `recorded`, `automatic`, `automatic-step`, `retry` and every other `repair` refuse; rerunning the identical command completes it (the same commits, one fork). `status` lists `repairs` and any `repair_workspaces`; removing a workspace (`git worktree remove`) is your decision.
++
+ ## Command reference
+ 
+ ```bash
+@@ -334,10 +356,11 @@ Nothing launches a Claude session without `--live`. Nothing ever pushes or merge
+ | `approve` | `--bundle-sha256` | | refused until every declared reviewer is imported and approved; then fast-forwards the source branch locally |
+ | `automatic` | `--live` | | supervises to a verified feature branch, or resumes an interrupted run, printing the timeline as it grows; exit 75: Claude Code was unavailable, nothing was stopped, run it again once `claude` works |
+ | `automatic-step` | `--live` | | one controller step; exit 75 means checkpoint persisted, run again; exit 69 means Claude Code was unavailable (the supervisor then exits 75) |
++| `repair` | `<lane>[,<lane>]` and `--commit <sha> --reason "<text>"`, or `--workspace` | `--dry-run` | after freeze, before review: a detached worktree at the fix's base, or the fix commit as new lane snapshots and a checkpoint forked at the freeze boundary; launches nothing, runs no check; continue with `automatic --live` or `retry` |
+ | `retry` | | `--phase worker\|candidate`, `--node <lane>` | reruns one failed check at the same revision, or resumes failed post-freeze steps; never relaunches |
+ | `reconcile` | | | rebinds surviving sessions after an ambiguous launch; never relaunches |
+ | `attach` | | | creates the run's Herdr tab and panes when `start` ran without `--herdr`, or adds missing reviewer panes |
+-| `status` | | | next nodes, pending interrupts, errors, `workers`/`excluded_workers`, the challenge status when there is one; refreshes `report.html` |
++| `status` | | | next nodes, pending interrupts, errors, `workers`/`excluded_workers`, the challenge status when there is one, `repairs` and `repair_workspaces`; refreshes `report.html` |
+ | `export` | | | rebuilds `run-state.json` at the current export version; launches nothing |
+ 
+ `python -m workflow.interactive attach-one "$RUN" --node <lane>|review|review-<reviewer>` reconnects one session in the current terminal; it needs an interactive terminal, reattaches after a lost connection while the session lives, exits 0 once the controller has stopped the session and refuses to restart a missing one. Native session controls, from the run's receipts:
+@@ -364,6 +387,9 @@ cd "$RUN/review-worktree" && claude --resume <uuid>   # reread or continue a rev
+ | `challenge-worktree/`, `challenge-inputs/` | `start`, `prepare` | the read-only base-commit checkout the challenge reads, the pinned PRD copy |
+ | `challenge-revision.json` | `resume` | a move to revised feature files in progress (old base, paths); `start` and `--accept-challenge` refuse while it exists |
+ | `<node>.stop.json` | stop | identity-checked stop marker |
++| `candidate.json`, `candidate/`, `candidate-<g>.json`, `candidate-<g>/` | candidate | the combined revision and its worktree; generation g after g lane repairs |
++| `repairs.json`, `repair-<n>.diff` | `repair` | the lane repairs (snapshots, attempt floors, fork) and each repair's change per lane |
++| `repair-workspace-<m>/`, `repair-workspace-<m>.brief.md` | `repair --workspace` | a detached checkout at a fix's base and the brief of what blocked |
+ | `review-bundle.json`, `review.diff`, `review-worktree/` | candidate | what every reviewer sees (one shared worktree) |
+ | `review[-<reviewer>].completion.json`, `<node>.imported.json` | each reviewer, `review --reviewer` | a reviewer's bound verdict file, a manually imported review |
+ | `automatic-review[-<reviewer>].json`, `review.json` | controller | combined and per-reviewer review status, the combined verdict |
+diff --git a/workflow/__main__.py b/workflow/__main__.py
+index 2d330a1..7ae1ac1 100644
+--- a/workflow/__main__.py
++++ b/workflow/__main__.py
+@@ -1,4 +1,4 @@
+-"""`python -m workflow` exposes the complete operator-driven pipeline CLI, plus `launch`, `init`, `resume`, `answer` and `check-report`."""
++"""`python -m workflow` exposes the complete operator-driven pipeline CLI, plus `launch`, `init`, `resume`, `answer`, `repair` and `check-report`."""
+ import sys
+ 
+ if __name__ == "__main__":
+@@ -14,6 +14,9 @@ if __name__ == "__main__":
+     elif len(sys.argv) > 1 and sys.argv[1] == "answer":
+         from .guardrails import answer_main
+         answer_main(sys.argv[2:])
++    elif len(sys.argv) > 1 and sys.argv[1] == "repair":
++        from .repair import repair_main
++        repair_main(sys.argv[2:])
+     elif len(sys.argv) > 1 and sys.argv[1] == "check-report":
+         from .checks import check_report_main
+         check_report_main(sys.argv[2:])
+diff --git a/workflow/automatic.py b/workflow/automatic.py
+index 772f5bf..de1da52 100644
+--- a/workflow/automatic.py
++++ b/workflow/automatic.py
+@@ -276,7 +276,8 @@ def review_brief(reviewer: dict | None) -> str:
+ 
+ 
+ def review_prompt(runtime, patch: Path, reviewer: dict | None = None) -> str:
+-    """The brief followed by the fixed blocks every reviewer gets: bundle paths, task locations, lane vocabulary."""
++    """The brief followed by the fixed blocks every reviewer gets: bundle paths, task locations, lane vocabulary, the lane repairs."""
++    from .repair import repair_note
+     return (review_brief(reviewer) + " "
+             f"Diff: {patch}. Bundle: {runtime.directory / 'review-bundle.json'}. "
+             f"Requirements: each worker's task text pinned in {runtime.directory / 'plan.json'} under nodes.<worker>.task, "
+@@ -285,7 +286,7 @@ def review_prompt(runtime, patch: Path, reviewer: dict | None = None) -> str:
+             f"For every finding name the worker it concerns ({worker_vocabulary(runtime)}: multiple when it concerns several lanes, "
+             "none for cross-cutting/policy findings) and, as `requirement`, a verbatim quote from that worker's task text that the "
+             "finding relates to, or null when no single requirement applies. Never paraphrase a quote."
+-            + decisions_block(runtime.plan))
++            + repair_note(runtime.directory) + decisions_block(runtime.plan))
+ 
+ 
+ def completion_protocol_prompt(runtime, launch_token: str, digest: str, candidate_commit: str, reviewer_id: str = DEFAULT_REVIEWER) -> str:
+@@ -782,6 +783,12 @@ def _review_print(runtime, bundle: dict, digest: str, cwd: Path, patch: Path) ->
+     return review
+ 
+ 
++def same_revision(previous: Path, packet: Path) -> bool:
++    """Both attempts checked one revision. A lane repair's new revision starts over; packets without `expected` count as one."""
++    commits = [read_json(path).get("expected", {}).get("output_commit") for path in (previous, packet)]
++    return None in commits or commits[0] == commits[1]
++
++
+ def gate_reasons(packet: Path) -> list[str]:
+     """A packet's gate reasons with its own attempt directory neutralised.
+ 
+@@ -793,6 +800,7 @@ def gate_reasons(packet: Path) -> list[str]:
+ 
+ def advance_failed_checks(runtime, state) -> bool:
+     """Retry only recorded failing verification packets, never launches or review."""
++    from .repair import attempt_floor
+     # A checkpoint can carry an error from an earlier attempt of a task that has since
+     # succeeded (its writes are applied and it is no longer pending). Only pending
+     # tasks with errors are failures to classify.
+@@ -810,25 +818,34 @@ def advance_failed_checks(runtime, state) -> bool:
+             path = runtime.directory / "verification" / phase / node / str(attempt) / "packet.json"
+             if path.exists() and read_json(path)["gate"]["status"] != "passed":
+                 previous = runtime.directory / "verification" / phase / node / str(attempt - 1) / "packet.json"
+-                if attempt > 1 and previous.exists() and gate_reasons(previous) == gate_reasons(path):
++                if attempt > 1 and previous.exists() and same_revision(previous, path) and gate_reasons(previous) == gate_reasons(path):
+                     # Retries rerun immutable code; two identical failures mean the cause is
+                     # deterministic (code or environment), and more attempts only burn time.
+                     raise RuntimeError(f"{phase}/{node} failed identically on attempts {attempt - 1} and {attempt}; "
+-                                       f"not transient, inspect {path}")
++                                       f"not transient, inspect {path}. Before review a code fix is a lane repair (RUNBOOK)")
+                 stage_targets.append((phase, node))
+         if not stage_targets:
+             return False
+         targets.extend(stage_targets)
+     if not targets:
+         return False
+-    # Check all bounds before changing any counters.
+-    if any(runtime.attempt(p, n) >= runtime.policy.get("max_verification_attempts", 3) for p, n in targets):
++    # Check all bounds before changing any counters. The limit counts from the floor of the lane's revision.
++    if any(runtime.attempt(p, n) >= attempt_floor(runtime.directory, p, n) + runtime.policy.get("max_verification_attempts", 3) - 1 for p, n in targets):
+         raise RuntimeError("Verification retry limit exhausted; work and evidence retained")
+     for phase, node in targets:
+         runtime.retry_check(phase, node)
+     return True
+ 
+ 
++def advance_or_block(runtime, state) -> bool:
++    """advance_failed_checks; when it stops the run (identical failures, the attempt limit) the timeline says why."""
++    try:
++        return advance_failed_checks(runtime, state)
++    except RuntimeError as error:
++        runtime.event("controller", "blocked", str(error))
++        raise
++
++
+ TIMELINE_TAIL = 5  # Recent events a starting or resumed supervisor shows before following new ones.
+ TIMELINE_POLL_SECONDS = 1.0
+ 
+@@ -983,7 +1000,9 @@ def resume_interrupted_review(runtime, state) -> bool:
+ def drive(runtime, *, single_step=False) -> str | None:
+     """Advance persisted graph state; CLI supervision restarts this process at joins."""
+     from .pipeline import build_pipeline, graph_config, report
++    from .repair import refuse_recorded
+     validate_automatic(runtime.plan)
++    refuse_recorded(runtime.directory)
+     if git(Path(runtime.plan["repository"]), "symbolic-ref", "--short", "HEAD") != runtime.plan["source_branch"]:
+         raise RuntimeError("Source feature branch changed; no automatic continuation")
+     runtime.event("controller", "running", f"Automatic checkpoint controller PID {os.getpid()}")
+@@ -1032,7 +1051,7 @@ def drive(runtime, *, single_step=False) -> str | None:
+                 value = Command(resume={"freeze": True})
+             elif pending:
+                 raise RuntimeError("Unexpected manual gate in automatic run; inspect state")
+-            elif any(task.error for task in state.tasks) and not (advance_failed_checks(runtime, state) or reviewer_stop_pending(runtime, state)
++            elif any(task.error for task in state.tasks) and not (advance_or_block(runtime, state) or reviewer_stop_pending(runtime, state)
+                                                                   or resume_interrupted_review(runtime, state)):
+                 raise RuntimeError("Non-retryable graph failure; inspect retained evidence")
+             try:
+diff --git a/workflow/pipeline.py b/workflow/pipeline.py
+index 4436084..aa1de5e 100644
+--- a/workflow/pipeline.py
++++ b/workflow/pipeline.py
+@@ -367,6 +367,19 @@ class Pipeline:
+         self.stop_session(review_node(reviewer_id))
+         self.event(REVIEW, "stopped", f"Reviewer {reviewer_id} session stopped; its transcript stays resumable")
+ 
++    def check_ownership(self, node: str, changed: list[str]) -> None:
++        """Every changed path is an exact repository path the lane owns: at freeze, and in a lane repair's snapshot."""
++        # Ownership is enforced from the full declared policy: an excluded lane's paths are off-limits to every selected lane.
++        excluded_paths = [(other, safe_path(prefix)) for other in self.excluded for prefix in self.worker_policy(other)["owned_paths"]]
++        worker = self.worker_policy(node)
++        for name in changed:
++            safe_path(name)
++            for other, prefix in excluded_paths:
++                if owns(name, prefix):
++                    raise ValueError(f"Ownership violation: {node} edited {name}, owned by excluded lane {other}")
++            if not any(owns(name, safe_path(prefix)) for prefix in worker["owned_paths"]):
++                raise ValueError(f"{node} edited unowned path: {name}")
++
+     def freeze(self) -> dict:
+         record = self.directory / "snapshots.json"
+         if record.exists():
+@@ -381,22 +394,14 @@ class Pipeline:
+                 raise ValueError("Malformed worker handoff")
+             handoffs[node] = handoff
+         self.stop_workers()
+-        # Ownership is enforced from the full declared policy: an excluded lane's paths are off-limits to every selected lane.
+-        excluded_paths = [(other, safe_path(prefix)) for other in self.excluded for prefix in self.worker_policy(other)["owned_paths"]]
+         snapshots = {}
+         for node in self.workers:
+-            worker = self.worker_policy(node)
+             cwd = Path(self.plan["nodes"][node]["worktree"])
+             if git(cwd, "rev-parse", "HEAD") != self.plan["base_commit"]:
+                 raise ValueError("Worker changed HEAD; reconcile commits rather than silently accepting them")
+             changed = changed_files(cwd, self.plan["base_commit"])
++            self.check_ownership(node, changed)
+             for name in changed:
+-                safe_path(name)
+-                for other, prefix in excluded_paths:
+-                    if owns(name, prefix):
+-                        raise ValueError(f"Ownership violation: {node} edited {name}, owned by excluded lane {other}")
+-                if not any(owns(name, safe_path(prefix)) for prefix in worker["owned_paths"]):
+-                    raise ValueError(f"{node} edited unowned path: {name}")
+                 if (cwd / name).is_symlink():
+                     raise ValueError("Symlink changes require manual review before snapshot")
+             index = self.directory / f"{node}.snapshot-index"
+@@ -424,15 +429,19 @@ class Pipeline:
+         return snapshots
+ 
+     def attempt(self, phase: str, node: str) -> int:
++        """The lane's current attempt: from the floor of its revision (1, or the one a lane repair set) to the run's limit past it."""
++        from .repair import attempt_floor
+         path = self.directory / "attempts.json"
+         value = read_json(path).get(f"{phase}:{node}", 1) if path.exists() else 1
+-        if type(value) is not int or value < 1 or value > self.policy.get("max_verification_attempts", 3):
++        floor = attempt_floor(self.directory, phase, node)
++        if type(value) is not int or value < floor or value >= floor + self.policy.get("max_verification_attempts", 3):
+             raise ValueError("Verification attempt exceeds the run's hard limit")
+         return value
+ 
+     def retry_check(self, phase: str, node: str) -> int:
++        from .repair import attempt_floor
+         value = self.attempt(phase, node) + 1
+-        if value > self.policy.get("max_verification_attempts", 3):
++        if value >= attempt_floor(self.directory, phase, node) + self.policy.get("max_verification_attempts", 3):
+             raise ValueError("Verification attempt limit reached; inspect evidence and create an explicitly revised run")
+         path = self.directory / "attempts.json"
+         attempts = read_json(path) if path.exists() else {}
+@@ -474,17 +483,23 @@ class Pipeline:
+         return str(path)
+ 
+     def candidate(self, state: PipelineState) -> str:
++        from .repair import applied_repairs, candidate_paths as generation_paths
+         # Validate branch evidence again before combining anything.
+         worker_paths = [Path(state["packets"][node]) for node in self.workers]
+-        for path in worker_paths:
++        for node, path in zip(self.workers, worker_paths):
+             packet = recheck_packet(read_json(path), self.policy, self.directory)
+             if packet["gate"]["status"] != "passed":
+                 raise ValueError("Worker evidence no longer passes")
+-        saved = self.directory / "candidate.json"
++            # The bundle binds these packets to these snapshots: a packet of another revision (a repair written onto a
++            # failed head instead of the freeze boundary would bring the old ones) is never combined or reviewed.
++            if packet["expected"]["output_commit"] != state["snapshots"][node]["commit"]:
++                raise ValueError(f"Worker evidence for {node} is not of its snapshot {state['snapshots'][node]['commit']}; contradictory run state")
++        # One candidate generation per applied lane repair: candidate.json and candidate/ stay generation 0's evidence.
++        repairs = applied_repairs(self.directory)
++        saved, cwd = generation_paths(self.directory, len(repairs))
+         if saved.exists():
+             candidate = read_json(saved)
+         else:
+-            cwd = self.directory / "candidate"
+             if cwd.exists():
+                 raise ValueError("Partial candidate worktree exists; inspect before recovery")
+             git_worktree(self.plan["repository"], "add", "--detach", str(cwd), self.plan["base_commit"])
+@@ -494,6 +509,9 @@ class Pipeline:
+                     subprocess.run(["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "cherry-pick", commit], env=commit_env(), check=True, capture_output=True)
+             candidate = {"commit": git(cwd, "rev-parse", "HEAD"), "worktree": str(cwd)}
+             save_json(saved, candidate)
++        expected_tree = repairs[-1]["expected_candidate_tree"] if repairs else None
++        if expected_tree and git(Path(self.plan["repository"]), "rev-parse", f"{candidate['commit']}^{{tree}}") != expected_tree:
++            raise ValueError(f"Candidate {candidate['commit']} differs from the repaired tree of repair {repairs[-1]['n']}; inspect")
+         candidate_paths = []
+         for node in self.workers:
+             attempt = self.attempt("candidate", node)
+@@ -781,6 +799,10 @@ def report(runtime: Pipeline, state) -> Path:
+     failure_report = runtime.directory / "failure-report.json"
+     if failure_report.exists():
+         parts.append('<h2>Checkpoint failure drill</h2><pre>' + html.escape(failure_report.read_text()) + '</pre>')
++    repairs = runtime.directory / "repairs.json"
++    if repairs.exists():
++        parts.append('<h2>Repairs</h2><pre>' + html.escape(repairs.read_text()) + '</pre>')
++        parts.extend(f'<p><a href="{path.name}">{html.escape(path.name)}</a></p>' for path in sorted(runtime.directory.glob("repair-*.diff")))
+     destination = runtime.directory / "report.html"
+     destination.write_text("\n".join(parts))
+     return destination
+@@ -789,7 +811,7 @@ def report(runtime: Pipeline, state) -> Path:
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("action", choices=["preflight", "prepare", "start", "automatic", "automatic-step", "attach", "freeze", "retry", "reconcile", "review", "approve", "status", "export"],
+-                        help="resume and answer (feature.json 2.2.0 runs) have their own options: python -m workflow resume|answer --help")
++                        help="resume and answer (feature.json 2.2.0 runs) and repair have their own options: python -m workflow resume|answer|repair --help")
+     parser.add_argument("directory", type=Path)
+     parser.add_argument("--repo", type=Path, default=Path.cwd())
+     parser.add_argument("--policy", type=Path)
+@@ -1014,6 +1036,8 @@ def main():
+                                 parser.error("No durable launch intent; cannot reconcile without potentially launching a new agent")
+                             runtime.sessions.run(node)  # Existing receipt path never starts a new process.
+                 elif args.action == "retry":
++                    from .repair import refuse_recorded
++                    refuse_recorded(directory)  # Its counters and refs may exist already: only rerunning the repair continues.
+                     if not state.values or pending or not state.next:
+                         parser.error("Retry requires a failed graph step, not an interrupt/completed run")
+                     if args.node:
+@@ -1038,6 +1062,13 @@ def main():
+                               "errors": [str(task.error) for task in state.tasks if task.error]}
+                     if (directory / "challenge.json").exists():
+                         status["challenge"] = read_json(directory / "challenge.json")["status"]
++                    if (directory / "repairs.json").exists():
++                        from .repair import load_repairs
++                        status["repairs"] = [{"n": entry["n"], "status": entry["status"], "lanes": list(entry["lanes"]), "commit": entry["source_commit"]}
++                                             for entry in load_repairs(directory)]
++                    workspaces = sorted(path.name for path in directory.glob("repair-workspace-*") if path.is_dir())
++                    if workspaces:
++                        status["repair_workspaces"] = workspaces  # Cleanup is the operator's decision.
+                     print(json.dumps(status, indent=2))
+                     print(f"Report: {report(runtime, state)}")
+     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:

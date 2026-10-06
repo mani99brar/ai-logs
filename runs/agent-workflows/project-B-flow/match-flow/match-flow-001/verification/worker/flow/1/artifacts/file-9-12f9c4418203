@@ -1,0 +1,236 @@
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { matchRules as defaultMatchRules, validateMatchRules, type MatchRules } from "@pirate-sea-race/content/match";
+import { objectiveRules } from "@pirate-sea-race/content/objectives";
+
+export type MatchKind = "public" | "private";
+
+/** §2's phases in the order a match moves through them; only `ready` may fall back, to `lobby`. */
+export const MATCH_PHASES = ["lobby", "ready", "departure", "exploration", "ended"] as const;
+export type MatchPhase = (typeof MATCH_PHASES)[number];
+
+export const MATCH_END_REASONS = ["claim", "deadline", "abandoned", "aborted"] as const;
+/** `claim` has a winner; a `deadline` (§2), an `abandoned` room and an `aborted` match (§12) have none. */
+export type MatchEndReason = (typeof MATCH_END_REASONS)[number];
+
+/** Static flow data for one match; the step reads it and it never changes. */
+export interface MatchConfig {
+  readonly kind: MatchKind;
+  /** §2: private matches are marked custom. */
+  readonly custom: boolean;
+  /** The most players the lobby admits. */
+  readonly seats: number;
+  /** The fewest present players that start a match, or keep a ready check going; a public match needs every seat. */
+  readonly minPlayers: number;
+  readonly readyTicks: number;
+  readonly departureTicks: number;
+  /** World ticks from control start to the deadline: the claim rules' `deadlineTicks`, for the timer only. */
+  readonly durationTicks: number;
+  /** A player's gold in the results until the caller reports another balance. */
+  readonly startingGold: number;
+}
+
+export interface MatchConfigOptions {
+  readonly kind: MatchKind;
+  readonly rules?: MatchRules;
+  /** Defaults to the claim rules' deadline, which must be the one the caller's claim config uses. */
+  readonly durationTicks?: number;
+  /** Defaults to the objective rules' starting gold. */
+  readonly startingGold?: number;
+}
+
+export function requireInteger(value: unknown, name: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
+}
+
+export function requireId(value: unknown, name: string): void {
+  if (typeof value !== "string" || value.length === 0) throw new RangeError(`${name} must be a non-empty string`);
+}
+
+/** Builds a match's flow config from the content rules, refusing invalid rules. */
+export function createMatchConfig(options: MatchConfigOptions): MatchConfig {
+  if (options.kind !== "public" && options.kind !== "private") throw new RangeError(`kind must be public or private, got ${String(options.kind)}`);
+  const rules = validateMatchRules(options.rules ?? defaultMatchRules);
+  if (!rules.ok) throw new RangeError(`invalid match rules: ${rules.issues.join("; ")}`);
+  const durationTicks = options.durationTicks ?? claimRules.deadlineTicks;
+  const startingGold = options.startingGold ?? objectiveRules.startingGold;
+  requireInteger(durationTicks, "durationTicks");
+  requireInteger(startingGold, "startingGold");
+  if (durationTicks <= 0) throw new RangeError(`durationTicks must be positive, got ${durationTicks}`);
+  if (startingGold < 0) throw new RangeError(`startingGold must not be negative, got ${startingGold}`);
+  const isPublic = options.kind === "public";
+  return {
+    kind: options.kind,
+    custom: !isPublic,
+    seats: isPublic ? rules.value.publicSeats : rules.value.privateMaxPlayers,
+    minPlayers: isPublic ? rules.value.publicSeats : rules.value.privateMinPlayers,
+    readyTicks: rules.value.readyTicks,
+    departureTicks: rules.value.departureTicks,
+    durationTicks,
+    startingGold,
+  };
+}
+
+/** What a player accomplished, counted from the caller's reports after control start. */
+export interface MatchPlayerStats {
+  readonly collected: number;
+  readonly thefts: number;
+  readonly lost: number;
+  readonly duelsWon: number;
+  readonly duelsLost: number;
+  readonly duelsDrawn: number;
+  /** The last reported balance. */
+  readonly gold: number;
+  readonly cachesClaimed: number;
+  /** Distinct island ids, sorted. */
+  readonly islands: readonly string[];
+}
+
+export interface MatchPlayer {
+  readonly id: string;
+  /** Join order, for passing the private host on. */
+  readonly order: number;
+  /** Left after control start; a player who leaves before it is removed. */
+  readonly left: boolean;
+  readonly stats: MatchPlayerStats;
+}
+
+export interface MatchEnd {
+  readonly reason: MatchEndReason;
+  /** Only a claim has one. */
+  readonly winner: string | null;
+  readonly tick: number;
+}
+
+/** One line of the results screen. */
+export interface MatchPlayerResult {
+  readonly id: string;
+  readonly winner: boolean;
+  readonly left: boolean;
+  /** collected + thefts + cachesClaimed − lost, never below 0. */
+  readonly rubbingsHeld: number;
+  readonly collected: number;
+  readonly thefts: number;
+  readonly lost: number;
+  readonly duelsWon: number;
+  readonly duelsLost: number;
+  readonly duelsDrawn: number;
+  readonly gold: number;
+  readonly cachesClaimed: number;
+  readonly islandsVisited: number;
+}
+
+export interface MatchResults {
+  readonly reason: MatchEndReason;
+  readonly winner: string | null;
+  readonly tick: number;
+  readonly custom: boolean;
+  /** Match time played, from control start to the end (0 if control never started). */
+  readonly elapsedTicks: number;
+  /** The winner first, then by rubbings held (most first), then by id. */
+  readonly players: readonly MatchPlayerResult[];
+}
+
+/** The flow state: plain integer data that `hashState` covers entirely. */
+export interface MatchState {
+  /** The last world tick processed. */
+  readonly tick: number;
+  readonly phase: MatchPhase;
+  readonly custom: boolean;
+  readonly durationTicks: number;
+  /** Sorted by id. */
+  readonly players: readonly MatchPlayer[];
+  readonly nextOrder: number;
+  /** The private match's host, who may start it; always null in a public match. */
+  readonly host: string | null;
+  /** The tick the current ready check began, while in `ready`. */
+  readonly readyTick: number | null;
+  /** The world tick player control started on (§2); the timer and every other module's clock count from it. */
+  readonly controlStartTick: number | null;
+  /** Set once; the state never changes afterwards. */
+  readonly end: MatchEnd | null;
+  /** Built once, when the match ends. */
+  readonly results: MatchResults | null;
+}
+
+/** An empty lobby before any tick: the first step processes a later tick. */
+export function createMatchState(config: MatchConfig, tick = 0): MatchState {
+  requireInteger(tick, "tick");
+  if (tick < 0) throw new RangeError(`tick must not be negative, got ${tick}`);
+  return {
+    tick,
+    phase: "lobby",
+    custom: config.custom,
+    durationTicks: config.durationTicks,
+    players: [],
+    nextOrder: 0,
+    host: null,
+    readyTick: null,
+    controlStartTick: null,
+    end: null,
+    results: null,
+  };
+}
+
+/** An accomplishment the caller reports after control start; the module only counts them. */
+export type MatchStatEvent =
+  /** Collected a rubbing from a source. */
+  | { readonly kind: "collected"; readonly playerId: string }
+  /** Took a rubbing from a duel loser. */
+  | { readonly kind: "stole"; readonly playerId: string }
+  /** Lost a rubbing: to a thief, or into a recovery cache. */
+  | { readonly kind: "lost"; readonly playerId: string }
+  /** A settled duel; `winner` null is a draw (a match-end freeze or a cancellation counts as the caller reports it). */
+  | { readonly kind: "duel-ended"; readonly playerIds: readonly [string, string]; readonly winner: string | null }
+  /** Claimed a rubbing from a recovery cache. */
+  | { readonly kind: "cache-claimed"; readonly playerId: string }
+  | { readonly kind: "island-visited"; readonly playerId: string; readonly island: string }
+  /** The player's gold balance now. */
+  | { readonly kind: "gold"; readonly playerId: string; readonly gold: number };
+
+/** The claim module's `match-ended` event, passed on unchanged. */
+export interface ClaimEndReport {
+  readonly kind: "match-ended";
+  readonly tick: number;
+  readonly reason: "claim" | "deadline";
+  readonly winner: string | null;
+}
+
+export type MatchReport =
+  | { readonly kind: "join"; readonly playerId: string }
+  /** The seat is released (§12: an explicit quit or an expired reservation); a mere disconnection is not a leave. */
+  | { readonly kind: "leave"; readonly playerId: string }
+  /** The private host asks to start. */
+  | { readonly kind: "start"; readonly playerId: string }
+  | MatchStatEvent
+  | ClaimEndReport
+  /** §12: the server process failed; abort with no winner and no competitive penalty. */
+  | { readonly kind: "fault" };
+
+/** What happened up to one world tick. */
+export interface MatchInput {
+  /** A tick at or before the state's is stale: the step ignores the whole input. Later ticks may skip ahead. */
+  readonly tick: number;
+  /** Applied in order after the timed transitions up to `tick`. */
+  readonly reports: readonly MatchReport[];
+}
+
+export type JoinRefusal = "started" | "full";
+export type StartRefusal = "public" | "not-host" | "too-few";
+
+/** Something that happened, for the caller to apply or show. */
+export type MatchEvent =
+  | { readonly kind: "player-joined"; readonly tick: number; readonly playerId: string }
+  /** §2: late arrivals wait for another match. */
+  | { readonly kind: "join-refused"; readonly tick: number; readonly playerId: string; readonly reason: JoinRefusal }
+  | { readonly kind: "player-left"; readonly tick: number; readonly playerId: string }
+  | { readonly kind: "host-changed"; readonly tick: number; readonly playerId: string | null }
+  | { readonly kind: "start-refused"; readonly tick: number; readonly playerId: string; readonly reason: StartRefusal }
+  | { readonly kind: "phase-changed"; readonly tick: number; readonly from: MatchPhase; readonly to: MatchPhase }
+  /** Player control starts: pass `tick` to the claim config and to the encounter rules' spawn protection. */
+  | { readonly kind: "control-started"; readonly tick: number }
+  | { readonly kind: "match-ended"; readonly tick: number; readonly reason: MatchEndReason; readonly winner: string | null; readonly results: MatchResults };
+
+export interface MatchStepResult {
+  readonly state: MatchState;
+  readonly events: readonly MatchEvent[];
+}

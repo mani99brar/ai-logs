@@ -1,0 +1,220 @@
+import { DUEL_BUTTONS, DUEL_INPUT_MASK, KIT_IDS, movesetVersion, type DuelMoveset, type KitId } from "@pirate-sea-race/content/moves";
+import { canonicalize } from "../hash.js";
+import type {
+  Bolt,
+  DuelConfig,
+  DuelEvent,
+  DuelEventKind,
+  DuelPhase,
+  DuelResult,
+  DuelState,
+  FighterAction,
+  FighterState,
+  InputBuffer,
+  Zone,
+} from "./state.js";
+
+/** A duel state as plain JSON-safe data: what the netcode stores and what the server sends as a checkpoint. */
+export type DuelSnapshot = DuelState;
+
+/** A deep, independent copy of the complete duel state (it also proves every number is a safe integer). */
+export function snapshotDuel(state: DuelState): DuelSnapshot {
+  return JSON.parse(canonicalize(state)) as DuelSnapshot;
+}
+
+/**
+ * Turns a snapshot (possibly received over the wire) back into a state to step from. It is refused when it was
+ * taken on other move data, or when any field is not what a duel state on this moveset can hold: a missing or extra
+ * field, a wrong type, an integer out of range, an unknown move, a move outside the fighter's kit and the shared
+ * normals, a bolt or smoke screen its kit cannot make, or an event naming another kit's bolt.
+ */
+export function restoreDuel(config: DuelConfig, snapshot: unknown): DuelState {
+  if (typeof snapshot !== "object" || snapshot === null) throw new TypeError("a duel snapshot must be an object");
+  const version = movesetVersion(config.moveset);
+  const candidate = snapshot as Partial<DuelState>;
+  if (candidate.movesetVersion !== version) {
+    throw new Error(`the snapshot was taken on moveset ${String(candidate.movesetVersion)}, not ${version}`);
+  }
+  const issue = duelStateCheck(config.moveset)(snapshot, "");
+  if (issue !== null) throw new TypeError(`the snapshot is not a duel state: ${issue}`);
+  return snapshotDuel(candidate as DuelState);
+}
+
+/** What is wrong with `value` at `path`, or null when nothing is. */
+type Check = (value: unknown, path: string) => string | null;
+
+const at = (path: string, key: string | number) => (path === "" ? String(key) : `${path}.${key}`);
+
+const integer =
+  (min: number, max = Number.MAX_SAFE_INTEGER): Check =>
+  (value, path) =>
+    Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max ? null : `${path} must be an integer from ${min} to ${max}`;
+
+const anyInteger: Check = (value, path) => (Number.isSafeInteger(value) ? null : `${path} must be a safe integer`);
+
+const boolean: Check = (value, path) => (typeof value === "boolean" ? null : `${path} must be a boolean`);
+
+const oneOf =
+  (...values: readonly unknown[]): Check =>
+  (value, path) =>
+    values.includes(value) ? null : `${path} must be one of ${values.map((item) => JSON.stringify(item)).join(", ")}`;
+
+/** One of a string union, listed as a record so that the compiler notices a member missing from the list. */
+const member = <T extends string>(members: Record<T, true>): Check => oneOf(...Object.keys(members));
+
+const nullable =
+  (check: Check): Check =>
+  (value, path) =>
+    value === null ? null : check(value, path);
+
+/** A plain object with exactly the listed fields; the mapped type makes the list cover every field of `T`. */
+function exactly<T>(fields: { readonly [K in keyof T]-?: Check }): Check {
+  const shape = fields as Readonly<Record<string, Check>>;
+  return (value, path) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return `${path || "the snapshot"} must be an object`;
+    const extra = Object.keys(value).find((key) => !Object.hasOwn(shape, key));
+    if (extra !== undefined) return `${at(path, extra)} is not a field`;
+    for (const [key, check] of Object.entries(shape)) {
+      const issue = check((value as Record<string, unknown>)[key], at(path, key));
+      if (issue !== null) return issue;
+    }
+    return null;
+  };
+}
+
+const list =
+  (item: Check, length?: number): Check =>
+  (value, path) => {
+    if (!Array.isArray(value)) return `${path} must be an array`;
+    if (length !== undefined && value.length !== length) return `${path} must hold ${length} entries`;
+    for (const [index, entry] of value.entries()) {
+      const issue = item(entry, at(path, index));
+      if (issue !== null) return issue;
+    }
+    return null;
+  };
+
+const both =
+  (check: Check, rule: (value: never) => boolean, message: string): Check =>
+  (value, path) =>
+    check(value, path) ?? (rule(value as never) ? null : `${path || "the snapshot"}: ${message}`);
+
+const ACTIONS: Record<FighterAction, true> = {
+  idle: true,
+  walk: true,
+  crouch: true,
+  jump: true,
+  dash: true,
+  backdash: true,
+  attack: true,
+  hitstun: true,
+  blockstun: true,
+  stagger: true,
+  thrown: true,
+  "throw-break": true,
+  knockdown: true,
+};
+const PHASES: Record<DuelPhase, true> = { round: true, overtime: true, over: true };
+const EVENT_KINDS: Record<DuelEventKind, true> = {
+  hit: true,
+  block: true,
+  "guard-break": true,
+  grab: true,
+  throw: true,
+  "throw-escape": true,
+  "throw-clash": true,
+};
+const REASONS: Record<DuelResult["reason"], true> = { ko: true, "double-ko": true, timeout: true, overtime: true };
+
+/** Every field of a duel state on `moveset`, with the ranges the step keeps it in. */
+function duelStateCheck(moveset: DuelMoveset): Check {
+  const { rules, arena, fighter: body, commands, kits } = moveset;
+  const moveId = oneOf(...moveset.moves.map((move) => move.timing.id));
+  const byId = new Map(moveset.moves.map((move) => [move.timing.id, move]));
+  // What each kit's fighter can be doing: the shared normals (every command but the Duelist's specials) and its two specials.
+  const normals = [commands.light, commands.downLight, commands.heavy, commands.downHeavy, commands.forwardHeavy, commands.throw];
+  const kitMoves = (kit: KitId) => [...normals, kits[kit].special1, kits[kit].special2];
+  const kitSpecial = (kit: KitId, has: "projectile" | "zone") =>
+    [kits[kit].special1, kits[kit].special2].find((id) => byId.get(id)?.[has] !== undefined) ?? null;
+  const projectileIds = moveset.moves.flatMap((move) => (move.projectile === undefined ? [] : [move.projectile.id]));
+  const castOf = (id: string) => moveset.moves.find((move) => move.projectile?.id === id)?.timing.id ?? null;
+  const boltCheck = both(
+    exactly<Bolt>({
+      moveId: oneOf(...moveset.moves.filter((move) => move.projectile !== undefined).map((move) => move.timing.id)),
+      x: anyInteger,
+      y: integer(0),
+      vx: anyInteger,
+      life: integer(1),
+    }),
+    (bolt: Bolt) => {
+      const projectile = byId.get(bolt.moveId)!.projectile!;
+      return Math.abs(bolt.vx) === projectile.speed && bolt.life <= projectile.life;
+    },
+    "a bolt flies at its speed within its life",
+  );
+  const zoneCheck = both(
+    exactly<Zone>({
+      moveId: oneOf(...moveset.moves.filter((move) => move.zone !== undefined).map((move) => move.timing.id)),
+      x: integer(body.pushbox.halfWidth, arena.width - body.pushbox.halfWidth),
+      facing: oneOf(1, -1),
+      life: integer(1),
+    }),
+    (zone: Zone) => zone.life <= byId.get(zone.moveId)!.zone!.life,
+    "a smoke screen lasts within its life",
+  );
+  const buffer = exactly<InputBuffer>(
+    Object.fromEntries(DUEL_BUTTONS.map((button) => [button, integer(0, rules.inputBufferFrames)])) as Record<keyof InputBuffer, Check>,
+  );
+  const fighter = both(
+    exactly<FighterState>({
+      x: integer(body.pushbox.halfWidth, arena.width - body.pushbox.halfWidth),
+      y: integer(0),
+      vx: anyInteger,
+      vy: anyInteger,
+      facing: oneOf(1, -1),
+      health: integer(0, rules.maxHealth),
+      stamina: integer(0, rules.maxStamina),
+      staminaIdle: integer(0),
+      action: member(ACTIONS),
+      actionFrame: integer(0),
+      timer: integer(0),
+      moveId: nullable(moveId),
+      moveHit: boolean,
+      crouching: boolean,
+      combo: integer(0, rules.comboCap),
+      held: integer(0, DUEL_INPUT_MASK),
+      buffer,
+      kit: oneOf(...KIT_IDS),
+      bolt: nullable(boltCheck),
+      zone: nullable(zoneCheck),
+      obscured: boolean,
+    }),
+    (state: FighterState) =>
+      (state.action === "attack") === (state.moveId !== null) &&
+      (state.moveId === null || kitMoves(state.kit).includes(state.moveId)) &&
+      (state.bolt === null || state.bolt.moveId === kitSpecial(state.kit, "projectile")) &&
+      (state.zone === null || state.zone.moveId === kitSpecial(state.kit, "zone")),
+    "a fighter has a move of its kit exactly while it attacks, and only its kit's bolt and smoke screen",
+  );
+  const event = exactly<DuelEvent>({ kind: member(EVENT_KINDS), attacker: oneOf(0, 1), moveId: oneOf(...moveset.moves.map((move) => move.timing.id), ...projectileIds), damage: integer(0) });
+  // An event names a move, or a bolt of the attacker's own kit.
+  const eventsFit = (state: DuelState) =>
+    state.events.every((event) => {
+      const cast = castOf(event.moveId);
+      return cast === null || kitSpecial(state.fighters[event.attacker]!.kit, "projectile") === cast;
+    });
+  const result = exactly<DuelResult>({ winner: oneOf(0, 1, null), reason: member(REASONS), frame: integer(0) });
+  return both(
+    exactly<DuelState>({
+      movesetVersion: oneOf(movesetVersion(moveset)),
+      frame: integer(0),
+      phase: member(PHASES),
+      rng: integer(0, 0xffffffff),
+      fighters: list(fighter, 2),
+      events: list(event),
+      result: nullable(result),
+    }),
+    (state: DuelState) => (state.phase === "over") === (state.result !== null) && eventsFit(state),
+    "a duel is over exactly when it has a result, and its events name the attackers' own bolts",
+  );
+}

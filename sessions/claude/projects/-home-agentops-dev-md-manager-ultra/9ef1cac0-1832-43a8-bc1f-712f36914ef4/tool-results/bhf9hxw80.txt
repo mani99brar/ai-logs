@@ -1,0 +1,808 @@
+     1	"""Atomic read-only-consumer export. Producing state never launches an agent."""
+     2	from __future__ import annotations
+     3	
+     4	import hashlib
+     5	import json
+     6	from datetime import datetime, timezone
+     7	
+     8	from .sessions import read_json, save_json
+     9	
+    10	GRAPH_NODES = [
+    11	    {"node_id": "launch_ui", "label": "Launch UI worker", "kind": "worker", "depends_on": []},
+    12	    {"node_id": "launch_adapter", "label": "Launch adapter worker", "kind": "worker", "depends_on": []},
+    13	    {"node_id": "handoff", "label": "Freeze worker handoffs", "kind": "prepare", "depends_on": ["launch_ui", "launch_adapter"]},
+    14	    {"node_id": "verify_ui", "label": "Verify UI", "kind": "verification", "depends_on": ["handoff"]},
+    15	    {"node_id": "verify_adapter", "label": "Verify adapter", "kind": "verification", "depends_on": ["handoff"]},
+    16	    {"node_id": "candidate", "label": "Verify combined candidate", "kind": "verification", "depends_on": ["verify_ui", "verify_adapter"]},
+    17	    {"node_id": "review", "label": "Independent review", "kind": "review", "depends_on": ["candidate"]},
+    18	    {"node_id": "approval", "label": "Integration approval", "kind": "integration", "depends_on": ["review"]},
+    19	    {"node_id": "integrate", "label": "Integrate candidate", "kind": "integration", "depends_on": ["approval"]},
+    20	]
+    21	
+    22	
+    23	def export_state(runtime, state) -> dict:
+    24	    path = runtime.directory / "run-state.json"
+    25	    previous = read_json(path) if path.exists() else None
+    26	    events_path = runtime.directory / "events.jsonl"
+    27	    events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
+    28	    tasks = [{"node_id": task.name, "error": str(task.error) if task.error else None,
+    29	              "interrupts": [item.value for item in task.interrupts],
+    30	              "result": getattr(task, "result", None)} for task in state.tasks]
+    31	    created = runtime.plan.get("created_at") or datetime.fromtimestamp((runtime.directory / "plan.json").stat().st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
+    32	    packets = []
+    33	    for packet_path in sorted((runtime.directory / "verification").glob("*/*/*/packet.json")):
+    34	        relative = packet_path.relative_to(runtime.directory)
+    35	        _, phase, node, attempt, _ = relative.parts
+    36	        packets.append({"phase": phase, "node_id": node, "attempt": int(attempt), "path": str(relative),
+    37	                        "sha256": hashlib.sha256(packet_path.read_bytes()).hexdigest()})
+    38	    value = {"version": "1.0.0", "run_id": runtime.plan["run_id"], "base_commit": runtime.plan["base_commit"],
+    39	             "created_at": created, "definition": {"name": "Feature implementation", "nodes": GRAPH_NODES},
+    40	             "values": dict(state.values), "next": list(state.next), "tasks": tasks, "events": events,
+    41	             "verification_packets": packets}
+    42	    if previous and {key: item for key, item in previous.items() if key != "updated_at"} == value:
+    43	        return previous
+    44	    value["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    45	    save_json(path, value)
+    46	    return value
+    47	"""One-command preparation/start of a committed feature; never skips human gates."""
+    48	from __future__ import annotations
+    49	
+    50	import argparse
+    51	import json
+    52	import re
+    53	import subprocess
+    54	import sys
+    55	from pathlib import Path
+    56	
+    57	from .pipeline import validate_pipeline_policy
+    58	from .sessions import read_json
+    59	
+    60	
+    61	def launch_commands(repo: Path, feature: str, run_id: str, run_root: Path, herdr: bool = True, automatic: bool = False,
+    62	                    worker_timeout_seconds: int | None = None, review_timeout_seconds: int | None = None) -> tuple[Path, list[list[str]]]:
+    63	    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+    64	        raise ValueError("run-id must be an opaque identifier, not a path")
+    65	    folder = repo / "features" / feature
+    66	    manifest = read_json(folder / "feature.json")
+    67	    files = {}
+    68	    for key in ("policy", "ui_task", "adapter_task"):
+    69	        path = (folder / manifest[key]).resolve(strict=True)
+    70	        if not path.is_relative_to(folder.resolve()):
+    71	            raise ValueError("Feature file escapes feature directory")
+    72	        files[key] = path
+    73	    validate_pipeline_policy(read_json(files["policy"]))
+    74	    run = (run_root / run_id).resolve()
+    75	    if run == repo or repo in run.parents:
+    76	        raise ValueError("Run storage must be outside the repository")
+    77	    base = [sys.executable, "-m", "workflow"]
+    78	    preflight = [*base, "preflight", str(run), "--repo", str(repo), "--policy", str(files["policy"])]
+    79	    start = [*base, "start", str(run), "--live"]
+    80	    if herdr:
+    81	        preflight.append("--herdr")
+    82	        start.append("--herdr")
+    83	    branch = f"{manifest['branch_prefix']}/{run_id}"
+    84	    commands = [
+    85	        preflight,
+    86	        ["git", "switch", "-c", branch],
+    87	        [*base, "prepare", str(run), "--repo", str(repo), "--policy", str(files["policy"]),
+    88	         "--ui-task", str(files["ui_task"]), "--adapter-task", str(files["adapter_task"])],
+    89	        start,
+    90	    ]
+    91	    if automatic:
+    92	        from .automatic import automatic_settings
+    93	        settings = automatic_settings(worker_timeout_seconds, review_timeout_seconds)  # Reject bad deadlines before any command runs.
+    94	        commands[0].append("--automatic")
+    95	        commands[2].extend(["--automatic", "--worker-timeout-seconds", str(settings["worker_timeout_seconds"]),
+    96	                            "--review-timeout-seconds", str(settings["review_timeout_seconds"])])
+    97	        commands.append([*base, "automatic", str(run), "--live"])
+    98	    elif worker_timeout_seconds is not None or review_timeout_seconds is not None:
+    99	        raise ValueError("Timeouts apply to --automatic runs only")
+   100	    return run, commands
+   101	
+   102	
+   103	def main(argv=None):
+   104	    parser = argparse.ArgumentParser(description=__doc__)
+   105	    parser.add_argument("feature", choices=["project-workflows"])
+   106	    parser.add_argument("--run-id", default="project-workflows-001")
+   107	    parser.add_argument("--run-root", type=Path, default=Path.home() / ".local/state/md-manager-workflows/project-workflows")
+   108	    parser.add_argument("--live", action="store_true", help="Authorize Claude usage")
+   109	    parser.add_argument("--automatic", action="store_true", help="Bypass worker permission prompts; run through independent review to a verified feature branch")
+   110	    parser.add_argument("--worker-timeout-seconds", type=int, help="Automatic mode: per-worker deadline from launch to completion signal (default 4h, max 24h)")
+   111	    parser.add_argument("--review-timeout-seconds", type=int, help="Automatic mode: reviewer process timeout (default 30m, max 24h)")
+   112	    parser.add_argument("--no-herdr", action="store_true", help="Explicitly omit terminal attachments")
+   113	    parser.add_argument("--dry-run", action="store_true", help="Validate feature configuration and print commands only")
+   114	    args = parser.parse_args(argv)
+   115	    repo = Path(__file__).resolve().parents[1]
+   116	    try:
+   117	        run, commands = launch_commands(repo, args.feature, args.run_id, args.run_root.resolve(), not args.no_herdr, args.automatic,
+   118	                                        args.worker_timeout_seconds, args.review_timeout_seconds)
+   119	        if args.dry_run:
+   120	            print(json.dumps({"run_directory": str(run), "commands": commands, "executes": False}, indent=2))
+   121	            return
+   122	        if not args.live:
+   123	            parser.error("Use --live to authorize worker usage, or --dry-run to inspect without running anything")
+   124	        if run.exists():
+   125	            raise ValueError(f"Run already exists: {run}. Inspect it with status; do not launch duplicate workers.")
+   126	        try:
+   127	            for command in commands:
+   128	                subprocess.run(command, cwd=repo, check=True)
+   129	        except KeyboardInterrupt:
+   130	            parser.exit(130, f"Launch interrupted. Nothing was rolled back. If workers were started they are still running;\n"
+   131	                             f"inspect with: {sys.executable} -m workflow status {run}\n"
+   132	                             + (f"resume with:  {sys.executable} -m workflow automatic {run} --live\n" if args.automatic else ""))
+   133	        if args.automatic:
+   134	            print(f"\nAutomatic run finished. Evidence: {run / 'report.html'}. No main merge or push.")
+   135	            return
+   136	        print(f"\nRun: {run}\nWorkers are in their dedicated Herdr tab (unless --no-herdr).")
+   137	        print("Watch/answer permission prompts. When both finish, return to Pi for handoffs and freeze.")
+   138	        print("The intentional adapter verification drill will block its first attempt; retry that check explicitly after restarting the controller.")
+   139	        print(f"Status: {sys.executable} -m workflow status {run}")
+   140	        print("Review and integration still require separate explicit approval. Nothing is pushed.")
+   141	    except (ValueError, OSError, subprocess.SubprocessError) as error:
+   142	        parser.exit(1, f"Launch blocked: {error}\nNo fallback, reset or cleanup was attempted. Inspect any retained branch/run state.\n")
+   143	
+   144	
+   145	if __name__ == "__main__":
+   146	    main()
+   147	"""LangGraph-owned Claude processes. Herdr never launches these processes.
+   148	
+   149	Execution receipts are internal state, NOT verified WorkerResult evidence. Interrupted
+   150	or failed launches require operator reconciliation; this module never retries them.
+   151	"""
+   152	from __future__ import annotations
+   153	
+   154	import fcntl
+   155	import hashlib
+   156	import json
+   157	import os
+   158	import signal
+   159	import subprocess
+   160	import threading
+   161	import uuid
+   162	from contextlib import contextmanager
+   163	from pathlib import Path
+   164	
+   165	NODES = ("ui", "adapter")
+   166	TERMINAL = {"succeeded", "failed", "blocked"}
+   167	
+   168	
+   169	def read_json(path: Path) -> dict:
+   170	    return json.loads(path.read_text())
+   171	
+   172	
+   173	def save_json(path: Path, value: dict) -> None:
+   174	    temporary = path.with_name(f".{path.name}.{uuid.uuid4()}.tmp")
+   175	    with temporary.open("x") as handle:
+   176	        os.chmod(temporary, 0o600)
+   177	        json.dump(value, handle, indent=2)
+   178	        handle.write("\n")
+   179	        handle.flush()
+   180	        os.fsync(handle.fileno())
+   181	    os.replace(temporary, path)
+   182	    descriptor = os.open(path.parent, os.O_RDONLY)
+   183	    try:
+   184	        os.fsync(descriptor)
+   185	    finally:
+   186	        os.close(descriptor)
+   187	
+   188	
+   189	@contextmanager
+   190	def run_lock(directory: Path, lock_name: str = "controller.lock"):
+   191	    """Only the controller takes this lock. Observers need no lock or write access."""
+   192	    with (directory / lock_name).open("a") as handle:
+   193	        try:
+   194	            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+   195	        except BlockingIOError as error:
+   196	            raise RuntimeError("Another controller owns this run") from error
+   197	        try:
+   198	            yield
+   199	        finally:
+   200	            fcntl.flock(handle, fcntl.LOCK_UN)
+   201	
+   202	
+   203	def git(repo: Path, *arguments: str) -> str:
+   204	    return subprocess.check_output(["git", "-C", str(repo), *arguments], text=True).strip()
+   205	
+   206	
+   207	def prepare(directory: Path, repo: Path, base: str, tasks: dict[str, str], allow_edits: bool) -> dict:
+   208	    if set(tasks) != set(NODES) or any(not text.strip() for text in tasks.values()):
+   209	        raise ValueError("Exactly two nonempty tasks are required: ui and adapter")
+   210	    repo = repo.resolve()
+   211	    if git(repo, "status", "--porcelain"):
+   212	        raise ValueError("Commit or preserve source changes before creating worker worktrees")
+   213	    revision = git(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+   214	    # Require the pinned revision to include the shared contract.
+   215	    git(repo, "cat-file", "-e", f"{revision}:contracts/workflow/workerResult.schema.json")
+   216	    directory = directory.resolve()
+   217	    if directory == repo or repo in directory.parents:
+   218	        raise ValueError("Run data/worktrees must be outside the source repository")
+   219	    directory.mkdir(parents=True, mode=0o700, exist_ok=False)
+   220	    os.chmod(directory, 0o700)
+   221	    plan = {"run_id": directory.name, "repository": str(repo), "base_commit": revision,
+   222	            "allow_edits": allow_edits, "nodes": {}}
+   223	    # Journal before allocation. Partial worktrees are retained on failure.
+   224	    save_json(directory / "plan.json", plan)
+   225	    for node in NODES:
+   226	        worktree = directory / f"worktree-{node}"
+   227	        plan["nodes"][node] = {"worktree": str(worktree), "task": tasks[node],
+   228	                               "session_id": str(uuid.uuid4()), "observed_start_commit": None}
+   229	        save_json(directory / "plan.json", plan)
+   230	        subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(worktree), revision], check=True, capture_output=True)
+   231	        observed = git(worktree, "rev-parse", "HEAD")
+   232	        if observed != revision or git(worktree, "status", "--porcelain"):
+   233	            raise RuntimeError(f"Unclean or mismatched initial worktree: {worktree}")
+   234	        plan["nodes"][node]["observed_start_commit"] = observed
+   235	        save_json(directory / "plan.json", plan)
+   236	    return plan
+   237	
+   238	
+   239	def plan_digest(plan: dict) -> str:
+   240	    return hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+   241	
+   242	
+   243	def terminate(process: subprocess.Popen) -> None:
+   244	    try:
+   245	        os.killpg(process.pid, signal.SIGTERM)
+   246	    except ProcessLookupError:
+   247	        return
+   248	    try:
+   249	        process.wait(timeout=5)
+   250	    except subprocess.TimeoutExpired:
+   251	        os.killpg(process.pid, signal.SIGKILL)
+   252	        process.wait()
+   253	
+   254	
+   255	class ClaudeSessions:
+   256	    def __init__(self, directory: Path, executable: str = "claude", timeout: float = 1800):
+   257	        self.directory = directory.resolve()
+   258	        self.plan = read_json(self.directory / "plan.json")
+   259	        if set(self.plan["nodes"]) != set(NODES):
+   260	            raise RuntimeError("Run preparation is incomplete; inspect retained allocation state")
+   261	        for node in NODES:
+   262	            info = self.plan["nodes"][node]
+   263	            if Path(info["worktree"]).resolve() != self.directory / f"worktree-{node}" or info["observed_start_commit"] != self.plan["base_commit"]:
+   264	                raise RuntimeError("Invalid worktree identity/start revision in plan")
+   265	        self.executable = executable
+   266	        self.timeout = timeout
+   267	        self.cancelled = threading.Event()
+   268	
+   269	    def run(self, node: str) -> dict:
+   270	        if node not in NODES:
+   271	            raise ValueError("Unknown worker")
+   272	        if self.cancelled.is_set():
+   273	            raise RuntimeError("Controller cancelled before launch")
+   274	        info = self.plan["nodes"][node]
+   275	        path = self.directory / f"{node}.json"
+   276	        digest = plan_digest(self.plan)
+   277	        if path.exists():
+   278	            previous = read_json(path)
+   279	            if previous["plan_digest"] != digest:
+   280	                raise RuntimeError("Run plan changed; refuse result reuse/relaunch")
+   281	            if previous["status"] == "succeeded":
+   282	                return previous
+   283	            raise RuntimeError(f"{node}: existing {previous['status']} session {previous['session_id']}; reconcile before any relaunch")
+   284	        cwd = Path(info["worktree"])
+   285	        record = {"node_id": node, "session_id": info["session_id"], "attempt": 1,
+   286	                  "status": "launching", "pid": None, "plan_digest": digest,
+   287	                  "worktree": str(cwd), "base_commit": self.plan["base_commit"]}
+   288	        save_json(path, record)  # A crash from here onward must never cause blind relaunch.
+   289	        tools = "Read,Glob,Grep,Edit,Write" if self.plan["allow_edits"] else "Read,Glob,Grep"
+   290	        command = [self.executable, "--print", "--verbose", "--output-format", "stream-json",
+   291	                   "--session-id", info["session_id"], "--safe-mode", "--strict-mcp-config",
+   292	                   "--mcp-config", '{"mcpServers":{}}', "--tools", tools,
+   293	                   "--permission-mode", "acceptEdits" if self.plan["allow_edits"] else "dontAsk",
+   294	                   "--permission-prompts", "none"]
+   295	        prompt = ("You are an independent workflow worker. Do not launch other agents, modify shared contract files, "
+   296	                  "commit, merge, push or change files outside your assigned worktree. "
+   297	                  "Report changed files, checks actually executed, and open assumptions. "
+   298	                  "No command execution tools are enabled in this initial session slice.\n\n" + info["task"])
+   299	        # Do not let detached workers target the controller's Herdr pane through hooks.
+   300	        env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+   301	        env["TMPDIR"] = str(self.directory / f"tmp-{node}")
+   302	        Path(env["TMPDIR"]).mkdir(exist_ok=True)
+   303	        process = None
+   304	        try:
+   305	            if git(cwd, "rev-parse", "HEAD") != self.plan["base_commit"] or git(cwd, "status", "--porcelain"):
+   306	                raise RuntimeError(f"{node}: worktree changed since preparation")
+   307	            prompt_path = self.directory / f"{node}.prompt.txt"
+   308	            prompt_path.write_text(prompt)
+   309	            os.chmod(prompt_path, 0o600)
+   310	            # A regular stdin file avoids blocking the controller on a full pipe.
+   311	            with prompt_path.open("rb") as input_handle, (self.directory / f"{node}.stream.jsonl").open("wb") as output:
+   312	                process = subprocess.Popen(command, cwd=cwd, env=env, stdin=input_handle,
+   313	                                           stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+   314	                record.update(status="running", pid=process.pid)
+   315	                save_json(path, record)
+   316	                import time
+   317	                deadline = time.monotonic() + self.timeout
+   318	                while process.poll() is None:
+   319	                    if self.cancelled.wait(0.1) or time.monotonic() > deadline:
+   320	                        terminate(process)
+   321	                        raise RuntimeError("Controller cancelled or session timed out; partial work preserved")
+   322	                output.flush()
+   323	                os.fsync(output.fileno())
+   324	            terminal = None
+   325	            with (self.directory / f"{node}.stream.jsonl").open(errors="replace") as output:
+   326	                for line in output:
+   327	                    try:
+   328	                        message = json.loads(line)
+   329	                    except ValueError:
+   330	                        continue
+   331	                    if isinstance(message, dict) and message.get("type") == "result":
+   332	                        terminal = message
+   333	            record["exit_code"] = process.returncode
+   334	            if not terminal or terminal.get("session_id") != info["session_id"]:
+   335	                raise RuntimeError("Missing or mismatched Claude terminal result; reconciliation required")
+   336	            record["claude_result"] = terminal
+   337	            if process.returncode != 0 or terminal.get("is_error") is not False or terminal.get("subtype") != "success":
+   338	                raise RuntimeError("Claude did not succeed; inspect retained result for usage, permission or execution failure. No automatic retry/provider switch.")
+   339	            record["status"] = "succeeded"
+   340	        except BaseException as error:
+   341	            if process is not None and process.poll() is None:
+   342	                terminate(process)
+   343	            record.update(status="blocked", error=str(error))
+   344	            raise
+   345	        finally:
+   346	            # Preserve work and a diff even after failure; untracked files remain in the worktree.
+   347	            try:
+   348	                record["git_status"] = git(cwd, "status", "--porcelain")
+   349	                with (self.directory / f"{node}.patch").open("w") as patch:
+   350	                    subprocess.run(["git", "-C", str(cwd), "diff", "--binary", self.plan["base_commit"]], stdout=patch, check=True)
+   351	            except Exception as error:
+   352	                record["evidence_error"] = str(error)
+   353	                record["status"] = "blocked"
+   354	            save_json(path, record)
+   355	        if record["status"] != "succeeded":
+   356	            raise RuntimeError("Session evidence capture failed")
+   357	        return record
+   358	"""Reusable policy/evidence gates. No agents, browsers, shells or graph launches.
+   359	
+   360	Inputs must come from a trusted verifier plus backend-owned artifact registry, not
+   361	unchecked agent prose. Passing this evidence gate never authorizes integration.
+   362	"""
+   363	from __future__ import annotations
+   364	
+   365	import hashlib
+   366	import json
+   367	import shlex
+   368	from datetime import datetime
+   369	from pathlib import Path
+   370	
+   371	from jsonschema import Draft202012Validator, FormatChecker
+   372	from jsonschema.exceptions import ValidationError
+   373	
+   374	CONTRACTS = Path(__file__).resolve().parents[1] / "contracts" / "workflow"
+   375	
+   376	
+   377	def validate_schema(name: str, value: dict) -> None:
+   378	    schema = json.loads((CONTRACTS / f"{name}.schema.json").read_text())
+   379	    Draft202012Validator(schema, format_checker=FormatChecker()).validate(value)
+   380	
+   381	
+   382	def policy_digest(policy: dict) -> str:
+   383	    """Canonical UTF-8 JSON: sorted keys, no whitespace, literal Unicode."""
+   384	    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+   385	
+   386	
+   387	def safe_path(value: str) -> str:
+   388	    normalized = value.rstrip("/")
+   389	    if not normalized or normalized.startswith("/") or any(char in normalized for char in "\\:*?[]") or any(part in {"", ".", ".."} for part in normalized.split("/")):
+   390	        raise ValueError(f"Not an exact repository-relative path/prefix: {value}")
+   391	    return normalized
+   392	
+   393	
+   394	def owns(path: str, prefix: str) -> bool:
+   395	    return path == prefix or path.startswith(prefix + "/")
+   396	
+   397	
+   398	def unique(items: list[dict], key: str) -> dict:
+   399	    result = {item[key]: item for item in items}
+   400	    if len(result) != len(items):
+   401	        raise ValueError(f"Duplicate {key}")
+   402	    return result
+   403	
+   404	
+   405	def validate_policy(policy: dict) -> dict:
+   406	    validate_schema("verification", policy)
+   407	    workers = unique(policy["workers"], "node_id")
+   408	    claimed = []
+   409	    for worker in workers.values():
+   410	        paths = [safe_path(path) for path in worker["owned_paths"]]
+   411	        for other_node, other_path in claimed:
+   412	            if any(owns(path, other_path) or owns(other_path, path) for path in paths):
+   413	                raise ValueError(f"Overlapping ownership: {worker['node_id']} and {other_node}")
+   414	        claimed.extend((worker["node_id"], path) for path in paths)
+   415	        checks = unique(worker["checks"], "id")
+   416	        if len({tuple(check["argv"]) for check in checks.values()}) != len(checks):
+   417	            raise ValueError("Each check needs a distinct command")
+   418	        kinds = {check["kind"] for check in checks.values()}
+   419	        required = {"build", "browser"} if worker["role"] == "frontend" else {"unit"}
+   420	        if not required <= kinds:
+   421	            raise ValueError(f"{worker['role']} requires {sorted(required)} checks")
+   422	        for check in checks.values():
+   423	            unique(check["scenarios"], "id")
+   424	            if (check["kind"] == "browser") != bool(check["scenarios"]):
+   425	                raise ValueError("Browser checks require named scenarios; other checks must not have scenarios")
+   426	    drill = policy.get("failure_drill")
+   427	    if drill and (drill["node_id"] not in workers or policy.get("max_verification_attempts", 3) < 2):
+   428	        raise ValueError("Failure drill requires a configured worker and at least two allowed verification attempts")
+   429	    return policy
+   430	
+   431	
+   432	def evaluate_worker(policy: dict, result: dict, evidence: dict, *, expected: dict,
+   433	                    artifact_root: Path, artifact_paths: dict[str, Path], enforce_ownership: bool = True) -> dict:
+   434	    """Fail closed on absent, stale or inconsistent evidence.
+   435	
+   436	    `expected` is backend-owned: run_id, node_id, attempt, base_commit,
+   437	    output_commit and verification_cwd. Caller must freeze edits and independently
+   438	    derive the full Git diff/commit before invoking; this function cannot prove
+   439	    that an agent has reported all changed files.
+   440	    """
+   441	    reasons = []
+   442	    try:
+   443	        validate_policy(policy)
+   444	        validate_schema("workerResult", result)
+   445	        validate_schema("verificationEvidence", evidence)
+   446	        workers = {worker["node_id"]: worker for worker in policy["workers"]}
+   447	        worker = workers[expected["node_id"]]
+   448	        for field in ("run_id", "node_id", "attempt", "base_commit", "output_commit"):
+   449	            if result[field] != expected[field]:
+   450	                raise ValueError(f"Worker result has stale/mismatched {field}")
+   451	        for field in ("run_id", "node_id", "attempt", "output_commit"):
+   452	            if evidence[field] != expected[field]:
+   453	                raise ValueError(f"Verification evidence has stale/mismatched {field}")
+   454	        if evidence["policy_sha256"] != policy_digest(policy):
+   455	            raise ValueError("Verification policy changed after evidence capture")
+   456	        if result["status"] != "succeeded" or result["output_commit"] is None or result["error"] is not None:
+   457	            raise ValueError("Worker did not produce a successful durable result")
+   458	        prefixes = [safe_path(path) for path in worker["owned_paths"]]
+   459	        for changed in result["changed_files"]:
+   460	            if enforce_ownership and not any(owns(safe_path(changed), prefix) for prefix in prefixes):
+   461	                reasons.append(f"Changed file outside ownership: {changed}")
+   462	        artifacts = unique(result["artifacts"], "artifact_id")
+   463	        root = artifact_root.resolve(strict=True)
+   464	        resolved = {}
+   465	        for artifact_id, artifact in artifacts.items():
+   466	            path = artifact_paths[artifact_id].resolve(strict=True)
+   467	            if not path.is_relative_to(root) or not path.is_file():
+   468	                raise ValueError(f"Artifact escapes registry root: {artifact_id}")
+   469	            with path.open("rb") as handle:
+   470	                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+   471	            if digest != artifact["sha256"]:
+   472	                raise ValueError(f"Artifact hash mismatch: {artifact_id}")
+   473	            resolved[artifact_id] = path
+   474	        for check in result["checks"]:
+   475	            if artifacts.get(check["log_artifact_id"], {}).get("kind") != "log":
+   476	                reasons.append("Executed check is missing a log artifact")
+   477	            if datetime.fromisoformat(check["finished_at"]) < datetime.fromisoformat(check["started_at"]):
+   478	                reasons.append("Check finish precedes start")
+   479	            if check["exit_code"] != 0:
+   480	                reasons.append(f"Executed check failed: {check['command']}")
+   481	        supplied = unique(evidence["checks"], "id")
+   482	        required = {check["id"]: check for check in worker["checks"]}
+   483	        if set(supplied) != set(required):
+   484	            raise ValueError("Required check evidence missing or contains unknown check IDs")
+   485	        indexes = [check["worker_check_index"] for check in supplied.values()]
+   486	        if len(set(indexes)) != len(indexes):
+   487	            raise ValueError("A command execution cannot satisfy multiple check IDs")
+   488	        for check_id, requirement in required.items():
+   489	            receipt = supplied[check_id]
+   490	            execution = result["checks"][receipt["worker_check_index"]]
+   491	            if execution["command"] != shlex.join(requirement["argv"]):
+   492	                reasons.append(f"{check_id}: executed command differs from approved argv")
+   493	            if Path(execution["cwd"]).resolve() != Path(expected["verification_cwd"]).resolve():
+   494	                reasons.append(f"{check_id}: wrong verification worktree")
+   495	            duration = (datetime.fromisoformat(execution["finished_at"]) - datetime.fromisoformat(execution["started_at"])).total_seconds()
+   496	            if duration > requirement["timeout_seconds"]:
+   497	                reasons.append(f"{check_id}: execution exceeded approved timeout")
+   498	            if requirement["kind"] in {"unit", "browser", "integration", "contract"}:
+   499	                tests = receipt["tests"]
+   500	                if tests is None or tests["passed"] < 1 or tests["failed"] > 0:
+   501	                    reasons.append(f"{check_id}: no passing test evidence or failed tests")
+   502	            scenarios = unique(receipt["scenarios"], "id")
+   503	            if requirement["kind"] == "browser" and receipt["tests"] is not None and receipt["tests"]["passed"] < len(requirement["scenarios"]):
+   504	                reasons.append(f"{check_id}: fewer passing tests than required browser scenarios")
+   505	            if set(scenarios) != {scenario["id"] for scenario in requirement["scenarios"]}:
+   506	                reasons.append(f"{check_id}: missing/unknown browser scenarios")
+   507	            screenshot_ids = []
+   508	            for scenario in scenarios.values():
+   509	                artifact_id = scenario["screenshot_artifact_id"]
+   510	                if scenario["status"] != "passed":
+   511	                    reasons.append(f"{check_id}/{scenario['id']}: browser scenario did not pass")
+   512	                if artifact_id is None or artifacts.get(artifact_id, {}).get("kind") != "screenshot":
+   513	                    reasons.append(f"{check_id}/{scenario['id']}: screenshot required")
+   514	                    continue
+   515	                screenshot_ids.append(artifact_id)
+   516	                # Format sanity only, not proof of visual correctness/authenticity.
+   517	                with resolved[artifact_id].open("rb") as image:
+   518	                    header = image.read(24)
+   519	                if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR" or int.from_bytes(header[16:20], "big") == 0 or int.from_bytes(header[20:24], "big") == 0:
+   520	                    reasons.append(f"{check_id}/{scenario['id']}: expected a PNG screenshot")
+   521	            if len(set(screenshot_ids)) != len(screenshot_ids):
+   522	                reasons.append(f"{check_id}: each scenario needs a distinct screenshot artifact")
+   523	    except (ValueError, KeyError, IndexError, TypeError, OSError) as error:
+   524	        reasons.append(str(error))
+   525	    except ValidationError as error:
+   526	        reasons.append(error.message)
+   527	    return {"status": "blocked" if reasons else "passed", "reasons": reasons,
+   528	            "pending_gates": ["independent_review", "integration_approval"],
+   529	            "integration_allowed": False}
+   530	"""`python -m workflow` exposes the complete operator-driven pipeline CLI."""
+   531	import sys
+   532	
+   533	if __name__ == "__main__":
+   534	    if len(sys.argv) > 1 and sys.argv[1] == "launch":
+   535	        from .launch import main
+   536	        main(sys.argv[2:])
+   537	    else:
+   538	        from .pipeline import main
+   539	        main()
+   540	"""Local, isolated check execution and artifact capture. Never launches agents."""
+   541	from __future__ import annotations
+   542	
+   543	import hashlib
+   544	import json
+   545	import os
+   546	import re
+   547	import shlex
+   548	import shutil
+   549	import signal
+   550	import subprocess
+   551	import sys
+   552	import tempfile
+   553	from datetime import datetime, timezone
+   554	from pathlib import Path
+   555	
+   556	from .sessions import git, save_json, terminate
+   557	from .verification import evaluate_worker, policy_digest
+   558	
+   559	
+   560	def now() -> str:
+   561	    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+   562	
+   563	
+   564	def execute(argv: list[str], cwd: Path, log: Path, timeout: int, env: dict) -> tuple[int, str, str]:
+   565	    started = now()
+   566	    with log.open("wb") as output:
+   567	        process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+   568	                                   stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+   569	        try:
+   570	            code = process.wait(timeout=timeout)
+   571	        except subprocess.TimeoutExpired:
+   572	            terminate(process)
+   573	            output.write(b"\nWORKFLOW: timeout; process group terminated\n")
+   574	            code = 124
+   575	        except BaseException:
+   576	            terminate(process)
+   577	            raise
+   578	        finally:
+   579	            # Test runners must not leave servers or descendant writers alive.
+   580	            # terminate also signals the group after the group leader has exited.
+   581	            terminate(process)
+   582	            try:
+   583	                os.killpg(process.pid, signal.SIGKILL)
+   584	            except ProcessLookupError:
+   585	                pass
+   586	            output.flush()
+   587	            os.fsync(output.fileno())
+   588	    return code, started, now()
+   589	
+   590	
+   591	def text_test_counts(log: str) -> dict | None:
+   592	    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", log)
+   593	    unit = re.search(r"^Ran (\d+) tests? in .+$", text, re.MULTILINE)
+   594	    if unit:
+   595	        total = int(unit[1])
+   596	        skipped = re.search(r"\bskipped=(\d+)", text)
+   597	        skipped = int(skipped[1]) if skipped else 0
+   598	        failures = sum(int(value) for value in re.findall(r"\b(?:failures|errors|unexpected successes)=(\d+)", text))
+   599	        if not re.search(r"^(?:OK(?:\s|$)|FAILED\s*\()", text, re.MULTILINE):
+   600	            return None
+   601	        return {"passed": max(0, total - skipped - failures), "failed": failures, "skipped": skipped}
+   602	    # Node's TAP and spec reporters. Require a complete self-consistent summary.
+   603	    counts = {}
+   604	    for key in ("tests", "pass", "fail", "skipped", "cancelled", "todo"):
+   605	        found = re.findall(rf"^[#ℹ]\s+{key}\s+(\d+)\s*$", text, re.MULTILINE)
+   606	        if found:
+   607	            counts[key] = int(found[-1])
+   608	    if {"tests", "pass", "fail", "skipped"} <= counts.keys():
+   609	        if sum(counts.get(key, 0) for key in ("pass", "fail", "skipped", "cancelled", "todo")) == counts["tests"]:
+   610	            return {"passed": counts["pass"], "failed": counts["fail"] + counts.get("cancelled", 0),
+   611	                    "skipped": counts["skipped"] + counts.get("todo", 0)}
+   612	    return None
+   613	
+   614	
+   615	class Capture:
+   616	    def __init__(self, directory: Path):
+   617	        self.directory = directory
+   618	        self.artifacts = []
+   619	        self.paths = {}
+   620	
+   621	    def add(self, source: Path, kind: str) -> str:
+   622	        if not source.is_file() or source.is_symlink():
+   623	            raise ValueError("Evidence must be a regular file")
+   624	        content = source.read_bytes()
+   625	        digest = hashlib.sha256(content).hexdigest()
+   626	        artifact_id = f"{kind}-{len(self.artifacts)}-{digest[:12]}"
+   627	        destination = self.directory / artifact_id
+   628	        with destination.open("xb") as handle:
+   629	            handle.write(content)
+   630	            handle.flush()
+   631	            os.fsync(handle.fileno())
+   632	        destination.chmod(0o400)
+   633	        self.artifacts.append({"artifact_id": artifact_id, "kind": kind,
+   634	                               "uri": destination.name, "sha256": digest})
+   635	        self.paths[artifact_id] = destination
+   636	        return artifact_id
+   637	
+   638	
+   639	def browser_evidence(report_path: Path, output_root: Path, requirement: dict, capture: Capture) -> tuple[dict, list]:
+   640	    report = json.loads(report_path.read_text())
+   641	    if report.get("errors"):
+   642	        raise ValueError("Playwright reported global errors")
+   643	    specs = []
+   644	    def walk(suite):
+   645	        specs.extend(suite.get("specs", []))
+   646	        for child in suite.get("suites", []):
+   647	            walk(child)
+   648	    walk(report)
+   649	    required = {case["id"] for case in requirement["scenarios"]}
+   650	    found = {}
+   651	    counts = {"passed": 0, "failed": 0, "skipped": 0}
+   652	    for spec in specs:
+   653	        for test in spec.get("tests", []):
+   654	            results = test.get("results", [])
+   655	            # No flaky retries or expected failures counted as passing verification.
+   656	            passed = test.get("status") == "expected" and test.get("expectedStatus") == "passed" and len(results) == 1 and results[0].get("status") == "passed"
+   657	            skipped = test.get("status") == "skipped"
+   658	            counts["passed" if passed else "skipped" if skipped else "failed"] += 1
+   659	            matches = set(re.findall(r"\[scenario:([^\]]+)\]", spec.get("title", ""))) & required
+   660	            for scenario_id in matches:
+   661	                if scenario_id in found:
+   662	                    raise ValueError(f"Duplicate browser scenario/project result: {scenario_id}")
+   663	                screenshot = None
+   664	                if passed:
+   665	                    attachments = [item for item in results[0].get("attachments", [])
+   666	                                   if item.get("name") == f"screenshot:{scenario_id}" and item.get("contentType") == "image/png"]
+   667	                    if len(attachments) != 1:
+   668	                        raise ValueError(f"Expected one screenshot attachment for {scenario_id}")
+   669	                    path = Path(attachments[0].get("path", "")).resolve(strict=True)
+   670	                    if not path.is_relative_to(output_root.resolve()):
+   671	                        raise ValueError("Screenshot attachment outside isolated browser output directory")
+   672	                    screenshot = capture.add(path, "screenshot")
+   673	                found[scenario_id] = {"id": scenario_id, "status": "passed" if passed else "skipped" if skipped else "failed",
+   674	                                      "screenshot_artifact_id": screenshot}
+   675	    if set(found) != required:
+   676	        raise ValueError("Playwright report does not cover every required scenario")
+   677	    return counts, list(found.values())
+   678	
+   679	
+   680	def verify_revision(run: Path, plan: dict, policy: dict, node: str, commit: str, changed: list[str],
+   681	                    session_id: str, phase: str = "worker", attempt: int = 1) -> dict:
+   682	    """One fresh verification worktree per node/phase/attempt, artifacts retained."""
+   683	    worker = next(worker for worker in policy["workers"] if worker["node_id"] == node)
+   684	    directory = run / "verification" / phase / node / str(attempt)
+   685	    packet_path = directory / "packet.json"
+   686	    if packet_path.exists():
+   687	        packet = json.loads(packet_path.read_text())
+   688	        if packet["expected"]["output_commit"] != commit or packet["evidence"]["policy_sha256"] != policy_digest(policy):
+   689	            raise ValueError("Existing verification belongs to a different revision/policy")
+   690	        return recheck_packet(packet, policy, run)
+   691	    if directory.exists():
+   692	        raise RuntimeError("Interrupted check attempt exists; use an explicitly incremented attempt")
+   693	    directory.mkdir(parents=True, mode=0o700)
+   694	    worktree = directory / "worktree"
+   695	    subprocess.run(["git", "-C", plan["repository"], "worktree", "add", "--detach", str(worktree), commit], check=True, capture_output=True)
+   696	    if git(worktree, "rev-parse", "HEAD") != commit or git(worktree, "status", "--porcelain"):
+   697	        raise RuntimeError("Verification worktree did not start clean at expected revision")
+   698	    artifacts_dir = directory / "artifacts"
+   699	    artifacts_dir.mkdir()
+   700	    capture = Capture(artifacts_dir)
+   701	    env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+   702	    for key in list(env):
+   703	        if key.startswith("PLAYWRIGHT_JSON_OUTPUT"):
+   704	            del env[key]  # The runner owns JSON capture, not inherited reporter paths.
+   705	    # Share installed browser executables read-only, not profiles or test caches.
+   706	    if sys.platform == "linux":
+   707	        env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path(env.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ms-playwright"))
+   708	    env.update(PATH=str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", ""),
+   709	               PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", FORCE_COLOR="0", CI="1",
+   710	               WORKFLOW_VERIFICATION_PHASE=phase)
+   711	    for name in ("XDG_CACHE_HOME", "npm_config_cache"):
+   712	        path = directory / name.lower()
+   713	        path.mkdir()
+   714	        env[name] = str(path)
+   715	    # Unix domain sockets (tsx IPC, Chromium) are limited to ~107 bytes of path, so the
+   716	    # lane's TMPDIR cannot live under the run directory. It is private to this lane,
+   717	    # holds no evidence, and is removed once the checks finish.
+   718	    tmpdir = lane_tmpdir()
+   719	    env["TMPDIR"] = str(tmpdir)
+   720	    executions, receipts, errors, effective_commands = [], [], [], []
+   721	    try:
+   722	        run_lane_commands(policy, worker, worktree, directory, env, capture, executions, receipts, errors, effective_commands)
+   723	    finally:
+   724	        shutil.rmtree(tmpdir, ignore_errors=True)
+   725	    # Source edits by checks invalidate the evidence. Ignored caches are allowed.
+   726	    if git(worktree, "rev-parse", "HEAD") != commit or git(worktree, "status", "--porcelain"):
+   727	        errors.append("Verification modified the tested source revision")
+   728	    expected = {"run_id": plan["run_id"], "node_id": node, "attempt": attempt, "base_commit": plan["base_commit"],
+   729	                "output_commit": commit, "verification_cwd": str(worktree)}
+   730	    result = {"contract_version": "1.0.0", **{key: value for key, value in expected.items() if key != "verification_cwd"},
+   731	              "session_id": session_id, "status": "succeeded", "changed_files": changed,
+   732	              "checks": executions, "open_assumptions": [], "artifacts": capture.artifacts,
+   733	              "summary": f"Trusted {phase} check capture; not integration approval", "error": None}
+   734	    evidence = {"version": "1.0.0", "policy_sha256": policy_digest(policy),
+   735	                **{key: expected[key] for key in ("run_id", "node_id", "attempt", "output_commit")}, "checks": receipts}
+   736	    packet = {"phase": phase, "expected": expected, "result": result, "evidence": evidence,
+   737	              "artifact_root": str(artifacts_dir), "artifact_paths": {key: str(path) for key, path in capture.paths.items()},
+   738	              "capture_errors": errors, "effective_commands": effective_commands, "tmpdir": str(tmpdir)}
+   739	    packet = recheck_packet(packet, policy, run)
+   740	    save_json(packet_path, packet)
+   741	    return packet
+   742	
+   743	
+   744	SOCKET_PATH_LIMIT = 107  # sun_path on Linux, excluding the terminating NUL.
+   745	SOCKET_NAME_ALLOWANCE = len("/tsx-4294967295/4294967295.pipe")
+   746	
+   747	
+   748	def lane_tmpdir() -> Path:
+   749	    """A short private temp directory whose sockets fit within sun_path."""
+   750	    tmpdir = Path(tempfile.mkdtemp(prefix="mdwf-"))
+   751	    if len(str(tmpdir)) + SOCKET_NAME_ALLOWANCE > SOCKET_PATH_LIMIT:
+   752	        shutil.rmtree(tmpdir, ignore_errors=True)
+   753	        raise RuntimeError(f"System temp directory is too deep for Unix sockets: {tmpdir.parent}")
+   754	    return tmpdir
+   755	
+   756	
+   757	def run_lane_commands(policy: dict, worker: dict, worktree: Path, directory: Path, env: dict, capture: "Capture",
+   758	                      executions: list, receipts: list, errors: list, effective_commands: list) -> None:
+   759	    for index, setup in enumerate(policy.get("setup", [])):
+   760	        log = directory / f"setup-{index}.log"
+   761	        code, _, _ = execute(setup["argv"], worktree, log, setup["timeout_seconds"], env)
+   762	        capture.add(log, "log")
+   763	        if code != 0:
+   764	            errors.append(f"Setup {index} failed with exit {code}")
+   765	            break
+   766	    if not errors:
+   767	        for index, check in enumerate(worker["checks"]):
+   768	            argv = list(check["argv"])
+   769	            log = directory / f"check-{index}.log"
+   770	            browser_output = directory / f"browser-{index}"
+   771	            browser_report = directory / f"browser-report-{index}.json"
+   772	            check_env = dict(env)
+   773	            if check["kind"] == "browser":
+   774	                # Runtime-owned reporter/output flags override project defaults.
+   775	                argv.extend(["--reporter=json", f"--output={browser_output}", "--workers=1", "--retries=0"])
+   776	                check_env["PLAYWRIGHT_JSON_OUTPUT_FILE"] = str(browser_report)
+   777	            effective_commands.append(argv)
+   778	            code, start, finish = execute(argv, worktree, log, check["timeout_seconds"], check_env)
+   779	            log_id = capture.add(log, "log")
+   780	            executions.append({"command": shlex.join(check["argv"]), "cwd": str(worktree),
+   781	                               "started_at": start, "finished_at": finish, "exit_code": code, "log_artifact_id": log_id})
+   782	            tests, scenarios = None, []
+   783	            try:
+   784	                if check["kind"] == "browser":
+   785	                    # Keep structured results separate from npm/Node warnings in logs.
+   786	                    tests, scenarios = browser_evidence(browser_report, browser_output, check, capture)
+   787	                    capture.add(browser_report, "test_report")
+   788	                elif check["kind"] in {"unit", "contract", "integration"}:
+   789	                    tests = text_test_counts(log.read_text(errors="replace"))
+   790	                if code != 0:
+   791	                    errors.append(f"{check['id']}: exit {code}")
+   792	            except (ValueError, OSError, KeyError, TypeError) as error:
+   793	                errors.append(f"{check['id']}: {error}")
+   794	            receipts.append({"id": check["id"], "worker_check_index": index, "tests": tests, "scenarios": scenarios})
+   795	
+   796	
+   797	def recheck_packet(packet: dict, policy: dict, run: Path) -> dict:
+   798	    root = Path(packet["artifact_root"]).resolve()
+   799	    if not root.is_relative_to(run.resolve()):
+   800	        raise ValueError("Artifact root outside run")
+   801	    gate = evaluate_worker(policy, packet["result"], packet["evidence"], expected=packet["expected"],
+   802	                           artifact_root=root, artifact_paths={key: Path(value) for key, value in packet["artifact_paths"].items()},
+   803	                           enforce_ownership=packet["phase"] == "worker")
+   804	    gate["reasons"].extend(packet["capture_errors"])
+   805	    if gate["reasons"]:
+   806	        gate["status"] = "blocked"
+   807	    packet["gate"] = gate
+   808	    return packet

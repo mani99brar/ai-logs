@@ -1,0 +1,192 @@
+import { rulesPresets, seaPathCosts, type RulesPresetId, type SeaMapDefinition } from "@pirate-sea-race/content";
+import { sourceId } from "@pirate-sea-race/content/objectives";
+import {
+  cacheRubbings,
+  createLedger,
+  createLedgerFromAssignment,
+  heldTypes,
+  RUBBING_TYPES,
+  type LedgerCache,
+  type LedgerState,
+  type ObjectiveRules,
+  type RubbingType,
+  type SourceAssignment,
+  type SourceSite,
+} from "@pirate-sea-race/simulation/objectives";
+
+/**
+ * The room's side of the objective ledger (`docs/objectives.md`): where the sources stand on the sea, what interact
+ * (E) targets at a dock, and where a leaver's recovery cache goes. The ledger itself decides every move of a rubbing
+ * or of gold; nothing here writes one.
+ */
+
+/** Private matches play the slice preset (§18 stage 2): two types, eight rubbings, two sources on each of four islands. */
+export const MATCH_PRESET: RulesPresetId = "slice";
+
+/** The centre of a dock's tile, in sub-units: where a moored ship lies, a source stands and a cache is placed. */
+export function dockCentre(map: SeaMapDefinition, dockId: number): { x: number; y: number } {
+  const dock = map.docks[dockId];
+  if (dock === undefined) throw new RangeError(`no dock ${dockId}`);
+  const half = Math.floor(map.subUnitsPerTile / 2);
+  return { x: dock.tileX * map.subUnitsPerTile + half, y: dock.tileY * map.subUnitsPerTile + half };
+}
+
+/** An island's docks, in id order. */
+export function islandDocks(map: SeaMapDefinition, island: number): number[] {
+  return map.docks.filter((dock) => dock.island === island).map((dock) => dock.id);
+}
+
+/**
+ * The ledger's source sites: `sourcesPerIsland` on each regular island, at that island's docks taken in id order (a
+ * dock is reused when the island has fewer docks than sources). Site `j` of island `i` becomes source `source-i-j`.
+ */
+export function sourceSites(map: SeaMapDefinition, presetId: RulesPresetId = MATCH_PRESET): SourceSite[] {
+  const preset = rulesPresets[presetId];
+  const sites: SourceSite[] = [];
+  for (let island = 0; island < preset.islands; island++) {
+    const docks = islandDocks(map, island);
+    if (docks.length === 0) throw new Error(`${map.name}: island ${island} has no dock for its sources`);
+    for (let slot = 0; slot < preset.sourcesPerIsland; slot++) sites.push({ island, ...dockCentre(map, docks[slot % docks.length]!) });
+  }
+  return sites;
+}
+
+/**
+ * A fixed assignment for the test-only source layout (`TEST_SOURCES_ENV`): island `i`'s sources get the types of
+ * group `i`, in order, each the next unused copy of that type. The ledger validates the result like any assignment,
+ * so a layout that does not seal every rubbing once is refused.
+ */
+export function layoutAssignment(sites: readonly SourceSite[], layout: readonly (readonly string[])[], presetId: RulesPresetId = MATCH_PRESET): SourceAssignment {
+  const copies = new Map<string, number>();
+  const slots = new Map<number, number>();
+  const sources = sites.map((site) => {
+    const slot = slots.get(site.island) ?? 0;
+    slots.set(site.island, slot + 1);
+    const type = layout[site.island]?.[slot];
+    if (type === undefined || !(RUBBING_TYPES as readonly string[]).includes(type)) {
+      throw new Error(`test source layout: island ${site.island} source ${slot} has no valid type`);
+    }
+    const copy = (copies.get(type) ?? 0) + 1;
+    copies.set(type, copy);
+    return { id: sourceId(site.island, slot), island: site.island, x: site.x, y: site.y, type: type as RubbingType, rubbingId: `${type}-${copy}` };
+  });
+  return { preset: presetId, seed: 0, sources };
+}
+
+export interface MatchLedgerOptions {
+  readonly map: SeaMapDefinition;
+  /** The room's own private randomness, never the public match code (§3, §16). */
+  readonly seed: number;
+  readonly rules: ObjectiveRules;
+  /** Test-only: deal the sources in this layout instead of shuffling them. */
+  readonly layout?: readonly (readonly string[])[];
+}
+
+/**
+ * A new match's ledger. Every source starts locked behind its island's ruin (§3): the first solve of that ruin unlocks
+ * them (`ruins-online`).
+ */
+export function createMatchLedger(options: MatchLedgerOptions): LedgerState {
+  const sites = sourceSites(options.map);
+  return options.layout === undefined
+    ? createLedger({ preset: MATCH_PRESET, seed: options.seed, sites, rules: options.rules })
+    : createLedgerFromAssignment(layoutAssignment(sites, options.layout), options.seed >>> 0, options.rules);
+}
+
+const typeOrder = (type: RubbingType) => RUBBING_TYPES.indexOf(type);
+
+/** The types still sealed at an island's sources, one per source, in type order: what a moored player may see there. */
+export function sealedTypesAt(ledger: LedgerState, island: number): RubbingType[] {
+  return ledger.sources
+    .filter((source) => source.island === island && sealedAt(ledger, source.id, source.rubbingId))
+    .map((source) => source.type)
+    .sort((a, b) => typeOrder(a) - typeOrder(b));
+}
+
+function sealedAt(ledger: LedgerState, sourceIdentifier: string, rubbingId: string): boolean {
+  const rubbing = ledger.rubbings.find((each) => each.id === rubbingId);
+  return rubbing?.location.kind === "source" && rubbing.location.sourceId === sourceIdentifier;
+}
+
+/** The dock a cache stands at (caches are only ever placed at dock centres), or -1. */
+export function cacheDock(map: SeaMapDefinition, cache: Pick<LedgerCache, "x" | "y">): number {
+  for (const dock of map.docks) {
+    const centre = dockCentre(map, dock.id);
+    if (centre.x === cache.x && centre.y === cache.y) return dock.id;
+  }
+  return -1;
+}
+
+/** The caches at a dock, in creation order. */
+export function cachesAtDock(ledger: LedgerState, map: SeaMapDefinition, dockId: number): LedgerCache[] {
+  return ledger.caches.filter((cache) => cacheDock(map, cache) === dockId);
+}
+
+/** The types held in the caches at a dock, one per rubbing, in type order: what a player moored there may see. */
+export function cachedTypesAt(ledger: LedgerState, map: SeaMapDefinition, dockId: number): RubbingType[] {
+  return cachesAtDock(ledger, map, dockId)
+    .flatMap((cache) => cacheRubbings(ledger, cache.id).map((rubbing) => rubbing.type))
+    .sort((a, b) => typeOrder(a) - typeOrder(b));
+}
+
+/** What holding E at a dock works on: an island source to collect, or one cached rubbing to claim. */
+export type InteractTarget =
+  | { readonly kind: "collect"; readonly sourceId: string; readonly type: RubbingType }
+  | { readonly kind: "claim"; readonly cacheId: string; readonly rubbingId: string; readonly type: RubbingType };
+
+/**
+ * E's target for a player moored at a dock: first the island's unlocked sealed source of a type the player lacks,
+ * then a rubbing of a type they lack in a cache at this dock, each in the fixed type order (ties to the lower source
+ * id, the older cache, the lower rubbing id). None when the player lacks nothing on offer.
+ */
+export function interactTarget(ledger: LedgerState, map: SeaMapDefinition, playerId: string, dockId: number): InteractTarget | undefined {
+  const island = map.docks[dockId]?.island;
+  if (island === undefined || island < 0) return undefined;
+  const held = new Set(heldTypes(ledger, playerId));
+  const source = ledger.sources
+    .filter((each) => each.island === island && each.unlocked && !held.has(each.type) && sealedAt(ledger, each.id, each.rubbingId))
+    .sort((a, b) => typeOrder(a.type) - typeOrder(b.type) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
+  if (source !== undefined) return { kind: "collect", sourceId: source.id, type: source.type };
+  for (const type of ledger.types) {
+    if (held.has(type)) continue;
+    for (const cache of cachesAtDock(ledger, map, dockId)) {
+      const rubbing = cacheRubbings(ledger, cache.id)
+        .filter((each) => each.type === type)
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0];
+      if (rubbing !== undefined) return { kind: "claim", cacheId: cache.id, rubbingId: rubbing.id, type };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The dock nearest a position by sea (§12: a quitter's cache goes to the nearest reachable dock): the shortest
+ * eight-way path over navigable tiles, ties to the lower dock id. A position whose tile reaches no dock falls back to
+ * the nearest dock in a straight line.
+ */
+export function nearestDockBySea(map: SeaMapDefinition, x: number, y: number): number {
+  const tileX = Math.floor(x / map.subUnitsPerTile);
+  const tileY = Math.floor(y / map.subUnitsPerTile);
+  const costs = seaPathCosts(map, tileX, tileY);
+  let best = -1;
+  let bestCost = Number.POSITIVE_INFINITY;
+  for (const dock of map.docks) {
+    const cost = costs[dock.tileY * map.widthTiles + dock.tileX]!;
+    if (cost < bestCost) {
+      best = dock.id;
+      bestCost = cost;
+    }
+  }
+  if (best >= 0 && bestCost < Number.MAX_SAFE_INTEGER) return best;
+  let nearest = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const dock of map.docks) {
+    const centre = dockCentre(map, dock.id);
+    const distance = (centre.x - x) ** 2 + (centre.y - y) ** 2;
+    if (distance < nearestDistance) {
+      nearest = dock.id;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}

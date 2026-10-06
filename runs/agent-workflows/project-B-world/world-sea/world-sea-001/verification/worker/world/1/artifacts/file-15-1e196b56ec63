@@ -1,0 +1,244 @@
+import * as Phaser from "phaser";
+import { HEADING_COUNT, insideIsland, ISLAND_THEMES, SIGHT_RADIUS_TILES, Terrain, terrainAt, type IslandTheme } from "@pirate-sea-race/content";
+import { defaultSimulationConfig } from "@pirate-sea-race/simulation";
+import { followScroll, TILE_PIXELS, VIEW_HEIGHT, VIEW_WIDTH } from "./camera.js";
+import { FogOfWar } from "./fog.js";
+import { cssColor, slotColor, type MatchView } from "./matchView.js";
+
+const { map } = defaultSimulationConfig;
+const WORLD_WIDTH = map.widthTiles * TILE_PIXELS;
+const WORLD_HEIGHT = map.heightTiles * TILE_PIXELS;
+const PIXELS_PER_SUB_UNIT = TILE_PIXELS / map.subUnitsPerTile;
+
+/** Placeholder palette. None of these is near a ship colour, so a ship's colour on the canvas is always a ship. */
+const SEA_COLOR = 0x0b3d5c;
+const GRID_COLOR = 0x145374;
+const SHOAL_COLOR = 0x2e7d86;
+const SHOAL_FLECK = 0x4f9aa0;
+const DOCK_COLOR = 0x8b5a2b;
+const DOCK_PLANK = 0x6b4220;
+const LAND_COLORS: Readonly<Record<IslandTheme, number>> = { tropical: 0x6b8e23, volcanic: 0x5b4a45, ruin: 0x9a8f73, mist: 0x7d8a99 };
+const FOG_COLOR = 0x16202a;
+const OWN_RING_COLOR = 0xfff3b0;
+const SIGHT_COLOR = 0x9bd1e5;
+
+/** Tile indexes in the generated tileset texture. */
+const TILE_SEA = 0;
+const TILE_SHOAL = 1;
+const TILE_DOCK = 2;
+const TILE_LAND = 3;
+
+const MINIMAP_SCALE = 0.75;
+const MINIMAP_MARGIN = 8;
+
+/** A ship as drawn this frame, in canvas pixels, for the DOM report tests read. */
+export interface DrawnShip {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly color: string;
+}
+
+function landTile(tileX: number, tileY: number): number {
+  const theme = map.islands.find((island) => insideIsland(island, tileX, tileY))?.theme ?? "tropical";
+  return TILE_LAND + ISLAND_THEMES.indexOf(theme);
+}
+
+function tileIndex(tileX: number, tileY: number): number {
+  switch (terrainAt(map, tileX, tileY)) {
+    case Terrain.Land:
+      return landTile(tileX, tileY);
+    case Terrain.Shoal:
+      return TILE_SHOAL;
+    case Terrain.Dock:
+      return TILE_DOCK;
+    default:
+      return TILE_SEA;
+  }
+}
+
+function tileColor(tileX: number, tileY: number): number {
+  const index = tileIndex(tileX, tileY);
+  if (index >= TILE_LAND) return LAND_COLORS[ISLAND_THEMES[index - TILE_LAND]!];
+  return [SEA_COLOR, SHOAL_COLOR, DOCK_COLOR][index]!;
+}
+
+/**
+ * Draws the sea: the tile map from content, the ships the server sent at interpolated positions, a camera that
+ * follows the player's ship, the sight circle, and a minimap whose fog clears along the player's path. Each frame
+ * it records what it drew in data attributes on the report element (`data-drawn-ships`, `data-camera`,
+ * `data-fog-revealed`) for the browser tests.
+ */
+export class SeaScene extends Phaser.Scene {
+  private readonly shipGraphics = new Map<string, Phaser.GameObjects.Graphics>();
+  private readonly fog = new FogOfWar(map.widthTiles, map.heightTiles, SIGHT_RADIUS_TILES);
+  private minimap!: Phaser.Textures.CanvasTexture;
+  private minimapMarks!: Phaser.GameObjects.Graphics;
+  private sight!: Phaser.GameObjects.Graphics;
+  private lastReport = "";
+
+  constructor(
+    private readonly view: MatchView,
+    private readonly report: HTMLElement,
+  ) {
+    super("sea");
+  }
+
+  create(): void {
+    this.createTerrain();
+    this.sight = this.add.graphics();
+    this.sight.lineStyle(1, SIGHT_COLOR, 0.45);
+    this.sight.strokeCircle(0, 0, SIGHT_RADIUS_TILES * TILE_PIXELS);
+    this.sight.setDepth(1);
+    this.createMinimap();
+  }
+
+  /** The tile map, as a Phaser tilemap over a tileset texture drawn here in placeholder colours. */
+  private createTerrain(): void {
+    const kinds = TILE_LAND + ISLAND_THEMES.length;
+    const tileset = this.textures.createCanvas("terrain-tiles", kinds * TILE_PIXELS, TILE_PIXELS)!;
+    const context = tileset.getContext();
+    const paint = (index: number, color: number) => {
+      context.fillStyle = cssColor(color);
+      context.fillRect(index * TILE_PIXELS, 0, TILE_PIXELS, TILE_PIXELS);
+    };
+    paint(TILE_SEA, SEA_COLOR);
+    paint(TILE_SHOAL, SHOAL_COLOR);
+    context.fillStyle = cssColor(SHOAL_FLECK);
+    for (const [x, y] of [[3, 4], [10, 2], [6, 10], [13, 12], [2, 13]] as const) context.fillRect(TILE_SHOAL * TILE_PIXELS + x, y, 2, 2);
+    paint(TILE_DOCK, DOCK_COLOR);
+    context.fillStyle = cssColor(DOCK_PLANK);
+    for (const y of [4, 9, 14]) context.fillRect(TILE_DOCK * TILE_PIXELS, y, TILE_PIXELS, 1);
+    ISLAND_THEMES.forEach((theme, index) => paint(TILE_LAND + index, LAND_COLORS[theme]));
+    tileset.refresh();
+
+    // Open sea is left empty (-1): the camera's background is the sea, so the layer draws only the few land, shoal
+    // and dock tiles in view. Drawing every sea tile too costs a software renderer most of its frame rate.
+    const data = Array.from({ length: map.heightTiles }, (_, tileY) =>
+      Array.from({ length: map.widthTiles }, (_, tileX) => {
+        const index = tileIndex(tileX, tileY);
+        return index === TILE_SEA ? -1 : index;
+      }),
+    );
+    const tilemap = this.make.tilemap({ data, tileWidth: TILE_PIXELS, tileHeight: TILE_PIXELS });
+    const tiles = tilemap.addTilesetImage("terrain", "terrain-tiles", TILE_PIXELS, TILE_PIXELS, 0, 0)!;
+    tilemap.createLayer(0, tiles, 0, 0);
+
+    // A chart grid every eight tiles, so open water shows the ship's motion.
+    const grid = this.add.graphics();
+    grid.lineStyle(1, GRID_COLOR, 0.6);
+    for (let tile = 0; tile <= map.widthTiles; tile += 8) grid.lineBetween(tile * TILE_PIXELS, 0, tile * TILE_PIXELS, WORLD_HEIGHT);
+    for (let tile = 0; tile <= map.heightTiles; tile += 8) grid.lineBetween(0, tile * TILE_PIXELS, WORLD_WIDTH, tile * TILE_PIXELS);
+
+    for (const island of map.islands) {
+      const label = this.add.text((island.tileX + island.widthTiles / 2) * TILE_PIXELS, (island.tileY - 1.2) * TILE_PIXELS, island.name, {
+        fontFamily: "system-ui, sans-serif",
+        fontSize: "12px",
+        color: "#e8f1f5",
+      });
+      label.setOrigin(0.5, 0.5).setAlpha(0.85);
+    }
+  }
+
+  /** The minimap: one pixel per tile, fogged until the player's ship has seen it. */
+  private createMinimap(): void {
+    this.minimap = this.textures.createCanvas("minimap", map.widthTiles, map.heightTiles)!;
+    const context = this.minimap.getContext();
+    context.fillStyle = cssColor(FOG_COLOR);
+    context.fillRect(0, 0, map.widthTiles, map.heightTiles);
+    this.minimap.refresh();
+    const left = VIEW_WIDTH - MINIMAP_MARGIN - map.widthTiles * MINIMAP_SCALE;
+    const frame = this.add.graphics().setScrollFactor(0).setDepth(10);
+    frame.lineStyle(2, 0x9bb8c6, 0.9);
+    frame.strokeRect(left - 1, MINIMAP_MARGIN - 1, map.widthTiles * MINIMAP_SCALE + 2, map.heightTiles * MINIMAP_SCALE + 2);
+    this.add.image(left, MINIMAP_MARGIN, "minimap").setOrigin(0, 0).setScale(MINIMAP_SCALE).setScrollFactor(0).setDepth(10);
+    this.minimapMarks = this.add.graphics().setScrollFactor(0).setDepth(11);
+  }
+
+  private revealFog(x: number, y: number): void {
+    const fresh = this.fog.revealAround(Math.floor(x / TILE_PIXELS), Math.floor(y / TILE_PIXELS));
+    if (fresh.length === 0) return;
+    const context = this.minimap.getContext();
+    for (const [tileX, tileY] of fresh) {
+      context.fillStyle = cssColor(tileColor(tileX, tileY));
+      context.fillRect(tileX, tileY, 1, 1);
+    }
+    this.minimap.refresh();
+    this.report.dataset["fogRevealed"] = String(this.fog.revealedCount);
+  }
+
+  override update(): void {
+    const now = performance.now();
+    const own = this.view.renderPosition(this.view.selfId, now);
+    if (own !== undefined) {
+      const x = own.x * PIXELS_PER_SUB_UNIT;
+      const y = own.y * PIXELS_PER_SUB_UNIT;
+      const scroll = followScroll(x, y);
+      this.cameras.main.setScroll(scroll.x, scroll.y);
+      this.sight.setPosition(x, y);
+      this.revealFog(x, y);
+    }
+    const camera = this.cameras.main;
+    const minimapLeft = VIEW_WIDTH - MINIMAP_MARGIN - map.widthTiles * MINIMAP_SCALE;
+    this.minimapMarks.clear();
+
+    const drawn: DrawnShip[] = [];
+    const present = new Set<string>();
+    for (const ship of this.view.ships()) {
+      const position = this.view.renderPosition(ship.id, now);
+      if (position === undefined) continue;
+      present.add(ship.id);
+      const mine = ship.id === this.view.selfId;
+      let graphics = this.shipGraphics.get(ship.id);
+      if (graphics === undefined) {
+        graphics = this.drawShip(slotColor(ship.slot), mine);
+        this.shipGraphics.set(ship.id, graphics);
+      }
+      const x = position.x * PIXELS_PER_SUB_UNIT;
+      const y = position.y * PIXELS_PER_SUB_UNIT;
+      graphics.setPosition(x, y);
+      graphics.setRotation((ship.heading * 2 * Math.PI) / HEADING_COUNT);
+      drawn.push({ id: ship.id, x: Math.round(x - camera.scrollX), y: Math.round(y - camera.scrollY), color: cssColor(slotColor(ship.slot)) });
+      this.minimapMarks.fillStyle(mine ? OWN_RING_COLOR : slotColor(ship.slot), 1);
+      this.minimapMarks.fillRect(minimapLeft + (x / TILE_PIXELS) * MINIMAP_SCALE - 1.5, MINIMAP_MARGIN + (y / TILE_PIXELS) * MINIMAP_SCALE - 1.5, 3, 3);
+    }
+    for (const [id, graphics] of this.shipGraphics) {
+      if (present.has(id)) continue;
+      graphics.destroy();
+      this.shipGraphics.delete(id);
+    }
+    const report = JSON.stringify(drawn);
+    if (report !== this.lastReport) {
+      this.report.dataset["drawnShips"] = report;
+      this.lastReport = report;
+    }
+    this.report.dataset["camera"] = `${camera.scrollX},${camera.scrollY}`;
+  }
+
+  /** A round hull with a bow pointing along +x; the player's own ship gets a pale ring. */
+  private drawShip(color: number, own: boolean): Phaser.GameObjects.Graphics {
+    const graphics = this.add.graphics();
+    graphics.setDepth(2);
+    graphics.fillStyle(color, 1);
+    graphics.fillCircle(0, 0, 6);
+    graphics.fillTriangle(3, -5, 12, 0, 3, 5);
+    if (own) {
+      graphics.lineStyle(2, OWN_RING_COLOR, 1);
+      graphics.strokeCircle(0, 0, 10);
+    }
+    return graphics;
+  }
+}
+
+export function startGame(parent: HTMLElement, view: MatchView): Phaser.Game {
+  return new Phaser.Game({
+    type: Phaser.AUTO,
+    parent,
+    width: VIEW_WIDTH,
+    height: VIEW_HEIGHT,
+    backgroundColor: SEA_COLOR,
+    banner: false,
+    audio: { noAudio: true },
+    scene: new SeaScene(view, parent),
+  });
+}

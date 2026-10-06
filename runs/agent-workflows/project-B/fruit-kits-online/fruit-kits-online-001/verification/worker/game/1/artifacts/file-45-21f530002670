@@ -1,0 +1,193 @@
+import { expect, test, type Page } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/index.js";
+import { encounterRules } from "../../packages/content/src/encounters/index.js";
+import { duelistMoveset } from "../../packages/content/src/moves/index.js";
+import { attachScreenshot, colourAt, createMatch, joinMatch, place, readout, selfId, startMatch, TILE } from "./helpers.js";
+
+const HUB_X = seaMap.hub.tileX;
+/** The row three tiles south of the hub, which the map keeps clear for a hull 20 tiles either side of the hub. */
+const OPEN_ROW = seaMap.hub.tileY + 3;
+const RANGE = encounterRules.grapple.rangeTiles * TILE;
+/**
+ * The browser server pins the fruit deal (`PIRATE_SEA_RACE_TEST_FRUITS` in the Playwright config): Ember on Palm Key's
+ * pedestal, which stands at the island's highest-id dock.
+ */
+const PALM_PEDESTAL = seaMap.docks.filter((dock) => dock.island === 0).at(-1)!;
+const BOLT_DAMAGE = duelistMoveset.moves.find((move) => move.timing.id === "flame-bolt-cast")!.projectile!.damage;
+const MAX_HEALTH = duelistMoveset.rules.maxHealth;
+
+/**
+ * Where the sea scene draws the pedestal's fruit, in world sub-units: up and right of the dock's centre by the marker's
+ * offset (`PEDESTAL_OFFSET`, 12 px at 24 px a tile), and half a stone higher (6 px).
+ */
+const FRUIT_ON_PEDESTAL = {
+  x: PALM_PEDESTAL.tileX * TILE + TILE / 2 + (12 * TILE) / 24,
+  y: PALM_PEDESTAL.tileY * TILE + TILE / 2 - (18 * TILE) / 24,
+};
+const FRUIT_COLOR = "#ff7a1a";
+
+const scene = (page: Page) => page.getByTestId("game").getAttribute("data-scene");
+
+/**
+ * Records every bolt the arena draws from now on, as the page reports it (`data-bolts` on the game): a MutationObserver
+ * catches a bolt however briefly it flies. `boltsSeen(page)` returns them.
+ */
+async function recordBolts(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const seen: { owner: number; x: number; y: number }[] = [];
+    (window as unknown as { __bolts: typeof seen }).__bolts = seen;
+    const game = document.querySelector<HTMLElement>('[data-testid="game"]')!;
+    new MutationObserver(() => seen.push(...(JSON.parse(game.dataset["bolts"] ?? "[]") as typeof seen))).observe(game, { attributes: true, attributeFilter: ["data-bolts"] });
+  });
+}
+
+/**
+ * Counts, on every animation frame from now on, the canvas pixels in the bolt's flame colour (`BOLT_COLOR`), read
+ * from the game's 2D canvas itself (the match game uses Phaser's canvas renderer): `boltFramesSeen(page)` returns how
+ * many frames showed a flame. It checks what was painted, not what the scene reported.
+ */
+async function recordBoltPixels(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const record = { frames: 0 };
+    (window as unknown as { __boltPixels: typeof record }).__boltPixels = record;
+    const canvas = document.querySelector<HTMLCanvasElement>("#game canvas")!;
+    const context = canvas.getContext("2d")!;
+    const sample = () => {
+      const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+      let hits = 0;
+      for (let index = 0; index < data.length; index += 4 * 3) {
+        if (Math.abs(data[index]! - 0xff) <= 24 && Math.abs(data[index + 1]! - 0x7a) <= 24 && Math.abs(data[index + 2]! - 0x1a) <= 24) hits++;
+      }
+      if (hits >= 3) record.frames++;
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  });
+}
+
+async function boltFramesSeen(page: Page): Promise<number> {
+  return page.evaluate(() => (window as unknown as { __boltPixels: { frames: number } }).__boltPixels.frames);
+}
+
+async function boltsSeen(page: Page): Promise<{ owner: number; x: number; y: number }[]> {
+  return page.evaluate(() => (window as unknown as { __bolts: { owner: number; x: number; y: number }[] }).__bolts);
+}
+
+test("one browser moors at a pedestal's dock, presses F, reads the kit from the panel and holds F to eat Ember; it grapples the other browser, casts the flame bolt, both see it drawn and the other's health drops by its damage [scenario:fruit-duel]", async ({ browser, request }, testInfo) => {
+  test.setTimeout(120_000);
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+    const code = await createMatch(host);
+    await joinMatch(guest, code);
+    await startMatch(host, guest);
+    const [hostId, guestId] = [await selfId(host), await selfId(guest)];
+
+    // Both start as the Duelist.
+    for (const page of [host, guest]) await expect(page.getByTestId("hud-kit")).toHaveText("Duelist: U advancing thrust, I counter slash");
+
+    // The host moors at Palm Key's pedestal dock: the HUD offers F.
+    await place(request, host, code, PALM_PEDESTAL.tileX, PALM_PEDESTAL.tileY, 0);
+    await host.keyboard.press("e");
+    await expect(host.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(PALM_PEDESTAL.id));
+    await expect(host.getByTestId("hud-pedestal")).toHaveText("F: inspect fruit");
+    // The sea shows the pedestal beside the dock with its fruit on it.
+    await expect.poll(() => colourAt(host, FRUIT_ON_PEDESTAL.x, FRUIT_ON_PEDESTAL.y, FRUIT_COLOR)).toBe(true);
+
+    // F: the panel shows the pedestal's kit, its specials and its description.
+    await host.keyboard.press("f");
+    const panel = host.getByTestId("fruit-panel");
+    await expect(panel).toBeVisible();
+    const kitName = (await host.getByTestId("fruit-name").textContent())!;
+    expect(kitName).toBe("Ember");
+    await expect(host.getByTestId("fruit-special-u")).toHaveText("U: Flame bolt");
+    await expect(host.getByTestId("fruit-special-i")).toHaveText("I: Rising flare");
+    await expect(host.getByTestId("fruit-advantage")).toContainText("Controls space");
+    await expect(host.getByTestId("fruit-hint")).toHaveText("Hold F for 3 s to eat it");
+
+    // Letting go of F part-way, or the window losing focus, stops eating, and the panel says why.
+    await host.keyboard.down("f");
+    await expect(host.getByTestId("fruit-progress")).toBeVisible({ timeout: 3000 });
+    await host.keyboard.up("f");
+    await expect(host.getByTestId("fruit-message")).toHaveText("You let go of F: eating stopped");
+    await expect(host.getByTestId("fruit-progress")).toBeHidden();
+    await host.keyboard.down("f");
+    await expect(host.getByTestId("fruit-message")).toHaveText("", { timeout: 3000 });
+    await host.evaluate(() => window.dispatchEvent(new Event("blur")));
+    await expect(host.getByTestId("fruit-message")).toHaveText("You let go of F: eating stopped");
+    await host.keyboard.up("f");
+    await expect(host.getByTestId("hud-kit")).toHaveAttribute("data-state", "duelist");
+
+    // Holding F for three seconds eats it: the ring fills, then the HUD names the kit.
+    await host.keyboard.down("f");
+    try {
+      await expect(host.getByTestId("fruit-progress")).toBeVisible({ timeout: 3000 });
+      await expect(host.getByTestId("hud-kit")).toHaveText(`${kitName}: U flame bolt, I rising flare`, { timeout: 8000 });
+    } finally {
+      await host.keyboard.up("f");
+    }
+    await expect(host.getByTestId("hud-kit")).toHaveAttribute("data-state", "ember");
+    await expect(host.getByTestId("fruit-message")).toHaveText("You ate the fruit. Ember: U flame bolt, I rising flare");
+    await expect(host.getByTestId("hud-pedestal")).toHaveText("Fruit pedestal: empty");
+    // The guest's kit is its own: still the Duelist.
+    await expect(guest.getByTestId("hud-kit")).toHaveText("Duelist: U advancing thrust, I counter slash");
+    await host.keyboard.press("Escape");
+    await expect(panel).toBeHidden();
+    // The pedestal is empty now: no fruit on it.
+    await expect.poll(() => colourAt(host, FRUIT_ON_PEDESTAL.x, FRUIT_ON_PEDESTAL.y, FRUIT_COLOR)).toBe(false);
+
+    // At sea, eight tiles apart: the host sails at the guest and, within range, taps J.
+    await place(request, host, code, HUB_X - 4, OPEN_ROW, 0);
+    await place(request, guest, code, HUB_X + 4, OPEN_ROW, 32);
+    await expect.poll(async () => (await readout(host, guestId)) !== undefined).toBe(true);
+    await host.keyboard.down("ArrowUp");
+    try {
+      await expect
+        .poll(
+          async () => {
+            const [own, target] = [await readout(host, hostId), await readout(host, guestId)];
+            return own === undefined || target === undefined ? Number.POSITIVE_INFINITY : Math.hypot(target.x - own.x, target.y - own.y);
+          },
+          { intervals: [25], timeout: 10_000 },
+        )
+        .toBeLessThanOrEqual(RANGE - TILE);
+      await host.keyboard.press("j");
+    } finally {
+      await host.keyboard.up("ArrowUp");
+    }
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "countdown", { timeout: 5000 });
+      await expect.poll(() => scene(page)).toBe("arena");
+    }
+    // Both arenas show both kits: the host's Ember, the guest's Duelist.
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("duel-kit-0")).toHaveText("Ember · U Flame bolt · I Rising flare");
+      await expect(page.getByTestId("duel-kit-1")).toHaveText("Duelist · U Advancing thrust · I Counter slash");
+      await recordBolts(page);
+      await recordBoltPixels(page);
+    }
+    for (const page of [host, guest]) await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "fighting", { timeout: 15_000 });
+
+    // The host casts the flame bolt (U) at the guest, who stands still.
+    await host.keyboard.press("u");
+    // Both browsers draw the host's bolt, flying toward the guest.
+    for (const page of [host, guest]) {
+      await expect.poll(async () => (await boltsSeen(page)).filter((bolt) => bolt.owner === 0).length, { timeout: 5000 }).toBeGreaterThan(1);
+      const bolts = (await boltsSeen(page)).filter((bolt) => bolt.owner === 0);
+      expect(bolts.at(-1)!.x).toBeGreaterThan(bolts[0]!.x);
+      // And its flame is painted on the canvas.
+      await expect.poll(() => boltFramesSeen(page), { timeout: 3000 }).toBeGreaterThan(0);
+    }
+    // The guest's health bar drops by the bolt's damage, in both browsers (the confirmed, server-equal state).
+    for (const page of [host, guest]) await expect(page.getByTestId("duel-health-1")).toHaveAttribute("data-value", String(MAX_HEALTH - BOLT_DAMAGE), { timeout: 5000 });
+    await expect(guest.getByTestId("duel-health-text-1")).toHaveText(`${MAX_HEALTH - BOLT_DAMAGE} / ${MAX_HEALTH}`);
+    await expect(host.getByTestId("duel-health-0")).toHaveAttribute("data-value", String(MAX_HEALTH));
+
+    await attachScreenshot(guest, testInfo, "fruit-duel");
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

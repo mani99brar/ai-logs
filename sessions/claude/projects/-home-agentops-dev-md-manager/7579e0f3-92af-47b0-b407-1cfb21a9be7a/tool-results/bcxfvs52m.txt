@@ -1,0 +1,296 @@
+### Finding 0 (P1, seam controller-paths) An update's respawn gap still counts as a missing worker: the controller blocks and stops every worker
+File: workflow/automatic.py:186
+fix/autoupdate made a failing `claude agents` listing a TransientInfraError. fix/attach-respawn (3e85a14, 9861d0e; RUNBOOK:139) found that a background-service restart also respawns idle sessions under a new PID. Between the two processes the listing succeeds but either omits the session (a `done` session with no process is not listed without --all) or lists its ended PID, a row with no PID, or a starting/resuming state. attach-one now waits these states out. The controller's wait loops do not. `wait_handoffs` raises `Native worker missing; reconciliation required` when `locate` returns None, and `InteractiveSessions.locate` raises `Native process is unavailable`, `No live native PID` or `Session is not attachable` (interactive.py:119-127). All of these are plain RuntimeErrors, so `drive` (automatic.py:1069-1076) records `controller blocked` and calls `stop_workers()`. `wait_reviews` does the same at 462-464 and then stops the reviewers. The idle sessions that get respawned are exactly the finished (`met`) lanes and the lanes paused on a question. A related case: `stop_session` saves the intent with the old PID, so if the first `claude stop` fails during the restart, every retry after the respawn fails with `identity changed after stop intent` (pipeline.py:346), and the freeze can never finish. RUNBOOK:288 still lists a missing session as a verdict, which contradicts RUNBOOK:139.
+Failure scenario: Confirmed with a probe on GraphFixture. Lanes ui and adapter. adapter has finished and is idle; ui is working. Another long-lived Claude session on the machine updates Claude Code, the service restarts and respawns adapter. One poll lands in the gap and `locate(adapter)` returns None. drive raises `Native worker missing; reconciliation required`, logs `controller blocked` and calls `stop_workers()`: ui's live session is stopped (or, if adapter comes first in the order, the stop fails and nothing is stopped). The run is blocked and needs a new run.
+Reviewer's suggested fix: Give the controller the same bounded gap that attach-one uses (reuse `observe`/ProcessEnded or a shared helper). For a lane or reviewer whose receipt is bound, treat a missing row, a dead-PID row, a row with no PID and a non-terminal non-attachable state as a gap for up to DEAD_PID_GRACE_SECONDS from when it was first seen, and raise TransientInfraError when it lasts longer (so the run exits 75 instead of stopping anything). Keep terminal `stopped`/`failed` rows and identity mismatches as verdicts. In `stop_session`, when a row has the same sessionId and background id but a new live PID, update the intent's PID instead of refusing.
+Verifier's reasoning (first): I could not refute the main claim. The stop_session sub-claim is weaker (see the end).
+
+**The code path.** `wait_handoffs` (workflow/automatic.py:185-188) calls `runtime.sessions.locate(node, rows)` for every lane on every poll, including lanes that already met their deadline. When `locate` returns None it raises a plain `RuntimeError("Native worker missing; reconciliation required")`. `InteractiveSessions.locate` (workflow/interactive.py:119-127) also raises plain RuntimeErrors in three cases:
+- a state outside {idle, working, blocked, done}
+- a row with no PID
+- a PID that `os.kill(pid, 0)` rejects
+
+None of these is a `TransientInfraError`. `drive` (automatic.py:1069-1076) therefore takes the `BaseException` branch: it records `controller blocked` and calls `runtime.stop_workers()`. `wait_reviews` raises the same way (`Native reviewer ... missing`), but only for reviewers that are not yet accepted.
+
+**Probe.** I ran a probe on GraphFixture from a scratchpad script, with FakeSessions.locate returning None for `adapter`. `drive` raised "Native worker missing; reconciliation required", logged `controller blocked` and called stop_workers once. After that a resume cannot succeed: `wait_handoffs` sees a stop.json and requires every lane's completion to equal its handoff, and the stopped working lane has none.
+
+**The gap is real in Claude Code 2.1.281.** I read the installed binary:
+- `printAgentsJson` skips a job that has no process record unless its state is working or blocked. An idle session is listed as `done`, so it disappears from the listing while no process is registered.
+- `respawnIfIdleStale` only respawns settled or idle sessions that are version-stale, have no attached client and are not busy. It moves the job to `upgrading`, shuts the old worker down and then starts a new one.
+- It is called by the post-takeover prewarm burst 15 s after the service restarts, and by the periodic prewarm sweep at any later time.
+
+**Evidence from the live run.** `~/.claude/daemon.log` shows it happened during workflow-guardrails-001 ("respawned 1/2 stale workers" at 19:49:11). The ui lane was idle at the time: its completion was written at 19:45. ui.stop.json holds PID 2097718, which is not the PID it was launched with. The controller was not polling then only because it had already blocked on the missing binary at 19:48:29, and the fixes now wait that out.
+
+**Conditions it needs.** It happens when a lane (finished, or paused on a question) is not attached and a real version upgrade happens during the run. Two setups give that:
+- **`--no-herdr`:** a documented setup with no panes at all.
+- **A detached pane:** the operator detached (Ctrl+Z is documented) or closed the pane.
+
+The update itself comes from another Claude session on the machine. RUNBOOK:433 says those sessions still update, and the live run saw five reinstalls in 40 minutes.
+
+A caveat the finding does not mention: attach-one reattaches within about 2-3 s after a restart. So in the standard Herd
+Verifier's suggested fix: 1. **Controller wait loops.** In `wait_handoffs` and `wait_reviews`, apply attach-one's bounded-gap rule. Reuse `observe()` and the `ProcessEnded`/`SessionGap` classification, or pull out a shared helper. For a node whose receipt is bound (it has a background_id), treat these as a gap:
+   - no row in the listing
+   - a row whose PID is dead or a zombie
+   - a row with no PID
+   - a non-terminal state that `locate` refuses as not attachable
+
+   Record when the gap was first seen for each node and skip that node's other checks while the gap lasts. Once it lasts longer than `DEAD_PID_GRACE_SECONDS`, raise `TransientInfraError`, so the run exits 75 and stops nothing. `stopped`/`failed` rows and identity or cwd/name mismatches stay immediate verdicts.
+2. **stop_session.** When the listed row has the intent's `session_id` and `background_id` but a different live PID, rewrite the intent's PID to the new one before issuing `claude stop`, instead of raising "identity changed after stop intent".
+3. **RUNBOOK:288.** Change the last sentence so that "a missing session" means one still missing after the respawn grace.
+4. **Test.** Add a GraphFixture test: a met lane's `locate` returns None, or raises "Native process is unavailable", for one poll and then returns a row with a new PID. The run must continue and `stop_workers` must not be called.
+
+### Finding 8 (P1, seam panes-launch-worktrees) Controller waits treat an update's respawn gap as a missing session and stop every lane
+File: workflow/automatic.py:186
+Commits 3e85a14 and 9861d0e found that when Claude Code updates, the background service restarts and about 15 s later respawns each idle session under a new PID. For a few seconds `claude agents --json` then does one of three things for that session: omits it entirely (an idle session with no process is listed as `done` and skipped without --all), lists the dead PID, or lists a row with no PID or in a transitional state. attach-one's observe() waits these out. The controller's own polls still treat each of these states as a verdict: wait_handoffs (automatic.py:186-188: `locate` returns None, which raises "Native worker missing"; or locate raises "Native process is unavailable", "No live native PID" or "Session is not attachable"), wait_reviews (automatic.py:462-464) and check_independence (automatic.py:668-671). None of these is a TransientInfraError, so drive's BaseException branch runs. This breaks the guarantee of aee3b68 ("Stop nothing when Claude Code updates under a run"). The RUNBOOK's "a missing session still stops the sessions" (RUNBOOK.md:288) documents the same wrong classification.
+Failure scenario: During an automatic run, the operator's other Claude session (which still auto-updates; RUNBOOK:433) updates Claude Code. The service restarts: the listing fails for a while (handled, exit 75). Then, as the service respawns lane ui, the next 2 s poll gets a listing without ui. wait_handoffs raises RuntimeError("Native worker missing; reconciliation required"). drive records `controller blocked` and calls stop_workers, so every lane is stopped with no handoff and the run is dead before freeze, needing a new run. Reproduced with a probe: an inventory sequence of working, then ui omitted, then working makes wait_handoffs raise RuntimeError, not TransientInfraError. For reviewers, the same gap blocks the review ("Native reviewer X missing") or refuses the verdict after all files are in.
+Reviewer's suggested fix: Move attach-one's classification (observe: no row or dead PID for a bound background id, no PID, or a transitional state) into a shared helper on InteractiveSessions. In wait_handoffs, wait_reviews and check_independence, re-poll such a row for a grace measured from when it was first seen, as attach-one does with DEAD_PID_GRACE_SECONDS. Only a gap that outlasts the grace should block. Update RUNBOOK:288 and add a wait_handoffs test with a listing that omits one lane for one poll.
+Verifier's reasoning (first): I tried to refute this and could not. The combined branch treats an update's respawn gap as a verdict, so the transient state makes the controller stop the workers.
+
+1. **The code behaves as described.** In /home/agentops/dev/mdm-integrate/workflow/automatic.py:185-188, wait_handoffs calls `runtime.sessions.locate(node, rows)` on every lane at every poll. That includes lanes whose completion was already accepted: these are the idle sessions, which are the ones an update respawns.
+   - When locate returns None, wait_handoffs raises `RuntimeError("Native worker missing; reconciliation required")`.
+   - InteractiveSessions.locate (/home/agentops/dev/mdm-integrate/workflow/interactive.py:117-127) raises a plain RuntimeError in three more cases:
+     - a row in a state such as `starting`: "Session is not attachable";
+     - a row with no PID: "No live native PID";
+     - a row that still lists the ended PID: "Native process is unavailable".
+   - `inventory()` retries only a listing that fails, meaning a nonzero exit or output that is not a list. A valid listing that leaves out the lane goes straight through.
+   - In drive (automatic.py:1063-1077), only TransientInfraError and KeyboardInterrupt are spared. Every other exception records `controller blocked` and calls `runtime.stop_workers()`.
+   - stop_workers (pipeline.py:358-364) stops each lane in order and writes `<node>.stop.json`. On the next `automatic --live`, wait_handoffs sees a stop.json and requires `handoff.json` for every lane (automatic.py:171-176), so the run cannot resume.
+
+2. **A probe confirms it.** I ran the real wait_handoffs with fake sessions. The listings were: ui done and adapter working, then ui left out, then ui done again. It raised `RuntimeError: Native worker missing; reconciliation required`, which is not a TransientInfraError.
+
+3. **The respawn is real and the branch already models it.**
+   - ~/.claude/daemon.log shows the service restarting itself whenever the binary's mtime changes. About 15 s later it respawns stale idle workers: "respawned 1/2 stale workers" at 19:49:11.
+   - That respawn moved the idle ui lane of workflow-guardrails-001 to PID 2097718, as ui.stop.json shows. The controller missed it only because it had already blocked at 19:48:29 and did not restart until 19:55:04.
+   - The branch's own test test_a_session_respawned_under_a_new_pid_is_reattached (test_interactive.py:865-870) lists the listing states on the way: (A) a row with no PID or `starting`, (D) the ended PID, and (E) the id left out. That test only covers attach-one. Each of these states is a fatal verdict in the controller.
+   - RUNBOOK:433 admits that the operator's other sessions still auto-update during a run.
+
+4. **Reviewers are exposed too, less often.**
+   - wait_reviews (automatic.py:462-464) is exposed only for a reviewer that is not yet decided, because decided reviewers are skipped.
+   - check_independence (automatic.py:668-671) is exposed for one listing taken right after every ver
+Verifier's suggested fix: 1. **Share one classifier.** Move attach-one's gap classification into a helper on InteractiveSessions. It returns a live row, a gap, or a verdict:
+   - **Gap:**
+     - no row for a bound background_id;
+     - a row whose PID is dead or a zombie;
+     - a row with no PID;
+     - a non-terminal state other than idle, working, blocked or done.
+   - **Verdict:** a `stopped` or `failed` row, and every identity refusal.
+2. **Use it in the three waits.** In wait_handoffs, wait_reviews and check_independence, keep a per-node `gap_since` timestamp.
+   - On a gap, skip the node for this poll. Do not accept a completion, and keep checking the deadline.
+   - Raise the existing RuntimeError only when `clock() - gap_since >= DEAD_PID_GRACE_SECONDS`. That error still stops the sessions.
+   - Clear `gap_since` when the node returns a live row.
+   - For check_independence, re-poll the inventory for up to the same grace before refusing the verdict.
+3. **Add tests.**
+   - A wait_handoffs listing that leaves out one finished lane for one poll, and then lists it again under a new PID, completes with no stop.
+   - The same for the dead-PID row and the no-PID row.
+   - A lane that stays missing past the grace still raises.
+4. **Update the RUNBOOK.** At RUNBOOK.md:288 and :34, say that a session missing for more than 30 s stops the sessions, and that a respawn gap is waited out.
+
+### Finding 10 (P2, seam panes-launch-worktrees) stop_session is bound to the PID, so a respawn either refuses the stop forever or records it without stopping
+File: workflow/pipeline.py:343
+The stop intent pins `pid` from the row. attach-respawn (3e85a14) established that an update respawns idle sessions under a new PID and that the listing can omit them for a moment (9861d0e); stop_session was not updated. There are two failure modes. (a) After a respawn, `row["pid"] != intent["pid"]` raises "identity changed after stop intent; reconcile manually". The intent is persisted, so every later freeze or retry fails the same way. (b) If the second listing falls in the gap (row omitted), `matching` is empty and no `claude stop` is issued. The old PID is dead, so `pid_alive` is False, and the intent is saved as `stopped: true` while the session comes back under a new PID.
+Failure scenario: A service restart coincides with the automatic freeze, or with the stop after a blocked wait (the inventory is retried for up to 60 s during that restart, which widens the window). In case (b), stop.json for ui says stopped. stop_workers' final check then either fails permanently ("A stopped worker was restarted") once the new row appears, or passes while the row is still missing, so the snapshot is taken with a live, unstopped session. attach-one then reports "stopped by the controller; nothing to attach" for a running session.
+Reviewer's suggested fix: Bind the stop identity to background_id and sessionId, not the PID; accept a changed live PID for the same ids. Treat a missing row or dead PID for the bound id as a gap to wait out, as attach-one does, before concluding termination. Conclude `stopped` only after a successful `claude stop`, or after a listing (for example with --all) that shows a terminal state for that id.
+Verifier's reasoning (first): I tried to refute this and could not. Both failure modes are real in the combined branch at workflow/pipeline.py:330-356, and I reproduced both with a scratch probe that calls Pipeline.stop_session directly.
+
+Where the defect sits:
+- stop_session saves `pid` in `<node>.stop.json` from the first listing (line 339).
+- On every later attempt, line 346 refuses the stop when `row["pid"] != intent["pid"]`.
+- The termination check at line 353 uses `pid_alive(intent["pid"])`, the old PID.
+- The integration diff changed only `subprocess.run` to `run_claude` here. The PID binding comes from the reviewed base.
+- 3e85a14 and 9861d0e write down (code comments, RUNBOOK:139, commit message) that an update keeps each idle session's background id and sessionId but respawns it under a new PID. They also show that `claude agents --json` can omit the row, or list it without a PID, between the old process and the new one. attach-one's locate refuses a changed sessionId, so a respawn keeps the same id and sessionId. Only the PID changes.
+
+Probe results:
+- (a) Attempt 1 saved the intent `{pid:111, stopped:false}`, then `claude stop` exited nonzero ("Stop failed for ui"). The listing then showed the same id and sessionId with pid 222. Both retries raised "Native ui session identity changed after stop intent; reconcile manually" and issued zero `claude stop` calls. The intent is persisted, so this repeats on every retry.
+- (b) Listings `[old]`, `[]`, `[]` with the old PID dead gave zero `claude stop` calls and saved `stopped: true`. After that, stop_session skips the node. stop_workers' final check (line 362) either raises "A stopped worker was restarted" on every retry once the new row appears, or passes while the row is missing.
+
+How a real run reaches it:
+- An intent is persisted but not confirmed whenever `claude stop` exits nonzero or the second or third listing raises TransientInfraError. Both are what a background-service restart produces: run_claude repeats only exec failures, not a nonzero `claude stop`.
+- automatic.wait_handoffs returns early once any stop.json exists (automatic.py:170). A resumed controller therefore goes straight to freeze and stop_workers, and fails permanently.
+- For reviewers, reviewer_stop_pending plus RUNBOOK:246 ("`python -m workflow automatic "$RUN" --live` retries the outstanding stops") then fail the same way on every resume. So the documented recovery command does not work in this case.
+- The existing test (test_pipeline.py:468-475) only checks that a changed PID is refused. No test covers a respawn with the same id and sessionId.
+
+Why P2 and not P1:
+- It needs a Claude Code update or background-service restart in the few seconds between saving the intent and confirming the stop, or a respawn before a retry. 3854e1e now turns the auto-updater off inside run sessions, so such a restart is rarer, though still possible from sessions outside the run.
+- Case (a) fails closed, with a "reconcile manually" message. The operator can `claude 
+Verifier's suggested fix: In Pipeline.stop_session (workflow/pipeline.py:330-356), bind the stop to `background_id` and `session_id` only.
+1. On a retry, a live row with the same id and sessionId but a different PID is a respawn: issue `claude stop <background_id>` for it. Keep the identity refusal for a changed id, sessionId, cwd or name, which locate already checks.
+2. Before concluding termination, treat a listing that omits the id, a row with no PID, or a row with a non-terminal state as a gap to wait out, bounded like DEAD_PID_GRACE_SECONDS in attach-one. Do not save `stopped: true` from a single empty listing plus a dead old PID.
+3. Set `stopped` only after `claude stop` succeeds and a later listing, preferably `claude agents --json --all` or a check equivalent to interactive.TERMINAL_STATES, shows the id stopped or absent after the grace. Check the PID of the row just stopped, not `intent["pid"]`.
+4. Add test_pipeline cases:
+   - Intent saved with pid P1, row now P2 with the same id and sessionId: exactly one `claude stop` is issued and the intent is confirmed.
+   - Listings `[row]`, `[]`, `[respawned row]`: `stopped: true` is never saved without a stop.
+   - Reviewer stop pending followed by a respawn: `automatic --live` retries the stop and it succeeds.
+
+### Finding 1 (P1, seam controller-paths) TransientInfraError from any node except the review wait exits 75 as a checkpoint, and the next step blocks; after a freeze it cannot be resumed at all
+File: workflow/automatic.py:1095
+`drive` handles a TransientInfraError from `graph.invoke` specially only when `review_interrupted` is true, which needs a native review in status running with the marker. Every other TransientInfraError falls through the `except Exception`, and with single_step `automatic-step` exits 75 ('Checkpoint persisted'). It does not exit 69. The next step then classifies it as a verdict. Paths that hit this: (a) the handoff node's `freeze()` → `stop_workers` (inventory, or the `claude stop` exec, pipeline.py:396/336-352); (b) a reviewer launch: the inventory in `run_reviewer` before any receipt, the `--bg` exec, or `settle`. `_review_native` turns these into needs_reconciliation; (c) print reviewers: popen_claude for the second job fails, `_review_print` terminates the first job and marks the review blocked; (d) a reviewer stop after acceptance, which exits 1 with REVIEW_STOP_NOTE. For (a), a probe shows that after the failed freeze `state.next == ()` while the handoff task still holds its interrupt and error. The next `drive` fails at line 1044 with 'No verified feature-branch completion'. `retry` refuses because an interrupt is pending. Yet `graph.invoke(None)` would re-run the freeze and continue (probe: stop_workers is called again, snapshots.json is written, verify is reached). For (b), `rebind_reviewers` refuses a reviewer with no receipt, although no receipt proves nothing was launched. This contradicts RUNBOOK:288 and RUNBOOK:34, which say every transient failure exits 75, stops nothing and can be resumed with `automatic --live`.
+Failure scenario: Probe (GraphFixture): wait_handoffs returns and `stop_workers` raises TransientInfraError('Claude session inventory unavailable for 60s'). Step 1 returns None, so automatic-step exits 75. Step 2 raises 'No verified feature-branch completion' (exit 1), and the supervisor reports 'Automatic controller blocked (exit 1)'. After 4 hours of worker time the run is dead: `automatic --live` and `retry` both refuse. Likewise, an outage of more than 60 s when review starts (inventory in `run_reviewer`) gives exit 75, then 'Non-retryable graph failure', exit 1, and 'start a new run for a fresh review'.
+Reviewer's suggested fix: In drive's `except Exception`, re-raise any TransientInfraError (exit 69, supervisor 75) and first persist a marker naming the failed node, as the review path does. On the next drive, re-enter a node marked this way once: for the handoff, skip the `not state.next` completion check when a task has an error and a worker_handoff interrupt, then call `graph.invoke(None)`, which re-runs freeze; stop_session is already idempotent through stop.json. For a reviewer whose launch failed before its receipt was written, record that nothing was issued, so re-entry may launch it. For print reviewers, do not terminate jobs that already started on a transient exec failure of a later job. Add a test for each node.
+Verifier's reasoning (first): I could not refute the core claim, path (a). Paths (b), (c) and (d) are overstated.
+
+Path (a), freeze. I confirmed it with a probe that subclasses GraphFixture and runs from the scratchpad, with patch.object(f.runtime, 'stop_workers') raising TransientInfraError on its first call. `drive(single_step=True)` returns None, so `automatic-step` exits 75, not 69. The error falls through the `except Exception` at workflow/automatic.py:1087-1097 because `review_interrupted` is false. No `interrupted` event is recorded.
+
+After the failure the checkpoint has `state.next == ()`. The handoff task still holds its error and its worker_handoff interrupt (LangGraph 1.2.11).
+
+The next `drive` goes into the `if not state.next:` branch at automatic.py:1044 and raises 'No verified feature-branch completion'. The supervisor then reports 'Automatic controller blocked (exit 1)'. Rerunning `automatic --live` repeats the same failure. `retry` (pipeline.py:1034) refuses because `pending` is non-empty and `state.next` is empty.
+
+Yet `graph.invoke(None)` and `graph.invoke(Command(resume={'freeze': True}))` both re-run freeze. In the probe, stop_workers was called a second time, snapshots.json was written, and the graph reached verify_adapter. The only way to recover is the undocumented manual `freeze --handoff ...` command. It would also run the rest of the graph, review included, inside that command.
+
+This breaks what the code promises:
+- RUNBOOK:288 names 'a stop' among the calls that are waited out, then says the controller records an `interrupted` event and that `automatic --live` resumes with exit 75.
+- RUNBOOK:34 says a Claude Code outage leaves the run resumable.
+- The existing test `test_stop_intent_recovery_uses_existing_validated_handoffs` shows the design meant a partial freeze stop to be resumed through stop.json. `drive` can never reach that path.
+
+The same dead end also hits a non-transient freeze failure, e.g. 'Stop failed for ui'. There, too, RUNBOOK's 'Failure after stopping/snapshotting: `retry` resumes only failed graph steps' is contradicted.
+
+Severity is P1: a documented resume command does not work, and the run looks dead after hours of worker time. It is triggered only by an outage longer than 60 s during the short freeze window.
+
+Refutations:
+- (b) Reviewer launch failure leading to needs_reconciliation: this is deliberate and documented. RUNBOOK:289 says 'Reviewer needs reconciliation ... start a new run'. test_automatic.py's 'Without the marker a review failure stays non-retryable, transient or not' asserts it.
+- (d) Reviewer stop after acceptance: it exits 1 with REVIEW_STOP_NOTE, but the next `automatic --live` does resume. `drive` checks `reviewer_stop_pending` before invoking and retries the stop.
+- (c) Terminating print jobs on a later exec failure: this is a real but minor wording mismatch with 'stops nothing', not a dead run.
+Verifier's suggested fix: In `drive` (workflow/automatic.py), check for an errored handoff before the `if not state.next:` completion check. The test: a task named 'handoff' has `task.error` and a worker_handoff interrupt. Such a state must never reach 'No verified feature-branch completion'.
+
+For such a task, re-enter the node with `graph.invoke(Command(resume={'freeze': True}), config)`. Optionally call `wait_handoffs` first; it already honours stop.json intents. `stop_session` is idempotent through `<node>.stop.json`, and `freeze` returns snapshots.json once it has been recorded.
+
+In the `except Exception` around `graph.invoke`:
+1. When the error is a TransientInfraError and the failed task is 'handoff', record `runtime.event('freeze', 'interrupted', ...)` with UNAVAILABLE_NOTE.
+2. Re-raise, so `automatic-step` exits 69 and `automatic` exits 75.
+
+Let `retry` (pipeline.py:1034) accept the same errored-handoff state, or have the RUNBOOK name the recovery.
+
+Add a GraphFixture test in which `stop_workers` raises TransientInfraError once. It should assert:
+- the step exits 69;
+- the next `drive` re-runs freeze;
+- snapshots.json exists;
+- verify is reached.
+
+Optionally reword RUNBOOK:288, so 'stops nothing / re-enters' covers only the worker wait, the review wait and freeze. Print-reviewer jobs and reviewer launches are blocked by design.
+
+### Finding 9 (P1, seam panes-launch-worktrees) A Claude Code outage during freeze's worker stop leaves an automatic run unresumable
+File: workflow/automatic.py:1044
+aee3b68 made TransientInfraError resumable only in wait_handoffs and the review node. freeze() runs inside the resumed `handoff` node and calls stop_workers, which calls stop_session, which calls inventory(). If the listing stays unavailable for 60 s there, it raises TransientInfraError inside graph.invoke. drive's except branch neither re-raises it nor records an `interrupted` event. After a resumed interrupt node fails, LangGraph leaves `state.next == ()`, with the handoff task carrying both the error and the worker_handoff interrupt. The next drive() reaches `if not state.next:` before computing `pending`, and raises "No verified feature-branch completion". `retry` also refuses ("Retry requires a failed graph step"). The stop intents written so far are never completed.
+Failure scenario: Reproduced with test_automatic.GraphFixture: wait_handoffs is patched out and stop_workers raises TransientInfraError once. drive(single_step=True) returns None, so automatic-step exits 75 as if a checkpoint persisted. get_state then shows next=() and tasks=[('handoff', error, ['worker_handoff'])]. The next drive() raises RuntimeError("No verified feature-branch completion"), and the supervisor ends with "Automatic controller blocked (exit 1)". No documented command continues the run, although the RUNBOOK promises `automatic --live` resumes after exit 75.
+Reviewer's suggested fix: In drive, compute `pending` before the `not state.next` completion check. When the handoff task carries an error and its worker_handoff interrupt, re-issue Command(resume={"freeze": True}); wait_handoffs' stop-intent branch then lets stop_session finish the recorded intents. Also re-raise TransientInfraError from the handoff node (event `interrupted`, step exit 69), as the review node does, instead of returning None as a persisted checkpoint. Add a GraphFixture test for this case.
+Verifier's reasoning (first): I reproduced the finding on the combined branch (7f8d3b6, langgraph 1.2.11).
+
+**Probe.** GraphFixture with wait_handoffs patched out and runtime.stop_workers raising TransientInfraError once, called from freeze in the resumed handoff node:
+- drive(f.runtime, single_step=True) returned None. automatic-step therefore exits 75 with "Checkpoint persisted" (pipeline.py:949-953).
+- No `interrupted` event was written. The last event was ('controller','running').
+- get_state gave next=() and tasks=[('handoff', "TransientInfraError(...)", ['worker_handoff'])].
+- A second drive() raised RuntimeError("No verified feature-branch completion") at automatic.py:1044-1048. That check runs before `pending` is computed at :1052, so the worker_handoff interrupt that is still recorded is never seen.
+- The supervisor turns that into exit 1, "Automatic controller blocked".
+- `retry` refuses because `not state.next` (pipeline.py:1042-1043).
+
+**Documentation.** RUNBOOK:312 says `automatic --live` is the only continuation of an automatic run and that `freeze`/`retry` must not be used. RUNBOOK:288 explicitly covers "a stop" among the calls that wait out an outage, then promises that the controller "records an `interrupted` event … exits 75" and that `automatic --live` resumes. None of that holds when the outage hits during freeze's stop_workers → stop_session → inventory(). That raises TransientInfraError after the 60 s grace, or RuntimeError("Stop failed") if `claude stop` exits nonzero while the service restarts. Stop intents may already be written, or some workers already stopped, and nothing finishes them. No documented command continues the run.
+
+**Refutation attempts that failed.**
+1. The drive loop without single_step also reaches `not state.next` and blocks.
+2. The error is not classified as retryable anywhere: pending is never computed, and advance_or_block/review_interrupted do not apply to handoff.
+3. Re-issuing Command(resume={"freeze": True}) does recover the graph. In my probe freeze re-ran, stop_workers was called a second time, snapshots were written and next moved to the verify steps. So the fix is feasible, but only through an undocumented manual step that RUNBOOK:312 tells operators not to use.
+
+**Caveats.**
+- The stuck state is pre-existing, not a seam between two fixes. Any freeze failure after resume already produced next=() in 7c5e37e; I confirmed it with a plain RuntimeError from stop_workers. aee3b68 made the transient case a documented guarantee without covering the freeze path.
+- The window is narrow: the listing has to stay unavailable for at least 60 s during the few seconds freeze spends stopping workers. With the auto-updater now off, this is less likely.
+- P1 still fits: a Claude Code outage leaves a run that cannot be resumed, and the documented resume command does not work.
+
+One correction to the suggested fix: re-resuming on every handoff error would retry deterministic freeze failures up to the supervisor's 45 restarts. Examples are an o
+Verifier's suggested fix: **1. Detect a failed handoff in drive before the completion check.** In drive (automatic.py:1044), compute `pending` before `if not state.next:`. Treat it as a failed handoff when all of these hold:
+- `state.next` is empty
+- `pending == ["worker_handoff"]`
+- the handoff task has an error
+
+**2. Record transient failures durably and retry only those.**
+- Make freeze's stop step mark a TransientInfraError durably, for example a `freeze-interrupted.json` marker, mirroring the review node's `interrupted` key.
+- In the handoff branch of drive, re-raise TransientInfraError as the review branch does: event `controller interrupted` with UNAVAILABLE_NOTE, automatic-step exit 69, supervisor exit 75.
+- On the next drive, if the marker is present, consume it, log "Resuming the freeze interrupted by …" and re-issue `Command(resume={"freeze": True})`. wait_handoffs' stop-intent branch revalidates the handoffs, and stop_session completes the recorded intents without issuing a second stop.
+- Without the marker, raise "Non-retryable graph failure". That keeps an ownership, HEAD or identity failure blocked with its own message, never "No verified feature-branch completion", and never loops 45 times.
+
+**3. Tests and docs.**
+- Add a GraphFixture test: stop_workers raises TransientInfraError once. Expect exit 69 or an `interrupted` event; the next drive finishes freeze with no worker launched or stopped twice. A deterministic freeze error must stay non-retryable.
+- Update RUNBOOK:288 to cover the freeze stop.
+
+### Finding 13 (P1, seam docs-vs-code) If Claude Code is unavailable during the automatic freeze, the run cannot be resumed, despite the RUNBOOK's exit-75 promise
+File: workflow/automatic.py:1044
+RUNBOOK.md:288 (also :34, :357 and README) says every `claude` call waits 60s and that the automatic controller then stops nothing, records an `interrupted` event and exits 75, and that `automatic --live` later waits for the same sessions. In the code this holds only for the two waits: `wait_handoffs` and `_accept_native`. The freeze runs `stop_workers` (listing and `claude stop`) inside the `handoff` node, after the `worker_handoff` interrupt was resumed. A TransientInfraError there fails the node. In LangGraph 1.2.11 (checked with a copy of the pipeline's fan-in graph) the checkpoint then has `next == ()` with values, the handoff task shows an error, and `worker_handoff` is still pending. `drive` checks `if not state.next` before anything else and raises "No verified feature-branch completion". A reviewer launch during an outage has a similar problem: `_review_native` marks it `needs_reconciliation`, and the next step raises "Non-retryable graph failure".
+Failure scenario: All lanes write accepted completions. The service stays down for more than 60s while freeze stops the first lane (its `stop.json` intent is written). Step 1 exits 75 because a checkpoint persisted. Step 2 raises "No verified feature-branch completion", so `automatic` exits 1 ("Automatic controller blocked (exit 1)") with no `interrupted` event and some workers already stopped. Every later `automatic --live` fails the same way. `retry` is refused because an interrupt is pending. Only an undocumented `freeze --handoff <lane>=$RUN/<lane>.handoff.json ...` would continue the run.
+Reviewer's suggested fix: In `drive`, before the `not state.next` completion check, detect a failed `handoff` task with `worker_handoff` still pending. Re-resume it with `Command(resume={"freeze": True})`; the stop intents make that idempotent, and `wait_handoffs` already returns early once `stop.json` exists. Re-raise a TransientInfraError from that invoke so the step exits 69 and `automatic` exits 75. Otherwise, narrow RUNBOOK :288 to the worker and reviewer waits and document the recovery for the freeze and for a reviewer launch.
+Verifier's reasoning (first): I could not refute this finding. I reproduced it on the combined branch at 7f8d3b6.
+
+Code path:
+- The automatic freeze runs inside the `handoff` node: `pipeline.py` has `handoff`, which calls `runtime.freeze()`, which calls `stop_workers()`, which calls `stop_session`. `stop_session` writes the stop intent, then calls `sessions.inventory()` and `run_claude([... 'stop' ...])`.
+- Both calls can raise TransientInfraError after 60s. The inventory raises it at `interactive.py:57-69` and `run_claude` at `sessions.py:270`.
+- The `except` around `graph.invoke` in `drive` (automatic.py ~1086-1099) swallows the error. It sees `task.error`, `reviewer_stop_pending` is false and `review_interrupted` is false. It records no `interrupted` event, and with `single_step` it returns None, so the step exits 75 ("Checkpoint persisted").
+- On the next step, `get_state` has `next == ()`. LangGraph 1.2.11 drops a task from `next` when it has pending writes, and the resumed interrupt's RESUME write counts. So `drive` raises at automatic.py:1044-1048 "No verified feature-branch completion" before it reaches the `pending == ["worker_handoff"]` branch.
+
+Probes (scratchpad only):
+1. A bare LangGraph fan-in graph with an interrupt node that is resumed and then raises: `next == ()`, the values are present, the handoff task has the error and still holds the `worker_handoff` interrupt. Re-resuming with `Command(resume={"freeze": True})` completes the graph.
+2. The real `build_pipeline`, `drive` and `OfflinePipeline` from `GraphFixture`, with `stop_workers` raising TransientInfraError once and `wait_handoffs` patched out:
+   - step 1 returned None (exit 75);
+   - the last events were only `controller running`, with no `interrupted` event;
+   - steps 2 and 3 both raised "RuntimeError No verified feature-branch completion";
+   - `stop_workers` was never retried.
+
+In the CLI, that becomes an `automatic-step` exit 1, then "Automatic controller blocked (exit 1)" from `automatic`, on every later `automatic --live`. `retry` is refused because an interrupt is pending and `state.next` is empty (pipeline.py ~1043). The only way to continue is the manual `freeze --handoff <lane>=...` for every lane, which the automatic-mode docs never mention.
+
+The docs contradict this. RUNBOOK:288 names "a stop" among the `claude` calls after which the controller "stops nothing", records `interrupted`, exits 75, and `automatic --live` "waits for the same sessions again". RUNBOOK:34 and :357 say the same.
+
+Scope and severity:
+- A freeze failure left the run stuck in the same way at 7c5e37e, so this is not purely a seam. But the exit-75 promise and TransientInfraError itself (cc35452, 2834604, aee3b68) are new on this branch, so the documented guarantee is broken in the combined code.
+- The trigger needs an outage that starts within the freeze window and lasts over 60s, but that is exactly the failure class these fixes target.
+- Nothing is silently wrong, so it is not P0. Under the rubric it is P1: a run tha
+Verifier's suggested fix: The fix goes in workflow/automatic.py `drive`.
+
+1. In the `except` after `graph.invoke`: if `error` is a TransientInfraError and the failed task is `handoff`, with the `worker_handoff` interrupt still on it:
+   - persist a marker, for example `freeze-interrupted.json` holding the cause;
+   - record `runtime.event("controller", "interrupted", f"{error}. {UNAVAILABLE_NOTE...}")`;
+   - re-raise, so the step exits 69 and `automatic` exits 75.
+2. At the top of the loop, compute `pending` before the `if not state.next` completion check. When `not state.next` and `pending == ["worker_handoff"]` and the marker exists: consume the marker, record a resume event, and fall into the existing worker_handoff branch.
+   - `wait_handoffs` returns early because a `stop.json` intent exists and checks that the handoffs are unchanged.
+   - `Command(resume={"freeze": True})` re-enters `freeze`. `stop_session` is idempotent through `<lane>.stop.json`, and I verified that LangGraph accepts the re-resume.
+3. Without the marker, a freeze that failed for another reason (ownership, HEAD changed, stop failed) must not be re-resumed, or the supervisor loops up to 45 times. Raise a specific error for it instead of the misleading "No verified feature-branch completion", naming the recovery (`freeze --handoff` from the saved `<lane>.handoff.json` files).
+4. Add a GraphFixture test: `stop_workers` raises TransientInfraError once, the step exits 69 with an `interrupted` event, and the next `drive` completes the freeze.
+5. If this is not fixed, narrow RUNBOOK :288, :34 and :357 to the worker and reviewer waits, and document the freeze and reviewer-launch recovery.On branch fix/int-outage
+nothing to commit, working tree clean
+7f8d3b6 wait_handoffs: a lane whose completion was accepted keeps its deadline met if its session works again
+a6d47f1 repair: a repair whose continuation failed its lane's check again is continued
+26b5e83 workflow: repair a frozen lane with an operator's fix commit, before review
+README.md
+RUNBOOK.md
+__init__.py
+__main__.py
+automatic.py
+checks.py
+export_state.py
+guardrails.py
+herdr.py
+interactive.py
+launch.py
+pipeline.py
+prompts
+registry.py
+repair.py
+requirements.lock
+requirements.txt
+run_tests.py
+scaffold.py
+sessions.py
+skills
+test_automatic.py
+test_browser_rules.py
+test_checks.py
+test_export.py
+test_feature_launch.py
+test_guardrails.py
+test_interactive.py
+test_lanes.py
+test_pipeline.py
+test_portable.py
+test_repair.py
+test_run_tests.py
+test_sessions.py
+test_verification.py
+test_worktrees.py
+testdata
+verification.py
+worktrees.py

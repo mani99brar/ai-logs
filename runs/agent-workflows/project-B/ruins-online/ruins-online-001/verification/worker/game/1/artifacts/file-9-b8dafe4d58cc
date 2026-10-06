@@ -1,0 +1,124 @@
+import type { SeaMapDefinition } from "@pirate-sea-race/content";
+import type { TestRuins, TestRuinSetting } from "@pirate-sea-race/protocol";
+import { unlockSource, type LedgerState } from "@pirate-sea-race/simulation/objectives";
+import { createRuins, type RuinIsland, type RuinKind, type RuinsState } from "@pirate-sea-race/simulation/ruins";
+
+/**
+ * The room's side of the ruins (`docs/ruins.md`, §3): which islands have one, the seed they are dealt from, and the
+ * test-only settings. The ruins module itself decides every open, answer, lockout and unlock.
+ */
+
+/** Every regular island with its ledger source ids (`source-<island>-<slot>`), in island order: the islands with a ruin. */
+export function ruinIslandsOf(ledger: LedgerState): RuinIsland[] {
+  const byIsland = new Map<number, string[]>();
+  for (const source of ledger.sources) byIsland.set(source.island, [...(byIsland.get(source.island) ?? []), source.id]);
+  return [...byIsland.entries()].sort(([a], [b]) => a - b).map(([island, sourceIds]) => ({ island, sourceIds }));
+}
+
+/** A test-only ruin setting for one island: its own, else the `*` one, else none. */
+export function testRuinSetting(settings: TestRuins | undefined, island: number): TestRuinSetting | undefined {
+  return settings?.[String(island)] ?? settings?.["*"];
+}
+
+/** How many derived seeds a pinned kind may try before the room gives up: each island's kind is one fair draw. */
+export const RUIN_PIN_TRIES = 256;
+
+export interface MatchRuinsOptions {
+  readonly islands: readonly RuinIsland[];
+  /**
+   * The ruins' seeds, derived from the match's master secret: `seed(0)` is the ruins' own (`deriveSeed(secret,
+   * "ruins")`); `seed(n)` for n > 0 is only tried to meet a test-only pinned kind.
+   */
+  readonly seed: (attempt: number) => number;
+  readonly settings?: TestRuins | undefined;
+}
+
+export interface MatchRuins {
+  readonly ruins: RuinsState;
+  /** The seed the ruins were dealt from. */
+  readonly seed: number;
+  /** Test-only: islands whose sources are open from the start. */
+  readonly openIslands: readonly number[];
+}
+
+/**
+ * A match's ruins, dealt once at its creation from the ruins' own seed (never the ledger's, so a clue says nothing of the
+ * deal, and never the public match code). Test-only settings may pin an island's kind: the room then takes the first
+ * of the ruins' derived seeds that deals every pinned kind, or open an island from the start.
+ */
+export function createMatchRuins(options: MatchRuinsOptions): MatchRuins {
+  const pins = new Map<number, RuinKind>();
+  const openIslands: number[] = [];
+  for (const { island } of options.islands) {
+    const setting = testRuinSetting(options.settings, island);
+    if (setting === "open") openIslands.push(island);
+    else if (setting !== undefined) pins.set(island, setting);
+  }
+  for (let attempt = 0; attempt < RUIN_PIN_TRIES; attempt++) {
+    const seed = options.seed(attempt);
+    const ruins = createRuins({ seed, islands: options.islands });
+    if ([...pins].every(([island, kind]) => ruins.ruins[String(island)]?.puzzle.kind === kind)) return { ruins, seed, openIslands };
+  }
+  throw new Error(`no ruins seed in ${RUIN_PIN_TRIES} tries deals the pinned kinds`);
+}
+
+/** Test-only: unlocks the sources of islands a test opened from the start, in the ledger. */
+export function openIslandsInLedger(ledger: LedgerState, islands: readonly number[]): LedgerState {
+  let next = ledger;
+  for (const source of ledger.sources) if (islands.includes(source.island)) next = unlockSource(next, { sourceId: source.id, tick: 0 }).state;
+  return next;
+}
+
+/** Whether every source of an island is unlocked in the ledger: its ruin was solved (or a test opened it). */
+export function islandUnlocked(ledger: LedgerState, island: number): boolean {
+  const sources = ledger.sources.filter((source) => source.island === island);
+  return sources.length > 0 && sources.every((source) => source.unlocked);
+}
+
+/** The island a dock belongs to, or null (at sea, or a dock of no island). */
+export function islandOfDock(map: SeaMapDefinition, dock: number): number | null {
+  const island = map.docks[dock]?.island;
+  return island === undefined || island < 0 ? null : island;
+}
+
+/** The centre of an island's rectangle, in sub-units: where its ruin's marker stands for players in sight. */
+export function islandCentre(map: SeaMapDefinition, island: number): { x: number; y: number } {
+  const rect = map.islands[island];
+  if (rect === undefined) throw new RangeError(`no island ${island}`);
+  return { x: Math.floor(((rect.tileX * 2 + rect.widthTiles) * map.subUnitsPerTile) / 2), y: Math.floor(((rect.tileY * 2 + rect.heightTiles) * map.subUnitsPerTile) / 2) };
+}
+
+/**
+ * The point of an island's rectangle nearest a position, in sub-units: an island is in a player's sight when this point
+ * is (§16), so a ship off its shore sees it however large it is.
+ */
+export function nearestIslandPoint(map: SeaMapDefinition, island: number, x: number, y: number): { x: number; y: number } {
+  const rect = map.islands[island];
+  if (rect === undefined) throw new RangeError(`no island ${island}`);
+  const tile = map.subUnitsPerTile;
+  const clamp = (value: number, low: number, high: number) => Math.min(Math.max(value, low), high);
+  return { x: clamp(x, rect.tileX * tile, (rect.tileX + rect.widthTiles) * tile), y: clamp(y, rect.tileY * tile, (rect.tileY + rect.heightTiles) * tile) };
+}
+
+/** Verdicts a player's request ids are remembered for: a retry of any of the last this many gets its first verdict. */
+export const REMEMBERED_RUIN_REQUESTS = 16;
+
+/** A player's recent answers by request id, oldest first, at most `REMEMBERED_RUIN_REQUESTS`. */
+export class RuinRequests<T> {
+  private readonly byPlayer = new Map<string, Map<string, T>>();
+
+  get(playerId: string, requestId: string): T | undefined {
+    return this.byPlayer.get(playerId)?.get(requestId);
+  }
+
+  remember(playerId: string, requestId: string, verdict: T): void {
+    const entries = this.byPlayer.get(playerId) ?? new Map<string, T>();
+    entries.set(requestId, verdict);
+    if (entries.size > REMEMBERED_RUIN_REQUESTS) entries.delete(entries.keys().next().value!);
+    this.byPlayer.set(playerId, entries);
+  }
+
+  forget(playerId: string): void {
+    this.byPlayer.delete(playerId);
+  }
+}

@@ -1,0 +1,267 @@
+### Finding 2 (P1, seam controller-paths) A reviewer's deadline is checked before its completion file: a verdict written in time but read after a resume blocks the run
+File: workflow/automatic.py:458
+`wait_reviews` raises 'Reviewer <id> deadline exhausted' before it looks at the row state or the completion file (line 470). This is unlike `wait_handoffs`, which accepts a completion before its deadline check (lines 215-217). The in-memory `decisions` start empty on every entry, so a reviewer that was already accepted (status `accepted`, persisted) is checked against its deadline again. The new transient path makes this routine: `_accept_native` marks `interrupted`, `automatic` exits 75, and the operator reruns `automatic --live` whenever `claude` works again. `resume_interrupted_review` re-enters the node, `wait_reviews` refuses the reviewers on the deadline, and `_accept_native` marks the review blocked, writes a partial review.json and stops every reviewer. review.json now exists, so `repair` also refuses and the run needs a new run.
+Failure scenario: Confirmed with a probe on ReviewCompletionTests. Review timeout 1800 s. The reviewer writes a valid approved completion at t=600, and it is accepted. At t=900 `claude agents` is unavailable for 60 s: TransientInfraError, marker set, exit 75. The operator reruns `automatic --live` at t=1900. `wait_reviews(clock=1801)` raises 'Reviewer review deadline exhausted' although the file is present and valid. Read at t=10, the same file is accepted.
+Reviewer's suggested fix: In `wait_reviews`, evaluate an idle/done reviewer's existing completion file before the deadline check, as `wait_handoffs` does, and apply the deadline only to a reviewer still without an accepted file. Alternatively, exempt a reviewer whose persisted status is `accepted` with `accepted_at` before its deadline, after re-validating its file. Add a test where the file is read at clock ≥ started + timeout.
+Verifier's reasoning (first): I could not refute this. I confirmed it by reading the code and running a probe.
+
+Code path at 7f8d3b6:
+- `wait_reviews` in workflow/automatic.py checks the deadline at line 458 (`if clock() >= started[reviewer_id] + timeout: ... raise`). This happens before it looks at the row state or the completion file at line 470.
+- `decisions = state.decisions`. `ReviewStatus.__init__` always sets `self.decisions = {}`, and `ReviewStatus.load` does not restore decisions. So a reviewer accepted before a restart is checked against its deadline again, and its file is read again only if the deadline has not passed.
+- The branch added `resume_interrupted_review` and the `TransientInfraError` handler in `_accept_native`. A transient failure now sets the `interrupted` marker and `automatic` exits 75. The re-run goes `review_candidate` -> `rebind_reviewers` -> `_accept_native` -> `wait_reviews` with a freshly loaded state.
+- If the re-run comes after the reviewer's deadline, `wait_reviews` raises "deadline exhausted". `_accept_native`'s BaseException branch then marks the combined status `blocked`, supersedes the running reviewers and stops every reviewer. After that, `review_candidate` only raises "Prior reviewer invocation needs reconciliation", so this run cannot continue.
+
+Probe (TwoReviewerCompletionTests fixture, TMPDIR in the scratchpad):
+1. "general" is accepted at t=1300, before its deadline at 1800, and its status `accepted` is saved. "coverage" was launched at t=1200, so its deadline is 3000; it is still working.
+2. The inventory call then raises `TransientInfraError`.
+3. "coverage" writes a valid file and goes idle.
+4. The resumed `wait_reviews` at clock=1900 raises "Reviewer general deadline exhausted; no second reviewer is launched".
+5. The same files read at clock=10 are both accepted.
+
+The first scenario (both files present, resume at t=1900) behaves the same way. A single reviewer is also exposed: after `wait_reviews` accepts it, `check_independence` calls `inventory()`, which can raise `TransientInfraError`. A resume after the deadline then blocks the verdict that was already accepted.
+
+This contradicts two documented guarantees:
+- RUNBOOK.md:245: "The first reviewer to idle without a file until its deadline blocks the run; verdicts already accepted from the others are retained".
+- RUNBOOK.md:338 and launch.py:260: the deadline runs "from its launch to its completion file".
+It also contradicts the worker-side fix in 7f8d3b6 (`deadline_met`/`mark_deadline_met`), which was never mirrored for reviewers.
+
+Two caveats that do not change the verdict:
+1. The check-before-read order predates this branch (the code is unchanged since 7c5e37e), and a Ctrl-C resume could already hit it. The branch's transient re-entry path is what makes it routine: the operator resumes "once `claude` works", which can easily be more than 30 minutes after launch.
+2. The finding says a partial review.json is written. That only happens if another decision was accepted in the sam
+Verifier's suggested fix: In `wait_reviews` (workflow/automatic.py:456-481), handle the completion file before the deadline, as `wait_handoffs` does. For each reviewer not yet in `decisions`, first locate its row. If the row is `idle`/`done` and `<node>.completion.json` exists, run `read_review_completion` and accept the decision (or block on a rejected file) as now. Apply the deadline check only when the reviewer has no accepted file.
+
+To avoid accepting a file written after the deadline, key the exemption on the persisted `accepted_at` instead:
+`if clock() >= started + timeout and not (status.get("accepted_at") and datetime.fromisoformat(status["accepted_at"]).timestamp() < started + timeout): raise ...`
+and then re-validate the file with `read_review_completion`. Use `accepted_at`, not `status`, because `ReviewStatus.save` merges the default reviewer's status under the combined file, and the combined `status` ("running") overwrites it. `accepted_at` survives the merge.
+
+Add tests in ReviewCompletionTests and TwoReviewerCompletionTests:
+1. A reviewer is accepted at clock=1. `_accept_native` is then interrupted by `TransientInfraError`. After `resume_interrupted_review`, `wait_reviews` runs at clock >= started + review_timeout_seconds and must return the accepted decisions, not raise.
+2. With two reviewers, a reviewer that is still missing its file past its deadline still blocks the run, and review.json keeps the verdict of the reviewer accepted earlier.
+
+### Finding 3 (P2, seam controller-paths) A worker question read after the lane's deadline is refused as 'deadline exhausted' instead of pausing it
+File: workflow/automatic.py:221
+8abf776 reordered `wait_handoffs` so that a `completed` signal is accepted before the deadline check. A `question` signal is still handled after it (lines 221-225). If a question file is first read after `started + worker_timeout + extension`, the lane raises 'Worker <lane> deadline exhausted', and drive stops every worker. This happens even though the worker asked in time, and the file (its mtime) proves it. This is common when the controller was away (the new exit 75 on a Claude Code outage, or a Ctrl+C) and was resumed after the deadline. The pause should have started when the question was asked, and the other lanes are killed with it.
+Failure scenario: worker_timeout 4 h. At 3h50 an update makes `claude` unavailable and the supervisor exits 75. At 3h55 the ui worker writes a `question` completion and waits. The operator reruns `automatic --live` at 4h10. On the first poll, ui's item is a question, but the deadline check runs first and raises 'Worker ui deadline exhausted'. drive calls stop_workers() and the run is blocked instead of paused on the question.
+Reviewer's suggested fix: Handle `item['status'] == 'question'` (call record_question) before the deadline check, as a completed signal is handled. If needed, date `asked_at`/`paused_at` from the question file's mtime, bounded by the deadline, so the pause starts when the question was asked.
+Verifier's reasoning (first): I could not refute this finding; it holds on the combined branch at 7f8d3b6.
+
+**The code (workflow/automatic.py):**
+- Lines 215-217: after 8abf776, a `completed` signal is accepted before the deadline check, with no check on when it was written.
+- Lines 219-222: next comes the deadline check. `deadline_extension()` is not None, because an unrecorded question has not set `paused_at` yet. So the lane raises "Worker <lane> deadline exhausted".
+- Lines 223-225: `record_question` is reached only after that check.
+
+**Probe:** I reused the `WorkerQuestion` fixture from `test_guardrails`, in a temp directory.
+- Setup: ui's question completion was written at TIMEOUT-300, adapter had completed and was idle, ui's state was blocked, and clock = TIMEOUT+600.
+- Result: `wait_handoffs` raised "Worker ui deadline exhausted; no automatic relaunch".
+- Nothing was recorded: no `ui.questions.json`, no pause, no event.
+- `drive()` (lines 1066-1076) handles that exception as a block: it calls `runtime.stop_workers()` and the run is blocked.
+- Lane repair (26b5e83) only works after freeze, so it cannot recover this block.
+
+**Why it is a seam and not just the old behaviour:**
+- 8abf776 made the two signals asymmetric. A `completed` file read after the deadline is accepted, even one written after the deadline while the controller was away. A `question` file written before the deadline is refused.
+- aee3b68 (exit 75, "stops nothing, resumable") and the RUNBOOK's Ctrl+C promise make "controller away across a lane's deadline" a documented recovery path.
+- Through that path, a lane that asked in time kills every worker.
+- `record_question` also dates `asked_at`/`paused_at` with `clock()` at recording time. So even when the controller comes back before the deadline, the lane silently loses the time the controller was away.
+
+**Why P2 rather than P1:**
+- It needs the controller to be absent across the lane's deadline, with the question asked during that gap. While the controller runs, the window is about one poll or inventory retry.
+- 8abf776's commit message says outright that "a question still meets the deadline check before it is recorded, as before".
+- The RUNBOOK wording describes the pause as starting when the controller records the question, and says a deadline still stops sessions after exit 75. So no written promise is plainly broken.
+- It is still an inconsistent and harmful outcome, and the tests don't cover it.
+- Arguably it reaches P1 under "question pause wrong", but it is rarer than the earlier P1 (a finished lane's deadline killing a pause), which hit every multi-lane run with a question.
+Verifier's suggested fix: In workflow/automatic.py `wait_handoffs`, handle a question before the deadline check, lines 219-222:
+
+```python
+if item and item["status"] == "question":
+    asked = min(clock(), (runtime.directory / f"{node}.completion.json").stat().st_mtime)
+    if node in met or extension is None or asked < started + timeout + extension:
+        record_question(runtime, node, item, lambda: asked)
+        continue
+```
+
+Then run the existing deadline check. A question written after the deadline is still refused.
+
+Dating `asked_at`/`paused_at` from the file's mtime, bounded by now, means the pause starts when the worker asked. That also fixes a return before the deadline, which today charges the controller's absence to the lane.
+
+Add a `WorkerQuestion` test:
+- ui's question file is written, with `os.utime`, before `TIMEOUT`, and the clock is past `TIMEOUT`.
+- Expect question 1 to be recorded with `asked_at` equal to that mtime, and no raise.
+- A second case writes the file after `TIMEOUT` and still expects "deadline exhausted".
+
+Add one sentence to the RUNBOOK "Worker questions" paragraph: a question written while the controller was away counts from the time it was written.
+
+### Finding 4 (P2, seam controller-paths) A met lane whose session works or blocks again has no bound once the other lanes are done: the controller waits forever
+File: workflow/automatic.py:221
+7f8d3b6 exempts a lane with `met_at` from its deadline permanently (`node not in met`). Such a lane joins `handoffs` only when its row is idle/done and not blocked (line 215). If its session is `working` or `blocked` again (an operator prompt in its pane, a permission stall, a command of its own) and stays that way, `wait_handoffs` loops with no deadline even after every other lane has handed off and no question pause is running. Nothing freezes, no timeout fires and the review never starts. Before 8abf776/7f8d3b6 the worker deadline bounded this wait. RUNBOOK:34 still says a blocked worker is waited on 'until that worker's deadline'.
+Failure scenario: adapter completes at 1h and gets met_at. At 3h the operator types a follow-up in adapter's pane, and adapter ends that turn `blocked`, waiting on the operator, who leaves. ui completes at 3h30. From then on every poll finds ui in handoffs and adapter blocked with the deadline skipped. At 4h (and at 24h) nothing happens: the supervisor waits indefinitely while holding the run locks.
+Reviewer's suggested fix: Keep the exemption only while it protects something: apply the met lane's deadline again once every other lane is in `handoffs` and no question waits. Alternatively, give met lanes their own bounded grace, or accept their already-validated completion once their turn ends. State the rule in the RUNBOOK.
+Verifier's reasoning (first): I tried to refute this and could not. The behaviour is confirmed in the code and by a probe.
+
+**The code path** (workflow/automatic.py):
+- Line 179 builds `met` from `met_at`, and lines 241-243 add a lane to it once its completion is accepted while other lanes still work. It is never removed.
+- Line 215 puts a lane in `handoffs` only when its state is not `blocked`. When the state is `working`, `item` is None.
+- The deadline check at line 221 is skipped for every lane in `met`, whatever its current state.
+- A met lane that is `blocked` or `working` therefore has no deadline and never hands off. Once every other lane is in `handoffs`, the loop polls forever.
+
+At the reviewed base (7c5e37e), every lane's deadline was checked on every poll, so this wait was bounded. At 8abf776 the exemption was decided on each poll from the session state, so it was still bounded. 7f8d3b6 made the exemption permanent, which caused this.
+
+**Probe.** It used the WorkerQuestion fixture and wrote only to a temp directory. Steps:
+- adapter completes at 1h, so `met_at` is written.
+- At 3h adapter's state becomes `blocked`.
+- ui completes at 3.5h.
+- The clock then advances to 52.5h over 50 polls.
+
+Result: no raise and no return; the wait was still looping. The only event is `Worker adapter needs attention in its pane (native state blocked); waiting until its deadline`, and adapter has no deadline.
+
+**Why this is intended in part.** The 7f8d3b6 commit message and the RUNBOOK table row (RUNBOOK.md:384, "its deadline stays met if its session works again") say this on purpose. The Worker questions paragraph also says an accepted lane "no longer has" a deadline.
+
+**Why it is still a defect.** RUNBOOK.md:34 says a blocked worker is waited on "until that worker's deadline". The comment at automatic.py:226-230 says "the worker deadline bounds the wait". The event text at automatic.py:232-233 says the same. For a met lane all three are false, and the wait has no bound at all.
+
+**Why P2, not P1.** Something outside the controller has to start it (an operator prompt in the pane, or rarely a command the session runs itself). A blocked session uses no tokens. The timeline shows an attention event. The run can still be recovered: the operator answers in the pane (the lane goes idle and hands off), or presses Ctrl-C, which is resumable. Nothing is lost and nothing is silently wrong.
+Verifier's suggested fix: 1. **Bound the wait in workflow/automatic.py `wait_handoffs`.** After the per-lane loop, find the met lanes that are not in `handoffs`. Take the case where every other lane is in `handoffs` and no question waits (`waiting_question` is None for all). There, apply a deadline to those met lanes again. Two ways to do it:
+   - Use their original `started + worker_timeout_seconds + extension`.
+   - Or, so a lane whose deadline already passed is not stopped the moment the others finish, allow a grace period counted from the first poll that reached this state, persisted next to `met_at`.
+
+   A third option: accept the met lane's already-validated completion once its turn ends in `blocked`. This is a policy choice.
+2. **Fix the event text at automatic.py:232-233.** For a lane in `met`, say that it has no deadline (or name the new bound) instead of "waiting until its deadline". Update the comment at lines 226-230 to match.
+3. **Update the documentation.**
+   - Change RUNBOOK.md:34 to state the rule for a lane whose completion was already accepted.
+   - Add a test: met lane blocked, all other lanes handed off, clock past the deadline. It should assert that the chosen bound is applied (or that the event wording is correct).
+
+### Finding 7 (P2, seam guardrails-py) A finished lane whose session works or blocks again has no deadline, and the run can wait forever while the event says it waits 'until its deadline'
+File: workflow/automatic.py:221
+review-wait (7f8d3b6) persists `met_at` through `guardrails.mark_deadline_met` and skips the deadline for every lane in `met` for good. The 'blocked turns ask' rule (8abf776) accepts a completion file only while the session is idle or done. Together: a met lane whose session goes back to `blocked` (or keeps `working`) after its acceptance is never accepted again and never timed out. Once every other lane has finished, `wait_handoffs` loops with no bound. The attention event at line 234 still says `waiting until its deadline`, but that lane has no deadline. A probe using the WorkerQuestion harness: adapter accepted at t=100 while ui worked, adapter then `blocked`, ui completed. After 50 polls, at 49x `worker_timeout_seconds`, `wait_handoffs` had neither returned nor raised. Its only event was 'Worker adapter needs attention in its pane (native state blocked); waiting until its deadline'.
+Failure scenario: Automatic run with lanes ui and adapter. adapter finishes early and is accepted, and `met_at` is written. Later a background command it started wakes it, or someone types in its pane, and the turn ends `blocked` (a permission prompt or a question in chat). ui finishes. The supervisor then waits indefinitely: nothing stops it, no deadline error is raised, and a session that keeps `working` keeps consuming usage. Before 7f8d3b6, worker_timeout_seconds bounded exactly this case.
+Reviewer's suggested fix: Keep the exemption only while it is needed: a met lane is exempt only while another lane still runs a deadline or waits on a question. After that, bound it again, for example by `met_at + worker_timeout_seconds` or by the latest end among the other lanes. Also change the attention message for met lanes so it does not promise a deadline (e.g. 'its deadline was met; the run waits for its turn to end'). Add the probe scenario as a test.
+Verifier's reasoning (first): I tried to refute this and could not: the defect is real. I reproduced it against integrate/slice2 at 7f8d3b6.
+
+**How the code behaves**
+- In workflow/automatic.py:215, a completion file becomes a handoff only when its status is not `question` and the state is not `blocked`.
+- The file is read at all only when the state is idle, done or blocked. So a lane that is `working` or `blocked` never becomes a handoff.
+- Line 221 skips the deadline for every lane in `met`. `met` is loaded from the persisted `met_at` at line 179 and added to at lines 241-243. Nothing ever removes a lane from it.
+- Nothing else bounds the wait:
+  - `drive` (around line 1056) calls `wait_handoffs(runtime)` without a timeout.
+  - `supervise` (around line 964) runs `automatic-step` with no timeout.
+  - There is no run-level deadline.
+
+**Probe**
+I used a scratchpad subclass of `WorkerQuestion`:
+1. adapter completed and was accepted at t=100 while ui worked, and `met_at` was persisted.
+2. adapter went `blocked`.
+3. ui completed before its own deadline.
+4. The clock then jumped by `TIMEOUT` per poll.
+
+Result: after 50 polls (t = 50 x `worker_timeout_seconds`), `wait_handoffs` had neither returned nor raised. Its only event was "Worker adapter needs attention in its pane (native state blocked); waiting until its deadline".
+
+The same probe with adapter `working` instead also waited all 50 polls, and emitted no event at all.
+
+**Before 7f8d3b6**
+The exemption depended on the state at each poll. A lane that worked again was held to launch + `worker_timeout_seconds` + extension, so this case was bounded.
+
+**Why it is a defect and not the intended design**
+- The docstring (line 162) scopes the exemption to "not held to it while others work".
+- The RUNBOOK justifies it only by another lane's question: line 50 ("never ends the run while another lane waits on its answer") and line 384 ("while other lanes still worked").
+- Once every other lane has finished, the exemption has no stated purpose and just removes the bound.
+- The RUNBOOK still promises this bound in two places:
+  - Line 34: "persisted per-worker deadlines enforced by the running supervisor … waits until that worker's deadline".
+  - The drive() comment: stop the workers "so no session keeps consuming usage".
+- The event at line 234 promises a deadline that no longer exists.
+
+**Why P2 and not P1**
+- It only happens after activity that follows acceptance: an operator prompt in the pane, or a background command waking the session. The RUNBOOK itself names that second case.
+- In the `blocked` case, the operator is told to act in the pane.
+- Waiting on the operator without a bound is already accepted for question pauses.
+
+So this is a real minor defect plus a message and doc that contradict the code. It is not a silently wrong run or a broken core guarantee.
+
+**Compatibility with the fix**
+A bound of `met_at + worker_timeout_seconds` would still pass the 7f8d3b6 test (`test_a_finished_lane_that_works_again_keeps_its_deadline_met_acr
+Verifier's suggested fix: In `wait_handoffs` (workflow/automatic.py:221), keep the exemption for a met lane only while it is needed. Either:
+- bound a met lane by `met_at + worker_timeout_seconds` (read `met_at` from `<lane>.deadline.json`), or
+- exempt it only while some other lane not in `handoffs` still has a running deadline or a waiting question, and otherwise hold it to a bound such as `max(met_at, latest handoff time) + worker_timeout_seconds`.
+
+Change the line-234 event for a lane in `met`, for example: "its completion was accepted; the run waits for its turn to end until <bound>". Also emit an event when a met lane is seen `working` again, so the wait is not silent.
+
+Update RUNBOOK lines 34, 50 and 384 to state the bound.
+
+Add the probe as a test in `WorkerQuestion`: adapter accepted at t=100 while ui works, then adapter `blocked` (and a second case with `working`), ui completes. Assert that the wait ends with "deadline exhausted" at the bound, and that the event does not promise a deadline the lane lacks.### Finding 14 (P1, seam docs-vs-code) `answer` types into a detached pane's shell and marks the answer delivered
+File: workflow/guardrails.py:837
+`deliver_answer` sends the text and Enter to the lane's pane from terminals.json without checking what runs in that pane. The pane runs `cd <tool checkout> && python -m workflow.interactive attach-one ...`. `attach_one` returns, leaving the pane's shell, when the operator detaches with Ctrl+Z (interactive.py:566, which RUNBOOK:405 documents as the normal detach). It also leaves the shell after giving up after 30 attempts (exit 1) or after Ctrl+C in a wait (exit 130). `went_on` refuses only after a controller stop, and RUNBOOK:56 and README:60 name only a stopped worker's pane as a shell. `require_shell` in interactive.py already reads `herdr pane process-info`, but `answer` never makes the reverse check.
+Failure scenario: The operator presses Ctrl+Z in `Claude: ui`, and later the ui worker asks question 1. `answer "$RUN" ui "Use B > A; record it"` types the text into bash in md-manager's checkout. Bash runs it and redirects into a file named `A`, which dirties the checkout; for md-manager's own runs that is the source checkout, so integration refuses it. The answer is recorded with `delivered: true` and the deadline restarts, but the worker never receives it. Its deadline expires and the whole run is blocked with all workers stopped.
+Reviewer's suggested fix: Before `send-text`, read `herdr pane process-info --pane <pane>` and raise a RuntimeError when the only foreground process is the pane's shell (the reverse of `require_shell`). That goes through the existing failed-delivery path: the answer stays undelivered and the command prints the `--no-herdr` alternative. Document in RUNBOOK/README that a detached pane needs `attach-one` again, or `--no-herdr`.
+Verifier's reasoning (first): I could not refute this finding. The defect is real in the combined branch at 7f8d3b6.
+
+1. `deliver_answer` (workflow/guardrails.py:826-839) reads `terminals.json` and calls `herdr pane send-text` and then `send-keys Enter`. It never checks what is running in the pane. A probe with a mocked herdr showed this: the pane reported an idle shell (shell_pid 1, one foreground process with pid 1), and the function still sent `Use B > A; record it` and Enter, then returned "Answer typed into pane w1:p1 (ui)". It never called process-info.
+
+2. The pane runs a command that `attach_pane` (interactive.py:352-361) types into the pane's shell with `herdr pane run`: `cd <tool checkout> && python -m workflow.interactive attach-one ...`. When attach-one ends, the pane is back at that shell. `attach_one` (interactive.py:533-599) ends in these cases:
+   - The operator detaches (exit 0) and the session keeps the same PID. This path is tested: `test_a_detach_ends_attach_one_quietly`. RUNBOOK:405 describes Ctrl+Z as "detaches to the pane's shell".
+   - `claude attach` is interrupted (exit 130).
+   - attach-one gives up after REATTACH_LIMIT (30) attempts (RuntimeError, exit 1).
+   - Ctrl+C during a backoff wait (KeyboardInterrupt, exit 130).
+   - The session ends (ProcessEnded).
+
+3. `went_on` (guardrails.py:747) refuses only when a stop, handoff or completion file exists. RUNBOOK:56 and README:60 name only a stopped worker's pane as a shell. For a failed delivery they list only "outside a Herdr pane, no pane recorded, a closed pane". Neither says that a detached pane takes the typed text.
+
+4. `answer_main` then calls `mark_delivered`, so the entry becomes `delivered: true`. `record_answer` already restarted the deadline. A rerun of `answer` is refused because the answer counts as delivered. The worker's session never received any input. It stays done or blocked, `record_pane_answer` sees nothing, and `wait_handoffs` (automatic.py:220-221) raises "Worker <lane> deadline exhausted", which blocks the run.
+
+5. Bash also runs the answer as a command in the tool checkout. A `>` in the text creates or truncates a file there.
+
+One part of the scenario is conditional. The typed text lands in the tool checkout (`Path(__file__).parents[1]`), which is the source checkout only when the controller runs from it. The "integration refuses it" consequence depends on that, but the silent non-delivery does not.
+
+This is not caused by the merge itself. At 7c5e37e, attach-one exec'd `claude attach` and `deliver_answer` already had no pane check, so the gap was there before. The integrated fixes (3d72a7d `went_on` and its docs, 41a8189 delivery retry) spotted the "pane is a shell" risk but closed it only for the stop case. 424204f added more exit paths back to the shell (giving up, Ctrl+C in a wait).
+
+Severity is P1, not P0: the answer is marked delivered while the question pause is effectively lost, and the run ends blocked. It is visible in the end, not silently wrong.
+Verifier's suggested fix: In `deliver_answer` (workflow/guardrails.py, before `herdr("pane", "send-text", ...)`), read `herdr("pane", "process-info", "--pane", pane)["result"]["process_info"]`. If `shell_pid` is set and the only foreground process is the shell, raise `RuntimeError(f"Pane {pane} ({node}) is at its shell: attach-one ended (a detach, an interrupt or a give-up). Run attach-one --node {node} in it, or use --no-herdr")`. That is the reverse of `interactive.require_shell`, and you could factor out a shared `pane_is_idle_shell` helper. The RuntimeError goes through the existing failed-delivery path in `answer_main`: the answer stays recorded as `delivered: false`, the deadline keeps running, and both rerun commands are printed. Add a unit test that uses an idle-shell process-info and asserts that nothing is typed and `delivered` stays false. Update RUNBOOK:56 and README:60 to list "a detached pane (attach-one ended)" among the failed-delivery causes, with the fix: run attach-one in the pane again, or use --no-herdr.
+
+### Finding 15 (P2, seam docs-vs-code) A rerun after a failed Enter types the answer twice, contradicting "delivers it once"
+File: workflow/guardrails.py:838
+`send-text` and `send-keys Enter` are two separate herdr calls. If `send-text` succeeds and `send-keys` fails (timeout, pane closing), `answer` exits 1 with `delivered: false` and prints a rerun command. The rerun types the whole text again into the same unsubmitted input and then presses Enter. RUNBOOK:56, README:60 and PRD 4.6 say a rerun "delivers the recorded answer once".
+Failure scenario: `herdr pane send-keys` times out once (15s timeout in herdr.py). The operator reruns `answer` as told, and the worker receives "Use option B.Use option B." as a single message.
+Reviewer's suggested fix: Record a `typed` marker after `send-text` succeeds. A rerun then sends only Enter when the text was already typed, or refuses and tells the operator to press Enter in the pane. Alternatively, document that case.
+Verifier's reasoning (first): I could not refute this, and a probe reproduced it. deliver_answer (workflow/guardrails.py:836-837) makes two separate herdr calls: `pane send-text` and then `pane send-keys Enter`. Each goes through herdr.herdr() with timeout=15 and check=True. Suppose send-text succeeds and send-keys raises (TimeoutExpired or CalledProcessError, both SubprocessError). answer_main (line 924) then sees `delivered` still None and `entry` set. It exits 1 and says "it did not reach the worker. Deliver it by rerunning". That is false, because the text is already sitting unsubmitted in the pane's input. On the rerun, undelivered_answer (line 800) returns the entry: the text matches, `delivered` is False, and went_on is None because the worker never submitted anything. deliver_answer then types the whole text again and presses Enter.
+
+The probe subclassed AnswerDelivery, made send-keys raise TimeoutExpired once, then reran the command. The rerun's herdr calls were [send-text 'Use option B', send-keys Enter] a second time. The entry was marked delivered: true, so the worker got the text typed twice as one submission. The --no-herdr alternative in the same message has the same problem: the operator types the text into an input that already holds it.
+
+The docs promise that a rerun delivers the answer once: RUNBOOK.md:56 ("it delivers the recorded answer once"), the README Questions bullet ("rerun the same command ... to deliver it once") and PRD line 131 ("delivers it once without recording it again"). The only test, AnswerDelivery.test_a_failed_delivery_keeps_the_answer_and_a_rerun_delivers_it_exactly_once (test_guardrails.py:1388), fails only at send-text, so it never exercises this path. The defect came in with commit 41a8189. It needs a transient failure between the two calls, and the result is a garbled, duplicated answer rather than lost data or a stuck run, so P2 is the right severity, not P1.
+Verifier's suggested fix: In deliver_answer, handle the two herdr calls separately. If send-text succeeds and send-keys fails, raise a distinct error, or record `typed: true` on the entry under question_lock before calling send-keys. In answer_main, a rerun of an entry with `typed: true` should send only `send-keys Enter`. Alternatively, it can refuse and print "the text is typed in pane <pane>; press Enter there, do not rerun answer" (and not offer the --no-herdr retry for this case). Treat a send-text timeout as ambiguous in the same way: say the text may already be in the pane and should be checked before rerunning. Add a test in AnswerDelivery where send-keys raises TimeoutExpired once, and assert that the rerun does not repeat send-text.
+
+### Finding 16 (P2, seam docs-vs-code) The unconfirmed-stop message tells the operator to run `claude attach`, which can wake the session being stopped
+File: workflow/interactive.py:488
+`stop_reported` prints "The controller is stopping <lane> ...; not attaching. Inspect it with `claude logs <id>` or `claude attach <id>`", and RUNBOOK:139 repeats that advice. The same module says (line 543) that "`claude attach` would wake a missing session, so only an exact live row is ever attached", which is why attach-one itself refuses while a stop is unconfirmed. The stop intent is written before `claude stop` runs, and while its termination check is still pending.
+Failure scenario: The freeze's `claude stop` returns but its termination check fails ("termination is not established"). The operator follows the printed advice and runs `claude attach <id>`, which wakes the stopped session. The controller's retry then finds a live process ("A stopped worker was restarted; reconcile before snapshot capture") and the run blocks.
+Reviewer's suggested fix: Keep only `claude logs <id>` in the message and in RUNBOOK:139, or add a warning that attaching may restart a session the controller is stopping.
+Verifier's reasoning (first): I could not refute this finding. It is real and P2, but it is not a seam between two fixes: the message and the docstring that contradicts it both come from the same commit, 3e85a14.
+
+**What the code says**
+- `workflow/interactive.py:487-488` (`stop_reported`, when the stop is not confirmed) tells the operator to inspect the session with "`claude logs <id>` or `claude attach <id>`".
+- `test_interactive.py:805` asserts that exact text, and RUNBOOK.md:139 repeats it.
+- The same module's rule, at `interactive.py:543`, is that "`claude attach` would wake a missing session, so only an exact live row is ever attached". The comment at `test_interactive.py:810` says the same thing.
+- The "refusing implicit restart" guard, `PROCESS_ENDED` at line 404, has relied on this since 7c5e37e. RUNBOOK:139 and :366 also promise attach-one "refuses to restart a missing one".
+- attach-one checks the stop again right before each attach (`interactive.py:568-569`) so that it never attaches a session the controller is stopping. It then prints that same command for the operator to run by hand.
+
+**How long an unconfirmed stop lasts**
+- `pipeline.py:332-357` (`stop_session`) writes `<node>.stop.json` with `stopped: false` before it runs `claude stop`.
+- It raises and leaves the marker unconfirmed when `claude stop` exits non-zero, when identity changed, or when "termination is not established" (the session is still listed with a PID, or its PID is still alive right after the stop).
+- Callers keep that state across a block or resume:
+  - `automatic.py:1073-1076`: "Could not confirm worker stop".
+  - `automatic.py:713-718`: "Could not confirm reviewer stop ...; resume retries the stop".
+- So the message is not limited to a brief window. The advice sits in the pane while the run is blocked.
+
+**Concrete failure**
+1. `claude stop` returns 0, but the PID is still alive, so the termination check fails and the marker stays unconfirmed.
+2. The process then exits.
+3. The operator follows the printed advice and runs `claude attach <id>`, which by the repo's own premise wakes the session under a new PID.
+4. On resume, `stop_session` finds a matching row with a PID and runs `locate()`. Because `row["pid"] != intent["pid"]`, it raises at `pipeline.py:346-347`.
+
+Correction to the finding: the blocking error is "Native <node> session identity changed after stop intent; reconcile manually", not "A stopped worker was restarted". The run still blocks until the operator stops the session by hand. The same applies to a reviewer whose stop resume retries.
+
+**Why P2 and not higher**
+- When the stop failed and the session is still live, attaching does no harm. That is what the controller's own "inspect native session" error asks for.
+- The harm needs the session to have already ended. It is recoverable with a manual `claude stop`.
+- So this is misleading operator advice that contradicts the module's own rule, not a broken guarantee.
+
+**Caveats**
+- The CLI help ("Open the background session in this
+Verifier's suggested fix: 1. In `workflow/interactive.py:488`, keep only `claude logs {background_id}`. Alternatively, add: "do not `claude attach` it: attaching a session that already ended restarts it; check `claude agents --json` first".
+2. Update the asserted text in `workflow/test_interactive.py:804-805` to match.
+3. In RUNBOOK.md:139, change "with the `claude logs <id>` and `claude attach <id>` commands to inspect it yourself" to mention only `claude logs <id>`, or add the same warning.

@@ -1,0 +1,117 @@
+import { z } from "zod";
+import { formatIssues, rulesPresets, type RulesPreset, type ValidationResult } from "../rules.js";
+import { presetRubbings, rubbingIdSchema, rubbingTypeOf, rubbingTypeSchema } from "./types.js";
+
+/**
+ * Where a source can stand: an island index of the preset and an integer sub-unit position that the caller takes from
+ * the map. The ledger does not know the map; it only keeps the positions with the sources.
+ */
+export const sourceSiteSchema = z.strictObject({
+  island: z.int().nonnegative(),
+  x: z.int(),
+  y: z.int(),
+});
+
+export type SourceSite = z.infer<typeof sourceSiteSchema>;
+
+/** A source's id names its island and its place among that island's sources: `source-<island>-<slot>`. */
+export function sourceId(island: number, slot: number): string {
+  return `source-${island}-${slot}`;
+}
+
+export const assignedSourceSchema = z.strictObject({
+  id: z.string().regex(/^source-[0-9]+-[0-9]+$/, "a source id is source-<island>-<slot>"),
+  island: z.int().nonnegative(),
+  x: z.int(),
+  y: z.int(),
+  type: rubbingTypeSchema,
+  /** The rubbing sealed here at the start of the match. */
+  rubbingId: rubbingIdSchema,
+});
+
+export type AssignedSource = z.infer<typeof assignedSourceSchema>;
+
+interface Issue {
+  readonly path: (string | number)[];
+  readonly message: string;
+}
+
+/** The island rule shared by sites and assignments: `sourcesPerIsland` sources on each island, and no other island. */
+function islandIssues(preset: RulesPreset, islands: readonly number[]): Issue[] {
+  const issues: Issue[] = [];
+  if (islands.length !== preset.rubbings) {
+    issues.push({ path: [], message: `preset ${preset.id} needs ${preset.rubbings} sources, got ${islands.length}` });
+  }
+  const perIsland = new Map<number, number>();
+  islands.forEach((island, index) => {
+    if (island >= preset.islands) {
+      issues.push({ path: [index, "island"], message: `preset ${preset.id} has islands 0–${preset.islands - 1}` });
+    }
+    perIsland.set(island, (perIsland.get(island) ?? 0) + 1);
+  });
+  for (let island = 0; island < preset.islands; island++) {
+    const count = perIsland.get(island) ?? 0;
+    if (count !== preset.sourcesPerIsland) {
+      issues.push({ path: [], message: `island ${island} needs ${preset.sourcesPerIsland} source(s), got ${count}` });
+    }
+  }
+  return issues;
+}
+
+/** The sites the server offers for a preset: exactly `sourcesPerIsland` on each of its islands. */
+export function sourceSitesSchema(preset: RulesPreset) {
+  return z.array(sourceSiteSchema).superRefine((sites, ctx) => {
+    for (const issue of islandIssues(preset, sites.map((site) => site.island))) ctx.addIssue({ code: "custom", ...issue });
+  });
+}
+
+export function validateSourceSites(preset: RulesPreset, candidate: unknown): ValidationResult<SourceSite[]> {
+  const parsed = sourceSitesSchema(preset).safeParse(candidate);
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, issues: formatIssues(parsed.error) };
+}
+
+/**
+ * The server-controlled assignment of rubbings to sources (§4): the preset's rubbings, each sealed at exactly one
+ * source, `sourcesPerIsland` sources on each island, every source id unique and naming its island.
+ */
+export const sourceAssignmentSchema = z
+  .strictObject({
+    preset: z.enum(["slice", "alpha"]),
+    /** The seed the assignment was drawn from, so it can be reproduced. */
+    seed: z.int().nonnegative(),
+    sources: z.array(assignedSourceSchema),
+  })
+  .superRefine((assignment, ctx) => {
+    const preset = rulesPresets[assignment.preset];
+    const { sources } = assignment;
+    for (const issue of islandIssues(preset, sources.map((source) => source.island))) {
+      ctx.addIssue({ code: "custom", path: ["sources", ...issue.path], message: issue.message });
+    }
+    const ids = new Set<string>();
+    sources.forEach((source, index) => {
+      if (ids.has(source.id)) ctx.addIssue({ code: "custom", path: ["sources", index, "id"], message: `duplicate source id ${source.id}` });
+      ids.add(source.id);
+      if (!source.id.startsWith(`source-${source.island}-`)) {
+        ctx.addIssue({ code: "custom", path: ["sources", index, "id"], message: `source ${source.id} is not on island ${source.island}` });
+      }
+      if (rubbingTypeOf(source.rubbingId) !== source.type) {
+        ctx.addIssue({ code: "custom", path: ["sources", index, "type"], message: `rubbing ${source.rubbingId} is not of type ${source.type}` });
+      }
+    });
+    const expected = presetRubbings(preset).map((rubbing) => rubbing.id).sort();
+    const actual = sources.map((source) => source.rubbingId).sort();
+    if (expected.join(",") !== actual.join(",")) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["sources"],
+        message: `preset ${preset.id} seals each of ${expected.join(", ")} exactly once; got ${actual.join(", ")}`,
+      });
+    }
+  });
+
+export type SourceAssignment = z.infer<typeof sourceAssignmentSchema>;
+
+export function validateSourceAssignment(candidate: unknown): ValidationResult<SourceAssignment> {
+  const parsed = sourceAssignmentSchema.safeParse(candidate);
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, issues: formatIssues(parsed.error) };
+}

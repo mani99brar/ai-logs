@@ -1,0 +1,332 @@
+=== features/review-result/README.md ===
+     1	# Ready-to-launch feature: review verdict and findings in the viewer (slice B)
+     2	
+     3	This directory is the committed assignment for the two workers of `docs/PRD_REVIEW_RESULT.md`, **not** an implementation. The API contract is `contracts/projects/README.md` (`reviewResult`, `.../runs/{run_id}/reviews/{attempt}`). The producer shape is the `review` section of `run-state.json` documented in [features/project-workflows/README.md](../project-workflows/README.md#runtime-storage-seam); `workflow export <run>` re-exports older runs so project-workflows-001 shows its own six findings after this slice merges.
+     4	
+     5	```bash
+     6	.venv/bin/python -m workflow launch review-result --live --automatic --worker-timeout-seconds 7200
+     7	```
+     8	
+     9	Default run: `~/.local/state/md-manager-workflows/review-result/review-result-001`; default branch `feature/review-result/review-result-001`. `--dry-run` prints the commands without executing anything. The profile is the same as project-workflows (policy v1.1.0, `npm ci` setup, three verification attempts per lane/phase, same ownership) without the checkpoint failure drill. The independent reviewer runs as a native attachable session (slice A): a third `Claude: reviewer` pane appears in the run's tab when the review node starts, and `--reviewer-transport print` keeps the headless fallback. See `workflow/RUNBOOK.md`.
+    10	
+    11	## Scenarios
+    12	
+    13	`policy.json` pins the six project-workflows scenario IDs plus:
+    14	
+    15	| Scenario id | Asserts |
+    16	| --- | --- |
+    17	| review-verdict | review node shows approved, reviewer session, bundle hash linked to the candidate node, the summary line, and a findings table with severity and disposition (6 rows grouped 4 open + 2 accepted) |
+    18	| review-blocked | a seeded blocked review shows verdict blocked, node failed, run failed, and the findings that caused it |
+    19	| review-legacy | a seeded run whose export is version 1.0.0 shows "no review recorded" and no error |
+    20	| paths-redacted | no absolute path from the seeded fixtures appears in the rendered review (`innerText`), while `<path>` does |
+    21	
+    22	Every scenario attaches `screenshot:<id>`; both `WORKFLOW_VERIFICATION_PHASE=worker` (mocks) and `candidate` (real backend with seeded runs) must pass without skipping.
+    23	
+    24	## Seeded export shape
+    25	
+    26	Candidate-mode seeds write `run-state.json` with `version: "1.2.0"` and a `review` section (or `"1.0.0"` without it for the legacy run):
+    27	
+    28	```jsonc
+    29	"review": {
+    30	  "attempt": 1, "transport": "native" | "print" | "manual",
+    31	  "reviewer_session_id": "<uuid or operator identity>", "independent": true,
+    32	  "bundle_sha256": "<64 hex>", "candidate_commit": "<40 hex>",
+    33	  "verdict": "approved" | "blocked",
+    34	  "findings": [{"severity": "P2", "message": "...", "disposition": "open", "worker": "ui" | null, "requirement": "verbatim quote" | null}],
+    35	  "reviewed_at": "2026-09-21T15:42:27.848828Z",
+    36	  "diff": {"path": "review.diff", "sha256": "<64 hex>", "bytes": 289187} | null
+    37	}
+    38	```
+    39	
+    40	The adapter registers `review.diff` as artifact `patch-review-<sha12>`, redacts paths in messages and quotes, and serves 404 `REVIEW_NOT_FOUND` for runs without the section. Seeds use synthetic UUIDs and test-only data.
+=== features/review-result/adapter-task.md ===
+     1	# Adapter worker: serve the persisted review verdict
+     2	
+     3	Implement the backend side of slice B in `docs/PRD_REVIEW_RESULT.md` on the existing Fastify server. The payload is `reviewResult` in `contracts/projects/v1.ts` (`validateReviewResult`) and the producer shape is the `review` section of `run-state.json` version `1.1.0`/`1.2.0` described in `features/review-result/README.md`. Keep the frozen contracts and runtime engine unchanged.
+     4	
+     5	## Ownership
+     6	
+     7	Only edit `server/` and `config/projects.example.json`. Do not modify UI, `workflow/`, contracts, feature policy, package manifests or the root browser configuration. Use existing Node/Fastify/Zod dependencies. Escalate necessary changes outside ownership to Pi/the operator.
+     8	
+     9	## Deliverables
+    10	
+    11	- `exportSchema` accepts export versions `1.0.0` (no `review`/`inputs` keys), `1.1.0` (`review`, no `inputs`) and `1.2.0` (both). `review` is optional-or-null; when present it is validated strictly against the section shape in the feature README. A violation is `RUN_STORAGE_INVALID` naming the run but never a path. Never trust `values.review`.
+    12	- `GET /api/projects/:project_id/workflows/:workflow_id/runs/:run_id/reviews/:attempt` returns `reviewResult` after `validateReviewResult` and `conform(schemas.reviewResult, ...)`: `reviewer.session_id` = `reviewer_session_id`, `reviewer.transport` and `independent` passed through, `reviewed_at` passed through, `findings[].message` and `requirement` through `redactPaths`, `requirement_found_in` computed against the raw `inputs.workers.<lane>.task` (or `prompt` when the task is missing) — a lane is included only when `requirement` is a verbatim substring; empty when `requirement` is null or `inputs` is absent. 404 `REVIEW_NOT_FOUND` when the run has no review section or the attempt is not the recorded one; 405 for other methods; `HEAD` handled like the existing routes.
+    13	- Run detail: the `review` node gets `session_id = reviewer_session_id` and `result_uri = <run route>/reviews/<attempt>` when the export has a review section; status logic is unchanged (task error → failed, evidence → succeeded, …). Old exports keep `session_id`/`result_uri` null.
+    14	- Artifact route: when the review section has `diff`, the artifact id `patch-review-<first 12 hex of sha256>` resolves to `<run>/review.diff`, read bounded by `artifactByteLimit`, hash-verified, served `text/plain; charset=utf-8` inline with the same nosniff/CSP headers as packet artifacts. Mismatch → `ARTIFACT_HASH_MISMATCH`; missing → `ARTIFACT_UNAVAILABLE`; ids matching neither registry → `ARTIFACT_NOT_FOUND`.
+    15	- Manual-transport reviews pass the operator-stated identity through as `session_id`. Error messages never contain paths. Nothing is written into the run root by a read.
+    16	
+    17	## Verification
+    18	
+    19	Extend `server/projects.test.ts` (executed by the policy's tsx command) with disposable roots: review served with redaction (a finding message containing an absolute path under the temp root comes back with `<path>`), `requirement_found_in` computed only from verbatim matches, the diff artifact served, hash-checked and bounded, a blocked review served with verdict `blocked` while the node projects `failed` and the run `failed`, a legacy `1.0.0` export → 404 `REVIEW_NOT_FOUND` with detail still 200 and `session_id`/`result_uri` null, a `1.1.0` export loading, manual transport passing through the operator identity, malformed sections → 500 `RUN_STORAGE_INVALID` without paths, every payload conforming to the committed schemas and cross-field validators, and 405/HEAD on the new route. Existing app tests must still pass without project configuration.
+    20	
+    21	No new dependencies or changes to global permission settings are authorized. The trusted verifier independently runs your unit/contract/build checks after handoff. Do not claim tests were executed if they were not.
+    22	
+    23	## Finish
+    24	
+    25	Report a summary, all changed files, checks actually executed (or explicitly none) and open assumptions. In manual mode wait for the operator to freeze. In automatic mode follow the appended completion-file protocol and finish your turn without waiting for a human. Do not commit, push, merge, launch other agents or modify shared contracts/runtime.
+=== features/review-result/feature.json ===
+     1	{
+     2	  "version": "1.0.0",
+     3	  "name": "Review verdict and findings in the viewer",
+     4	  "branch_prefix": "feature/review-result",
+     5	  "policy": "policy.json",
+     6	  "ui_task": "ui-task.md",
+     7	  "adapter_task": "adapter-task.md"
+     8	}
+=== features/review-result/policy.json ===
+     1	{
+     2	  "version": "1.1.0",
+     3	  "feature": "Review verdict and findings in the viewer",
+     4	  "independent_review": true,
+     5	  "integration_approval": true,
+     6	  "max_verification_attempts": 3,
+     7	  "setup": [{"argv": ["npm", "ci"], "timeout_seconds": 600}],
+     8	  "workers": [
+     9	    {
+    10	      "node_id": "ui", "role": "frontend",
+    11	      "owned_paths": ["src/App.tsx", "src/App.css", "src/graph", "src/projects", "src/index.css", "tests/project-workflows"],
+    12	      "checks": [
+    13	        {"id": "frontend-build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 180, "scenarios": []},
+    14	        {"id": "frontend-unit-regression", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 180, "scenarios": []},
+    15	        {
+    16	          "id": "project-workflows-browser", "kind": "browser",
+    17	          "argv": ["npx", "--no-install", "playwright", "test", "--config=tests/project-workflows/playwright.config.ts"],
+    18	          "timeout_seconds": 300,
+    19	          "scenarios": [
+    20	            {"id": "projects-navigation", "description": "Pi and Claude remain usable and Projects opens registered projects"},
+    21	            {"id": "workflow-run-graph", "description": "Select a project, workflow and run and inspect the pinned graph"},
+    22	            {"id": "run-evidence", "description": "Inspect worker checks, changed files, assumptions, logs and screenshot evidence"},
+    23	            {"id": "empty-states", "description": "Distinguish no workflows from no runs"},
+    24	            {"id": "failed-and-paused", "description": "Show failure and awaiting-approval state without implying completion"},
+    25	            {"id": "request-errors", "description": "Show an actionable API error rather than silently substituting fixtures"},
+    26	            {"id": "review-verdict", "description": "The review node shows approved, the reviewer session, the bundle hash, the summary line and a findings table with severity and disposition"},
+    27	            {"id": "review-blocked", "description": "A seeded blocked review shows verdict blocked, the node failed, and the findings that caused it"},
+    28	            {"id": "review-legacy", "description": "A seeded run without the review export section shows no review recorded and no error"},
+    29	            {"id": "paths-redacted", "description": "No absolute path from the seeded fixtures appears in the rendered review"}
+    30	          ]
+    31	        }
+    32	      ]
+    33	    },
+    34	    {
+    35	      "node_id": "adapter", "role": "backend",
+    36	      "owned_paths": ["server", "config/projects.example.json"],
+    37	      "checks": [
+    38	        {"id": "backend-unit", "kind": "unit", "argv": ["npx", "--no-install", "tsx", "--test", "server/projects.test.ts"], "timeout_seconds": 180, "scenarios": []},
+    39	        {"id": "backend-regression", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 180, "scenarios": []},
+    40	        {"id": "shared-contract", "kind": "contract", "argv": ["npm", "run", "test:contracts"], "timeout_seconds": 120, "scenarios": []},
+    41	        {"id": "backend-build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 180, "scenarios": []}
+    42	      ]
+    43	    }
+    44	  ]
+    45	}
+=== features/review-result/ui-task.md ===
+     1	# UI worker: review verdict and findings on the review node
+     2	
+     3	Implement the viewer side of slice B in `docs/PRD_REVIEW_RESULT.md`. The payload is `reviewResult` in `contracts/projects/v1.ts` (`validateReviewResult`, `isBlockingFinding`), with a fixture in `contracts/projects/examples.ts`. Read `features/review-result/README.md` for the seeded export shape the candidate-mode tests must write. Do not redesign the runtime or change contracts, policy or package manifests.
+     4	
+     5	## Ownership
+     6	
+     7	Only edit the UI-owned paths in the attached policy: `src/App.tsx`, `src/App.css`, `src/graph/`, `src/projects/`, `src/index.css` and `tests/project-workflows/`. The backend owns `server/` and `config/projects.example.json`; do not edit them. If a necessary change falls outside ownership, stop and ask Pi/the operator rather than crossing the boundary. Reuse `src/document/Markdown.tsx` by import only.
+     8	
+     9	## Deliverables
+    10	
+    11	- `src/projects/api.ts`: `paths.review(scope, attempt)`, `fetchReviewResult(scope, path, signal)` validating with `validateReviewResult` and `run_id === scope.runId`, and `scopedReviewPath(scope, resultUri)` accepting only `${paths.run(scope)}/reviews/<positive int>`. A 404 with code `REVIEW_NOT_FOUND` is the normal "not recorded" state, not an error panel.
+    12	- When the selected node's definition kind is `review`, its Result section becomes the review panel (`data-testid="review-result"`):
+    13	  - verdict pill `review-verdict` (`Approved` / `Blocked`, reuse `.status-badge` with `status-succeeded` / `status-failed`);
+    14	  - reviewer line `review-reviewer`: the session id in `<code>` plus the transport wording ("native session", "print-mode session", "operator-supplied review");
+    15	  - bundle hash `review-bundle` (first 12 characters in `<code>`, full hash in `title`) as an `AppLink` to the `candidate` node, and the candidate commit short SHA;
+    16	  - one-line summary `review-summary`, for example `approved with 6 findings: 4 open, 2 accepted, none blocking` or `blocked with 2 findings: 1 open, 1 resolved, 1 blocking` (blocking = `isBlockingFinding`); zero findings → `approved with no findings`;
+    17	  - findings table `review-findings` grouped by disposition (`open`, `resolved`, `accepted`, in that order; each group a `<section data-disposition>` with a heading and a table whose rows carry `data-testid="finding"`, `data-severity`, `data-disposition`, `data-worker`; columns Severity, Message, Worker, Requirement; an unresolved P0/P1 row gets class `finding-blocking`; a null requirement shows "—");
+    18	  - "Diff the reviewer saw" `review-diff`: a link to `diff.uri` (new tab, `rel="noopener"`, plain text) plus the sha prefix, or "No diff artifact was recorded";
+    19	  - no review section (404 `REVIEW_NOT_FOUND`) → `<p data-testid="review-none">No review recorded for this run: either the review has not happened or the run's export predates review results (re-export it with the workflow CLI).</p>`; loading and error panels as elsewhere.
+    20	- Preserve Pi/Claude browsing, Back/Forward, existing file operations and unsaved-edit guards. Add no launch, approve, retry or delete controls.
+    21	
+    22	## Browser tests and isolation
+    23	
+    24	Extend `tests/project-workflows/` so that every scenario ID in `features/review-result/policy.json` appears in exactly one test title with a `screenshot:<id>` PNG attachment: the six existing scenarios plus `review-verdict`, `review-blocked`, `review-legacy` and `paths-redacted`. Keep `WORKFLOW_VERIFICATION_PHASE` semantics:
+    25	
+    26	- `worker`: mock only `/api/projects/**` success responses from contract-validated fixtures; serve `.../reviews/<attempt>` (404 `REVIEW_NOT_FOUND` when absent or attempt ≠ 1) and the diff artifact as `text/plain`. Mock payloads are already the projected shape, so they carry the literal `<path>`, never a raw path.
+    27	- `candidate`: no mocked project success routes. Seed run directories with `run-state.json` version `1.2.0` carrying the `review` section (and `review.diff`) described in the feature README, plus one legacy run whose export is version `1.0.0` without the section; start the real backend and test the same scenarios against it.
+    28	
+    29	Fixtures: an approved run with six findings (4 open, 2 accepted, all P2, transport `native`, reviewer `33333333-3333-4333-8333-333333333333`, a diff artifact), a blocked run (verdict blocked, one P1 open and one P2 resolved, transport `print`, review node `failed`, run `failed`), and a legacy run (integrated, export `1.0.0`, no review section although `values.review` exists). Put an absolute path under the temp root into one finding message so `paths-redacted` can assert that `<path>` appears and no `/tmp/` or `/home/` string does. Update the run-list assertion in `workflow-run-graph` for the added runs. Both phases must pass without skipping.
+    30	
+    31	Pick free ports and temporary roots in the config, never reuse an existing server, clean up owned temporary directories, and do not modify the root Playwright configuration. No new package dependencies are authorized.
+    32	
+    33	## Finish
+    34	
+    35	Report a concise summary, complete changed-file list and open assumptions. In manual mode wait for the operator's explicit freeze. In automatic mode follow the appended completion-file protocol and finish your turn without waiting for a human. Do not commit, merge, push, spawn agents or write outside your own worktree. Do not edit shared verification fixtures/contracts to make tests pass.
+=== features/run-inputs/README.md ===
+     1	# Ready-to-launch feature: run inputs and finding-to-task links (slice C)
+     2	
+     3	This directory is the committed assignment for the two workers of `docs/PRD_RUN_INPUTS.md`, **not** an implementation. It depends on slice B (`features/review-result`) being merged: the finding-to-task link extends the findings panel. The API contract is `contracts/projects/README.md` (`runInputs`, `.../runs/{run_id}/inputs`; `reviewResult` findings gain `requirement_found_in`). The producer shape is the `inputs` section of `run-state.json` documented in [features/project-workflows/README.md](../project-workflows/README.md#runtime-storage-seam); `workflow export <run>` gives older runs an Assignment view.
+     4	
+     5	```bash
+     6	.venv/bin/python -m workflow launch run-inputs --live --automatic --worker-timeout-seconds 7200
+     7	```
+     8	
+     9	Default run: `~/.local/state/md-manager-workflows/run-inputs/run-inputs-001`; default branch `feature/run-inputs/run-inputs-001`. `--dry-run` prints the commands without executing anything. Same profile as review-result (policy v1.1.0, `npm ci` setup, three verification attempts per lane/phase, same ownership, no failure drill, native reviewer session with `--reviewer-transport print` as fallback).
+    10	
+    11	## Scenarios
+    12	
+    13	`policy.json` pins the ten review-result scenario IDs plus:
+    14	
+    15	| Scenario id | Asserts |
+    16	| --- | --- |
+    17	| run-assignment | the Assignment tab shows feature, branch, mode, deadlines, setup commands and both workers' tasks rendered as Markdown |
+    18	| worker-inputs | a worker node shows its task, owned paths, required checks linked to executed checks, launch receipt and completion signal |
+    19	| finding-to-task | a finding with a verbatim requirement quote links to the worker's Task panel with the quote highlighted; a quote not found is shown without a link |
+    20	| inputs-legacy | a seeded run without the `inputs` section shows "inputs not recorded" and no error |
+    21	| inputs-paths-redacted | no absolute path from the seeded fixtures appears in the rendered inputs (the PRD table names this `paths-redacted`; the browser suite needs one unique ID per test title, so the inputs variant carries the `inputs-` prefix) |
+    22	
+    23	Every scenario attaches `screenshot:<id>`; both `WORKFLOW_VERIFICATION_PHASE=worker` (mocks) and `candidate` (real backend with seeded runs) must pass without skipping.
+    24	
+    25	## Seeded export shape
+    26	
+    27	Candidate-mode seeds write `run-state.json` with `version: "1.2.0"` and an `inputs` section (raw task texts, so the real adapter redacts absolute paths):
+    28	
+    29	```jsonc
+    30	"inputs": {
+    31	  "feature": "...", "policy_version": "1.1.0", "base_commit": "<40 hex>", "source_branch": "feature/..." | null,
+    32	  "mode": "automatic" | "manual",
+    33	  "automatic": {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions",
+    34	                "worker_timeout_seconds": 3600, "review_timeout_seconds": 1800, "reviewer_transport": "native" | "print"} | null,
+    35	  "setup": [{"argv": ["npm", "ci"], "command": "npm ci", "timeout_seconds": 600}],
+    36	  "max_verification_attempts": 3, "failure_drill": null | {"node_id": "adapter", "phase": "worker", "attempt": 1},
+    37	  "workers": {
+    38	    "ui": {"role": "frontend", "task": "<plan task text>", "prompt": "<exact prompt>" | null,
+    39	           "owned_paths": ["src/projects"], "checks": [{"id": "...", "kind": "build", "argv": [...], "command": "npm run build", "timeout_seconds": 180, "scenarios": []}],
+    40	           "launch": {"session_id": "<uuid>" | null, "launch_token": "<uuid>", "launch_requested_at": "...Z", "native_started_at": 1790001207771 | null,
+    41	                      "observed_state": "working" | null, "status": "attached_session_available", "launcher_invocations": 1, "background_id": "..." | null} | null,
+    42	           "completion": {"status": "completed", "summary": "...", "open_assumptions": []} | null,
+    43	           "handoff": {"summary": "...", "open_assumptions": []} | null,
+    44	           "stop": {"stopped": true, "confirmed_at": "...Z" | null} | null},
+    45	    "adapter": {...}
+    46	  }
+    47	}
+    48	```
+    49	
+    50	The adapter serves 404 `INPUTS_NOT_FOUND` for runs without the section, truncates oversized texts with a marker, and computes `requirement_found_in` only from verbatim matches. Seeds use synthetic UUIDs and test-only data.
+=== features/run-inputs/adapter-task.md ===
+     1	# Adapter worker: serve run inputs and verbatim finding-to-task matches
+     2	
+     3	Implement the backend side of slice C in `docs/PRD_RUN_INPUTS.md` on the existing Fastify server. The payload is `runInputs` in `contracts/projects/v1.ts` (`validateRunInputs`); `reviewResult` findings gain `requirement_found_in`. The producer shape is the `inputs` section of `run-state.json` version `1.2.0` described in `features/run-inputs/README.md`. Keep the frozen contracts and runtime engine unchanged.
+     4	
+     5	## Ownership
+     6	
+     7	Only edit `server/` and `config/projects.example.json`. Do not modify UI, `workflow/`, contracts, feature policy, package manifests or the root browser configuration. Use existing Node/Fastify/Zod dependencies. Escalate necessary changes outside ownership to Pi/the operator.
+     8	
+     9	## Deliverables
+    10	
+    11	- `exportSchema`: `inputs` optional-or-null; when present it is validated strictly against the section shape in the feature README (`RUN_STORAGE_INVALID` on violation, naming the run but never a path). Versions `1.0.0`, `1.1.0` and `1.2.0` keep loading.
+    12	- `GET /api/projects/:project_id/workflows/:workflow_id/runs/:run_id/inputs` returns `runInputs` after `validateRunInputs` and `conform(schemas.runInputs, ...)`: `workers` as an array in policy order with `node_id` = lane and `launch_node_id` = `launch_<lane>` when that node exists in the pinned definition, else the lane; `task`/`prompt` texts through `redactPaths`, truncated to 65536 characters with the marker `\n\n[… truncated by the viewer API: N more characters]` and `truncated: true`; `launch.native_started_at` epoch milliseconds → ISO `Z` string; `launch.launch_requested_at` normalised to `Z`; `setup[].command` and `checks[].command` passed through (never re-joined); `stop.confirmed_at` passed through; receipts null when the run has not produced them. 404 `INPUTS_NOT_FOUND` when the section is absent; 405 for other methods; `HEAD` handled like the existing routes.
+    13	- `reviewResult.findings[].requirement_found_in`: computed against the raw (pre-redaction) `inputs.workers.<lane>.task` text, or the `prompt` when the task is missing; a lane is included only when `requirement` is a verbatim substring; empty when `requirement` is null or `inputs` is absent. Never guess a match.
+    14	- Error messages never contain paths. Nothing is written into the run root by a read.
+    15	
+    16	## Verification
+    17	
+    18	Extend `server/projects.test.ts` (executed by the policy's tsx command) with disposable roots: inputs projection (task truncation at 65536 characters with the marker, `prompt: null` passthrough, timestamps normalised to `Z`, `stop.confirmed_at`, `launch_node_id`), `requirement_found_in` from verbatim matches only (a quote found in the ui task → `['ui']`, a paraphrase → `[]`, a null requirement → `[]`), redaction of absolute paths in task text and completion summaries, a legacy export → 404 `INPUTS_NOT_FOUND` with detail still 200, malformed sections → 500 `RUN_STORAGE_INVALID` without paths, every payload conforming to the committed schemas and cross-field validators, 405/HEAD on the new route, and nothing written into the run root. Existing app tests must still pass without project configuration.
+    19	
+    20	No new dependencies or changes to global permission settings are authorized. The trusted verifier independently runs your unit/contract/build checks after handoff. Do not claim tests were executed if they were not.
+    21	
+    22	## Finish
+    23	
+    24	Report a summary, all changed files, checks actually executed (or explicitly none) and open assumptions. In manual mode wait for the operator to freeze. In automatic mode follow the appended completion-file protocol and finish your turn without waiting for a human. Do not commit, push, merge, launch other agents or modify shared contracts/runtime.
+=== features/run-inputs/feature.json ===
+     1	{
+     2	  "version": "1.0.0",
+     3	  "name": "Run inputs and finding-to-task links in the viewer",
+     4	  "branch_prefix": "feature/run-inputs",
+     5	  "policy": "policy.json",
+     6	  "ui_task": "ui-task.md",
+     7	  "adapter_task": "adapter-task.md"
+     8	}
+=== features/run-inputs/policy.json ===
+     1	{
+     2	  "version": "1.1.0",
+     3	  "feature": "Run inputs and finding-to-task links in the viewer",
+     4	  "independent_review": true,
+     5	  "integration_approval": true,
+     6	  "max_verification_attempts": 3,
+     7	  "setup": [{"argv": ["npm", "ci"], "timeout_seconds": 600}],
+     8	  "workers": [
+     9	    {
+    10	      "node_id": "ui", "role": "frontend",
+    11	      "owned_paths": ["src/App.tsx", "src/App.css", "src/graph", "src/projects", "src/index.css", "tests/project-workflows"],
+    12	      "checks": [
+    13	        {"id": "frontend-build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 180, "scenarios": []},
+    14	        {"id": "frontend-unit-regression", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 180, "scenarios": []},
+    15	        {
+    16	          "id": "project-workflows-browser", "kind": "browser",
+    17	          "argv": ["npx", "--no-install", "playwright", "test", "--config=tests/project-workflows/playwright.config.ts"],
+    18	          "timeout_seconds": 300,
+    19	          "scenarios": [
+    20	            {"id": "projects-navigation", "description": "Pi and Claude remain usable and Projects opens registered projects"},
+    21	            {"id": "workflow-run-graph", "description": "Select a project, workflow and run and inspect the pinned graph"},
+    22	            {"id": "run-evidence", "description": "Inspect worker checks, changed files, assumptions, logs and screenshot evidence"},
+    23	            {"id": "empty-states", "description": "Distinguish no workflows from no runs"},
+    24	            {"id": "failed-and-paused", "description": "Show failure and awaiting-approval state without implying completion"},
+    25	            {"id": "request-errors", "description": "Show an actionable API error rather than silently substituting fixtures"},
+    26	            {"id": "review-verdict", "description": "The review node shows approved, the reviewer session, the bundle hash, the summary line and a findings table with severity and disposition"},
+    27	            {"id": "review-blocked", "description": "A seeded blocked review shows verdict blocked, the node failed, and the findings that caused it"},
+    28	            {"id": "review-legacy", "description": "A seeded run without the review export section shows no review recorded and no error"},
+    29	            {"id": "paths-redacted", "description": "No absolute path from the seeded fixtures appears in the rendered review"},
+    30	            {"id": "run-assignment", "description": "The Assignment tab shows feature, branch, mode, deadlines, setup commands and both workers' tasks rendered as Markdown"},
+    31	            {"id": "worker-inputs", "description": "A worker node shows its task, owned paths, required checks linked to executed checks, launch receipt and completion signal"},
+    32	            {"id": "finding-to-task", "description": "A finding with a verbatim requirement quote links to the worker's Task panel with the quote highlighted; a quote not found is shown without a link"},
+    33	            {"id": "inputs-legacy", "description": "A seeded run without the inputs export section shows inputs not recorded and no error"},
+    34	            {"id": "inputs-paths-redacted", "description": "No absolute path from the seeded fixtures appears in the rendered inputs"}
+    35	          ]
+    36	        }
+    37	      ]
+    38	    },
+    39	    {
+    40	      "node_id": "adapter", "role": "backend",
+    41	      "owned_paths": ["server", "config/projects.example.json"],
+    42	      "checks": [
+    43	        {"id": "backend-unit", "kind": "unit", "argv": ["npx", "--no-install", "tsx", "--test", "server/projects.test.ts"], "timeout_seconds": 180, "scenarios": []},
+    44	        {"id": "backend-regression", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 180, "scenarios": []},
+    45	        {"id": "shared-contract", "kind": "contract", "argv": ["npm", "run", "test:contracts"], "timeout_seconds": 120, "scenarios": []},
+    46	        {"id": "backend-build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 180, "scenarios": []}
+    47	      ]
+    48	    }
+    49	  ]
+    50	}
+=== features/run-inputs/ui-task.md ===
+     1	# UI worker: run inputs, worker task panels and finding-to-task links
+     2	
+     3	Implement the viewer side of slice C in `docs/PRD_RUN_INPUTS.md`. The payload is `runInputs` in `contracts/projects/v1.ts` (`validateRunInputs`) with a fixture in `contracts/projects/examples.ts`; `reviewResult` findings now carry `requirement_found_in`. Read `features/run-inputs/README.md` for the seeded export shape the candidate-mode tests must write. The review panel from slice B already exists; extend it, do not rebuild it.
+     4	
+     5	## Ownership
+     6	
+     7	Only edit the UI-owned paths in the attached policy: `src/App.tsx`, `src/App.css`, `src/graph/`, `src/projects/`, `src/index.css` and `tests/project-workflows/`. The backend owns `server/` and `config/projects.example.json`; do not edit them. Render Markdown with `src/document/Markdown.tsx` by import only. If a necessary change falls outside ownership, stop and ask Pi/the operator rather than crossing the boundary.
+     8	
+     9	## Deliverables
+    10	
+    11	- `src/projects/api.ts`: `paths.inputs(scope)` and `fetchRunInputs(scope, signal)` validating with `validateRunInputs`. A 404 with code `INPUTS_NOT_FOUND` is the normal "not recorded" state, not an error panel.
+    12	- Run view: tabs above the graph (`role="tablist"`, `aria-label="Run views"`) `Run` (`data-testid="tab-run"`) and `Assignment` (`data-testid="tab-assignment"`), default Run. When inputs load, the run header facts gain Feature, Base commit (short), Source branch, Mode (`automatic` / `manual`) and, for automatic runs, Deadlines (`worker 4h · review 30m`, computed from seconds), Permission mode and Finish (`data-testid="run-inputs-facts"`). When inputs are absent: `<p data-testid="inputs-none">Inputs not recorded for this run (the export predates run inputs; re-export it with the workflow CLI).</p>` in the header and on the Assignment tab.
+    13	- Assignment tab (`data-testid="assignment"`): feature, branch, mode, deadlines, setup commands (`assignment-setup`, each as `<code>`), attempt cap, and one section per worker (`assignment-worker` with `data-worker`) with the task rendered as Markdown inside `assignment-task`, owned paths and required checks.
+    14	- Worker nodes (`launch_ui` / `launch_adapter`, matched by `worker.launch_node_id === node.node_id`):
+    15	  - "Task" panel `task-panel` with a `Rendered` / `Source` toggle (buttons with `aria-pressed`); source is `<pre data-testid="task-source">` with the exact text; a `truncated: true` text shows a note. When a highlight quote is active the panel is forced to Source, the quote is wrapped in `<mark data-testid="task-highlight">` and scrolled into view (`scrollIntoView({block: 'center'})`) once mounted. Below the task: owned paths (`task-owned-paths`) and required checks (`task-checks`, each row `data-check-id`; when the node's worker result is loaded, a check whose `command` equals an executed check's `command` links to it by `href="#check-<index>"` and shows its exit code, otherwise "not executed in this result"). The executed checks list gets `id="check-<index>"` anchors.
+    16	  - "Exact prompt" `<details data-testid="task-prompt">` when `prompt` is not null.
+    17	  - "Launch receipt" `launch-receipt`: session id, requested and native start times, observed state, launcher invocations; replaces "No session recorded" when present.
+    18	  - "Reported by the worker" `worker-completion`: status, summary, open assumptions; "No completion signal recorded" when null.
+    19	  - "Handoff as accepted" `worker-handoff` only when it differs from the completion.
+    20	  - Timeline addition `worker-stop`: "Stop confirmed at …" or "Stop not confirmed".
+    21	- Review panel: each finding's Requirement cell shows the quote in `<q data-testid="finding-requirement">`; when `requirement_found_in` includes a lane, an `AppLink` `finding-task-link` with `data-lane` to that lane's launch node that also asks the run view to highlight the quote there (`RunView` keeps `pendingHighlight: {nodeId, quote} | null`; the link sets it and navigates; `NodeDetail` receives the highlight for the selected node and clears it once applied; navigating elsewhere clears it). A quote not found verbatim shows the quote and `<span data-testid="finding-task-unlinked">not found verbatim in the task</span>`. A null requirement shows "—".
+    22	- Preserve Pi/Claude browsing, Back/Forward, existing file operations and unsaved-edit guards. Add no launch, approve, retry or delete controls.
+    23	
+    24	## Browser tests and isolation
+    25	
+    26	Extend `tests/project-workflows/` so that every scenario ID in `features/run-inputs/policy.json` appears in exactly one test title with a `screenshot:<id>` PNG attachment: the ten scenarios carried over from `review-result` plus `run-assignment`, `worker-inputs`, `finding-to-task`, `inputs-legacy` and `inputs-paths-redacted` (the PRD table calls the last one `paths-redacted`; the browser suite needs a unique ID per test title, hence the prefix). Keep `WORKFLOW_VERIFICATION_PHASE` semantics:
+    27	
+    28	- `worker`: mock only `/api/projects/**` success responses from contract-validated fixtures; serve `.../inputs` (404 `INPUTS_NOT_FOUND` when absent). Mock payloads are already the projected shape, so they carry the literal `<path>`.
+    29	- `candidate`: no mocked project success routes. Seed `run-state.json` version `1.2.0` with the `inputs` section from the feature README (raw task texts containing an absolute path so the real adapter redacts it), keep the legacy `1.0.0` run without the section, start the real backend and test the same scenarios against it.
+    30	
+    31	Inputs fixtures: automatic runs with realistic worker tasks (Markdown with headings, a list and the appended `Approved ownership and checks:` JSON line), one worker with a `prompt` and one with `prompt: null`, launch receipts, completion signals, a handoff that differs from the completion for one worker, stop confirmed for both. At least two review findings carry `worker: 'ui'` and a `requirement` that is a verbatim substring of the seeded ui task (`requirement_found_in: ['ui']`), one a quote that is not found (`[]`), one `worker: 'none'` with a null requirement. `finding-to-task` clicks a linked quote, lands on `/nodes/launch_ui`, asserts `task-highlight` contains the quote and is visible, and that the unlinked quote shows `finding-task-unlinked`. Both phases must pass without skipping.
+    32	
+    33	Pick free ports and temporary roots in the config, never reuse an existing server, clean up owned temporary directories, and do not modify the root Playwright configuration. No new package dependencies are authorized.
+    34	
+    35	## Finish
+    36	
+    37	Report a concise summary, complete changed-file list and open assumptions. In manual mode wait for the operator's explicit freeze. In automatic mode follow the appended completion-file protocol and finish your turn without waiting for a human. Do not commit, merge, push, spawn agents or write outside your own worktree. Do not edit shared verification fixtures/contracts to make tests pass.

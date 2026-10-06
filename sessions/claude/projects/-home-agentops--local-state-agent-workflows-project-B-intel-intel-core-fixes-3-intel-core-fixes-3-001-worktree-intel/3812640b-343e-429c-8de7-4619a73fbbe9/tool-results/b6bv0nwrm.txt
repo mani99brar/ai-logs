@@ -1,0 +1,535 @@
+# Match information (intel)
+
+The pure rules behind §2's timed reveals, §3's rumors and journal, §5's final-island announcement and §11's comeback leads. `@pirate-sea-race/simulation/intel` has the config, the state, `stepIntel`, `targetedRumorAvailability` and `replayIntel`. `@pirate-sea-race/content/intel` has the constants and the zod validator `validateIntelRules`. The module doesn't import the ledger. It is integer data with no clocks and no `Math.random`, and time is the world tick (20 per second). `objectives-endgame` wires it into `MatchRoom`; nothing calls it yet.
+
+## Constants (`intelRules`)
+
+| Rule | Value |
+| --- | --- |
+| Sector grid | 3 × 3, named row by row from "North-West Reach" to "South-East Reach" |
+| Sighting delay | 600 ticks (30 s), equal to the carrier interval |
+| Carrier interval | 600 ticks (30 s) |
+| Sector reveal | 24,000 ticks (minute 20) after control start |
+| Carrier reveal | 33,600 ticks (minute 28) after control start |
+| Targeted rumor price | 25 gold (the caller charges it) |
+
+The validator refuses a zero interval, reveals out of order, a delay that differs from the interval, and names that are missing or repeated.
+
+## Sectors
+
+`sectorOfTile` cuts the map's columns and rows into three bands each by integer division (`floor(tile × 3 / width)`). Every tile is in exactly one sector, and bands differ by at most one tile. On the 224 × 208 slice sea, the columns start at tiles 0, 75 and 150 and the rows at 0, 70 and 139. `sectorOf(position)` is the sector of the position's tile. A position off the map counts in the nearest edge sector. The config computes all of this from the map size, so the same code serves the slice and the 12-island alpha.
+
+## Leads
+
+A rumor names a missing type and a target: an **island**, where a source of that type is still sealed, or a **sector**, where a recovery cache holds one. It never names a rubbing, a player or a position. The generator picks among the eligible targets with the seeded generator (`random.ts`), so the same seed gives the same rumor. It tries three tiers in order:
+
+1. the islands with a sealed source of the type;
+2. the sectors with a cached copy;
+3. a **carrier sighting**, and only when every copy of the type is carried by someone else.
+
+Targets already active in the player's journal are skipped, so a player is never given the same lead twice.
+
+Leads are made on four occasions:
+
+- a **start** rumor for each player at control start, or when a player is first seen after it. It only ever names a source or a cache, of any type the player lacks. When every copy of every missing type is carried (a late joiner, say), there is no starting rumor, only a `no-lead`: a start never becomes a carrier sighting;
+- a free **fresh** rumor for each type a player lost (§11);
+- a **targeted** rumor, bought on request;
+- a **replacement**, when a journal rumor goes stale.
+
+Losses and completions come from diffing each player's held types between ticks. A rubbing reserved in a duel still counts as held, so entering a duel is never a loss; only a settled theft is.
+
+**Journal rumors** (island or sector) are the only leads tracked:
+
+- A rumor goes **stale** when its target no longer holds its type: the source was collected or the cache claimed by someone else. The player gets `rumor-stale` with the tick and then a replacement.
+- A rumor whose type the holder obtains, by any means, is **resolved** quietly. It gets no replacement.
+
+**Carrier sightings** are one-shot messages, never tracked, so they can never go stale and can't be used to follow a carrier. At every carrier boundary (control start plus a multiple of 30 s, counted when crossed), the state takes one snapshot of the carried copies: the sector, the type and the internal holder of each. It keeps the latest two. A sighting reads the **older** of the two, so it is 30–60 s old and never the current position. It also skips the requester's own former entries.
+
+Only three triggers ask for a sighting: a loss (`fresh`), a journal replacement and a targeted request. A `carrier-sighting` message may list several types: one entry per type (the type, the trigger's reason and a sector), all from the same older snapshot. Before minute 28, a player gets at most **one sighting message per snapshot**, and at any time at most **one per step**.
+
+**One accumulator, one decision.** In each step, every player has one sighting accumulator, a set of types. At a boundary it starts with the player's pending types. Each is replanned first: one that now has a source or cache gets a journal rumor instead, one the player obtained is dropped, and one with no copy left sends `no-lead`. Losses, journal replacements and targeted requests that find every other copy carried then add their types to it. None of them sends anything on its own. After every pass of the step, the player gets exactly one decision:
+
+- **Uncapped** (no sighting yet in this snapshot, or minute 28 on): one message lists every accumulated type that the older snapshot shows another player carrying. Targeted requests for those types are answered `sighting`. A free type the snapshot can't answer yet stays pending for the next boundary, and a targeted request for it is answered `none`.
+- **Capped:** nothing is sent. The free types join the one pending set, and targeted requests are answered `capped`. A paid type is never queued, so a purchase is never charged for something deferred.
+
+The message lists its types in type order and draws each sector when it is sent, so neither depends on the order the triggers came in. A type asked for by a request is sent with the reason `targeted`, otherwise with its free trigger's reason. So a player who loses two types on one tick, or at a boundary with a type already pending, or loses one while buying another, learns about all of them in one message. Skipped ticks change nothing: two losses seen in one batched view make one message. A free trigger with nothing at all to point at sends `no-lead`.
+
+**Targeted requests** are `{ requestId, playerId, type }`, and each gets exactly one outcome, whatever the order of the batch:
+
+- `rumor` or `sighting`: something was delivered. Charge the 25 gold only for these two.
+- `capped`: the player already got a sighting in this snapshot (before this step).
+- `none`: nothing to sell. The player holds the type, or the player is unknown, or it is before control start, or no untracked target exists.
+- `duplicate`: the request id was seen before. The step answers it without changing the state or drawing from the generator.
+
+`targetedRumorAvailability(config, state, view, playerId, type)` gives the same answer without drawing, so the UI can show whether buying would yield anything. A later step can differ only if it crosses a snapshot boundary first. A free trigger in the same step joins the purchase's message rather than spending the sighting.
+
+## Reveals (§2, §5)
+
+All reveals fire when their tick is crossed since the last processed tick, so a skipped tick never loses one. Nothing is sent before control start.
+
+- **First full set:** the first player to hold every type of the preset triggers `final-sector` (the final island's sector) to everyone. Each holder of a full set gets `final-route` with the exact point: the first completer, later completers, and anyone who restores a broken set (with `restored: true`). A player who loses a type gets `final-route-inactive`.
+- **Minute 20:** `sector-reveal` to everyone, listing the sectors with sealed sources and the sectors with caches.
+- **Minute 28, then every 30 s:** `carrier-report` to everyone, listing the (sector, type) pairs of the newest snapshot. Skipping several beats sends one report.
+- **Minute 35** belongs to the claim code.
+
+## Messages and hidden information (§16)
+
+`stepIntel(config, state, view, requests) → { state, messages, outcomes }` never writes into its input. Each message is `{ to, body }`, where `to` is `{ kind: "player", playerId }`, `{ kind: "players", playerIds }` or `{ kind: "everyone" }`. Broadcasts are `final-sector`, `sector-reveal` and `carrier-report`; every other kind goes to one player.
+
+Bodies carry sectors, island indexes and names, types, ticks and journal entry numbers. They never carry a player id, a rubbing id, or a source's, cache's or ship's position. The one exact position ever sent is the final island's, in a `final-route` to a full-set holder. The property tests check every message of every run against these rules:
+
+- six seeded runs with compressed reveal times;
+- one slice run with the real constants for 36,660 ticks;
+- one alpha run with the real constants that skips ticks.
+
+The same runs also check, after every step, that each player got at most one sighting message in it, that every free trigger needing a sighting (a loss, or a stale rumor's replacement) is either in that step's message or in the pending set, and that it waits only if the player's sighting was already spent in this snapshot or the older snapshot shows no other carrier of it. They also check that each player has at most one pending sighting message and that every deferred type goes out at the first boundary after it was capped (or is dropped only when the checker finds it ineligible, or kept only when the previous snapshot shows no other carrier of it). Every rumor is checked against the preference: a cache lead only when no sealed source of the type is left outside the player's journal, a carrier sighting only when no source or cache of the type exists. Their `EXERCISED` check asserts that every message kind, outcome and lead path occurred, including a deferred delivery, a free trigger sighted in its own step and a message with several types.
+
+## Building the world view from the ledger
+
+On each processed tick, the caller passes `{ tick, players, rubbings }`:
+
+- **`players`:** each player still in the match (`status` not `left`), with the ship's position in sub-units.
+- **`rubbings`:** each ledger rubbing with its `type` and its `location` resolved to a place:
+  - `source` becomes `{ kind: "source", island, x, y }` from its `LedgerSource`;
+  - `cache` becomes `{ kind: "cache", x, y }` from its `LedgerCache`;
+  - `player` becomes `{ kind: "carried", playerId }`;
+  - `duel` becomes `{ kind: "duel", playerId }`.
+
+Held types and claimed-out islands (islands with no sealed source left) follow from the rubbings, so they can't disagree with them. The ledger's sticky `freshRumors` flag isn't read. The config comes from `createIntelConfig({ preset, finalIsland, controlStartTick, map })`. The state comes from `createIntelState(config, seed)`, which starts before control start.
+
+## Decisions taken here
+
+- Held types and claimed-out islands are derived from the view's rubbings rather than passed separately.
+- A pending sighting is one message per player holding a set of types, so two types that need a sighting at once are delivered together at the next boundary, not one interval apart, and the cap stays one sighting message per 30 s before minute 28.
+- Every trigger of a step joins one accumulator per player, with one decision at the end of the step, so "learns about both at once" holds on every path: several losses, a loss with a replacement or a purchase, a batched view, and the boundary tick.
+- A start points only at sources and caches. Sightings come only from a loss, a targeted rumor or a journal replacement.
+- A free trigger that finds every copy carried but no snapshot entry to read yet waits like a capped one.
+- A targeted request whose type a free trigger of the same step also asks for is answered `sighting` (it is sent with the reason `targeted`). Two requests with different ids for the same type in one step are both answered `sighting` by that one entry, so both are charged. Before, the second was `capped`.
+- Targeted requests in one batch are handled in request-id order, so the order they are listed in never changes the result.
+import { z } from "zod";
+import { formatIssues, type ValidationResult } from "../rules.js";
+import { WORLD_STEPS_PER_SECOND } from "../sailing.js";
+
+/** The sea is split into a grid of named sectors this many columns wide and rows high (§2's "sectors"). */
+export const SECTOR_COLUMNS = 3;
+export const SECTOR_ROWS = 3;
+
+/** The nine sector names, row by row from the north-west corner. */
+export const SECTOR_NAMES = [
+  "North-West Reach",
+  "Northern Waters",
+  "North-East Reach",
+  "Western Waters",
+  "Central Waters",
+  "Eastern Waters",
+  "South-West Reach",
+  "Southern Waters",
+  "South-East Reach",
+] as const;
+
+/**
+ * §11: a carrier sighting is coarse and delayed. It reads the carrier snapshot taken one interval before the latest,
+ * so it is at least this old (and less than twice this old), never the current location.
+ */
+export const CARRIER_SIGHTING_DELAY_SECONDS = 30;
+/** §2: from minute 28 the carriers' sectors are published every 30 seconds; the carrier snapshots keep the same beat. */
+export const CARRIER_INTERVAL_SECONDS = 30;
+/** §2: at minute 20 the sectors holding unclaimed rubbings and abandoned caches are revealed. */
+export const SECTOR_REVEAL_MINUTE = 20;
+/** §2: from minute 28 the carriers' approximate sectors are published. */
+export const CARRIER_REVEAL_MINUTE = 28;
+/** §11: what the caller charges for a targeted rumor that delivers something. */
+export const TARGETED_RUMOR_GOLD = 25;
+
+/** The information rules (§2, §3, §11) in world ticks (20 a second), counted from the start of player control. */
+export const intelRulesSchema = z
+  .strictObject({
+    sectorColumns: z.int().positive(),
+    sectorRows: z.int().positive(),
+    /** Row by row from the north-west; one unique, non-empty name per sector. */
+    sectorNames: z.array(z.string().min(1)),
+    /** How old a carrier sighting is at least; it must equal the carrier interval, since sightings read the previous snapshot. */
+    sightingDelayTicks: z.int().positive(),
+    /** The beat of the carrier snapshots, of the sighting cap and, from the carrier reveal on, of the carrier broadcasts. */
+    carrierIntervalTicks: z.int().positive(),
+    /** Ticks from control start to the reveal of the sectors holding unclaimed rubbings and caches. */
+    sectorRevealTicks: z.int().positive(),
+    /** Ticks from control start to the first carrier broadcast. */
+    carrierRevealTicks: z.int().positive(),
+    targetedRumorGold: z.int().nonnegative(),
+  })
+  .superRefine((rules, ctx) => {
+    if (rules.sectorNames.length !== rules.sectorColumns * rules.sectorRows) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["sectorNames"],
+        message: `${rules.sectorNames.length} names for a ${rules.sectorColumns} × ${rules.sectorRows} grid`,
+      });
+    }
+    if (new Set(rules.sectorNames).size !== rules.sectorNames.length) {
+      ctx.addIssue({ code: "custom", path: ["sectorNames"], message: "sector names must be unique" });
+    }
+    if (rules.sightingDelayTicks !== rules.carrierIntervalTicks) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["sightingDelayTicks"],
+        message: `the sighting delay (${rules.sightingDelayTicks} ticks) must equal the carrier interval (${rules.carrierIntervalTicks} ticks)`,
+      });
+    }
+    if (rules.sectorRevealTicks >= rules.carrierRevealTicks) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["carrierRevealTicks"],
+        message: `the carrier reveal (${rules.carrierRevealTicks} ticks) must come after the sector reveal (${rules.sectorRevealTicks} ticks)`,
+      });
+    }
+  });
+
+export type IntelRules = z.infer<typeof intelRulesSchema>;
+
+export const intelRules: IntelRules = {
+  sectorColumns: SECTOR_COLUMNS,
+  sectorRows: SECTOR_ROWS,
+  sectorNames: [...SECTOR_NAMES],
+  sightingDelayTicks: CARRIER_SIGHTING_DELAY_SECONDS * WORLD_STEPS_PER_SECOND,
+  carrierIntervalTicks: CARRIER_INTERVAL_SECONDS * WORLD_STEPS_PER_SECOND,
+  sectorRevealTicks: SECTOR_REVEAL_MINUTE * 60 * WORLD_STEPS_PER_SECOND,
+  carrierRevealTicks: CARRIER_REVEAL_MINUTE * 60 * WORLD_STEPS_PER_SECOND,
+  targetedRumorGold: TARGETED_RUMOR_GOLD,
+};
+
+export function validateIntelRules(candidate: unknown): ValidationResult<IntelRules> {
+  const parsed = intelRulesSchema.safeParse(candidate);
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, issues: formatIssues(parsed.error) };
+}
+import { rulesPresets, seaMap, type RulesPresetId } from "@pirate-sea-race/content";
+import { intelRules as defaultIntelRules, validateIntelRules, type IntelRules } from "@pirate-sea-race/content/intel";
+import { presetRubbingTypes, type RubbingType } from "@pirate-sea-race/content/objectives";
+
+/** A point in integer sub-units. */
+export interface IntelPoint {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** Static information data for one match; the step reads it and it never changes. */
+export interface IntelConfig {
+  /** The preset's rubbing types, in the fixed type order. */
+  readonly types: readonly RubbingType[];
+  readonly widthTiles: number;
+  readonly heightTiles: number;
+  readonly subUnitsPerTile: number;
+  readonly sectorColumns: number;
+  readonly sectorRows: number;
+  /** Row by row from the north-west. */
+  readonly sectorNames: readonly string[];
+  /** Island names by island index, as rumors name them. */
+  readonly islandNames: readonly string[];
+  /** The world tick on which player control starts (§2); every reveal counts from it. */
+  readonly controlStartTick: number;
+  /** The final island's claim point: its sector goes to everyone, the point itself only to a full-set holder (§5). */
+  readonly finalIsland: IntelPoint;
+  /** The carrier snapshot beat, which is also the sighting delay and, from the carrier reveal, the broadcast beat. */
+  readonly carrierIntervalTicks: number;
+  /** Absolute world ticks of §2's minute-20 and minute-28 reveals. */
+  readonly sectorRevealTick: number;
+  readonly carrierRevealTick: number;
+}
+
+/** The map facts the sectors and rumors need; the content's `SeaMapDefinition` fits. */
+export interface IntelMapShape {
+  readonly widthTiles: number;
+  readonly heightTiles: number;
+  readonly subUnitsPerTile: number;
+  readonly islands: readonly { readonly name: string }[];
+}
+
+export interface IntelConfigOptions {
+  readonly preset: RulesPresetId;
+  readonly finalIsland: IntelPoint;
+  readonly controlStartTick?: number;
+  /** Defaults to the slice sea. */
+  readonly map?: IntelMapShape;
+  readonly rules?: IntelRules;
+}
+
+export function requireInteger(value: unknown, name: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
+}
+
+export function requireId(value: unknown, name: string): void {
+  if (typeof value !== "string" || value.length === 0) throw new RangeError(`${name} must be a non-empty string`);
+}
+
+/** Builds a match's information config from the content rules and the map, refusing invalid rules or maps. */
+export function createIntelConfig(options: IntelConfigOptions): IntelConfig {
+  const rules = validateIntelRules(options.rules ?? defaultIntelRules);
+  if (!rules.ok) throw new RangeError(`invalid intel rules: ${rules.issues.join("; ")}`);
+  const map = options.map ?? seaMap;
+  const start = options.controlStartTick ?? 0;
+  requireInteger(start, "controlStartTick");
+  if (start < 0) throw new RangeError(`controlStartTick must not be negative, got ${start}`);
+  for (const [value, name] of [
+    [map.widthTiles, "widthTiles"],
+    [map.heightTiles, "heightTiles"],
+    [map.subUnitsPerTile, "subUnitsPerTile"],
+  ] as const) {
+    requireInteger(value, name);
+    if (value <= 0) throw new RangeError(`${name} must be positive, got ${value}`);
+  }
+  if (map.widthTiles < rules.value.sectorColumns || map.heightTiles < rules.value.sectorRows) {
+    throw new RangeError(`a ${map.widthTiles} × ${map.heightTiles} map cannot hold ${rules.value.sectorColumns} × ${rules.value.sectorRows} sectors`);
+  }
+  requireInteger(options.finalIsland.x, "finalIsland.x");
+  requireInteger(options.finalIsland.y, "finalIsland.y");
+  return {
+    types: presetRubbingTypes(rulesPresets[options.preset]),
+    widthTiles: map.widthTiles,
+    heightTiles: map.heightTiles,
+    subUnitsPerTile: map.subUnitsPerTile,
+    sectorColumns: rules.value.sectorColumns,
+    sectorRows: rules.value.sectorRows,
+    sectorNames: [...rules.value.sectorNames],
+    islandNames: map.islands.map((island) => island.name),
+    controlStartTick: start,
+    finalIsland: { x: options.finalIsland.x, y: options.finalIsland.y },
+    carrierIntervalTicks: rules.value.carrierIntervalTicks,
+    sectorRevealTick: start + rules.value.sectorRevealTicks,
+    carrierRevealTick: start + rules.value.carrierRevealTicks,
+  };
+}
+
+/**
+ * The sector of a tile: the map's columns and rows are cut into `sectorColumns` × `sectorRows` bands by integer
+ * division, so every tile lies in exactly one sector and the bands differ in width by at most one tile.
+ */
+export function sectorOfTile(config: IntelConfig, tileX: number, tileY: number): number {
+  const x = Math.min(Math.max(tileX, 0), config.widthTiles - 1);
+  const y = Math.min(Math.max(tileY, 0), config.heightTiles - 1);
+  const column = Math.floor((x * config.sectorColumns) / config.widthTiles);
+  const row = Math.floor((y * config.sectorRows) / config.heightTiles);
+  return row * config.sectorColumns + column;
+}
+
+/** The sector of a sub-unit position: that of its tile. A position off the map counts in the nearest edge sector. */
+export function sectorOf(config: IntelConfig, position: IntelPoint): number {
+  return sectorOfTile(config, Math.floor(position.x / config.subUnitsPerTile), Math.floor(position.y / config.subUnitsPerTile));
+}
+
+export function sectorName(config: IntelConfig, sector: number): string {
+  const name = config.sectorNames[sector];
+  if (name === undefined) throw new RangeError(`there is no sector ${sector}`);
+  return name;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The world view: what the caller (the match room, from the ledger) tells the step on each tick.
+
+/**
+ * Where a rubbing is, as the ledger's `location` reads once resolved: sealed at a source (its island and position),
+ * in a recovery cache (its position), owned by a player, or reserved for a player in an unresolved duel.
+ */
+export type IntelRubbingPlace =
+  | { readonly kind: "source"; readonly island: number; readonly x: number; readonly y: number }
+  | { readonly kind: "cache"; readonly x: number; readonly y: number }
+  | { readonly kind: "carried"; readonly playerId: string }
+  | { readonly kind: "duel"; readonly playerId: string };
+
+export interface IntelRubbing {
+  readonly id: string;
+  readonly type: RubbingType;
+  readonly place: IntelRubbingPlace;
+}
+
+/** A player still in the match and their ship's position; a carried rubbing is where its carrier is. */
+export interface IntelPlayerView {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * One world tick as the information rules see it. A player's held types are the types of the rubbings carried by or
+ * reserved for them, so they cannot disagree with the rubbings; an island is claimed out when no source on it is sealed.
+ */
+export interface IntelWorldView {
+  /** Later than the state's tick; ticks may be skipped. */
+  readonly tick: number;
+  readonly players: readonly IntelPlayerView[];
+  readonly rubbings: readonly IntelRubbing[];
+}
+
+/** A request to buy a targeted rumor (§11). The caller charges the gold only for a `rumor` or `sighting` outcome. */
+export interface TargetedRumorRequest {
+  readonly requestId: string;
+  readonly playerId: string;
+  readonly type: RubbingType;
+}
+
+export type TargetedRumorResult = "rumor" | "sighting" | "capped" | "none" | "duplicate";
+
+export interface TargetedRumorOutcome {
+  readonly requestId: string;
+  readonly result: TargetedRumorResult;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The state.
+
+/** A journal rumor points at an island (a sealed source) or at a sector (a recovery cache), never at a carrier. */
+export type IntelLeadTarget = { readonly kind: "island"; readonly island: number } | { readonly kind: "sector"; readonly sector: number };
+
+export type IntelLeadReason = "start" | "fresh" | "targeted" | "replacement";
+
+/** One journal entry. `entry` numbers a player's rumors from 1. */
+export interface JournalRumor {
+  readonly entry: number;
+  readonly type: RubbingType;
+  readonly target: IntelLeadTarget;
+  readonly reason: IntelLeadReason;
+  readonly tick: number;
+  /** `stale` once the target no longer holds that type; `resolved` once the holder has the type. */
+  readonly status: "active" | "stale" | "resolved";
+  readonly closedTick: number | null;
+}
+
+/** One type of a deferred sighting: the free trigger (a loss or a journal replacement) that asked for it and when. */
+export interface PendingSightingType {
+  readonly type: RubbingType;
+  readonly reason: "fresh" | "replacement";
+  readonly tick: number;
+}
+
+/**
+ * The one deferred carrier-sighting message a player may have: the types whose free trigger met the cap, or found no
+ * snapshot entry to read, waiting for the next snapshot boundary. A step's capped free triggers add their types to the set.
+ */
+export interface PendingSighting {
+  /** In type order, each type once, never empty. */
+  readonly types: readonly PendingSightingType[];
+}
+
+export interface IntelPlayerState {
+  readonly id: string;
+  /** The held types as of the last processed tick, in type order; losses and completions are diffs of these. */
+  readonly held: readonly RubbingType[];
+  readonly journal: readonly JournalRumor[];
+  /** Whether the player's final-island route is active (they hold a full set) and whether they ever had one. */
+  readonly routeActive: boolean;
+  readonly routeEver: boolean;
+  /** The boundary of the snapshot current when the player last got a carrier sighting, or -1. */
+  readonly lastSightingBoundary: number;
+  /** The deferred sighting message, or null. */
+  readonly pending: PendingSighting | null;
+}
+
+/** One carried copy at a snapshot. The holder is kept only so a player is never shown their own copy. */
+export interface CarrierSnapshotEntry {
+  readonly sector: number;
+  readonly type: RubbingType;
+  readonly holder: string;
+}
+
+export interface CarrierSnapshot {
+  /** k for the boundary `controlStartTick + k × carrierIntervalTicks`. */
+  readonly boundary: number;
+  /** The tick whose world view it records (the boundary tick unless ticks were skipped). */
+  readonly tick: number;
+  readonly entries: readonly CarrierSnapshotEntry[];
+}
+
+/** The information state: plain integer data that `hashState` covers entirely. */
+export interface IntelState {
+  /** The last world tick processed. */
+  readonly tick: number;
+  readonly rng: number;
+  /** Whether control start has been processed. */
+  readonly started: boolean;
+  /** Players seen in the last view, by id. */
+  readonly players: readonly IntelPlayerState[];
+  /** The latest two snapshots, older first. */
+  readonly snapshots: readonly CarrierSnapshot[];
+  readonly finalSectorAnnounced: boolean;
+  readonly sectorRevealed: boolean;
+  /** The index j of the last carrier broadcast (`carrierRevealTick + j × carrierIntervalTicks`), or -1. */
+  readonly lastCarrierBroadcast: number;
+  /** Every targeted request id answered so far, sorted. */
+  readonly requestIds: readonly string[];
+}
+
+/** A state before any tick. `tick` must come before control start, so control start is always crossed. */
+export function createIntelState(config: IntelConfig, seed: number, tick = -1): IntelState {
+  requireInteger(seed, "seed");
+  requireInteger(tick, "tick");
+  if (tick >= config.controlStartTick) throw new RangeError(`the intel state must start before control start (tick ${config.controlStartTick})`);
+  return {
+    tick,
+    rng: seed >>> 0,
+    started: false,
+    players: [],
+    snapshots: [],
+    finalSectorAnnounced: false,
+    sectorRevealed: false,
+    lastCarrierBroadcast: -1,
+    requestIds: [],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Messages: every one names its recipients. Bodies never carry a player id, a rubbing id or an exact position, except
+// the final island's point in a `final-route` to a player holding a full set.
+
+export type IntelRecipients =
+  | { readonly kind: "player"; readonly playerId: string }
+  | { readonly kind: "players"; readonly playerIds: readonly string[] }
+  | { readonly kind: "everyone" };
+
+export interface SectorRef {
+  readonly sector: number;
+  readonly name: string;
+}
+
+export type IntelRumorTarget =
+  | { readonly kind: "island"; readonly island: number; readonly name: string }
+  | { readonly kind: "sector"; readonly sector: number; readonly name: string };
+
+/** One type of a carrier-sighting message, with the trigger that asked for it. */
+export interface CarrierSighting {
+  readonly type: RubbingType;
+  readonly reason: IntelLeadReason;
+  readonly sector: number;
+  readonly name: string;
+}
+
+export type IntelMessageBody =
+  /** A journal lead toward a missing type. */
+  | { readonly kind: "rumor"; readonly tick: number; readonly entry: number; readonly type: RubbingType; readonly reason: IntelLeadReason; readonly target: IntelRumorTarget }
+  /** One-shot: per type, the sector where a carrier of it was at `seenTick` (the previous snapshot). Never tracked. */
+  | { readonly kind: "carrier-sighting"; readonly tick: number; readonly seenTick: number; readonly sightings: readonly CarrierSighting[] }
+  /** A free trigger found nothing to point at. */
+  | { readonly kind: "no-lead"; readonly tick: number; readonly type: RubbingType; readonly reason: IntelLeadReason }
+  | { readonly kind: "rumor-stale"; readonly tick: number; readonly entry: number; readonly type: RubbingType }
+  | { readonly kind: "rumor-resolved"; readonly tick: number; readonly entry: number; readonly type: RubbingType }
+  /** A first full set exists: the final island's broad sector (§5). */
+  | { readonly kind: "final-sector"; readonly tick: number; readonly sector: number; readonly name: string }
+  /** The exact route, to a full-set holder only; `restored` after a lost set is whole again. */
+  | { readonly kind: "final-route"; readonly tick: number; readonly x: number; readonly y: number; readonly restored: boolean }
+  | { readonly kind: "final-route-inactive"; readonly tick: number }
+  /** Minute 20: sectors holding sealed sources and recovery caches. */
+  | { readonly kind: "sector-reveal"; readonly tick: number; readonly sources: readonly SectorRef[]; readonly caches: readonly SectorRef[] }
+  /** Minute 28 on: the carriers' sectors and types at the latest snapshot. */
+  | { readonly kind: "carrier-report"; readonly tick: number; readonly seenTick: number; readonly carriers: readonly (SectorRef & { readonly type: RubbingType })[] };
+
+export type IntelMessageKind = IntelMessageBody["kind"];
+
+export interface IntelMessage {
+  readonly to: IntelRecipients;
+  readonly body: IntelMessageBody;
+}
+
+export interface IntelStepResult {
+  readonly state: IntelState;
+  readonly messages: readonly IntelMessage[];
+  /** One per request, in the order given. */
+  readonly outcomes: readonly TargetedRumorOutcome[];
+}

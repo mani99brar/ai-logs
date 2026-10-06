@@ -1,0 +1,234 @@
+import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+import {
+  grantAmount,
+  itemPrice,
+  presetRubbings,
+  presetRubbingTypes,
+  type RubbingDefinition,
+  type RubbingType,
+} from "@pirate-sea-race/content/objectives";
+import type { LedgerDuel, LedgerPlayer, LedgerState } from "./state.js";
+
+/**
+ * Deeply frozen objects already found to be plain integer data. They cannot change any more, so a later check skips
+ * them: successive states share most of their structure, and this keeps checking every step cheap.
+ */
+const verified = new WeakSet<object>();
+
+/**
+ * What `hashState` needs: plain objects, arrays, strings, booleans, null and safe integers only. Returns the path to
+ * the first offending value, or null.
+ */
+function nonIntegerData(value: unknown): string | null {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return null;
+  if (typeof value === "number") return Number.isSafeInteger(value) ? null : ` = ${value}`;
+  if (typeof value !== "object") return ` is a ${typeof value}`;
+  if (verified.has(value)) return null;
+  let deeplyFrozen = Object.isFrozen(value);
+  const check = (child: unknown, label: string): string | null => {
+    const found = nonIntegerData(child);
+    if (found !== null) return `${label}${found}`;
+    if (typeof child === "object" && child !== null && !verified.has(child)) deeplyFrozen = false;
+    return null;
+  };
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const found = check(value[index], `[${index}]`);
+      if (found !== null) return found;
+    }
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return " is not a plain object";
+    for (const key in value) {
+      const found = check((value as Record<string, unknown>)[key], `.${key}`);
+      if (found !== null) return found;
+    }
+  }
+  if (deeplyFrozen) verified.add(value);
+  return null;
+}
+
+const facts = new Map<RulesPresetId, { expected: RubbingDefinition[]; types: RubbingType[]; expectedTypes: Map<string, RubbingType> }>();
+
+function presetFacts(presetId: RulesPresetId) {
+  let found = facts.get(presetId);
+  if (found === undefined) {
+    const preset = rulesPresets[presetId];
+    const expected = presetRubbings(preset);
+    found = { expected, types: presetRubbingTypes(preset), expectedTypes: new Map(expected.map((rubbing) => [rubbing.id, rubbing.type])) };
+    facts.set(presetId, found);
+  }
+  return found;
+}
+
+/**
+ * Every rule the ledger must keep between operations (§4, §12, §19 "Inventory correctness"), as a list of
+ * violations; empty when the state is sound:
+ *
+ * - every rubbing id of the preset is present exactly once, with its type, and no other rubbing exists;
+ * - each rubbing has one valid location: its own source, a player still in the match, an existing cache, or a
+ *   reservation for one of the two players of an unresolved duel;
+ * - no player holds (owns or has reserved) two rubbings of one type;
+ * - no cache is empty; a player in an unresolved duel owns nothing outside it, is in only one, and has no channel;
+ * - gold balances are non-negative integers that, with the gold spent, sum to the gold issued (purses and grants);
+ * - every grant holds its key once and pays the rules' amount; request ids are unique and the purchases add up to
+ *   the gold spent; a player carries 0 to the carry limit of tonics, one effect at most, and none once gone;
+ * - the state is plain integer data, so `hashState` covers it.
+ */
+export function checkLedger(state: LedgerState): string[] {
+  const problems: string[] = [];
+  const offending = nonIntegerData(state);
+  if (offending !== null) problems.push(`state is not plain integer data: state${offending}`);
+
+  const { expected, types, expectedTypes } = presetFacts(state.preset);
+  if (state.types.join(",") !== types.join(",")) problems.push(`types ${state.types.join(",")} are not the preset's ${types.join(",")}`);
+
+  const players = new Map<string, LedgerPlayer>();
+  for (const player of state.players) {
+    if (players.has(player.id)) problems.push(`duplicate player id ${player.id}`);
+    players.set(player.id, player);
+  }
+  const sources = new Map(state.sources.map((source) => [source.id, source]));
+  const caches = new Map<string, number>();
+  for (const cache of state.caches) {
+    if (caches.has(cache.id)) problems.push(`duplicate cache id ${cache.id}`);
+    caches.set(cache.id, 0);
+  }
+  const duels = new Map<string, LedgerDuel>();
+  const unresolved = new Map<string, number>();
+  for (const duel of state.duels) {
+    if (duels.has(duel.id)) problems.push(`duplicate duel id ${duel.id}`);
+    duels.set(duel.id, duel);
+    if (duel.phase !== "settled") for (const id of duel.players) unresolved.set(id, (unresolved.get(id) ?? 0) + 1);
+  }
+
+  const seen = new Map<string, number>();
+  const holdings = new Map<string, RubbingType[]>();
+  for (const rubbing of state.rubbings) {
+    seen.set(rubbing.id, (seen.get(rubbing.id) ?? 0) + 1);
+    const type = expectedTypes.get(rubbing.id);
+    if (type === undefined) problems.push(`rubbing ${rubbing.id} is not one of the preset's`);
+    else if (rubbing.type !== type) problems.push(`rubbing ${rubbing.id} has type ${rubbing.type}, not ${type}`);
+    if (rubbing.revision < 0) problems.push(`rubbing ${rubbing.id} has revision ${rubbing.revision}`);
+
+    const location = rubbing.location;
+    const where = `rubbing ${rubbing.id}`;
+    switch (location.kind) {
+      case "source": {
+        const source = sources.get(location.sourceId);
+        if (!source) problems.push(`${where} is at unknown source ${location.sourceId}`);
+        else if (source.rubbingId !== rubbing.id) problems.push(`${where} is at ${source.id}, which seals ${source.rubbingId}`);
+        break;
+      }
+      case "player": {
+        const player = players.get(location.playerId);
+        if (!player) problems.push(`${where} belongs to unknown player ${location.playerId}`);
+        else if (player.status === "left") problems.push(`${where} belongs to ${player.id}, who left`);
+        else if (unresolved.has(player.id)) problems.push(`${where} is owned by ${player.id} outside their duel`);
+        break;
+      }
+      case "cache":
+        if (!caches.has(location.cacheId)) problems.push(`${where} is in unknown cache ${location.cacheId}`);
+        else caches.set(location.cacheId, caches.get(location.cacheId)! + 1);
+        break;
+      case "duel": {
+        const duel = duels.get(location.duelId);
+        if (!duel) problems.push(`${where} is reserved in unknown duel ${location.duelId}`);
+        else if (duel.phase === "settled") problems.push(`${where} is reserved in settled duel ${duel.id}`);
+        else if (!duel.players.includes(location.playerId)) problems.push(`${where} is reserved for ${location.playerId}, not in ${duel.id}`);
+        break;
+      }
+      default:
+        problems.push(`${where} has no valid location`);
+    }
+    if (location.kind === "player" || location.kind === "duel") {
+      const held = holdings.get(location.playerId) ?? [];
+      if (held.includes(rubbing.type)) problems.push(`player ${location.playerId} holds two ${rubbing.type} rubbings`);
+      holdings.set(location.playerId, [...held, rubbing.type]);
+    }
+  }
+  for (const { id } of expected) {
+    const count = seen.get(id) ?? 0;
+    if (count !== 1) problems.push(`rubbing ${id} is present ${count} times`);
+  }
+  if (state.rubbings.length !== expected.length) problems.push(`${state.rubbings.length} rubbings instead of ${expected.length}`);
+  if (state.sources.length !== expected.length) problems.push(`${state.sources.length} sources instead of ${expected.length}`);
+  if (new Set(state.sources.map((source) => source.rubbingId)).size !== expected.length) problems.push("two sources seal the same rubbing");
+  for (const [cacheId, count] of caches) if (count === 0) problems.push(`cache ${cacheId} is empty`);
+
+  let gold = 0;
+  for (const player of state.players) {
+    if (player.gold < 0) problems.push(`player ${player.id} has ${player.gold} gold`);
+    gold += player.gold;
+    const inDuels = unresolved.get(player.id) ?? 0;
+    if (inDuels > 1) problems.push(`player ${player.id} is in ${inDuels} unresolved duels`);
+    if (player.channel !== null && (player.status !== "connected" || inDuels > 0)) {
+      problems.push(`player ${player.id} channels while ${inDuels > 0 ? "in a duel" : player.status}`);
+    }
+    if ((player.status === "disconnected") !== (player.reservationDeadline !== null)) {
+      problems.push(`player ${player.id} is ${player.status} with reservation deadline ${player.reservationDeadline}`);
+    }
+    if ((player.status === "left") !== (player.exit !== null)) problems.push(`player ${player.id} is ${player.status} with exit ${JSON.stringify(player.exit)}`);
+    if (player.freshRumors.some((type, index) => !types.includes(type) || player.freshRumors.indexOf(type) !== index)) {
+      problems.push(`player ${player.id} has fresh rumors ${player.freshRumors.join(",")}`);
+    }
+  }
+  if (state.goldSpent < 0) problems.push(`${state.goldSpent} gold was spent`);
+  if (gold + state.goldSpent !== state.goldIssued) {
+    problems.push(`balances sum to ${gold} gold and ${state.goldSpent} was spent, but ${state.goldIssued} was issued`);
+  }
+  problems.push(...economyProblems(state, players));
+
+  for (const duel of state.duels) {
+    if (duel.phase === "fighting") {
+      if (duel.result !== null || duel.settlement !== null) problems.push(`duel ${duel.id} fights with a result`);
+      for (const playerId of duel.players) {
+        if (players.get(playerId)?.status === "left") problems.push(`duel ${duel.id} fights on without ${playerId}, who left`);
+      }
+    } else if (duel.phase === "choosing") {
+      if (duel.result?.outcome !== "win" || duel.choiceDeadline === null) problems.push(`duel ${duel.id} chooses without a win`);
+      else if (players.get(duel.result.winner ?? "")?.status === "left") problems.push(`duel ${duel.id} waits for a winner who left`);
+    } else if (duel.result === null || duel.settlement === null) {
+      problems.push(`duel ${duel.id} settled without a result`);
+    }
+  }
+  return problems;
+}
+
+/** §11's economy: keyed grants, unique purchases that account for the gold spent, and carried tonics. */
+function economyProblems(state: LedgerState, players: ReadonlyMap<string, LedgerPlayer>): string[] {
+  const problems: string[] = [];
+  const keys = new Set<string>();
+  for (const grant of state.grants) {
+    const key = grant.reason === "ruin" ? `ruin ${grant.sourceKey} for ${grant.playerId}` : `supply cache ${grant.sourceKey}`;
+    if (keys.has(key)) problems.push(`${key} was granted twice`);
+    keys.add(key);
+    if (!players.has(grant.playerId)) problems.push(`${key} went to unknown player ${grant.playerId}`);
+    if (grant.amount !== grantAmount(state.rules, grant.reason)) problems.push(`${key} minted ${grant.amount} gold`);
+  }
+  const requestIds = new Set<string>();
+  let spent = 0;
+  for (const purchase of state.purchases) {
+    if (requestIds.has(purchase.requestId)) problems.push(`request ${purchase.requestId} was charged twice`);
+    requestIds.add(purchase.requestId);
+    if (!players.has(purchase.playerId)) problems.push(`request ${purchase.requestId} was made by unknown player ${purchase.playerId}`);
+    if (purchase.price !== itemPrice(state.rules, purchase.item)) problems.push(`request ${purchase.requestId} cost ${purchase.price} gold`);
+    spent += purchase.price;
+  }
+  if (spent !== state.goldSpent) problems.push(`purchases cost ${spent} gold, but ${state.goldSpent} was spent`);
+  for (const player of state.players) {
+    if (player.tonics < 0 || player.tonics > state.rules.tonicCarryLimit) problems.push(`player ${player.id} carries ${player.tonics} tonics`);
+    const effect = player.tonicEffect;
+    if (effect !== null && (effect.endTick !== effect.startTick + state.rules.tonicTicks || effect.startTick > state.tick)) {
+      problems.push(`player ${player.id} has tonic effect ${JSON.stringify(effect)}`);
+    }
+    if (player.status === "left" && (player.tonics !== 0 || effect !== null)) problems.push(`player ${player.id} left with tonics`);
+  }
+  return problems;
+}
+
+/** Throws with every violation when the ledger breaks its invariant. */
+export function assertLedger(state: LedgerState): void {
+  const problems = checkLedger(state);
+  if (problems.length > 0) throw new Error(`ledger invariant broken:\n${problems.join("\n")}`);
+}

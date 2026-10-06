@@ -1,0 +1,128 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+/**
+ * The authoritative packages stay pure (CLAUDE.md, §17): no Phaser, Colyseus, DOM, timers, wall-clock time or
+ * Math.random, so the same match can be simulated headlessly and identically on client and server. Nor do they call
+ * floating-point transcendental functions, whose results may differ between JavaScript engines (skeleton decision:
+ * integer maths only, so `hashState` is engine-independent).
+ */
+const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
+const PURE_PACKAGES = ["packages/simulation", "packages/protocol", "packages/content"];
+
+const FORBIDDEN_MODULES: readonly RegExp[] = [
+  /^phaser(\/|$)/,
+  /^colyseus(\/|$)/,
+  /^@colyseus\//,
+  /^(node:)?timers(\/|$)/,
+  /^(node:)?perf_hooks$/,
+  /^(node:)?worker_threads$/,
+  /^(node:)?(fs|net|http|https|dgram|child_process|os|process|crypto)(\/|$)/,
+];
+
+const FORBIDDEN_CALLS: readonly [RegExp, string][] = [
+  [/\bMath\.random\b/, "Math.random"],
+  [/\bDate\.now\b/, "Date.now"],
+  [/\bnew Date\b/, "new Date"],
+  [/\bperformance\.now\b/, "performance.now"],
+  [/\bprocess\.hrtime\b/, "process.hrtime"],
+  [/\b(setTimeout|setInterval|setImmediate|queueMicrotask|requestAnimationFrame)\s*\(/, "timers"],
+  [/\b(window|document|navigator|localStorage|sessionStorage)\s*[.[]/, "DOM globals"],
+  [/\bcrypto\.(getRandomValues|randomUUID)\b/, "crypto randomness"],
+  [
+    /\bMath\.(sqrt|cbrt|hypot|pow|exp|expm1|log\w*|sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|asinh|acosh|atanh)\b/,
+    "floating-point transcendental Math functions",
+  ],
+];
+
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return sourceFiles(path);
+    return /\.(ts|tsx|js|mjs|cjs)$/.test(entry.name) ? [path] : [];
+  });
+}
+
+/** Source without comments or string contents, so that prose mentioning a forbidden call is not a violation. */
+function code(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1")
+    .replace(/(["'`])(?:\\.|(?!\1)[^\\\n])*\1/g, '""');
+}
+
+function importedModules(source: string): string[] {
+  const specifiers: string[] = [];
+  const patterns = [
+    /\bimport\s+(?:type\s+)?(?:[\w*{}\s,$]+\s+from\s+)?["']([^"']+)["']/g,
+    /\bexport\s+(?:type\s+)?[\w*{}\s,$]+\s+from\s+["']([^"']+)["']/g,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
+  ];
+  for (const pattern of patterns) for (const match of source.matchAll(pattern)) specifiers.push(match[1]!);
+  return specifiers;
+}
+
+function violations(source: string): string[] {
+  const found = importedModules(source)
+    .filter((specifier) => FORBIDDEN_MODULES.some((pattern) => pattern.test(specifier)))
+    .map((specifier) => `imports ${specifier}`);
+  const stripped = code(source);
+  for (const [pattern, label] of FORBIDDEN_CALLS) if (pattern.test(stripped)) found.push(`uses ${label}`);
+  return found;
+}
+
+describe("purity rule", () => {
+  it("catches each forbidden dependency in a sample", () => {
+    expect(violations('import Phaser from "phaser";')).toEqual(["imports phaser"]);
+    expect(violations('import { Room } from "colyseus";')).toEqual(["imports colyseus"]);
+    expect(violations('import type { Client } from "@colyseus/sdk";')).toEqual(["imports @colyseus/sdk"]);
+    expect(violations('import { setTimeout } from "node:timers/promises";')).toEqual(["imports node:timers/promises"]);
+    expect(violations('export { x } from "phaser/src/x";')).toEqual(["imports phaser/src/x"]);
+    expect(violations('const m = await import("colyseus");')).toEqual(["imports colyseus"]);
+    expect(violations("const r = Math.random();")).toEqual(["uses Math.random"]);
+    expect(violations("const t = Date.now();")).toEqual(["uses Date.now"]);
+    expect(violations("setInterval(tick, 16);")).toEqual(["uses timers"]);
+    expect(violations("document.body.append(x);")).toEqual(["uses DOM globals"]);
+    const transcendental = ["uses floating-point transcendental Math functions"];
+    expect(violations("const d = Math.sqrt(x * x + y * y);")).toEqual(transcendental);
+    for (const call of ["Math.cbrt(v)", "Math.hypot(x, y)", "Math.pow(2, n)", "Math.exp(t)", "Math.log2(n)", "Math.atan2(y, x)", "Math.sin(a)"]) {
+      expect(violations(`const r = ${call};`)).toEqual(transcendental);
+    }
+    expect(violations("const r = Math.floor(Math.sign(x) * Math.imul(a, b));")).toEqual([]);
+    expect(violations('// Math.random is banned\nconst s = "Date.now";')).toEqual([]);
+  });
+
+  for (const pkg of PURE_PACKAGES) {
+    describe(pkg, () => {
+      it("imports and calls nothing impure", () => {
+        const files = sourceFiles(join(root, pkg, "src"));
+        expect(files.length).toBeGreaterThan(0);
+        const report = files.flatMap((file) =>
+          violations(readFileSync(file, "utf8")).map((violation) => `${relative(root, file)} ${violation}`),
+        );
+        expect(report).toEqual([]);
+      });
+
+      it("depends on no impure package", () => {
+        const manifest = JSON.parse(readFileSync(join(root, pkg, "package.json"), "utf8")) as Record<string, unknown>;
+        const names = ["dependencies", "peerDependencies", "optionalDependencies"].flatMap((field) =>
+          Object.keys((manifest[field] as Record<string, string> | undefined) ?? {}),
+        );
+        expect(names.filter((name) => FORBIDDEN_MODULES.some((pattern) => pattern.test(name)))).toEqual([]);
+      });
+
+      it("leaves the DOM library out of its tsconfig", () => {
+        const tsconfig = JSON.parse(readFileSync(join(root, pkg, "tsconfig.json"), "utf8")) as {
+          compilerOptions: { lib?: string[]; types?: string[] };
+        };
+        const lib = tsconfig.compilerOptions.lib;
+        expect(lib).toBeDefined();
+        expect(lib!.map((entry) => entry.toLowerCase()).filter((entry) => entry.startsWith("dom"))).toEqual([]);
+        expect(tsconfig.compilerOptions.types).toEqual([]);
+      });
+    });
+  }
+});

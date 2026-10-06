@@ -1,0 +1,331 @@
+import { rulesPresets, seaMap, type RulesPresetId } from "@pirate-sea-race/content";
+import { intelRules as defaultIntelRules, validateIntelRules, type IntelRules } from "@pirate-sea-race/content/intel";
+import { presetRubbingTypes, type RubbingType } from "@pirate-sea-race/content/objectives";
+
+/** A point in integer sub-units. */
+export interface IntelPoint {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** Static information data for one match; the step reads it and it never changes. */
+export interface IntelConfig {
+  /** The preset's rubbing types, in the fixed type order. */
+  readonly types: readonly RubbingType[];
+  readonly widthTiles: number;
+  readonly heightTiles: number;
+  readonly subUnitsPerTile: number;
+  readonly sectorColumns: number;
+  readonly sectorRows: number;
+  /** Row by row from the north-west. */
+  readonly sectorNames: readonly string[];
+  /** Island names by island index, as rumors name them. */
+  readonly islandNames: readonly string[];
+  /** The world tick on which player control starts (§2); every reveal counts from it. */
+  readonly controlStartTick: number;
+  /** The final island's claim point: its sector goes to everyone, the point itself only to a full-set holder (§5). */
+  readonly finalIsland: IntelPoint;
+  /** The carrier snapshot beat, which is also the sighting delay and, from the carrier reveal, the broadcast beat. */
+  readonly carrierIntervalTicks: number;
+  /** Absolute world ticks of §2's minute-20 and minute-28 reveals. */
+  readonly sectorRevealTick: number;
+  readonly carrierRevealTick: number;
+}
+
+/** The map facts the sectors and rumors need; the content's `SeaMapDefinition` fits. */
+export interface IntelMapShape {
+  readonly widthTiles: number;
+  readonly heightTiles: number;
+  readonly subUnitsPerTile: number;
+  readonly islands: readonly { readonly name: string }[];
+}
+
+export interface IntelConfigOptions {
+  readonly preset: RulesPresetId;
+  readonly finalIsland: IntelPoint;
+  readonly controlStartTick?: number;
+  /** Defaults to the slice sea. */
+  readonly map?: IntelMapShape;
+  readonly rules?: IntelRules;
+}
+
+export function requireInteger(value: unknown, name: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
+}
+
+export function requireId(value: unknown, name: string): void {
+  if (typeof value !== "string" || value.length === 0) throw new RangeError(`${name} must be a non-empty string`);
+}
+
+/** Builds a match's information config from the content rules and the map, refusing invalid rules or maps. */
+export function createIntelConfig(options: IntelConfigOptions): IntelConfig {
+  const rules = validateIntelRules(options.rules ?? defaultIntelRules);
+  if (!rules.ok) throw new RangeError(`invalid intel rules: ${rules.issues.join("; ")}`);
+  const map = options.map ?? seaMap;
+  const start = options.controlStartTick ?? 0;
+  requireInteger(start, "controlStartTick");
+  if (start < 0) throw new RangeError(`controlStartTick must not be negative, got ${start}`);
+  for (const [value, name] of [
+    [map.widthTiles, "widthTiles"],
+    [map.heightTiles, "heightTiles"],
+    [map.subUnitsPerTile, "subUnitsPerTile"],
+  ] as const) {
+    requireInteger(value, name);
+    if (value <= 0) throw new RangeError(`${name} must be positive, got ${value}`);
+  }
+  if (map.widthTiles < rules.value.sectorColumns || map.heightTiles < rules.value.sectorRows) {
+    throw new RangeError(`a ${map.widthTiles} × ${map.heightTiles} map cannot hold ${rules.value.sectorColumns} × ${rules.value.sectorRows} sectors`);
+  }
+  requireInteger(options.finalIsland.x, "finalIsland.x");
+  requireInteger(options.finalIsland.y, "finalIsland.y");
+  return {
+    types: presetRubbingTypes(rulesPresets[options.preset]),
+    widthTiles: map.widthTiles,
+    heightTiles: map.heightTiles,
+    subUnitsPerTile: map.subUnitsPerTile,
+    sectorColumns: rules.value.sectorColumns,
+    sectorRows: rules.value.sectorRows,
+    sectorNames: [...rules.value.sectorNames],
+    islandNames: map.islands.map((island) => island.name),
+    controlStartTick: start,
+    finalIsland: { x: options.finalIsland.x, y: options.finalIsland.y },
+    carrierIntervalTicks: rules.value.carrierIntervalTicks,
+    sectorRevealTick: start + rules.value.sectorRevealTicks,
+    carrierRevealTick: start + rules.value.carrierRevealTicks,
+  };
+}
+
+/**
+ * The sector of a tile: the map's columns and rows are cut into `sectorColumns` × `sectorRows` bands by integer
+ * division, so every tile lies in exactly one sector and the bands differ in width by at most one tile.
+ */
+export function sectorOfTile(config: IntelConfig, tileX: number, tileY: number): number {
+  const x = Math.min(Math.max(tileX, 0), config.widthTiles - 1);
+  const y = Math.min(Math.max(tileY, 0), config.heightTiles - 1);
+  const column = Math.floor((x * config.sectorColumns) / config.widthTiles);
+  const row = Math.floor((y * config.sectorRows) / config.heightTiles);
+  return row * config.sectorColumns + column;
+}
+
+/** The sector of a sub-unit position: that of its tile. A position off the map counts in the nearest edge sector. */
+export function sectorOf(config: IntelConfig, position: IntelPoint): number {
+  return sectorOfTile(config, Math.floor(position.x / config.subUnitsPerTile), Math.floor(position.y / config.subUnitsPerTile));
+}
+
+export function sectorName(config: IntelConfig, sector: number): string {
+  const name = config.sectorNames[sector];
+  if (name === undefined) throw new RangeError(`there is no sector ${sector}`);
+  return name;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The world view: what the caller (the match room, from the ledger) tells the step on each tick.
+
+/**
+ * Where a rubbing is, as the ledger's `location` reads once resolved: sealed at a source (its island and position),
+ * in a recovery cache (its position), owned by a player, or reserved for a player in an unresolved duel.
+ */
+export type IntelRubbingPlace =
+  | { readonly kind: "source"; readonly island: number; readonly x: number; readonly y: number }
+  | { readonly kind: "cache"; readonly x: number; readonly y: number }
+  | { readonly kind: "carried"; readonly playerId: string }
+  | { readonly kind: "duel"; readonly playerId: string };
+
+export interface IntelRubbing {
+  readonly id: string;
+  readonly type: RubbingType;
+  readonly place: IntelRubbingPlace;
+}
+
+/** A player still in the match and their ship's position; a carried rubbing is where its carrier is. */
+export interface IntelPlayerView {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * One world tick as the information rules see it. A player's held types are the types of the rubbings carried by or
+ * reserved for them, so they cannot disagree with the rubbings; an island is claimed out when no source on it is sealed.
+ */
+export interface IntelWorldView {
+  /** Later than the state's tick; ticks may be skipped. */
+  readonly tick: number;
+  readonly players: readonly IntelPlayerView[];
+  readonly rubbings: readonly IntelRubbing[];
+}
+
+/** A request to buy a targeted rumor (§11). The caller charges the gold only for a `rumor` or `sighting` outcome. */
+export interface TargetedRumorRequest {
+  readonly requestId: string;
+  readonly playerId: string;
+  readonly type: RubbingType;
+}
+
+export type TargetedRumorResult = "rumor" | "sighting" | "capped" | "none" | "duplicate";
+
+export interface TargetedRumorOutcome {
+  readonly requestId: string;
+  readonly result: TargetedRumorResult;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The state.
+
+/** A journal rumor points at an island (a sealed source) or at a sector (a recovery cache), never at a carrier. */
+export type IntelLeadTarget = { readonly kind: "island"; readonly island: number } | { readonly kind: "sector"; readonly sector: number };
+
+export type IntelLeadReason = "start" | "fresh" | "targeted" | "replacement";
+
+/** One journal entry. `entry` numbers a player's rumors from 1. */
+export interface JournalRumor {
+  readonly entry: number;
+  readonly type: RubbingType;
+  readonly target: IntelLeadTarget;
+  readonly reason: IntelLeadReason;
+  readonly tick: number;
+  /** `stale` once the target no longer holds that type; `resolved` once the holder has the type. */
+  readonly status: "active" | "stale" | "resolved";
+  readonly closedTick: number | null;
+}
+
+/** One type of a deferred sighting: the free trigger (a loss or a journal replacement) that asked for it and when. */
+export interface PendingSightingType {
+  readonly type: RubbingType;
+  readonly reason: "fresh" | "replacement";
+  readonly tick: number;
+}
+
+/**
+ * The one deferred carrier-sighting message a player may have: the types whose free trigger met the cap, or found no
+ * snapshot entry to read, waiting for the next snapshot boundary. A step's capped free triggers add their types to the set.
+ */
+export interface PendingSighting {
+  /** In type order, each type once, never empty. */
+  readonly types: readonly PendingSightingType[];
+}
+
+export interface IntelPlayerState {
+  readonly id: string;
+  /** The held types as of the last processed tick, in type order; losses and completions are diffs of these. */
+  readonly held: readonly RubbingType[];
+  readonly journal: readonly JournalRumor[];
+  /** Whether the player's final-island route is active (they hold a full set) and whether they ever had one. */
+  readonly routeActive: boolean;
+  readonly routeEver: boolean;
+  /** The boundary of the snapshot current when the player last got a carrier sighting, or -1. */
+  readonly lastSightingBoundary: number;
+  /** The deferred sighting message, or null. */
+  readonly pending: PendingSighting | null;
+}
+
+/** One carried copy at a snapshot. The holder is kept only so a player is never shown their own copy. */
+export interface CarrierSnapshotEntry {
+  readonly sector: number;
+  readonly type: RubbingType;
+  readonly holder: string;
+}
+
+export interface CarrierSnapshot {
+  /** k for the boundary `controlStartTick + k × carrierIntervalTicks`. */
+  readonly boundary: number;
+  /** The tick whose world view it records (the boundary tick unless ticks were skipped). */
+  readonly tick: number;
+  readonly entries: readonly CarrierSnapshotEntry[];
+}
+
+/** The information state: plain integer data that `hashState` covers entirely. */
+export interface IntelState {
+  /** The last world tick processed. */
+  readonly tick: number;
+  readonly rng: number;
+  /** Whether control start has been processed. */
+  readonly started: boolean;
+  /** Players seen in the last view, by id. */
+  readonly players: readonly IntelPlayerState[];
+  /** The latest two snapshots, older first. */
+  readonly snapshots: readonly CarrierSnapshot[];
+  readonly finalSectorAnnounced: boolean;
+  readonly sectorRevealed: boolean;
+  /** The index j of the last carrier broadcast (`carrierRevealTick + j × carrierIntervalTicks`), or -1. */
+  readonly lastCarrierBroadcast: number;
+  /** Every targeted request id answered so far, sorted. */
+  readonly requestIds: readonly string[];
+}
+
+/** A state before any tick. `tick` must come before control start, so control start is always crossed. */
+export function createIntelState(config: IntelConfig, seed: number, tick = -1): IntelState {
+  requireInteger(seed, "seed");
+  requireInteger(tick, "tick");
+  if (tick >= config.controlStartTick) throw new RangeError(`the intel state must start before control start (tick ${config.controlStartTick})`);
+  return {
+    tick,
+    rng: seed >>> 0,
+    started: false,
+    players: [],
+    snapshots: [],
+    finalSectorAnnounced: false,
+    sectorRevealed: false,
+    lastCarrierBroadcast: -1,
+    requestIds: [],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Messages: every one names its recipients. Bodies never carry a player id, a rubbing id or an exact position, except
+// the final island's point in a `final-route` to a player holding a full set.
+
+export type IntelRecipients =
+  | { readonly kind: "player"; readonly playerId: string }
+  | { readonly kind: "players"; readonly playerIds: readonly string[] }
+  | { readonly kind: "everyone" };
+
+export interface SectorRef {
+  readonly sector: number;
+  readonly name: string;
+}
+
+export type IntelRumorTarget =
+  | { readonly kind: "island"; readonly island: number; readonly name: string }
+  | { readonly kind: "sector"; readonly sector: number; readonly name: string };
+
+/** One type of a carrier-sighting message, with the trigger that asked for it. */
+export interface CarrierSighting {
+  readonly type: RubbingType;
+  readonly reason: IntelLeadReason;
+  readonly sector: number;
+  readonly name: string;
+}
+
+export type IntelMessageBody =
+  /** A journal lead toward a missing type. */
+  | { readonly kind: "rumor"; readonly tick: number; readonly entry: number; readonly type: RubbingType; readonly reason: IntelLeadReason; readonly target: IntelRumorTarget }
+  /** One-shot: per type, the sector where a carrier of it was at `seenTick` (the previous snapshot). Never tracked. */
+  | { readonly kind: "carrier-sighting"; readonly tick: number; readonly seenTick: number; readonly sightings: readonly CarrierSighting[] }
+  /** A free trigger found nothing to point at. */
+  | { readonly kind: "no-lead"; readonly tick: number; readonly type: RubbingType; readonly reason: IntelLeadReason }
+  | { readonly kind: "rumor-stale"; readonly tick: number; readonly entry: number; readonly type: RubbingType }
+  | { readonly kind: "rumor-resolved"; readonly tick: number; readonly entry: number; readonly type: RubbingType }
+  /** A first full set exists: the final island's broad sector (§5). */
+  | { readonly kind: "final-sector"; readonly tick: number; readonly sector: number; readonly name: string }
+  /** The exact route, to a full-set holder only; `restored` after a lost set is whole again. */
+  | { readonly kind: "final-route"; readonly tick: number; readonly x: number; readonly y: number; readonly restored: boolean }
+  | { readonly kind: "final-route-inactive"; readonly tick: number }
+  /** Minute 20: sectors holding sealed sources and recovery caches. */
+  | { readonly kind: "sector-reveal"; readonly tick: number; readonly sources: readonly SectorRef[]; readonly caches: readonly SectorRef[] }
+  /** Minute 28 on: the carriers' sectors and types at the latest snapshot. */
+  | { readonly kind: "carrier-report"; readonly tick: number; readonly seenTick: number; readonly carriers: readonly (SectorRef & { readonly type: RubbingType })[] };
+
+export type IntelMessageKind = IntelMessageBody["kind"];
+
+export interface IntelMessage {
+  readonly to: IntelRecipients;
+  readonly body: IntelMessageBody;
+}
+
+export interface IntelStepResult {
+  readonly state: IntelState;
+  readonly messages: readonly IntelMessage[];
+  /** One per request, in the order given. */
+  readonly outcomes: readonly TargetedRumorOutcome[];
+}

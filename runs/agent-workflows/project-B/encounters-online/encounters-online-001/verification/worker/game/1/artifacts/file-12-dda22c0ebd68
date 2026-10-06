@@ -1,0 +1,166 @@
+import { dockLabel, HEADING_COUNT, WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import { defaultSimulationConfig, dockInReach, NOT_DOCKED, toTilePosition } from "@pirate-sea-race/simulation";
+import { cssColor, slotColor, type GrappleSnapshot, type ShipSnapshot, type StatusSnapshot } from "./matchView.js";
+
+export type ConnectionStatus = "connected" | "disconnected";
+
+export interface HudModel {
+  readonly code: string;
+  readonly protocolVersion: number;
+  readonly custom: boolean;
+  readonly status: ConnectionStatus;
+  readonly selfId: string;
+  /** Players in the match, including those out of sight. */
+  readonly players: number;
+  /** The ships the server sent: the player's own and those in sight. */
+  readonly ships: readonly ShipSnapshot[];
+  /** The world tick of the last patch. */
+  readonly worldTick: number;
+  /** This player's encounter status, once the server sent it. */
+  readonly encounter: StatusSnapshot | undefined;
+  /** The grapples in sight, or aimed at this player. */
+  readonly grapples: readonly GrappleSnapshot[];
+}
+
+/** Whole seconds left until a world tick, rounded up; 0 once it has passed. */
+export function secondsUntil(tick: number, worldTick: number): number {
+  return Math.max(0, Math.ceil((tick - worldTick) / WORLD_STEPS_PER_SECOND));
+}
+
+/** A duel's elapsed time as its marker shows it (§6): minutes and seconds since the duel began. */
+export function elapsedText(startTick: number, worldTick: number): string {
+  const seconds = Math.max(0, Math.floor((worldTick - startTick) / WORLD_STEPS_PER_SECOND));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+const COMPASS = ["east", "south-east", "south", "south-west", "west", "north-west", "north", "north-east"] as const;
+
+/** The compass point (of eight) from one position toward another; y grows south. */
+export function compassToward(from: { x: number; y: number }, to: { x: number; y: number }): (typeof COMPASS)[number] {
+  const turns = Math.atan2(to.y - from.y, to.x - from.x) / (2 * Math.PI);
+  return COMPASS[(Math.round(turns * 8) + 8) % 8]!;
+}
+
+/** The compass point of a heading (of 64). */
+export function compassOfHeading(heading: number): (typeof COMPASS)[number] {
+  return COMPASS[Math.round((heading / HEADING_COUNT) * 8) % 8]!;
+}
+
+export interface HudLine {
+  readonly text: string;
+  /** What the line says, for tests and styling. */
+  readonly state: string;
+  /** Seconds left, where the line counts down. */
+  readonly seconds?: number;
+}
+
+/**
+ * The grapple (J, §6): aiming (this player's telegraph is out, with its aim), cooling down after a miss, not
+ * available (in a duel or waiting to respawn), or ready.
+ */
+export function grappleLine(model: Pick<HudModel, "selfId" | "encounter" | "grapples" | "worldTick">): HudLine {
+  const own = model.grapples.find((grapple) => grapple.attackerId === model.selfId);
+  if (own !== undefined) return { text: `Grappling, aimed ${compassOfHeading(own.aim)}`, state: "aiming", seconds: secondsUntil(own.landTick, model.worldTick) };
+  const status = model.encounter;
+  if (status !== undefined && status.mode !== "sea") return { text: "", state: "unavailable" };
+  const cooldown = status === undefined ? 0 : secondsUntil(status.cooldownUntil, model.worldTick);
+  if (cooldown > 0) return { text: `J: grapple in ${cooldown} s`, state: "cooldown", seconds: cooldown };
+  return { text: "J: grapple a ship ahead", state: "ready" };
+}
+
+/** A grapple aimed at this player (§6: escape before it lands), with the side it comes from. */
+export function incomingLine(model: Pick<HudModel, "selfId" | "grapples" | "ships" | "worldTick">): HudLine {
+  const incoming = model.grapples.find((grapple) => grapple.defenderId === model.selfId);
+  if (incoming === undefined) return { text: "", state: "none" };
+  const own = model.ships.find((ship) => ship.id === model.selfId);
+  const attacker = model.ships.find((ship) => ship.id === incoming.attackerId);
+  // Without both ships, the aim still says where it comes from: from the opposite side of its direction.
+  const from = own !== undefined && attacker !== undefined ? compassToward(own, attacker) : compassOfHeading(incoming.aim + HEADING_COUNT / 2);
+  return { text: `Incoming grapple from the ${from}! Sail out of range or out of its aim`, state: from, seconds: secondsUntil(incoming.landTick, model.worldTick) };
+}
+
+const PROTECTION_SOURCES: Record<string, string> = { spawn: "departure", win: "won a duel", draw: "drawn duel", respawn: "respawned" };
+
+/** Escape protection (§6): nobody can grapple this player until it runs out (or it grapples someone). */
+export function protectionLine(model: Pick<HudModel, "encounter" | "worldTick">): HudLine {
+  const status = model.encounter;
+  if (status === undefined || status.protection === "") return { text: "", state: "none" };
+  const seconds = secondsUntil(status.protectedUntil, model.worldTick);
+  return { text: `Protected for ${seconds} s (${PROTECTION_SOURCES[status.protection] ?? status.protection})`, state: status.protection, seconds };
+}
+
+/** The loser's wait out of the world (§6): 15 s from the end of the fight, then a dock. */
+export function respawnLine(model: Pick<HudModel, "encounter" | "worldTick">): HudLine {
+  const status = model.encounter;
+  if (status === undefined || status.mode !== "respawning") return { text: "", state: "none" };
+  const seconds = secondsUntil(status.respawnAt, model.worldTick);
+  return { text: `Duel lost: respawning at a dock in ${seconds} s`, state: "respawning", seconds };
+}
+
+function writeLine(element: HTMLElement, line: HudLine): void {
+  element.textContent = line.text;
+  element.dataset["state"] = line.state;
+  if (line.seconds === undefined) delete element.dataset["seconds"];
+  else element.dataset["seconds"] = String(line.seconds);
+}
+
+function field(root: ParentNode, id: string): HTMLElement {
+  const element = root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  if (element === null) throw new Error(`missing HUD field ${id}`);
+  return element;
+}
+
+/** "Palm Key, south dock" when moored, "at sea" otherwise. */
+export function dockText(dock: number): string {
+  return dock === NOT_DOCKED ? "at sea" : dockLabel(defaultSimulationConfig.map, dock);
+}
+
+/**
+ * What the player can do about docking right now, by the simulation's own rule (`dockInReach`; speed does not matter):
+ * nothing to say when moored or far from any dock; otherwise press E.
+ */
+export function dockHint(ship: Pick<ShipSnapshot, "x" | "y" | "dock">): string {
+  if (ship.dock !== NOT_DOCKED) return "";
+  const config = defaultSimulationConfig;
+  const berth = dockInReach(config, ship.x, ship.y);
+  return berth === undefined ? "" : `Press E to dock at ${dockLabel(config.map, berth.id)}`;
+}
+
+/** Writes the match status and the latest authoritative (not interpolated) state of the visible ships. */
+export function renderHud(root: ParentNode, model: HudModel): void {
+  field(root, "hud-code").textContent = model.code;
+  field(root, "hud-protocol").textContent = `v${model.protocolVersion}`;
+  field(root, "hud-players").textContent = String(model.players);
+  field(root, "hud-status").textContent = model.status;
+  field(root, "hud-mode").textContent = model.custom ? "custom" : "standard";
+  field(root, "hud-self").textContent = model.selfId;
+  const own = model.ships.find((ship) => ship.id === model.selfId);
+  const dock = field(root, "hud-dock");
+  dock.textContent = own === undefined ? "" : dockText(own.dock);
+  dock.dataset["dock"] = String(own?.dock ?? NOT_DOCKED);
+  field(root, "hud-dock-hint").textContent = own === undefined ? "" : dockHint(own);
+  writeLine(field(root, "hud-grapple"), grappleLine(model));
+  writeLine(field(root, "hud-incoming"), incomingLine(model));
+  writeLine(field(root, "hud-protection"), protectionLine(model));
+  writeLine(field(root, "hud-respawn"), respawnLine(model));
+
+  const list = field(root, "positions");
+  const items = model.ships.map((ship) => {
+    const item = document.createElement("li");
+    item.dataset["shipId"] = ship.id;
+    item.dataset["slot"] = String(ship.slot);
+    item.dataset["x"] = String(ship.x);
+    item.dataset["y"] = String(ship.y);
+    item.dataset["heading"] = String(ship.heading);
+    item.dataset["speed"] = String(ship.speed);
+    item.dataset["dock"] = String(ship.dock);
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = cssColor(slotColor(ship.slot));
+    const tile = toTilePosition(defaultSimulationConfig, ship.x, ship.y);
+    const who = ship.id === model.selfId ? "you" : ship.id;
+    item.append(swatch, `${who}: tile ${tile.tileX},${tile.tileY}, heading ${ship.heading}, speed ${ship.speed}`);
+    return item;
+  });
+  list.replaceChildren(...items);
+}

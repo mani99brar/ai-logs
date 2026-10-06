@@ -1,0 +1,1257 @@
+diff --git a/docs/claim.md b/docs/claim.md
+new file mode 100644
+index 0000000..20d6c5e
+--- /dev/null
++++ b/docs/claim.md
+@@ -0,0 +1,64 @@
++# Claim
++
++The §5 treasure claim as pure, integer rules: who may claim, the ten-second channel, what resets it, and how same-tick events and §2's deadline are ordered. The rules live in `packages/simulation/src/claim` (`@pirate-sea-race/simulation/claim`) and their tuning in `packages/content/src/claim` (`@pirate-sea-race/content/claim`). Nothing is wired into the match room yet.
++
++## Content
++
++`claimRules` holds the tuning in world ticks (20 a second) and tiles, and `validateClaimRules` checks it with zod:
++
++| Rule | Value | Source |
++| --- | --- | --- |
++| `channelTicks` | 200 (10 s); 0 means instant victory on arrival, §5's alternative | `CLAIM_CHANNEL_SECONDS` |
++| `deadlineTicks` | 42 000 (35 min after player control starts) | `MATCH_DURATION_MINUTES` |
++| `circleRadiusTiles` | 4, a placeholder until playtests (below the 6-tile engagement range) | `TREASURE_CIRCLE_RADIUS_TILES` |
++
++`createClaimConfig({ claimPoint, controlStartTick?, rules? })` turns them into a match's `ClaimConfig`: the claim point and circle radius in sub-units, the channel length and the absolute deadline tick. The caller picks the final island's claim point.
++
++## State
++
++`ClaimState` is plain integer data that `hashState` covers entirely:
++
++- `tick`: the last world tick processed. `createClaimState(config, tick = 0)` starts before the deadline.
++- `channel`: the one active channel or `null`: `playerId`, `startTick`, the position `x, y` the channeller stopped at, and `progress`, the ticks held since `startTick`.
++- `result`: `null` while the match runs. Then `{reason: "claim", winner, tick}` or `{reason: "deadline", winner: null, tick}`, set once.
++
++## A tick
++
++`stepClaim(config, state, input)` returns `{state, events}` and never changes its arguments. The caller supplies each tick's `input`:
++
++- `tick`: the state's tick plus one (anything else is refused).
++- `players`: `{id, x, y, speed, holdsAllTypes, interact, connected, protected}` for each relevant player. `holdsAllTypes` comes from the ledger, so this module does not depend on it. A player missing from the list counts as disconnected.
++- `encounters`: every accepted encounter reservation on this tick, newly accepted or still running, as `{id, playerIds: [a, b]}`. A player may be in only one of them.
++
++Both lists are read as sets. Ids compare by UTF-16 code unit (so `"B" < "a"` and `"p10" < "p9"`), never by locale. Malformed input (duplicate ids, non-integers, a player in two encounters) throws a `RangeError`.
++
++Once `result` is set, the step returns the same state object and no events, whatever the input, so nothing arriving after a win can cancel it. Otherwise it runs five phases in order:
++
++1. **Reservations.** If the channeller is in an encounter, the channel resets (`duel`). This comes before the channel phase, so a duel accepted on the tick a claim would complete stops the claim.
++2. **The active channel.** It breaks if the channeller is absent or disconnected (`disconnected`), no longer holds all four types (`ineligible`), has a nonzero speed or has moved from where the channel started (`moved`), or has released interact (`released`), checked in that order. Otherwise `progress` goes up by one. A break always resets progress to zero because the channel is discarded.
++3. **Starting.** With no channel active, including one that broke earlier in this tick, a player may start if they are connected, hold all four types, hold interact, are not reserved, have speed 0 and are inside the treasure circle (squared distance ≤ radius², so the edge counts). If several can start, the closest to the claim point wins, then the lowest id. Other eligible players wait, and they start on the first tick the channel is free. A protected player may start: the step emits `protection-ended` before `claim-started`, and protection is not read again during the channel (§6: claiming ends protection first). A player who is waiting keeps their protection.
++4. **Completion.** A channel whose `progress` has reached `channelTicks` completes. With the default of 200, that is the 200th tick after the tick it started on. Completion sets `result` to the winner.
++5. **Deadline.** If there is still no result and this is the deadline tick, any unfinished channel is cancelled (`deadline`) and the match ends with no winner. Completion runs first, so a claim completing on the deadline tick wins (§2).
++
++When the match ends, by claim or by deadline, every encounter in the tick's input is reported as ending without theft (sorted by id), because match outcomes are frozen. `match-ended` comes last.
++
++## Events
++
++Each tick's events are listed in the order of the phases above:
++
++| Event | Fields | The caller should |
++| --- | --- | --- |
++| `claim-interrupted` | `playerId`, `reason` (`duel`, `disconnected`, `ineligible`, `moved`, `released`, `deadline`), `progress` lost | Clear the claim UI or alarm |
++| `protection-ended` | `playerId` | End that player's spawn or return protection |
++| `claim-started` | `playerId` | Show the channel and warn nearby players |
++| `claim-completed` | `playerId` | Commit the winner |
++| `duel-ended-without-theft` | `encounterId`, `playerIds` | End the duel with no rubbing transfer |
++| `match-ended` | `reason` (`claim` or `deadline`), `winner` or `null` | Freeze outcomes and show results |
++
++Every event also carries `tick`. `replayClaim(config, state, inputs)` steps a list of ticks and returns the final state, every event and the final `hashState`.
++
++## Tests
++
++- `claim.test.ts`: scripted cases for each rule, with frozen inputs to prove the step does not mutate them.
++- `determinism.test.ts`: 60 seeded random scripts. It checks that at most one winner is committed, that the state is frozen after the result, the per-tick invariants, and identical hashes on replay. The symmetry checks are reordered input, rotated and mirrored positions, order-preserving relabelling, and a 1 000-trial oracle for the closest-then-lowest-id rule under random relabelling.
++- `packages/content/src/claim/claim.test.ts`: the constants and the validator.
+diff --git a/packages/content/package.json b/packages/content/package.json
+index 5919905..c9a13b9 100644
+--- a/packages/content/package.json
++++ b/packages/content/package.json
+@@ -17,6 +17,11 @@
+       "@pirate-sea-race/source": "./src/moves/index.ts",
+       "types": "./dist/moves/index.d.ts",
+       "default": "./dist/moves/index.js"
++    },
++    "./claim": {
++      "@pirate-sea-race/source": "./src/claim/index.ts",
++      "types": "./dist/claim/index.d.ts",
++      "default": "./dist/claim/index.js"
+     }
+   },
+   "files": [
+diff --git a/packages/content/src/claim/claim.test.ts b/packages/content/src/claim/claim.test.ts
+new file mode 100644
+index 0000000..7fe72c9
+--- /dev/null
++++ b/packages/content/src/claim/claim.test.ts
+@@ -0,0 +1,38 @@
++import { describe, expect, it } from "vitest";
++import { ENGAGEMENT_RANGE_TILES, WORLD_STEPS_PER_SECOND } from "../sailing.js";
++import { claimRules, TREASURE_CIRCLE_RADIUS_TILES, validateClaimRules } from "./index.js";
++
++function issuesOf(candidate: unknown): string[] {
++  const result = validateClaimRules(candidate);
++  return result.ok ? [] : result.issues;
++}
++
++describe("claim rules (§2, §5)", () => {
++  it("channel for ten seconds and stop the match at minute 35, in world ticks", () => {
++    expect(WORLD_STEPS_PER_SECOND).toBe(20);
++    expect(claimRules.channelTicks).toBe(200);
++    expect(claimRules.deadlineTicks).toBe(42_000);
++    expect(claimRules.circleRadiusTiles).toBe(TREASURE_CIRCLE_RADIUS_TILES);
++    expect(TREASURE_CIRCLE_RADIUS_TILES).toBeLessThan(ENGAGEMENT_RANGE_TILES);
++    expect(validateClaimRules(claimRules)).toEqual({ ok: true, value: claimRules });
++  });
++
++  it("allow a zero-tick channel, §5's instant victory on arrival", () => {
++    expect(issuesOf({ ...claimRules, channelTicks: 0 })).toEqual([]);
++  });
++
++  it("refuse fractional, negative or missing durations, a bad radius and unknown fields", () => {
++    expect(issuesOf({ ...claimRules, channelTicks: 1.5 })[0]).toMatch(/^channelTicks:/);
++    expect(issuesOf({ ...claimRules, channelTicks: -1 })[0]).toMatch(/^channelTicks:/);
++    expect(issuesOf({ ...claimRules, deadlineTicks: 0 })[0]).toMatch(/^deadlineTicks:/);
++    expect(issuesOf({ ...claimRules, circleRadiusTiles: 0 })[0]).toMatch(/^circleRadiusTiles:/);
++    expect(issuesOf({ channelTicks: 200, deadlineTicks: 42_000 })[0]).toMatch(/^circleRadiusTiles:/);
++    expect(issuesOf({ ...claimRules, extra: 1 })).toHaveLength(1);
++  });
++
++  it("refuse a channel that could never complete before the deadline", () => {
++    expect(issuesOf({ ...claimRules, channelTicks: 42_000 })).toEqual([
++      "channelTicks: a channel of 42000 ticks cannot complete before the deadline (42000 ticks)",
++    ]);
++  });
++});
+diff --git a/packages/content/src/claim/index.ts b/packages/content/src/claim/index.ts
+new file mode 100644
+index 0000000..0afde2d
+--- /dev/null
++++ b/packages/content/src/claim/index.ts
+@@ -0,0 +1 @@
++export * from "./rules.js";
+diff --git a/packages/content/src/claim/rules.ts b/packages/content/src/claim/rules.ts
+new file mode 100644
+index 0000000..b5a21ac
+--- /dev/null
++++ b/packages/content/src/claim/rules.ts
+@@ -0,0 +1,45 @@
++import { z } from "zod";
++import { formatIssues, type ValidationResult } from "../rules.js";
++import { WORLD_STEPS_PER_SECOND } from "../sailing.js";
++
++/** §5: a claim completes after holding interact this long. 0 would model §5's alternative, victory on arrival. */
++export const CLAIM_CHANNEL_SECONDS = 10;
++/** §2: the match stops 35 minutes after player control starts. */
++export const MATCH_DURATION_MINUTES = 35;
++/**
++ * §5's treasure circle around the final island's claim point, centre to centre. A placeholder until playtests: wider
++ * than a docking run (1.5 tiles), narrower than the engagement range (6 tiles), so a challenger can reach a claimer.
++ */
++export const TREASURE_CIRCLE_RADIUS_TILES = 4;
++
++/** The claim rules (§2, §5) in world ticks (20 a second) and tiles; the simulation converts tiles to sub-units. */
++export const claimRulesSchema = z
++  .strictObject({
++    /** World ticks of held interact that complete a claim; 0 completes it on the tick it starts. */
++    channelTicks: z.int().nonnegative(),
++    /** World ticks from player control to the match deadline. */
++    deadlineTicks: z.int().positive(),
++    circleRadiusTiles: z.int().positive(),
++  })
++  .superRefine((rules, ctx) => {
++    if (rules.channelTicks >= rules.deadlineTicks) {
++      ctx.addIssue({
++        code: "custom",
++        path: ["channelTicks"],
++        message: `a channel of ${rules.channelTicks} ticks cannot complete before the deadline (${rules.deadlineTicks} ticks)`,
++      });
++    }
++  });
++
++export type ClaimRules = z.infer<typeof claimRulesSchema>;
++
++export const claimRules: ClaimRules = {
++  channelTicks: CLAIM_CHANNEL_SECONDS * WORLD_STEPS_PER_SECOND,
++  deadlineTicks: MATCH_DURATION_MINUTES * 60 * WORLD_STEPS_PER_SECOND,
++  circleRadiusTiles: TREASURE_CIRCLE_RADIUS_TILES,
++};
++
++export function validateClaimRules(candidate: unknown): ValidationResult<ClaimRules> {
++  const parsed = claimRulesSchema.safeParse(candidate);
++  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, issues: formatIssues(parsed.error) };
++}
+diff --git a/packages/simulation/package.json b/packages/simulation/package.json
+index dfec7f3..ef68f4e 100644
+--- a/packages/simulation/package.json
++++ b/packages/simulation/package.json
+@@ -14,6 +14,11 @@
+       "@pirate-sea-race/source": "./src/duel/index.ts",
+       "types": "./dist/duel/index.d.ts",
+       "default": "./dist/duel/index.js"
++    },
++    "./claim": {
++      "@pirate-sea-race/source": "./src/claim/index.ts",
++      "types": "./dist/claim/index.d.ts",
++      "default": "./dist/claim/index.js"
+     }
+   },
+   "files": [
+diff --git a/packages/simulation/src/claim/claim.test.ts b/packages/simulation/src/claim/claim.test.ts
+new file mode 100644
+index 0000000..489b252
+--- /dev/null
++++ b/packages/simulation/src/claim/claim.test.ts
+@@ -0,0 +1,352 @@
++import { describe, expect, it } from "vitest";
++import {
++  claimRules,
++  createClaimConfig,
++  createClaimState,
++  hashState,
++  replayClaim,
++  stepClaim,
++  type ClaimConfig,
++  type ClaimEncounter,
++  type ClaimEvent,
++  type ClaimPlayer,
++  type ClaimState,
++  type ClaimTickInput,
++} from "./index.js";
++
++const POINT = { x: 20_000, y: 30_000 };
++const config = createClaimConfig({ claimPoint: POINT });
++const CHANNEL = config.channelTicks;
++const RADIUS = config.circleRadius;
++
++/** A player who could claim: at the claim point, stopped, holding everything, connected, unprotected. */
++function player(id: string, change: Partial<ClaimPlayer> = {}): ClaimPlayer {
++  return { id, x: POINT.x, y: POINT.y, speed: 0, holdsAllTypes: true, interact: true, connected: true, protected: false, ...change };
++}
++
++function duel(id: string, a: string, b: string): ClaimEncounter {
++  return { id, playerIds: [a, b] };
++}
++
++/** Recursively frozen, so a step that mutated its input would throw. */
++function deepFreeze<T>(value: T): T {
++  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
++    Object.freeze(value);
++    for (const child of Object.values(value)) deepFreeze(child);
++  }
++  return value;
++}
++
++type Tick = { players: ClaimPlayer[]; encounters?: ClaimEncounter[] };
++
++/** Steps one tick with frozen input and state, checking neither is changed. */
++function step(state: ClaimState, tick: Tick, cfg: ClaimConfig = config) {
++  const input: ClaimTickInput = deepFreeze({ tick: state.tick + 1, players: tick.players, encounters: tick.encounters ?? [] });
++  const before = hashState(deepFreeze(state));
++  const stepped = stepClaim(cfg, state, input);
++  expect(hashState(state)).toBe(before);
++  return stepped;
++}
++
++/** Steps `count` identical ticks and returns the final state and every event. */
++function hold(state: ClaimState, tick: Tick, count: number, cfg: ClaimConfig = config) {
++  const events: ClaimEvent[] = [];
++  let current = state;
++  for (let index = 0; index < count; index++) {
++    const stepped = step(current, tick, cfg);
++    current = stepped.state;
++    events.push(...stepped.events);
++  }
++  return { state: current, events };
++}
++
++const kinds = (events: readonly ClaimEvent[]) => events.map((event) => event.kind);
++
++describe("claim config", () => {
++  it("uses the content rules: a 200-tick channel, the treasure circle in sub-units and the minute-35 deadline", () => {
++    expect(config).toEqual({ claimPoint: POINT, circleRadius: claimRules.circleRadiusTiles * 256, channelTicks: 200, deadlineTick: 42_000 });
++    expect(createClaimConfig({ claimPoint: POINT, controlStartTick: 60 }).deadlineTick).toBe(42_060);
++    expect(() => createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: -1 } })).toThrow(/invalid claim rules/);
++    expect(() => createClaimConfig({ claimPoint: { x: 0.5, y: 0 } })).toThrow(RangeError);
++    expect(() => createClaimState(config, config.deadlineTick)).toThrow(RangeError);
++    expect(createClaimState(config)).toEqual({ tick: 0, channel: null, result: null });
++  });
++});
++
++describe("eligibility (§5)", () => {
++  const start = createClaimState(config);
++
++  it("lets a player start who holds all four types inside the circle, stopped, connected and holding interact", () => {
++    const { state, events } = step(start, { players: [player("a")] });
++    expect(events).toEqual([{ kind: "claim-started", tick: 1, playerId: "a" }]);
++    expect(state.channel).toEqual({ playerId: "a", startTick: 1, x: POINT.x, y: POINT.y, progress: 0 });
++  });
++
++  it("counts the circle's edge as inside and one sub-unit beyond it as outside", () => {
++    expect(step(start, { players: [player("a", { x: POINT.x + RADIUS })] }).state.channel?.playerId).toBe("a");
++    expect(step(start, { players: [player("a", { y: POINT.y - RADIUS })] }).state.channel?.playerId).toBe("a");
++    expect(step(start, { players: [player("a", { x: POINT.x + RADIUS + 1 })] }).state.channel).toBeNull();
++    // (3r/5, 4r/5) lies exactly on the circle when r is a multiple of 5; one sub-unit further does not.
++    const r = RADIUS - (RADIUS % 5);
++    const edge = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, circleRadiusTiles: 5 }, subUnitsPerTile: r / 5 });
++    expect(step(start, { players: [player("a", { x: POINT.x + (3 * r) / 5, y: POINT.y + (4 * r) / 5 })] }, edge).state.channel).not.toBeNull();
++    expect(step(start, { players: [player("a", { x: POINT.x + (3 * r) / 5 + 1, y: POINT.y + (4 * r) / 5 })] }, edge).state.channel).toBeNull();
++  });
++
++  it.each<[string, Partial<ClaimPlayer>]>([
++    ["missing a rubbing type", { holdsAllTypes: false }],
++    ["moving", { speed: 1 }],
++    ["reversing", { speed: -1 }],
++    ["disconnected", { connected: false }],
++    ["not holding interact", { interact: false }],
++    ["outside the circle", { x: POINT.x - RADIUS - 1 }],
++  ])("refuses a player %s", (_, change) => {
++    const { state, events } = step(start, { players: [player("a", change)] });
++    expect(state.channel).toBeNull();
++    expect(events).toEqual([]);
++  });
++
++  it("refuses a player reserved for a duel", () => {
++    const { state, events } = step(start, { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "a", "b")] });
++    expect(state.channel).toBeNull();
++    expect(events).toEqual([]);
++  });
++
++  it("ends a protected player's protection first, then starts the claim (§6)", () => {
++    const { state, events } = step(start, { players: [player("a", { protected: true })] });
++    expect(events).toEqual([
++      { kind: "protection-ended", tick: 1, playerId: "a" },
++      { kind: "claim-started", tick: 1, playerId: "a" },
++    ]);
++    expect(state.channel?.playerId).toBe("a");
++  });
++
++  it("keeps the protection of a protected player who must wait", () => {
++    const first = step(start, { players: [player("a")] }).state;
++    const { events } = step(first, { players: [player("a"), player("b", { protected: true })] });
++    expect(events).toEqual([]);
++  });
++});
++
++describe("the channel (§5)", () => {
++  const start = createClaimState(config);
++
++  it("completes after ten seconds of held interact: 200 ticks after the tick it starts", () => {
++    const almost = hold(start, { players: [player("a")] }, CHANNEL);
++    expect(almost.state.channel).toMatchObject({ playerId: "a", startTick: 1, progress: CHANNEL - 1 });
++    expect(almost.state.result).toBeNull();
++    const done = step(almost.state, { players: [player("a")] });
++    expect(done.state).toEqual({ tick: CHANNEL + 1, channel: null, result: { reason: "claim", winner: "a", tick: CHANNEL + 1 } });
++    expect(done.events).toEqual([
++      { kind: "claim-completed", tick: CHANNEL + 1, playerId: "a" },
++      { kind: "match-ended", tick: CHANNEL + 1, reason: "claim", winner: "a" },
++    ]);
++  });
++
++  it("runs one channel at a time: a second eligible player waits, then starts from zero when the first breaks", () => {
++    const both = { players: [player("a"), player("b", { x: POINT.x + 1 })] };
++    const first = hold(start, both, 50);
++    expect(first.state.channel).toMatchObject({ playerId: "a", progress: 49 });
++    expect(kinds(first.events)).toEqual(["claim-started"]);
++    const broken = step(first.state, { players: [player("a", { interact: false }), player("b", { x: POINT.x + 1 })] });
++    expect(broken.events).toEqual([
++      { kind: "claim-interrupted", tick: 51, playerId: "a", reason: "released", progress: 49 },
++      { kind: "claim-started", tick: 51, playerId: "b" },
++    ]);
++    // a holds interact again but b now owns the channel, which completes 200 ticks after it started.
++    const rest = hold(broken.state, both, CHANNEL);
++    expect(rest.state.result).toEqual({ reason: "claim", winner: "b", tick: 51 + CHANNEL });
++  });
++
++  const breaks: [string, (id: string) => ClaimPlayer | null, string][] = [
++    ["moving", (id) => player(id, { speed: 2 }), "moved"],
++    ["drifting to a new position at speed 0", (id) => player(id, { x: POINT.x + 1 }), "moved"],
++    ["losing a rubbing type", (id) => player(id, { holdsAllTypes: false }), "ineligible"],
++    ["disconnecting", (id) => player(id, { connected: false }), "disconnected"],
++    ["leaving the snapshot", () => null, "disconnected"],
++    ["releasing interact", (id) => player(id, { interact: false }), "released"],
++  ];
++
++  it.each(breaks)("resets progress to zero on %s", (_, broken, reason) => {
++    const channelled = hold(start, { players: [player("a")] }, 120).state;
++    const brokenPlayer = broken("a");
++    const interrupted = step(channelled, { players: brokenPlayer === null ? [] : [brokenPlayer] });
++    // A player who drifted but is still eligible where they stopped starts again at once, from zero.
++    expect(interrupted.state.channel === null || interrupted.state.channel.progress === 0).toBe(true);
++    expect(interrupted.events[0]).toEqual({ kind: "claim-interrupted", tick: 121, playerId: "a", reason, progress: 119 });
++    // Restarting counts from zero: the full channel again.
++    const restarted = hold(interrupted.state, { players: [player("a")] }, CHANNEL + 1);
++    expect(restarted.state.result).toEqual({ reason: "claim", winner: "a", tick: 122 + CHANNEL });
++  });
++
++  it("resets progress to zero when the channeller enters a duel", () => {
++    const channelled = hold(start, { players: [player("a"), player("b", { interact: false })] }, 120).state;
++    const reserved = step(channelled, { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "b", "a")] });
++    expect(reserved.state.channel).toBeNull();
++    expect(reserved.events).toEqual([{ kind: "claim-interrupted", tick: 121, playerId: "a", reason: "duel", progress: 119 }]);
++    // Still reserved: no claim. Released from the duel: a fresh channel.
++    const during = hold(reserved.state, { players: [player("a")], encounters: [duel("e1", "a", "b")] }, 30);
++    expect(during.state.channel).toBeNull();
++    expect(step(during.state, { players: [player("a")] }).state.channel).toMatchObject({ playerId: "a", startTick: 152, progress: 0 });
++  });
++
++  it("does not let a duel between two other players touch the channel", () => {
++    const tick = { players: [player("a"), player("b"), player("c")], encounters: [duel("e1", "b", "c")] };
++    expect(hold(start, tick, CHANNEL + 1).state.result).toMatchObject({ winner: "a" });
++  });
++
++  it("reads protection only when a claim starts: the channel has already ended it", () => {
++    const channelled = step(start, { players: [player("a", { protected: true })] }).state;
++    expect(hold(channelled, { players: [player("a", { protected: true })] }, CHANNEL).state.result).toMatchObject({ winner: "a" });
++  });
++});
++
++describe("completion (§5)", () => {
++  const start = createClaimState(config);
++  const won = hold(start, { players: [player("a")] }, CHANNEL + 1);
++
++  it("commits the winner once and freezes the state against every later input", () => {
++    expect(won.events.filter((event) => event.kind === "claim-completed")).toHaveLength(1);
++    const later: ClaimTickInput[] = [
++      { tick: CHANNEL + 2, players: [player("a", { holdsAllTypes: false, connected: false })], encounters: [duel("e1", "a", "b")] },
++      { tick: CHANNEL + 3, players: [player("b")], encounters: [] },
++      { tick: 1, players: [player("b"), player("b")], encounters: [] },
++      { tick: config.deadlineTick, players: [], encounters: [] },
++    ];
++    for (const input of later) {
++      const stepped = stepClaim(config, won.state, deepFreeze(input));
++      expect(stepped.state).toBe(won.state);
++      expect(stepped.events).toEqual([]);
++    }
++    expect(replayClaim(config, won.state, later).hash).toBe(hashState(won.state));
++  });
++
++  it("ends every duel still reserved or running without theft when the claim completes", () => {
++    const almost = hold(start, { players: [player("a")] }, CHANNEL).state;
++    const done = step(almost, { players: [player("a")], encounters: [duel("z", "e", "f"), duel("m", "c", "d")] });
++    expect(done.events).toEqual([
++      { kind: "claim-completed", tick: CHANNEL + 1, playerId: "a" },
++      { kind: "duel-ended-without-theft", tick: CHANNEL + 1, encounterId: "m", playerIds: ["c", "d"] },
++      { kind: "duel-ended-without-theft", tick: CHANNEL + 1, encounterId: "z", playerIds: ["e", "f"] },
++      { kind: "match-ended", tick: CHANNEL + 1, reason: "claim", winner: "a" },
++    ]);
++  });
++
++  it("with a zero-tick channel, wins on arrival (§5's alternative)", () => {
++    const instant = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: 0 } });
++    const { state, events } = step(createClaimState(instant), { players: [player("a", { protected: true })] }, instant);
++    expect(kinds(events)).toEqual(["protection-ended", "claim-started", "claim-completed", "match-ended"]);
++    expect(state.result).toEqual({ reason: "claim", winner: "a", tick: 1 });
++  });
++});
++
++describe("same-tick ordering (§5)", () => {
++  const start = createClaimState(config);
++
++  it("processes a reservation accepted on the completing tick before the channel: the duel wins", () => {
++    const almost = hold(start, { players: [player("a"), player("b", { interact: false })] }, CHANNEL).state;
++    const tick = { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "a", "b")] };
++    const { state, events } = step(almost, tick);
++    expect(state.result).toBeNull();
++    expect(events).toEqual([{ kind: "claim-interrupted", tick: CHANNEL + 1, playerId: "a", reason: "duel", progress: CHANNEL - 1 }]);
++  });
++
++  it("lets a waiting player start on the tick a reservation stops the channeller", () => {
++    const tick = { players: [player("a"), player("b", { x: POINT.x + 100 }), player("c", { interact: false })] };
++    const channelled = hold(start, tick, 10).state;
++    const { events } = step(channelled, { ...tick, encounters: [duel("e1", "c", "a")] });
++    expect(kinds(events)).toEqual(["claim-interrupted", "claim-started"]);
++    expect(events[1]).toMatchObject({ playerId: "b" });
++  });
++
++  it("starts the closest of several simultaneous starters", () => {
++    const players = [player("a", { x: POINT.x + 300 }), player("b", { y: POINT.y - 200 }), player("c", { x: POINT.x - 250 })];
++    expect(step(start, { players }).state.channel?.playerId).toBe("b");
++    expect(step(start, { players: [...players].reverse() }).state.channel?.playerId).toBe("b");
++  });
++
++  it("breaks a distance tie on the lowest stable id, by code units", () => {
++    const players = [player("p9", { x: POINT.x + 300 }), player("p10", { y: POINT.y + 300 }), player("q", { x: POINT.x - 300 })];
++    expect(step(start, { players }).state.channel?.playerId).toBe("p10");
++    const cased = [player("b", { x: POINT.x + 5 }), player("B", { x: POINT.x - 5 })];
++    expect(step(start, { players: cased }).state.channel?.playerId).toBe("B");
++  });
++
++  it("skips an ineligible closer player", () => {
++    const players = [player("a", { holdsAllTypes: false }), player("b", { x: POINT.x + 10, protected: true }), player("c", { x: POINT.x + 20 })];
++    const { state, events } = step(start, { players, encounters: [] });
++    expect(state.channel?.playerId).toBe("b");
++    expect(events).toEqual([
++      { kind: "protection-ended", tick: 1, playerId: "b" },
++      { kind: "claim-started", tick: 1, playerId: "b" },
++    ]);
++  });
++});
++
++describe("the deadline (§2)", () => {
++  const deadline = config.deadlineTick;
++  const late = createClaimState(config, deadline - CHANNEL - 10);
++
++  it("processes a claim completing on the deadline tick before the timeout", () => {
++    const channelled = hold(late, { players: [player("a", { interact: false })] }, 9).state;
++    const done = hold(channelled, { players: [player("a")] }, CHANNEL + 1);
++    expect(done.state.tick).toBe(deadline);
++    expect(done.state.result).toEqual({ reason: "claim", winner: "a", tick: deadline });
++    expect(done.events.at(-1)).toEqual({ kind: "match-ended", tick: deadline, reason: "claim", winner: "a" });
++  });
++
++  it("ends a match with no winner when a channel is one tick short at the deadline", () => {
++    const channelled = hold(late, { players: [player("a", { interact: false })] }, 10).state;
++    const done = hold(channelled, { players: [player("a")] }, CHANNEL);
++    expect(done.state).toEqual({ tick: deadline, channel: null, result: { reason: "deadline", winner: null, tick: deadline } });
++    expect(done.events.slice(-2)).toEqual([
++      { kind: "claim-interrupted", tick: deadline, playerId: "a", reason: "deadline", progress: CHANNEL - 1 },
++      { kind: "match-ended", tick: deadline, reason: "deadline", winner: null },
++    ]);
++  });
++
++  it("ends a match nobody claimed with no winner, and every running duel without theft", () => {
++    const quiet = hold(late, { players: [player("a", { interact: false })] }, CHANNEL + 9).state;
++    const { state, events } = step(quiet, { players: [], encounters: [duel("e2", "c", "d"), duel("e1", "a", "b")] });
++    expect(state.result).toEqual({ reason: "deadline", winner: null, tick: deadline });
++    expect(events).toEqual([
++      { kind: "duel-ended-without-theft", tick: deadline, encounterId: "e1", playerIds: ["a", "b"] },
++      { kind: "duel-ended-without-theft", tick: deadline, encounterId: "e2", playerIds: ["c", "d"] },
++      { kind: "match-ended", tick: deadline, reason: "deadline", winner: null },
++    ]);
++    expect(stepClaim(config, state, { tick: deadline + 1, players: [player("a")], encounters: [] })).toEqual({ state, events: [] });
++  });
++
++  it("lets a reservation on the deadline tick stop a claim that would have completed on it", () => {
++    const channelled = hold(late, { players: [player("a", { interact: false }), player("b", { interact: false })] }, 9).state;
++    const almost = hold(channelled, { players: [player("a"), player("b", { interact: false })] }, CHANNEL).state;
++    const { state, events } = step(almost, { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "b", "a")] });
++    expect(state.result).toEqual({ reason: "deadline", winner: null, tick: deadline });
++    expect(kinds(events)).toEqual(["claim-interrupted", "duel-ended-without-theft", "match-ended"]);
++  });
++
++  it("wins with a zero-tick channel started on the deadline tick", () => {
++    const instant = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: 0 } });
++    const state = createClaimState(instant, instant.deadlineTick - 1);
++    expect(step(state, { players: [player("a")] }, instant).state.result).toEqual({ reason: "claim", winner: "a", tick: instant.deadlineTick });
++  });
++});
++
++describe("malformed ticks", () => {
++  const start = createClaimState(config);
++  const input = (change: Partial<ClaimTickInput>): ClaimTickInput => ({ tick: 1, players: [player("a")], encounters: [], ...change });
++
++  it("are refused", () => {
++    expect(() => stepClaim(config, start, input({ tick: 2 }))).toThrow(/expected tick 1/);
++    expect(() => stepClaim(config, start, input({ tick: 0 }))).toThrow(/expected tick 1/);
++    expect(() => stepClaim(config, start, input({ players: [player("a"), player("a")] }))).toThrow(/twice/);
++    expect(() => stepClaim(config, start, input({ players: [player("")] }))).toThrow(/non-empty/);
++    expect(() => stepClaim(config, start, input({ players: [player("a", { x: 1.5 })] }))).toThrow(/safe integer/);
++    expect(() => stepClaim(config, start, input({ players: [player("a", { speed: Number.NaN })] }))).toThrow(/safe integer/);
++    expect(() => stepClaim(config, start, input({ players: [{ ...player("a"), interact: 1 as unknown as boolean }] }))).toThrow(/boolean/);
++    expect(() => stepClaim(config, start, input({ encounters: [duel("e", "a", "a")] }))).toThrow(/twice/);
++    expect(() => stepClaim(config, start, input({ encounters: [duel("e", "a", "b"), duel("e", "c", "d")] }))).toThrow(/twice/);
++    expect(() => stepClaim(config, start, input({ encounters: [duel("e1", "a", "b"), duel("e2", "b", "c")] }))).toThrow(/two encounters/);
++    expect(() => stepClaim(config, start, input({ players: [player("a", { x: 2 ** 40 })] }))).toThrow(/too far/);
++  });
++});
+diff --git a/packages/simulation/src/claim/determinism.test.ts b/packages/simulation/src/claim/determinism.test.ts
+new file mode 100644
+index 0000000..eafc66a
+--- /dev/null
++++ b/packages/simulation/src/claim/determinism.test.ts
+@@ -0,0 +1,326 @@
++import { claimRules } from "@pirate-sea-race/content/claim";
++import { describe, expect, it } from "vitest";
++import { nextInt } from "../random.js";
++import {
++  canStartClaim,
++  claimDistanceSquared,
++  createClaimConfig,
++  createClaimState,
++  hashState,
++  stepClaim,
++  type ClaimConfig,
++  type ClaimEncounter,
++  type ClaimEvent,
++  type ClaimPlayer,
++  type ClaimState,
++  type ClaimTickInput,
++} from "./index.js";
++
++const POINT = { x: 20_000, y: 30_000 };
++/** A short match with a short channel, so random ticks produce wins, interrupts and timeouts. */
++const config = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: 30, deadlineTicks: 400 } });
++
++/** Ids whose code-unit order differs from numeric and case-insensitive order. */
++const IDS = ["p1", "p10", "p2", "P3", "a", "B", "crew", "Z9"];
++/** Offsets from the claim point: several at the same distance (300), the circle's edge (1024) and outside it. */
++const SPOTS: readonly (readonly [number, number])[] = [
++  [0, 0],
++  [300, 0],
++  [0, 300],
++  [-300, 0],
++  [180, -240],
++  [500, 500],
++  [1024, 0],
++  [0, -1024],
++  [1025, 0],
++  [2000, 2000],
++];
++
++type Draw = (bound: number) => number;
++
++function generator(seed: number): Draw {
++  let rng = seed;
++  return (bound) => {
++    const drawn = nextInt(rng, bound);
++    rng = drawn.state;
++    return drawn.value;
++  };
++}
++
++function shuffled<T>(items: readonly T[], draw: Draw): T[] {
++  const copy = [...items];
++  for (let index = copy.length - 1; index > 0; index--) {
++    const other = draw(index + 1);
++    [copy[index], copy[other]] = [copy[other]!, copy[index]!];
++  }
++  return copy;
++}
++
++/**
++ * A seeded script of ticks from `start + 1` to past the deadline: players wander between spots, gain and lose their
++ * set, press and release interact, disconnect, gain protection, and pair off into duels that later end. `calm` (per
++ * mille) scales how rarely anything changes, so some scripts let a channel run to completion.
++ */
++function randomScript(seed: number, start: number, calm: number): ClaimTickInput[] {
++  const draw = generator(seed);
++  const chance = (perMille: number) => draw(1000) < Math.floor((perMille * (1000 - calm)) / 1000);
++  const count = 2 + draw(5);
++  const ids = shuffled(IDS, draw).slice(0, count);
++  const players = new Map<string, ClaimPlayer>();
++  for (const id of ids) {
++    const [dx, dy] = SPOTS[draw(SPOTS.length)]!;
++    players.set(id, { id, x: POINT.x + dx, y: POINT.y + dy, speed: 0, holdsAllTypes: draw(4) > 0, interact: draw(2) === 0, connected: true, protected: draw(3) === 0 });
++  }
++  let encounters: ClaimEncounter[] = [];
++  let encounterCount = 0;
++  const script: ClaimTickInput[] = [];
++  for (let tick = start + 1; tick <= config.deadlineTick + 20; tick++) {
++    for (const id of ids) {
++      let next = players.get(id)!;
++      if (next.speed !== 0) next = { ...next, speed: 0 };
++      if (chance(40)) {
++        const [dx, dy] = SPOTS[draw(SPOTS.length)]!;
++        next = { ...next, x: POINT.x + dx, y: POINT.y + dy, speed: 1 + draw(64) };
++      }
++      if (chance(20)) next = { ...next, holdsAllTypes: !next.holdsAllTypes };
++      if (chance(60)) next = { ...next, interact: !next.interact };
++      if (chance(15)) next = { ...next, connected: !next.connected };
++      if (chance(10)) next = { ...next, protected: !next.protected };
++      players.set(id, next);
++    }
++    encounters = encounters.filter(() => !chance(80));
++    if (chance(60)) {
++      const reserved = new Set(encounters.flatMap((encounter) => encounter.playerIds));
++      const free = ids.filter((id) => !reserved.has(id));
++      if (free.length >= 2) {
++        const [a, b] = shuffled(free, draw);
++        encounters = [...encounters, { id: `e${encounterCount++}`, playerIds: [a!, b!] }];
++      }
++    }
++    // Now and then a player drops out of the snapshot altogether.
++    const present = ids.filter(() => !chance(10));
++    script.push({ tick, players: present.map((id) => players.get(id)!), encounters });
++  }
++  return script;
++}
++
++interface Run {
++  readonly states: readonly ClaimState[];
++  readonly hashes: readonly string[];
++  readonly events: readonly (readonly ClaimEvent[])[];
++}
++
++function run(cfg: ClaimConfig, start: ClaimState, script: readonly ClaimTickInput[]): Run {
++  const states: ClaimState[] = [];
++  const events: ClaimEvent[][] = [];
++  let state = start;
++  for (const input of script) {
++    const stepped = stepClaim(cfg, state, input);
++    state = stepped.state;
++    states.push(state);
++    events.push([...stepped.events]);
++  }
++  return { states, hashes: states.map(hashState), events };
++}
++
++/** The same script with every tick's players and encounters in a different order. */
++function reorder(script: readonly ClaimTickInput[], seed: number): ClaimTickInput[] {
++  const draw = generator(seed);
++  return script.map((input) => ({ ...input, players: shuffled(input.players, draw), encounters: shuffled(input.encounters, draw) }));
++}
++
++/** The same script with ids renamed and positions moved by a distance-preserving map about the claim point. */
++function transform(
++  script: readonly ClaimTickInput[],
++  rename: (id: string) => string,
++  move: (dx: number, dy: number) => readonly [number, number],
++): ClaimTickInput[] {
++  return script.map((input) => ({
++    tick: input.tick,
++    players: input.players.map((player) => {
++      const [dx, dy] = move(player.x - POINT.x, player.y - POINT.y);
++      return { ...player, id: rename(player.id), x: POINT.x + dx, y: POINT.y + dy };
++    }),
++    encounters: input.encounters.map((encounter) => ({
++      id: encounter.id,
++      playerIds: [rename(encounter.playerIds[0]), rename(encounter.playerIds[1])] as const,
++    })),
++  }));
++}
++
++function renameEvents(events: readonly (readonly ClaimEvent[])[], rename: (id: string) => string): ClaimEvent[][] {
++  return events.map((tick) =>
++    tick.map((event) => {
++      switch (event.kind) {
++        case "duel-ended-without-theft":
++          return { ...event, playerIds: [rename(event.playerIds[0]), rename(event.playerIds[1])] as const };
++        case "match-ended":
++          return { ...event, winner: event.winner === null ? null : rename(event.winner) };
++        default:
++          return { ...event, playerId: rename(event.playerId) };
++      }
++    }),
++  );
++}
++
++const SEEDS = Array.from({ length: 60 }, (_, index) => index + 1);
++const scriptFor = (seed: number) => randomScript(seed, 0, [0, 500, 800][seed % 3]!);
++
++describe("seeded random ticks (§19 Endgame)", () => {
++  it.each(SEEDS)("seed %i commits at most one winner, freezes after the result and keeps every invariant", (seed) => {
++    const script = scriptFor(seed);
++    const { states, hashes, events } = run(config, createClaimState(config), script);
++    const all = events.flat();
++    const completed = all.filter((event) => event.kind === "claim-completed");
++    const ended = all.filter((event) => event.kind === "match-ended");
++    expect(completed.length).toBeLessThanOrEqual(1);
++    expect(ended).toHaveLength(1);
++
++    const resolvedAt = states.findIndex((state) => state.result !== null);
++    expect(resolvedAt).toBeGreaterThanOrEqual(0);
++    const result = states[resolvedAt]!.result!;
++    expect(ended[0]).toMatchObject({ tick: result.tick, reason: result.reason, winner: result.winner });
++    if (completed.length === 1) {
++      expect(result).toEqual({ reason: "claim", winner: completed[0]!.playerId, tick: completed[0]!.tick });
++    } else {
++      expect(result).toEqual({ reason: "deadline", winner: null, tick: config.deadlineTick });
++    }
++    // After the result nothing changes, whatever arrives.
++    for (let index = resolvedAt + 1; index < states.length; index++) {
++      expect(states[index]).toBe(states[resolvedAt]);
++      expect(hashes[index]).toBe(hashes[resolvedAt]);
++      expect(events[index]).toEqual([]);
++    }
++
++    for (let index = 0; index < resolvedAt; index++) {
++      const input = script[index]!;
++      const state = states[index]!;
++      const reserved = new Set(input.encounters.flatMap((encounter) => encounter.playerIds));
++      const channel = state.channel;
++      if (channel !== null) {
++        // The channeller is eligible this tick, where the channel started, and short of completion.
++        const player = input.players.find((candidate) => candidate.id === channel.playerId);
++        expect(player).toBeDefined();
++        expect(canStartClaim(config, player!, reserved.has(player!.id))).toBe(true);
++        expect([player!.x, player!.y]).toEqual([channel.x, channel.y]);
++        expect(channel.progress).toBe(input.tick - channel.startTick);
++        expect(channel.progress).toBeLessThan(config.channelTicks);
++      } else {
++        // A free channel is never left free while someone eligible is waiting.
++        expect(input.players.some((player) => canStartClaim(config, player, reserved.has(player.id)))).toBe(false);
++      }
++    }
++  });
++
++  it("exercise wins, timeouts and every interrupt reason across the seeds", () => {
++    const outcomes = { winners: 0, timeouts: 0, reasons: new Set<string>() };
++    for (const seed of SEEDS) {
++      const all = run(config, createClaimState(config), scriptFor(seed)).events.flat();
++      if (all.some((event) => event.kind === "claim-completed")) outcomes.winners++;
++      else outcomes.timeouts++;
++      for (const event of all) if (event.kind === "claim-interrupted") outcomes.reasons.add(event.reason);
++    }
++    expect(outcomes.winners).toBeGreaterThan(5);
++    expect(outcomes.timeouts).toBeGreaterThan(5);
++    expect([...outcomes.reasons].sort()).toEqual(["deadline", "disconnected", "duel", "ineligible", "moved", "released"]);
++  });
++
++  it.each(SEEDS.slice(0, 20))("seed %i hashes identically on replay, tick by tick", (seed) => {
++    const first = run(config, createClaimState(config), scriptFor(seed));
++    const replayed = run(config, createClaimState(config), JSON.parse(JSON.stringify(scriptFor(seed))) as ClaimTickInput[]);
++    expect(replayed.hashes).toEqual(first.hashes);
++    expect(replayed.events).toEqual(first.events);
++  });
++
++  it("changes the hash from the tick one input changes: a channeller releasing interact", () => {
++    let changed = 0;
++    for (const seed of SEEDS.slice(0, 20)) {
++      const script = scriptFor(seed);
++      const first = run(config, createClaimState(config), script);
++      const at = first.states.findIndex((state, index) => state.channel !== null && state.channel.progress > 0 && index + 1 < script.length);
++      if (at < 0) continue;
++      const channeller = first.states[at]!.channel!.playerId;
++      const altered = script.map((input, index) =>
++        index === at ? { ...input, players: input.players.map((player) => (player.id === channeller ? { ...player, interact: false } : player)) } : input,
++      );
++      const second = run(config, createClaimState(config), altered);
++      expect(second.hashes.slice(0, at)).toEqual(first.hashes.slice(0, at));
++      expect(second.hashes[at]).not.toBe(first.hashes[at]);
++      expect(second.events[at]).toContainEqual(expect.objectContaining({ kind: "claim-interrupted", playerId: channeller, reason: "released" }));
++      changed++;
++    }
++    expect(changed).toBeGreaterThan(10);
++  });
++});
++
++describe("symmetry (§5 ordering)", () => {
++  it.each(SEEDS.slice(0, 20))("seed %i: the order of players and encounters in each tick never matters", (seed) => {
++    const script = scriptFor(seed);
++    const first = run(config, createClaimState(config), script);
++    const again = run(config, createClaimState(config), reorder(script, seed * 7919));
++    expect(again.hashes).toEqual(first.hashes);
++    expect(again.events).toEqual(first.events);
++  });
++
++  const moves: [string, (dx: number, dy: number) => readonly [number, number]][] = [
++    ["a quarter turn", (dx, dy) => [-dy, dx]],
++    ["a half turn", (dx, dy) => [-dx, -dy]],
++    ["a mirror", (dx, dy) => [-dx, dy]],
++    ["a diagonal mirror", (dx, dy) => [dy, dx]],
++  ];
++
++  it.each(moves)("rotating or mirroring every position about the claim point by %s gives the same events", (_, move) => {
++    for (const seed of SEEDS.slice(0, 20)) {
++      const script = scriptFor(seed);
++      const first = run(config, createClaimState(config), script);
++      const moved = run(config, createClaimState(config), transform(script, (id) => id, move));
++      expect(moved.events).toEqual(first.events);
++      expect(moved.states.map((state) => state.result)).toEqual(first.states.map((state) => state.result));
++    }
++  });
++
++  it("relabelling players in an order-preserving way relabels the outcome and nothing else", () => {
++    const rename = (id: string) => `crew-${id}`;
++    for (const seed of SEEDS.slice(0, 20)) {
++      const script = scriptFor(seed);
++      const first = run(config, createClaimState(config), script);
++      const relabelled = run(config, createClaimState(config), transform(script, rename, (dx, dy) => [dx, dy]));
++      expect(relabelled.events).toEqual(renameEvents(first.events, rename));
++    }
++  });
++
++  it("starts the claimer the rule names, closest then lowest id, under any relabelling and input order", () => {
++    const draw = generator(424242);
++    const start = createClaimState(config);
++    let ties = 0;
++    for (let trial = 0; trial < 1000; trial++) {
++      const ids = shuffled(IDS, draw).slice(0, 2 + draw(6));
++      const players: ClaimPlayer[] = ids.map((id) => {
++        const [dx, dy] = SPOTS[draw(6)]!;
++        return { id, x: POINT.x + dx, y: POINT.y + dy, speed: draw(8) === 0 ? 1 : 0, holdsAllTypes: draw(8) > 0, interact: draw(8) > 0, connected: draw(12) > 0, protected: draw(2) === 0 };
++      });
++      const encounters: ClaimEncounter[] = draw(3) === 0 && ids.length >= 3 ? [{ id: "e", playerIds: [ids[1]!, ids[2]!] }] : [];
++      // Any relabelling: a random permutation of the id pool.
++      const pool = shuffled(IDS, draw);
++      const relabel = (id: string) => pool[IDS.indexOf(id)]!;
++
++      for (const rename of [(id: string) => id, relabel]) {
++        const renamedPlayers = players.map((player) => ({ ...player, id: rename(player.id) }));
++        const renamedEncounters = encounters.map((encounter) => ({ id: encounter.id, playerIds: [rename(encounter.playerIds[0]), rename(encounter.playerIds[1])] as const }));
++        const reserved = new Set(renamedEncounters.flatMap((encounter) => encounter.playerIds));
++        const eligible = renamedPlayers
++          .filter((player) => canStartClaim(config, player, reserved.has(player.id)))
++          .map((player) => ({ id: player.id, distance: claimDistanceSquared(config, player.x, player.y) }))
++          .sort((a, b) => a.distance - b.distance || (a.id < b.id ? -1 : 1));
++        if (eligible.length >= 2 && eligible[0]!.distance === eligible[1]!.distance) ties++;
++        const expected = eligible[0]?.id ?? null;
++        for (const order of [renamedPlayers, [...renamedPlayers].reverse(), shuffled(renamedPlayers, draw)]) {
++          const stepped = stepClaim(config, start, { tick: 1, players: order, encounters: shuffled(renamedEncounters, draw) });
++          expect(stepped.state.channel?.playerId ?? null).toBe(expected);
++        }
++      }
++    }
++    // The trials include plenty of distance ties, so the id rule is exercised.
++    expect(ties).toBeGreaterThan(100);
++  });
++});
+diff --git a/packages/simulation/src/claim/index.ts b/packages/simulation/src/claim/index.ts
+new file mode 100644
+index 0000000..0567131
+--- /dev/null
++++ b/packages/simulation/src/claim/index.ts
+@@ -0,0 +1,11 @@
++export * from "./state.js";
++export * from "./step.js";
++export {
++  CLAIM_CHANNEL_SECONDS,
++  claimRules,
++  MATCH_DURATION_MINUTES,
++  TREASURE_CIRCLE_RADIUS_TILES,
++  validateClaimRules,
++  type ClaimRules,
++} from "@pirate-sea-race/content/claim";
++export { hashState } from "../hash.js";
+diff --git a/packages/simulation/src/claim/state.ts b/packages/simulation/src/claim/state.ts
+new file mode 100644
+index 0000000..9d94315
+--- /dev/null
++++ b/packages/simulation/src/claim/state.ts
+@@ -0,0 +1,137 @@
++import { claimRules as defaultClaimRules, validateClaimRules, type ClaimRules } from "@pirate-sea-race/content/claim";
++import { seaMap } from "@pirate-sea-race/content";
++
++/** A point in integer sub-units. */
++export interface ClaimPoint {
++  readonly x: number;
++  readonly y: number;
++}
++
++/** Static claim data for one match; the step reads it and it never changes. */
++export interface ClaimConfig {
++  /** The centre of the treasure circle on the final island. */
++  readonly claimPoint: ClaimPoint;
++  /** The treasure circle's radius in sub-units; a point exactly on it is inside. */
++  readonly circleRadius: number;
++  /** World ticks of held interact that complete a claim (0: the claim completes on the tick it starts). */
++  readonly channelTicks: number;
++  /** The world tick on which the match stops (§2). */
++  readonly deadlineTick: number;
++}
++
++export interface ClaimConfigOptions {
++  readonly claimPoint: ClaimPoint;
++  /** The world tick on which player control starts; the deadline counts from it. */
++  readonly controlStartTick?: number;
++  readonly rules?: ClaimRules;
++  readonly subUnitsPerTile?: number;
++}
++
++function requireInteger(value: number, name: string): void {
++  if (!Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${value}`);
++}
++
++/** Builds a match's claim config from the content rules, refusing invalid rules. */
++export function createClaimConfig(options: ClaimConfigOptions): ClaimConfig {
++  const rules = validateClaimRules(options.rules ?? defaultClaimRules);
++  if (!rules.ok) throw new RangeError(`invalid claim rules: ${rules.issues.join("; ")}`);
++  const start = options.controlStartTick ?? 0;
++  const subUnitsPerTile = options.subUnitsPerTile ?? seaMap.subUnitsPerTile;
++  requireInteger(options.claimPoint.x, "claimPoint.x");
++  requireInteger(options.claimPoint.y, "claimPoint.y");
++  requireInteger(start, "controlStartTick");
++  requireInteger(subUnitsPerTile, "subUnitsPerTile");
++  if (start < 0) throw new RangeError(`controlStartTick must not be negative, got ${start}`);
++  return {
++    claimPoint: { x: options.claimPoint.x, y: options.claimPoint.y },
++    circleRadius: rules.value.circleRadiusTiles * subUnitsPerTile,
++    channelTicks: rules.value.channelTicks,
++    deadlineTick: start + rules.value.deadlineTicks,
++  };
++}
++
++/** The one active claim channel (§5). */
++export interface ClaimChannel {
++  readonly playerId: string;
++  /** The tick the channel started on. */
++  readonly startTick: number;
++  /** Where the channeller stopped; any change of position is movement. */
++  readonly x: number;
++  readonly y: number;
++  /** Ticks held since the start tick; the claim completes when this reaches `channelTicks`. */
++  readonly progress: number;
++}
++
++export type ClaimResult =
++  | { readonly reason: "claim"; readonly winner: string; readonly tick: number }
++  | { readonly reason: "deadline"; readonly winner: null; readonly tick: number };
++
++/** The claim state: plain integer data that `hashState` covers entirely. */
++export interface ClaimState {
++  /** The last world tick processed. */
++  readonly tick: number;
++  readonly channel: ClaimChannel | null;
++  /** Set once, by a completed claim or the deadline; the state never changes afterwards. */
++  readonly result: ClaimResult | null;
++}
++
++/** A state before any tick: the first step processes `tick + 1`. */
++export function createClaimState(config: ClaimConfig, tick = 0): ClaimState {
++  requireInteger(tick, "tick");
++  if (tick >= config.deadlineTick) throw new RangeError(`the claim state must start before the deadline tick ${config.deadlineTick}`);
++  return { tick, channel: null, result: null };
++}
++
++/** What the caller knows about one player on this tick. */
++export interface ClaimPlayer {
++  /** The stable player id; ties break on the lowest by UTF-16 code units. */
++  readonly id: string;
++  /** Position in sub-units. */
++  readonly x: number;
++  readonly y: number;
++  /** Speed in sub-units per world tick; the player is stopped only at 0. */
++  readonly speed: number;
++  /** Holds all four rubbing types (from the ledger). */
++  readonly holdsAllTypes: boolean;
++  /** Holding interact on this tick. */
++  readonly interact: boolean;
++  readonly connected: boolean;
++  /** Under spawn or return protection (§2, §6). Starting a claim ends it. */
++  readonly protected: boolean;
++}
++
++/** An accepted encounter reservation: two players reserved for, or fighting, a duel (§6). */
++export interface ClaimEncounter {
++  readonly id: string;
++  readonly playerIds: readonly [string, string];
++}
++
++/** One world tick's snapshot of the players that matter to the claim; order within the lists never matters. */
++export interface ClaimTickInput {
++  /** Must be the state's tick plus one. */
++  readonly tick: number;
++  /** A player absent from the list counts as disconnected. */
++  readonly players: readonly ClaimPlayer[];
++  /** Every encounter holding a reservation on this tick, newly accepted or still running. */
++  readonly encounters: readonly ClaimEncounter[];
++}
++
++export type ClaimInterruptReason = "duel" | "disconnected" | "ineligible" | "moved" | "released" | "deadline";
++
++/** Something that happened on a tick, for the caller to apply or announce. */
++export type ClaimEvent =
++  /** The channel reset to zero; `progress` is what was lost. */
++  | { readonly kind: "claim-interrupted"; readonly tick: number; readonly playerId: string; readonly reason: ClaimInterruptReason; readonly progress: number }
++  /** The player started a claim while protected: the caller must end their protection (§6). */
++  | { readonly kind: "protection-ended"; readonly tick: number; readonly playerId: string }
++  | { readonly kind: "claim-started"; readonly tick: number; readonly playerId: string }
++  | { readonly kind: "claim-completed"; readonly tick: number; readonly playerId: string }
++  /** The match ended with this encounter unresolved: the duel ends and no rubbing changes hands (§2). */
++  | { readonly kind: "duel-ended-without-theft"; readonly tick: number; readonly encounterId: string; readonly playerIds: readonly [string, string] }
++  /** The match is over; `winner` is null after a timeout (§2). */
++  | { readonly kind: "match-ended"; readonly tick: number; readonly reason: "claim" | "deadline"; readonly winner: string | null };
++
++export interface ClaimStepResult {
++  readonly state: ClaimState;
++  readonly events: readonly ClaimEvent[];
++}
+diff --git a/packages/simulation/src/claim/step.ts b/packages/simulation/src/claim/step.ts
+new file mode 100644
+index 0000000..019c7c6
+--- /dev/null
++++ b/packages/simulation/src/claim/step.ts
+@@ -0,0 +1,197 @@
++import { hashState } from "../hash.js";
++import type {
++  ClaimChannel,
++  ClaimConfig,
++  ClaimEncounter,
++  ClaimEvent,
++  ClaimInterruptReason,
++  ClaimPlayer,
++  ClaimResult,
++  ClaimState,
++  ClaimStepResult,
++  ClaimTickInput,
++} from "./state.js";
++
++/** Squared distance from the claim point, refusing coordinates whose square would not be an exact integer. */
++export function claimDistanceSquared(config: ClaimConfig, x: number, y: number): number {
++  const dx = x - config.claimPoint.x;
++  const dy = y - config.claimPoint.y;
++  const squared = dx * dx + dy * dy;
++  if (!Number.isSafeInteger(squared)) throw new RangeError(`position (${x}, ${y}) is too far from the claim point`);
++  return squared;
++}
++
++export function insideTreasureCircle(config: ClaimConfig, x: number, y: number): boolean {
++  return claimDistanceSquared(config, x, y) <= config.circleRadius * config.circleRadius;
++}
++
++/**
++ * Whether a player meets §5's conditions to start claiming on this tick, protection aside: starting ends protection
++ * (§6), so a protected player may start. A player can wait with interact held; this does not say a channel is free.
++ */
++export function canStartClaim(config: ClaimConfig, player: ClaimPlayer, reserved: boolean): boolean {
++  return (
++    player.connected &&
++    player.holdsAllTypes &&
++    player.interact &&
++    !reserved &&
++    player.speed === 0 &&
++    insideTreasureCircle(config, player.x, player.y)
++  );
++}
++
++/** Why the active channel cannot continue on this tick, or null. Reservations are checked before this. */
++function channelBreak(channel: ClaimChannel, player: ClaimPlayer | undefined): ClaimInterruptReason | null {
++  if (player === undefined || !player.connected) return "disconnected";
++  if (!player.holdsAllTypes) return "ineligible";
++  // The channel pins the position it started at, which lies inside the circle.
++  if (player.speed !== 0 || player.x !== channel.x || player.y !== channel.y) return "moved";
++  if (!player.interact) return "released";
++  return null;
++}
++
++/** Lowest id by UTF-16 code units, independent of locale. */
++function compareIds(a: string, b: string): number {
++  return a < b ? -1 : a > b ? 1 : 0;
++}
++
++function requireInteger(value: unknown, name: string): void {
++  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
++}
++
++function requireBoolean(value: unknown, name: string): void {
++  if (typeof value !== "boolean") throw new RangeError(`${name} must be a boolean, got ${String(value)}`);
++}
++
++function requireId(value: unknown, name: string): void {
++  if (typeof value !== "string" || value.length === 0) throw new RangeError(`${name} must be a non-empty string`);
++}
++
++/** Refuses a malformed tick: a skipped or repeated tick, duplicate ids, a player in two encounters. */
++function readInput(state: ClaimState, input: ClaimTickInput): { players: Map<string, ClaimPlayer>; reservedBy: Map<string, ClaimEncounter> } {
++  requireInteger(input.tick, "tick");
++  if (input.tick !== state.tick + 1) throw new RangeError(`expected tick ${state.tick + 1}, got ${input.tick}`);
++  const players = new Map<string, ClaimPlayer>();
++  for (const player of input.players) {
++    requireId(player.id, "player id");
++    if (players.has(player.id)) throw new RangeError(`player ${player.id} appears twice`);
++    requireInteger(player.x, `${player.id}.x`);
++    requireInteger(player.y, `${player.id}.y`);
++    requireInteger(player.speed, `${player.id}.speed`);
++    for (const flag of ["holdsAllTypes", "interact", "connected", "protected"] as const) requireBoolean(player[flag], `${player.id}.${flag}`);
++    players.set(player.id, player);
++  }
++  const encounterIds = new Set<string>();
++  const reservedBy = new Map<string, ClaimEncounter>();
++  for (const encounter of input.encounters) {
++    requireId(encounter.id, "encounter id");
++    if (encounterIds.has(encounter.id)) throw new RangeError(`encounter ${encounter.id} appears twice`);
++    encounterIds.add(encounter.id);
++    const [a, b] = encounter.playerIds;
++    requireId(a, `encounter ${encounter.id} player`);
++    requireId(b, `encounter ${encounter.id} player`);
++    if (a === b) throw new RangeError(`encounter ${encounter.id} reserves ${a} twice`);
++    for (const id of [a, b]) {
++      if (reservedBy.has(id)) throw new RangeError(`player ${id} is in two encounters`);
++      reservedBy.set(id, encounter);
++    }
++  }
++  return { players, reservedBy };
++}
++
++/**
++ * One world tick of §5's claim rules, in a fixed order: (1) accepted encounter reservations interrupt the channel,
++ * (2) the active channel breaks or advances, (3) with no channel active the best eligible starter begins one,
++ * (4) a channel that has run `channelTicks` completes, and (5) on the deadline tick a match without a winner ends with
++ * none. Players and encounters are read as sets, so their order in the input never matters. Once the match has a
++ * result, every later input is ignored and the state is returned unchanged. The input state is never mutated.
++ */
++export function stepClaim(config: ClaimConfig, state: ClaimState, input: ClaimTickInput): ClaimStepResult {
++  if (state.result !== null) return { state, events: [] };
++  const { players, reservedBy } = readInput(state, input);
++  const tick = input.tick;
++  const events: ClaimEvent[] = [];
++  let channel = state.channel;
++  const interrupt = (active: ClaimChannel, reason: ClaimInterruptReason) =>
++    events.push({ kind: "claim-interrupted", tick, playerId: active.playerId, reason, progress: active.progress });
++
++  // 1. Reservations first (§5): a duel accepted on the tick a claim would complete still stops it.
++  if (channel !== null && reservedBy.has(channel.playerId)) {
++    interrupt(channel, "duel");
++    channel = null;
++  }
++
++  // 2. The active channel.
++  if (channel !== null) {
++    const reason = channelBreak(channel, players.get(channel.playerId));
++    if (reason === null) {
++      channel = { ...channel, progress: channel.progress + 1 };
++    } else {
++      interrupt(channel, reason);
++      channel = null;
++    }
++  }
++
++  // 3. One channel at a time: others wait. Simultaneous starters: the closest to the claim point, then the lowest id.
++  if (channel === null) {
++    let best: { player: ClaimPlayer; distance: number } | null = null;
++    for (const player of players.values()) {
++      if (!canStartClaim(config, player, reservedBy.has(player.id))) continue;
++      const distance = claimDistanceSquared(config, player.x, player.y);
++      if (best === null || distance < best.distance || (distance === best.distance && compareIds(player.id, best.player.id) < 0)) {
++        best = { player, distance };
++      }
++    }
++    if (best !== null) {
++      const { id, x, y } = best.player;
++      if (best.player.protected) events.push({ kind: "protection-ended", tick, playerId: id });
++      events.push({ kind: "claim-started", tick, playerId: id });
++      channel = { playerId: id, startTick: tick, x, y, progress: 0 };
++    }
++  }
++
++  // 4. Completion commits the winner; it comes before the deadline, so a claim completing on the deadline tick wins.
++  let result: ClaimResult | null = null;
++  if (channel !== null && channel.progress >= config.channelTicks) {
++    events.push({ kind: "claim-completed", tick, playerId: channel.playerId });
++    result = { reason: "claim", winner: channel.playerId, tick };
++    channel = null;
++  }
++
++  // 5. The deadline: no winner, and an unfinished channel is cancelled.
++  if (result === null && tick >= config.deadlineTick) {
++    if (channel !== null) interrupt(channel, "deadline");
++    channel = null;
++    result = { reason: "deadline", winner: null, tick };
++  }
++
++  // The match is over: outcomes freeze, so every duel still reserved or running ends without theft.
++  if (result !== null) {
++    const encounters = [...input.encounters].sort((a, b) => compareIds(a.id, b.id));
++    for (const encounter of encounters) {
++      const playerIds: [string, string] = [encounter.playerIds[0], encounter.playerIds[1]];
++      events.push({ kind: "duel-ended-without-theft", tick, encounterId: encounter.id, playerIds });
++    }
++    events.push({ kind: "match-ended", tick, reason: result.reason, winner: result.winner });
++  }
++
++  return { state: { tick, channel, result }, events };
++}
++
++export interface ClaimReplay {
++  readonly state: ClaimState;
++  readonly events: readonly ClaimEvent[];
++  readonly hash: string;
++}
++
++/** Steps a sequence of ticks from a state, collecting every event; `hash` is the final state's `hashState`. */
++export function replayClaim(config: ClaimConfig, state: ClaimState, inputs: readonly ClaimTickInput[]): ClaimReplay {
++  let current = state;
++  const events: ClaimEvent[] = [];
++  for (const input of inputs) {
++    const stepped = stepClaim(config, current, input);
++    current = stepped.state;
++    events.push(...stepped.events);
++  }
++  return { state: current, events, hash: hashState(current) };
++}

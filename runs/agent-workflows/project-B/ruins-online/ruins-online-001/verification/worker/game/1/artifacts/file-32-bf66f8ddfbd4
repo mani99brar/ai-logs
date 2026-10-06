@@ -1,0 +1,266 @@
+/**
+ * The last step of `npm run build`: proves the build output runs, not just that it compiled. It loads every workspace
+ * package through its `default` export (the built `dist/`), checks that the web bundle carries no development-only
+ * latency setting, starts the built server (`node apps/server/dist/main.js`) on a free port, waits for its health
+ * check, creates a private match through the Colyseus SDK and waits for the creator's ship, checks that the production
+ * entry offers no test-only placement route and ignores the test-only source layout, timings and final-socket secret
+ * (set malformed here, which the dev entry would refuse to start with), that the match opens in its lobby with the
+ * rules' own 20 s countdown and 35:00 timer, and that the creator's private status carries the starting gold, and opens a practice duel whose client runs the built rollback core
+ * through the countdown into the fight. Every wait is bounded and the server is killed on every path, so a failure
+ * fails the build with its real error and no process outlives the script.
+ */
+import { spawn, type ChildProcess } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+
+const root = fileURLToPath(new URL("..", import.meta.url));
+const SERVER_ENTRY = "apps/server/dist/main.js";
+const LISTENING_LINE = /listening on ws:\/\/localhost:(\d+)/;
+
+const LISTEN_TIMEOUT_MS = 20_000;
+const HEALTH_TIMEOUT_MS = 10_000;
+const MATCH_TIMEOUT_MS = 15_000;
+/** A practice duel's three-second countdown and its first confirmed frames. */
+const DUEL_TIMEOUT_MS = 15_000;
+/** The web build's assets, and the marker the development-only latency module logs (apps/web/src/devLatency.ts). */
+const WEB_ASSETS = "apps/web/dist/assets";
+const DEV_LATENCY_MARKER = "pirate-sea-race dev latency";
+const STOP_TIMEOUT_MS = 5_000;
+/** Everything together stays far below the build check's 600 s. */
+const OVERALL_TIMEOUT_MS = 90_000;
+
+/** The built entry points, as a consumer without the `@pirate-sea-race/source` condition resolves them. */
+const WORKSPACE_EXPORTS = [
+  "@pirate-sea-race/content",
+  "@pirate-sea-race/content/moves",
+  "@pirate-sea-race/content/ruins",
+  "@pirate-sea-race/content/encounters",
+  "@pirate-sea-race/content/intel",
+  "@pirate-sea-race/content/match",
+  "@pirate-sea-race/content/fruits",
+  "@pirate-sea-race/content/claim",
+  "@pirate-sea-race/content/objectives",
+  "@pirate-sea-race/protocol",
+  "@pirate-sea-race/simulation",
+  "@pirate-sea-race/simulation/duel",
+  "@pirate-sea-race/simulation/claim",
+  "@pirate-sea-race/simulation/objectives",
+  "@pirate-sea-race/simulation/netcode",
+  "@pirate-sea-race/simulation/ruins",
+  "@pirate-sea-race/simulation/encounters",
+  "@pirate-sea-race/simulation/intel",
+  "@pirate-sea-race/simulation/match",
+  "@pirate-sea-race/simulation/fruits",
+  "@pirate-sea-race/server",
+  "@pirate-sea-race/server/schema",
+  "@pirate-sea-race/test-tools",
+];
+
+let server: ChildProcess | undefined;
+
+function log(message: string): void {
+  console.log(`build smoke: ${message}`);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not finish within ${timeoutMs} ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function running(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+async function checkWorkspaceExports(): Promise<void> {
+  for (const specifier of WORKSPACE_EXPORTS) {
+    const resolved = fileURLToPath(import.meta.resolve(specifier));
+    if (!/[\\/]dist[\\/](?:[^\\/]+[\\/])*[^\\/]+\.js$/.test(resolved)) throw new Error(`${specifier} resolves to ${resolved}, not to its dist/`);
+    const module = (await import(specifier)) as Record<string, unknown>;
+    if (Object.keys(module).length === 0) throw new Error(`${specifier} (${resolved}) exports nothing`);
+  }
+  log(`${WORKSPACE_EXPORTS.length} workspace exports load from dist/`);
+}
+
+/** The production web bundle must not contain the development-only socket delay. */
+async function checkWebBundle(): Promise<void> {
+  const directory = new URL(`../${WEB_ASSETS}/`, import.meta.url);
+  const scripts = (await readdir(directory)).filter((name) => name.endsWith(".js"));
+  if (scripts.length === 0) throw new Error(`${WEB_ASSETS} holds no scripts`);
+  for (const name of scripts) {
+    if ((await readFile(new URL(name, directory), "utf8")).includes(DEV_LATENCY_MARKER)) {
+      throw new Error(`${WEB_ASSETS}/${name} contains the development-only latency setting`);
+    }
+  }
+  log(`the web bundle (${scripts.length} scripts) carries no development-only latency setting`);
+}
+
+/** Starts the built server on a free port and resolves with the port from its "listening" line. */
+function startServer(): Promise<number> {
+  const child = spawn(process.execPath, [SERVER_ENTRY], {
+    cwd: root,
+    // Every test-only setting is set, all but placement malformed: the production entry reads none, so it starts anyway.
+    env: {
+      ...process.env,
+      PORT: "0",
+      PIRATE_SEA_RACE_TEST_PLACEMENT: "1",
+      PIRATE_SEA_RACE_TEST_SOURCES: "not a layout",
+      PIRATE_SEA_RACE_TEST_TIMINGS: "not timings",
+      PIRATE_SEA_RACE_TEST_FINAL_SECRET: "not a secret",
+      PIRATE_SEA_RACE_TEST_RUINS: "not ruins",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  server = child;
+  child.stderr!.on("data", (chunk: Buffer) => process.stderr.write(chunk));
+  return withTimeout(
+    new Promise<number>((resolve, reject) => {
+      createInterface({ input: child.stdout! }).on("line", (line) => {
+        console.log(`  server: ${line}`);
+        const match = LISTENING_LINE.exec(line);
+        if (match !== null) resolve(Number(match[1]));
+      });
+      child.once("error", reject);
+      child.once("exit", (code, signal) => reject(new Error(`${SERVER_ENTRY} exited (code ${code}, signal ${signal}) before listening`)));
+    }),
+    LISTEN_TIMEOUT_MS,
+    `${SERVER_ENTRY} listening`,
+  );
+}
+
+async function waitForHealth(endpoint: string): Promise<void> {
+  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${endpoint}/__healthcheck`, { signal: AbortSignal.timeout(1000) });
+      if (response.ok) return;
+      last = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      last = error;
+    }
+    await sleep(100);
+  }
+  throw new Error(`${endpoint}/__healthcheck did not answer OK within ${HEALTH_TIMEOUT_MS} ms`, { cause: last });
+}
+
+async function createMatch(endpoint: string): Promise<void> {
+  const { HeadlessClient } = await import("@pirate-sea-race/test-tools");
+  const { TEST_NEXT_MATCH_RUINS_PATH, TEST_NEXT_MATCH_TIMINGS_PATH, TEST_PLACEMENT_PATH } = await import("@pirate-sea-race/protocol");
+  const host = await withTimeout(HeadlessClient.create(endpoint), MATCH_TIMEOUT_MS, "creating a match");
+  try {
+    const ship = host.ship();
+    if (!/^[A-Z0-9]{6}$/.test(host.code)) throw new Error(`the match has no code (got "${host.code}")`);
+    if (ship === undefined || host.playerCount !== 1) throw new Error("the creator's ship is not in the match state");
+    log(`created match ${host.code}; the creator's ship is at (${ship.x}, ${ship.y})`);
+    // The production entry never reads the test-placement setting, even when the environment sets it.
+    const response = await fetch(`${endpoint}${TEST_PLACEMENT_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: host.code, sessionId: host.sessionId, tileX: 100, tileY: 76, heading: 0 }),
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    });
+    if (response.status !== 404) throw new Error(`the production server answered the test placement route with HTTP ${response.status}`);
+    const timings = await fetch(`${endpoint}${TEST_NEXT_MATCH_TIMINGS_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ match: 100 }),
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    });
+    if (timings.status !== 404) throw new Error(`the production server answered the next match's test timings route with HTTP ${timings.status}`);
+    const ruins = await fetch(`${endpoint}${TEST_NEXT_MATCH_RUINS_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ "*": "open" }),
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    });
+    if (ruins.status !== 404) throw new Error(`the production server answered the next match's test ruins route with HTTP ${ruins.status}`);
+    log("the production server offers no test placement and no next match's test timings or ruins");
+    // The match opens in its lobby with the rules' own timings: nothing shortened them.
+    const state = host.room.state;
+    if (state.phase !== "lobby" || state.readyTicks !== 400 || state.durationTicks !== 42_000 || state.minPlayers !== 2) {
+      throw new Error(`the match's flow: phase ${state.phase}, ready ${state.readyTicks} ticks, ${state.durationTicks} ticks, ${state.minPlayers} to start`);
+    }
+    log("the match waits in its lobby with a 20 s countdown and a 35:00 timer, for two players to start");
+    // The ledger runs in the built room: the creator's own status carries the starting purse and no rubbing yet.
+    await withTimeout(host.waitFor(() => host.gold() > 0), MATCH_TIMEOUT_MS, "the creator's gold");
+    if (host.gold() !== 50 || host.rubbings().length !== 0) throw new Error(`the creator's purse: ${host.gold()} gold, rubbings ${host.rubbings().join(",")}`);
+    log(`the creator's private status shows ${host.gold()} gold and no rubbing`);
+  } finally {
+    await withTimeout(host.leave(), STOP_TIMEOUT_MS, "leaving the match").catch(() => undefined);
+  }
+}
+
+/** A practice duel on the built server: the built rollback core confirms frames and agrees with every server hash. */
+async function openPracticeDuel(endpoint: string): Promise<void> {
+  const { HeadlessDuelClient } = await import("@pirate-sea-race/test-tools");
+  const player = await withTimeout(HeadlessDuelClient.create(endpoint, { practice: true }), MATCH_TIMEOUT_MS, "creating a practice duel");
+  try {
+    await withTimeout(player.waitForConfirmed(30, DUEL_TIMEOUT_MS), DUEL_TIMEOUT_MS + 1000, "the practice duel's first frames");
+    const stats = player.stats!;
+    if (stats.hashChecks === 0 || stats.desyncs !== 0) throw new Error(`the practice duel's hash checks: ${JSON.stringify(stats)}`);
+    log(`practice duel ${player.code}: frame ${player.duel!.rollback.confirmedFrame} confirmed, ${stats.hashChecks} hash checks, no desync`);
+  } finally {
+    await withTimeout(player.leave(), STOP_TIMEOUT_MS, "leaving the duel").catch(() => undefined);
+  }
+}
+
+/** Stops the server: SIGTERM lets it drain; SIGKILL follows if it does not exit in time. */
+async function stopServer(): Promise<void> {
+  const child = server;
+  if (child === undefined || !running(child)) return;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGTERM");
+  await withTimeout(exited, STOP_TIMEOUT_MS, "server shutdown").catch(async () => {
+    child.kill("SIGKILL");
+    await withTimeout(exited, STOP_TIMEOUT_MS, "killing the server");
+  });
+}
+
+// Last resort for paths that skip `finally`: an exit, or a signal from whoever runs the build.
+process.once("exit", () => {
+  if (server !== undefined && running(server)) server.kill("SIGKILL");
+});
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    console.error(`build smoke: interrupted by ${signal}`);
+    process.exit(1);
+  });
+}
+
+async function main(): Promise<void> {
+  await checkWorkspaceExports();
+  await checkWebBundle();
+  const entry = await readFile(`${root}${SERVER_ENTRY}`, "utf8");
+  if (["TEST_SOURCES", "TEST_TIMINGS", "TEST_FINAL_SECRET", "dev.js", "testSettings.js"].some((marker) => entry.includes(marker))) throw new Error(`${SERVER_ENTRY} reads a test-only setting`);
+  const port = await startServer();
+  const endpoint = `http://localhost:${port}`;
+  log(`${SERVER_ENTRY} listens on port ${port}`);
+  await waitForHealth(endpoint);
+  log("health check answers");
+  await createMatch(endpoint);
+  await openPracticeDuel(endpoint);
+}
+
+let failed = false;
+try {
+  await withTimeout(main(), OVERALL_TIMEOUT_MS, "the build smoke test");
+  log("passed");
+} catch (error) {
+  failed = true;
+  console.error("build smoke: FAILED");
+  console.error(error);
+} finally {
+  await stopServer().catch((error: unknown) => {
+    failed = true;
+    console.error("build smoke: could not stop the server", error);
+  });
+}
+process.exit(failed ? 1 : 0);

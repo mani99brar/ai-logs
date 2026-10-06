@@ -1,0 +1,123 @@
+import { describe, expect, it } from "vitest";
+import { DUEL_COUNTDOWN_FRAMES, DuelMessageType } from "@pirate-sea-race/protocol";
+import { MAX_INPUT_DELAY } from "@pirate-sea-race/simulation/netcode";
+import { DELAY_DECISION_FRAMES, DuelMachine, type DuelMachineOptions } from "./duelMachine.js";
+import { SeaDuelSchema } from "./schema.js";
+
+/** A machine on a sea duel's lobby with two seats, recording what it sends to whom. */
+function machine(start: DuelMachineOptions["start"]) {
+  const sent: { to: string; type: string; frame: number; snapshot: boolean }[] = [];
+  const lobby = new SeaDuelSchema();
+  const duel = new DuelMachine({
+    lobby,
+    seed: 7,
+    start,
+    send: (to, type, message) => sent.push({ to, type, frame: message.frame, snapshot: "snapshot" in message && message.snapshot !== undefined }),
+  });
+  duel.addSeat("a", 0);
+  duel.addSeat("b", 1);
+  duel.beginCountdown();
+  const advance = (frames: number) => {
+    for (let frame = 0; frame < frames; frame++) duel.advance();
+  };
+  return { duel, lobby, sent, advance };
+}
+
+describe("the duel machine's kits (§9)", () => {
+  it("fixes both fighters' kits in the frame-0 state and syncs them in the lobby; the Duelist mirror by default", () => {
+    const send = () => undefined;
+    const mirror = new DuelMachine({ lobby: new SeaDuelSchema(), seed: 7, start: "called", send });
+    expect(mirror.state.fighters.map((fighter) => fighter.kit)).toEqual(["duelist", "duelist"]);
+    const lobby = new SeaDuelSchema();
+    const kitted = new DuelMachine({ lobby, seed: 7, start: "called", send, kits: ["ember", "smoke"] });
+    expect(kitted.state.fighters.map((fighter) => fighter.kit)).toEqual(["ember", "smoke"]);
+    expect(lobby.kits).toBe("ember,smoke");
+    const standalone = new SeaDuelSchema();
+    new DuelMachine({ lobby: standalone, seed: 7, start: "countdown", send });
+    expect(standalone.kits).toBe("duelist,duelist");
+  });
+});
+
+describe("the duel machine", () => {
+  it("counts down, chooses the input delay, then fights on its own when started by the countdown (a duel room)", () => {
+    const { duel, lobby, sent, advance } = machine("countdown");
+    expect(lobby.phase).toBe("countdown");
+    advance(DUEL_COUNTDOWN_FRAMES - DELAY_DECISION_FRAMES);
+    // Nobody answered a probe: the longest delay.
+    expect(lobby.inputDelay).toBe(MAX_INPUT_DELAY);
+    advance(DELAY_DECISION_FRAMES);
+    expect(lobby.phase).toBe("fighting");
+    expect(sent.filter((each) => each.type === DuelMessageType.Frames)).toEqual([
+      { to: "a", type: DuelMessageType.Frames, frame: 0, snapshot: true },
+      { to: "b", type: DuelMessageType.Frames, frame: 0, snapshot: true },
+    ]);
+    expect(sent.filter((each) => each.type === DuelMessageType.Probe).length).toBe(2 * (DUEL_COUNTDOWN_FRAMES / 6));
+    advance(3);
+    expect(duel.state.frame).toBe(3);
+  });
+
+  it("at sea, waits after the countdown without probing until the rules start it, then fights at once", () => {
+    const { duel, lobby, sent, advance } = machine("called");
+    advance(DUEL_COUNTDOWN_FRAMES);
+    expect(lobby.phase).toBe("waiting");
+    const probes = sent.length;
+    advance(60);
+    expect(sent.length).toBe(probes);
+    expect(duel.serverFrame).toBe(0);
+    duel.start();
+    expect(lobby.phase).toBe("fighting");
+    expect(sent.slice(probes).map((each) => [each.to, each.frame, each.snapshot])).toEqual([
+      ["a", 0, true],
+      ["b", 0, true],
+    ]);
+  });
+
+  it("at sea, a start the rules give before the countdown's end begins the fight exactly at its end", () => {
+    const { duel, lobby, advance } = machine("called");
+    advance(DUEL_COUNTDOWN_FRAMES - 1);
+    duel.start();
+    expect(lobby.phase).toBe("countdown");
+    advance(1);
+    expect(lobby.phase).toBe("fighting");
+    expect(lobby.countdown).toBe(0);
+  });
+
+  it("decides forfeits at the next frame boundary: one is the other's win, two on one frame have no winner", () => {
+    const one = machine("countdown");
+    one.advance(DUEL_COUNTDOWN_FRAMES + 10);
+    one.duel.leave("b");
+    expect(one.lobby.phase).toBe("fighting");
+    one.advance(1);
+    expect(one.duel.outcome).toMatchObject({ winner: 0, reason: "forfeit" });
+    expect({ phase: one.lobby.phase, winner: one.lobby.winner, reason: one.lobby.reason }).toEqual({ phase: "over", winner: 0, reason: "forfeit" });
+
+    const both = machine("called");
+    both.advance(20);
+    both.duel.leave("a");
+    both.duel.leave("b");
+    both.advance(1);
+    expect(both.duel.outcome).toMatchObject({ winner: null, reason: "forfeit" });
+    expect(both.lobby.winner).toBe(-1);
+  });
+
+  it("ends from outside (the rules' ready check), once", () => {
+    const { duel, lobby, advance } = machine("called");
+    advance(DUEL_COUNTDOWN_FRAMES);
+    duel.end(null, "cancelled");
+    duel.end(1, "forfeit");
+    duel.start();
+    expect(duel.outcome).toEqual({ winner: null, reason: "cancelled", frame: 0 });
+    expect({ phase: lobby.phase, winner: lobby.winner, reason: lobby.reason }).toEqual({ phase: "over", winner: -1, reason: "cancelled" });
+  });
+
+  it("marks a dropped seat away and sends it a snapshot when it is back", () => {
+    const { duel, lobby, sent, advance } = machine("countdown");
+    advance(DUEL_COUNTDOWN_FRAMES + 30);
+    duel.drop("b");
+    expect([...lobby.seats].find((seat) => seat.sessionId === "b")?.connected).toBe(false);
+    const before = sent.length;
+    duel.reconnect("b");
+    expect([...lobby.seats].find((seat) => seat.sessionId === "b")?.connected).toBe(true);
+    expect(sent.slice(before)).toEqual([{ to: "b", type: DuelMessageType.Frames, frame: 30, snapshot: true }]);
+  });
+});

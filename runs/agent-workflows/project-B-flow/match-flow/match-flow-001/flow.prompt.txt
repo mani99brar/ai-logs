@@ -1,0 +1,109 @@
+You are a workflow worker in your own worktree. A human can type directly into this terminal. Do not launch agents, commit, merge, push or modify shared contracts. Stay within this worktree. Report changed files, checks actually executed, and open assumptions. Completion of a turn is not workflow approval.
+
+# Task: flow
+
+## Goal
+
+Build the match's lifecycle as pure, deterministic rules: the §2 phases from lobby to results, the match timer, how a match ends (a claim, the deadline, everyone leaving, a server fault), and the **results** a player sees at the end: the winner or "no winner", plus each player's exploration and duel accomplishments. These rules decide how a match begins and ends. The wiring feature (`objectives-endgame`) drives them from the room and shows the lobby countdown, the timer and the results screen. This one only builds and proves the rules.
+
+## Context
+
+- Read `docs/spec.md` §2 (the phase table, "Spawn fairness", "Time limits and results": no winner at the deadline, the results screen still shows exploration and duel accomplishments; private tests may start with 2–8 players and are marked custom), §5 (a completed claim freezes all outcomes), §12 ("Server process failure: abort affected match; no winner or competitive penalty"; "If everyone leaves, close the room and mark it abandoned with no winner") and §14 (the match process owns timers and the winner).
+- Read `docs/architecture.md` and the pure modules this one sits beside and must match in style: `packages/simulation/src/claim` (the deadline tick, the `match-ended` event, `MATCH_DURATION_MINUTES`), `packages/simulation/src/encounters` (spawn protection is `SPAWN_PROTECTION_SECONDS` = 45 there), `packages/simulation/src/objectives` (the ledger's events: collections, thefts, gold) and `packages/content/src/rules.ts` (presets, private-match limits).
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build`.
+- Another feature (`rubbings-theft`) runs at the same time and owns `apps`, `tests`, `packages/protocol`, `packages/test-tools` and both packages' `package.json`. You add one subpath export to each `package.json` (below); the operator resolves the merge. Never touch any other path of theirs.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Constraints
+
+- Owned paths only: `packages/simulation/src/match`, `packages/content/src/match`, `docs/match.md`, and `packages/simulation/package.json` and `packages/content/package.json` **only to add one subpath export each** (`@pirate-sea-race/simulation/match`, `@pirate-sea-race/content/match`, following the existing pattern with the `@pirate-sea-race/source` condition first). Don't change their `postbuild` scripts, dependencies, any existing source file, barrel, tsconfig or root file.
+- Don't duplicate other modules' rules. The deadline comes from the claim config (the caller passes the claim's `match-ended` event), and spawn protection is granted by the encounter rules (this module only emits `control-started` at the right tick). Import only content constants, never the other simulation modules' state, so the modules stay decoupled.
+- Pure and integer: no Phaser, Colyseus, DOM, timers, wall-clock time, `Math.random` or floating-point transcendental functions. Time is the world tick (20 per second), supplied by the caller. Durations are named content constants in seconds, converted to ticks.
+- The step is `stepMatch(config, state, input) → { state, events }`. It never mutates its input, and it is idempotent for repeated or stale inputs.
+
+## Design (settled)
+
+- **Phases:** `lobby` → `ready` → `departure` → `exploration` → `ended`.
+  - **`lobby`:** players join and leave. A **public** match needs its full preset (8 seats) to move on; a **private** match can start with 2 to 8 players when the host asks, and is marked `custom` (§2). Late joiners after `lobby` are refused (§2: they wait for another match).
+  - **`ready`:** a 20 s countdown during which clients preload (§2). If a player leaves during `ready`, a private match continues if it still has 2 or more players, and a public one returns to `lobby`.
+  - **`departure`:** starts at **control start**. The module emits `control-started` with the tick, which the caller passes to the claim config and to the encounter rules for the 45 s spawn protection. `departure` lasts 45 s, then becomes `exploration`, with no gameplay change; it's a label for the HUD.
+  - **`exploration`:** runs until the match ends.
+  - **`ended`:** has a reason: `claim` (the caller reports the claim module's winner), `deadline` (the claim module's `match-ended` with no winner), `abandoned` (every player has left, §12: no winner), or `aborted` (the caller reports a server fault, §12: no winner, no competitive penalty). The first end wins, later reports change nothing, and a claim on the deadline tick beats the deadline (§2, as the claim module orders it).
+- **Timer:** `elapsed(state, tick)` and `remaining(state, tick)` count from control start, for a HUD that shows 35:00 counting down. The match timer never pauses (§2).
+- **Results**, built when the match ends:
+  - the reason and the winner (or none);
+  - per player: rubbings collected, thefts made, rubbings lost, duels won, lost and drawn, gold at the end, caches claimed, and islands visited.
+  - The caller feeds these as events during the match (a small typed event union: `collected`, `stole`, `lost`, `duel-ended`, `cache-claimed`, `island-visited`, `gold`), and the module counts them.
+  - Results are deterministic, sorted by a stable order: the winner first, then by rubbings held at the end, then by player id.
+  - A player who left still appears, marked `left`.
+
+## Acceptance
+
+Each item names the test that proves it. Tests live in `packages/simulation/src/match`.
+
+1. **Phases:** scripted tests:
+   - every transition;
+   - public vs private start rules and the `custom` mark;
+   - late joiners refused;
+   - leaving during `ready`;
+   - `control-started` exactly once at the right tick;
+   - `departure` → `exploration` at 45 s.
+2. **Endings:** scripted tests for each reason, including:
+   - a claim on the deadline tick beating the deadline;
+   - an end report after the match already ended changing nothing;
+   - `abandoned` when the last player leaves in any phase after `lobby`;
+   - `aborted` from any phase.
+3. **Timer:** `elapsed` and `remaining` at control start, mid-match and at the deadline, and never negative.
+4. **Results:** a scripted match feeding every event kind produces exact per-player numbers and the stable order, and a player who left is marked.
+5. **Properties:** seeded random sequences of joins, leaves, starts, events and end reports keep the invariants:
+   - the phase only moves forward;
+   - there is at most one end;
+   - the results are built exactly once, at the end;
+   - replaying gives the same `hashState`;
+   - an `EXERCISED` check covers every phase and end reason.
+6. **Content:** the constants (the 20 s ready countdown, the 45 s departure, the private minimum of 2, the public seats from the preset) live in `@pirate-sea-race/content/match` with a zod validator. A content test refuses a ready countdown of 0.
+7. **Docs:** `docs/match.md`, about a page: the phases, the endings, the events, how the caller wires it with the claim and encounter rules, and the results shape.
+8. `npm ci` then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build` pass from a clean checkout, and the purity test covers the new directories.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A check can pass only by changing a path outside the owned paths.
+- After ninety minutes of work, any required check still fails and you cannot name the next fix.
+
+Report `question` only for a choice that would change this acceptance.
+
+Approved ownership and checks:
+{"node_id": "flow", "role": "simulation", "required_check_kinds": ["typecheck", "unit", "integration", "build"], "owned_paths": ["packages/simulation/src/match", "packages/content/src/match", "packages/simulation/package.json", "packages/content/package.json", "docs/match.md"], "checks": [{"id": "typecheck", "kind": "typecheck", "argv": ["npm", "run", "typecheck"], "timeout_seconds": 300, "scenarios": []}, {"id": "unit", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 300, "scenarios": []}, {"id": "integration", "kind": "integration", "argv": ["npm", "run", "test:integration"], "timeout_seconds": 300, "scenarios": []}, {"id": "build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 600, "scenarios": []}]}
+
+Decisions recorded before launch (decisions.md; they bind this run):
+# Decisions: match-flow
+
+From the overnight session of 2026-09-25. The operator is asleep and asked the assistant to decide, record each decision, and use the workflow for the code.
+
+## Decisions
+
+- The match lifecycle is built as pure rules, like the other modules, in parallel with `rubbings-theft`. The endgame wiring drives it.
+- Phases: lobby → ready (20 s preload) → departure (45 s, spawn protection, granted by the encounter rules) → exploration → ended.
+- Private matches start with 2–8 players on the host's request and are marked custom. Public matches need all 8 seats (§2).
+- There are four endings: claim, deadline (no winner), abandoned (everyone left: no winner), and aborted (a server fault: no winner, no penalty). The first end wins.
+- The results show the winner or "no winner" plus per-player accomplishments, so a timeout still feels like a finished match (§2).
+- The module doesn't duplicate the claim deadline or spawn protection. It emits `control-started`, and the other modules own their rules.
+
+## Assumptions
+
+- The per-player stats are fed as events by the caller, and the module only counts them.
+
+## Deferred
+
+- The lobby UI, the timer HUD, the results screen and the room wiring: `objectives-endgame`.
+- Public matchmaking and the queue (§2's public lobby): after stage 2.
+
+
+AUTOMATIC MODE: permission checks are bypassed and Bash is available. Do not wait for a human handoff. Stay within assigned ownership; do not commit, merge, push, launch agents, change runtime evidence or switch billing/provider. On completion write the following JSON shape atomically (temporary file then rename) to /home/agentops/.local/state/agent-workflows/project-B-flow/match-flow/match-flow-001/flow.completion.json. This one output file is allowed outside your worktree. Use status blocked if you cannot finish; never manufacture checks. Write it as your last action, then finish your turn and do not modify more files. Controller checks and independent review still determine acceptance.
+{"version": "1.1.0", "run_id": "match-flow-001", "node_id": "flow", "launch_token": "aa27b493-810e-4828-90fb-4701eb48ef0a", "status": "completed", "summary": "Describe actual work and checks executed", "open_assumptions": [], "untested": ["A behaviour no executed check covers"], "falsifying_check": "The check id (or exact command) that would fail if this were wrong", "verify_yourself": "One assumption the operator should verify independently", "question": null}
+Completion 1.1.0 evidence: for status completed, untested lists the behaviours no executed check covers (it may be empty), falsifying_check names the check that would fail if your implementation were wrong (a check id from your approved checks, or the exact command), verify_yourself names one assumption the operator should verify independently, and question is null; a completed file without them is refused. The commands you ran are not evidence by themselves: the controller reruns the checks.
+Questions: when a decision you cannot make yourself blocks the work, write the same file with status question, the question text in question (the evidence fields may be empty) and end your turn; the controller pauses your deadline and the operator's answer arrives in this terminal. Then continue and finish with a new completion file. At most 3 questions for this lane: after the third, decide yourself and record an open assumption; a fourth question is treated as blocked.
+Stop (from your task, the bound on this work): Report `blocked` instead of continuing when any of these happens: - `npm ci` or an install fails twice for reasons outside the repository (registry, network). - A check can pass only by changing a path outside the owned paths. - After ninety minutes of work, any required check still fails and you cannot name the next fix. Report `question` only for a choice that would change this acceptance. Approved ownership and checks: {"node_id": "flow", "role": "simulation", "required_check_kinds": ["typecheck", "unit", "integration", "build"], "owned_paths": ["packages/simulation/src/match", "packages/content/src/match", "packages/simulation/package.json", "packages/content/package.json", "docs/match.md"], "checks": [{"id": "typecheck", "kind": "typecheck", "argv": ["npm", "run", "typecheck"], "timeout_seconds": 300, "scenarios": []}, {"id": "unit", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 300, "scenarios": []}, {"id": "integration", "kind": "integration", "argv": ["npm", "run", "test:integration"], "timeout_seconds": 300, "scenarios": []}, {"id": "build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 600, "scenarios": []}]}

@@ -1,0 +1,52 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { dockCentre, nearestDockBySea, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { cacheRubbings, objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { ImpairmentProxy, type HeadlessClient } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, HOST_SEAT, ledgerOf, ledgerPlayer, tuned } from "./rubbingsSetup.js";
+import { collectAt, dockFor, playersAt, roomOf, tracker, until } from "./seaDuelSetup.js";
+
+/**
+ * Colyseus' reconnection window is only an outer bound (§12): here (test-only) it is 1 s against a 30 s seat, so it
+ * closes first, and the room handles that as a quit. Its own file, since one matchmaker per process means one set of
+ * timings per file.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  server = await startGameServer({
+    port: 0,
+    host: "127.0.0.1",
+    handleSignals: false,
+    testPlacement: true,
+    matchTuning: tuned({ objectives: { ...objectiveRules, collectTicks: 20, seatReservationTicks: 600 }, reconnectionSeconds: 1 }),
+  });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+describe("Colyseus' outer bound (§12)", () => {
+  it("treats Colyseus' reconnection window closing before the seat's deadline as a quit", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    const [watcher, leaver] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { endpoints: [endpoint, proxy.endpoint] })) as [HeadlessClient, HeadlessClient];
+    await collectAt(leaver, endpoint, dockFor("moon"), "moon");
+    await leaver.placeShip(endpoint, GUEST_SEAT);
+    proxy.sever({ refuse: true });
+    await until(() => ledgerPlayer(watcher, leaver.sessionId)?.status === "disconnected", 3000, "the disconnect");
+    const deadline = ledgerPlayer(watcher, leaver.sessionId)!.reservationDeadline!;
+    const ship = roomOf(watcher).matchState.ships.find((each) => each.id === leaver.sessionId)!;
+    await until(() => ledgerPlayer(watcher, leaver.sessionId)?.status === "left", 5000, "the window closing");
+    const ledger = ledgerOf(watcher);
+    // Long before the deadline, and as a quit: the cache is at the dock nearest the ship by sea.
+    expect(ledger.caches[0]!.createdTick).toBeLessThan(deadline - 400);
+    expect({ x: ledger.caches[0]!.x, y: ledger.caches[0]!.y }).toEqual(dockCentre(seaMap, nearestDockBySea(seaMap, ship.x, ship.y)));
+    expect(cacheRubbings(ledger, ledger.caches[0]!.id).map((rubbing) => rubbing.type)).toEqual(["moon"]);
+    await watcher.waitFor(() => watcher.ship(leaver.sessionId) === undefined, 2000);
+  }, 30_000);
+});

@@ -1,0 +1,79 @@
+import Fastify from 'fastify'
+import { lstat, readdir } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { join, resolve } from 'node:path'
+
+export type Source = 'Pi' | 'Claude'
+export type EntryKind = 'directory' | 'file'
+export type Entry = { source: Source; path: string; kind: EntryKind }
+
+const sources: ReadonlyArray<{ source: Source; directory: string }> = [
+  { source: 'Pi', directory: 'pi' },
+  { source: 'Claude', directory: 'claude' },
+]
+
+/** Fixture root bundled with the repository, resolved from this module rather than the shell's working directory. */
+export const bundledFixtureRoot = fileURLToPath(new URL('../fixtures/', import.meta.url))
+
+/** The root actually used: MD_MANAGER_FIXTURE_ROOT when set (must contain pi/ and claude/), otherwise the bundled fixtures. */
+export function defaultFixtureRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.MD_MANAGER_FIXTURE_ROOT?.trim()
+  return override ? resolve(override) : bundledFixtureRoot
+}
+
+export const listingErrorMessage =
+  'Unable to list the Pi and Claude folders. Check that both fixture folders exist and are readable, then refresh.'
+
+const collator = new Intl.Collator('en', { numeric: true, sensitivity: 'base' })
+export function compareNames(a: string, b: string): number {
+  return collator.compare(a, b) || (a < b ? -1 : a > b ? 1 : 0)
+}
+
+function isMarkdown(name: string): boolean {
+  return name.toLowerCase().endsWith('.md')
+}
+
+/**
+ * Lists every directory and Markdown file under fixtures/pi and fixtures/claude as one flat, deterministic list.
+ * Symlinks are never followed (readdir Dirents report them as neither file nor directory), so listings cannot escape the root.
+ * Only names are read; file contents are never opened.
+ */
+export async function listEntries(root = defaultFixtureRoot()): Promise<Entry[]> {
+  const entries: Entry[] = []
+  async function walk(directory: string, source: Source, prefix: string) {
+    const children = await readdir(directory, { withFileTypes: true })
+    children.sort((a, b) => compareNames(a.name, b.name))
+    for (const child of children) {
+      if (child.isSymbolicLink()) continue
+      const path = prefix ? `${prefix}/${child.name}` : child.name
+      if (child.isDirectory()) {
+        entries.push({ source, path, kind: 'directory' })
+        await walk(join(directory, child.name), source, path)
+      } else if (child.isFile() && isMarkdown(child.name)) {
+        entries.push({ source, path, kind: 'file' })
+      }
+    }
+  }
+  for (const { source, directory } of sources) {
+    const sourceRoot = join(root, directory)
+    // lstat (not stat) so a symlinked source directory is rejected instead of followed.
+    const stats = await lstat(sourceRoot)
+    if (!stats.isDirectory()) throw new Error(`${source} source is not a directory`)
+    await walk(sourceRoot, source, '')
+  }
+  return entries
+}
+
+export function createApp(root = defaultFixtureRoot()) {
+  const app = Fastify({ logger: true })
+  // The route accepts no parameters: query strings and bodies are ignored, so nothing can change the root or pick a path.
+  app.get('/api/entries', async (_request, reply) => {
+    try {
+      return { entries: await listEntries(root) }
+    } catch (error) {
+      app.log.error(error, 'Fixture listing failed')
+      return reply.code(500).send({ error: listingErrorMessage })
+    }
+  })
+  return app
+}

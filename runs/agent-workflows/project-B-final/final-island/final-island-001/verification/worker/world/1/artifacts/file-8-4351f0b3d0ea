@@ -1,0 +1,259 @@
+import { z } from "zod";
+import { formatIssues, type ValidationResult } from "./rules.js";
+import {
+  COMPASS,
+  ISLAND_THEMES,
+  Terrain,
+  TERRAIN_CHARS,
+  type FinalSocket,
+  type IslandSource,
+  type SeaMapSource,
+  type SpawnSlot,
+  type TilePoint,
+} from "./seaMap.js";
+
+/**
+ * The subset of Tiled's JSON map format (`.tmj`) that sea maps use. Anything outside it is refused, so a map that
+ * relies on a feature the converter ignores cannot slip through.
+ *
+ * - An orthogonal, finite map of 24 × 24 pixel tiles (the size the game draws them at).
+ * - One embedded tileset with `firstgid` 1 whose tiles each carry a `type` naming their terrain: `sea`, `land`,
+ *   `shoal` or `dock`.
+ * - A tile layer named `terrain` with its data as a plain array of global tile ids (Tiled's CSV encoding), no empty
+ *   cells and no flip flags.
+ * - An object layer named `objects` holding:
+ *   - one rectangle of type `island` per island, named, with a string property `theme` (`tropical`, `volcanic`,
+ *     `ruin` or `mist`), on tile boundaries, covering the island's land and docks;
+ *   - one point of type `spawn` per spawn slot, with an int property `slot` (0 upwards, no gaps) and a string
+ *     property `facing` (a compass direction such as `NE`);
+ *   - exactly one point of type `hub`, without properties: the shared crossing near the centre that every route
+ *     between islands passes (`validateSeaMap` checks it);
+ *   - one rectangle of type `final-socket` per hidden final-island socket (§3), on tile boundaries, covering the islet's
+ *     land (no docks), with int properties `claimX` and `claimY`: the claim tile, a sea tile beside the islet whose
+ *     centre is the §5 claim point. Its name is free. Nothing in the map says which socket a match picks.
+ *
+ * Other layers, properties and object types are errors. Tiled keeps extra editor fields (`version`, `nextobjectid`,
+ * `editorsettings` and so on); the schema ignores those.
+ */
+export const TILE_PIXELS = 24;
+
+const TERRAIN_TYPES = { sea: Terrain.Sea, land: Terrain.Land, shoal: Terrain.Shoal, dock: Terrain.Dock } as const;
+
+const propertySchema = z.discriminatedUnion("type", [
+  z.object({ name: z.string(), type: z.literal("string"), value: z.string() }),
+  z.object({ name: z.string(), type: z.literal("int"), value: z.int() }),
+]);
+
+const tilesetSchema = z.object({
+  firstgid: z.literal(1),
+  name: z.string(),
+  tilewidth: z.literal(TILE_PIXELS),
+  tileheight: z.literal(TILE_PIXELS),
+  tilecount: z.int().positive(),
+  tiles: z.array(z.object({ id: z.int().nonnegative(), type: z.enum(["sea", "land", "shoal", "dock"]) })),
+});
+
+const tileLayerSchema = z.object({
+  type: z.literal("tilelayer"),
+  name: z.literal("terrain"),
+  width: z.int().positive(),
+  height: z.int().positive(),
+  x: z.literal(0),
+  y: z.literal(0),
+  encoding: z.literal("csv").optional(),
+  compression: z.undefined().optional(),
+  data: z.array(z.int().positive()),
+});
+
+const objectSchema = z.object({
+  id: z.int(),
+  name: z.string(),
+  type: z.enum(["island", "spawn", "hub", "final-socket"]),
+  x: z.number(),
+  y: z.number(),
+  width: z.number().nonnegative(),
+  height: z.number().nonnegative(),
+  rotation: z.literal(0).optional(),
+  point: z.boolean().optional(),
+  properties: z.array(propertySchema).optional(),
+});
+
+const objectLayerSchema = z.object({
+  type: z.literal("objectgroup"),
+  name: z.literal("objects"),
+  objects: z.array(objectSchema),
+});
+
+export const tiledMapSchema = z.object({
+  type: z.literal("map"),
+  orientation: z.literal("orthogonal"),
+  infinite: z.literal(false),
+  width: z.int().positive(),
+  height: z.int().positive(),
+  tilewidth: z.literal(TILE_PIXELS),
+  tileheight: z.literal(TILE_PIXELS),
+  tilesets: z.tuple([tilesetSchema]),
+  layers: z.tuple([tileLayerSchema, objectLayerSchema]),
+});
+
+export type TiledMap = z.infer<typeof tiledMapSchema>;
+type TiledObject = z.infer<typeof objectSchema>;
+
+const CHAR_BY_TERRAIN: Readonly<Record<Terrain, string>> = Object.fromEntries(
+  Object.entries(TERRAIN_CHARS).map(([char, kind]) => [kind, char]),
+) as Record<Terrain, string>;
+
+const OBJECT_PROPERTIES: Readonly<Record<TiledObject["type"], readonly string[]>> = {
+  island: ["theme"],
+  spawn: ["slot", "facing"],
+  hub: [],
+  "final-socket": ["claimX", "claimY"],
+};
+
+function property(object: TiledObject, name: string): string | number | undefined {
+  return object.properties?.find((entry) => entry.name === name)?.value;
+}
+
+/** Converts a parsed `.tmj` into the map source the content module holds. Refuses anything outside the subset. */
+export function convertTiledMap(name: string, candidate: unknown): ValidationResult<SeaMapSource> {
+  const parsed = tiledMapSchema.safeParse(candidate);
+  if (!parsed.success) return { ok: false, issues: formatIssues(parsed.error) };
+  const map = parsed.data;
+  const [tileset] = map.tilesets;
+  const [terrainLayer, objectLayer] = map.layers;
+  const issues: string[] = [];
+
+  const terrainByGid = new Map<number, Terrain>();
+  for (const tile of tileset.tiles) {
+    if (tile.id >= tileset.tilecount) issues.push(`tileset: tile ${tile.id} is beyond its ${tileset.tilecount} tiles`);
+    terrainByGid.set(tileset.firstgid + tile.id, TERRAIN_TYPES[tile.type]);
+  }
+  if (terrainLayer.width !== map.width || terrainLayer.height !== map.height) {
+    issues.push(`terrain: layer is ${terrainLayer.width} × ${terrainLayer.height}, map is ${map.width} × ${map.height}`);
+  }
+  if (terrainLayer.data.length !== map.width * map.height) {
+    issues.push(`terrain: ${terrainLayer.data.length} tiles for a ${map.width} × ${map.height} map`);
+  }
+  const rows: string[] = [];
+  for (let tileY = 0; tileY < map.height && issues.length === 0; tileY++) {
+    let row = "";
+    for (let tileX = 0; tileX < map.width; tileX++) {
+      const gid = terrainLayer.data[tileY * map.width + tileX]!;
+      const kind = terrainByGid.get(gid);
+      if (kind === undefined) {
+        issues.push(`terrain: tile ${tileX},${tileY} has gid ${gid}, which has no terrain type`);
+        break;
+      }
+      row += CHAR_BY_TERRAIN[kind];
+    }
+    rows.push(row);
+  }
+
+  const islands: IslandSource[] = [];
+  const spawns: { slot: number; spawn: SpawnSlot }[] = [];
+  const hubs: TilePoint[] = [];
+  const finalSockets: FinalSocket[] = [];
+  for (const object of objectLayer.objects) {
+    const where = `object ${object.id} (${object.type} "${object.name}")`;
+    const allowed = OBJECT_PROPERTIES[object.type];
+    for (const entry of object.properties ?? []) {
+      if (!allowed.includes(entry.name)) issues.push(`${where}: unknown property "${entry.name}"`);
+    }
+    const onGrid = [object.x, object.y, object.width, object.height].every((value) => Number.isInteger(value / TILE_PIXELS));
+    const rectangle = object.point !== true && onGrid && object.width > 0 && object.height > 0;
+    if (object.type === "final-socket") {
+      const claimX = property(object, "claimX");
+      const claimY = property(object, "claimY");
+      if (!rectangle) issues.push(`${where}: a final socket is a rectangle on tile boundaries`);
+      else if (typeof claimX !== "number" || typeof claimY !== "number") issues.push(`${where}: claimX and claimY must be ints`);
+      else {
+        finalSockets.push({
+          rect: { tileX: object.x / TILE_PIXELS, tileY: object.y / TILE_PIXELS, widthTiles: object.width / TILE_PIXELS, heightTiles: object.height / TILE_PIXELS },
+          claimTile: { tileX: claimX, tileY: claimY },
+        });
+      }
+      continue;
+    }
+    if (object.type === "island") {
+      const theme = property(object, "theme");
+      if (!rectangle) {
+        issues.push(`${where}: an island is a rectangle on tile boundaries`);
+      } else if (object.name === "") {
+        issues.push(`${where}: an island needs a name`);
+      } else if (!ISLAND_THEMES.includes(theme as never)) {
+        issues.push(`${where}: theme must be one of ${ISLAND_THEMES.join(", ")}`);
+      } else {
+        islands.push({
+          name: object.name,
+          theme: theme as IslandSource["theme"],
+          tileX: object.x / TILE_PIXELS,
+          tileY: object.y / TILE_PIXELS,
+          widthTiles: object.width / TILE_PIXELS,
+          heightTiles: object.height / TILE_PIXELS,
+        });
+      }
+      continue;
+    }
+    if (object.type === "hub") {
+      if (object.point !== true) issues.push(`${where}: a hub is a point`);
+      else hubs.push({ tileX: Math.floor(object.x / TILE_PIXELS), tileY: Math.floor(object.y / TILE_PIXELS) });
+      continue;
+    }
+    const slot = property(object, "slot");
+    const facing = property(object, "facing");
+    if (object.point !== true) issues.push(`${where}: a spawn is a point`);
+    else if (typeof slot !== "number" || slot < 0) issues.push(`${where}: slot must be a non-negative int`);
+    else if (!COMPASS.includes(facing as never)) issues.push(`${where}: facing must be one of ${COMPASS.join(", ")}`);
+    else {
+      spawns.push({
+        slot,
+        spawn: { tileX: Math.floor(object.x / TILE_PIXELS), tileY: Math.floor(object.y / TILE_PIXELS), facing: facing as SpawnSlot["facing"] },
+      });
+    }
+  }
+  spawns.sort((a, b) => a.slot - b.slot);
+  // Checked only when every spawn object was readable, so one bad object reports once.
+  if (issues.length === 0 && spawns.some((entry, index) => entry.slot !== index)) {
+    issues.push(`spawns: slots must run 0, 1, 2… without gaps or repeats (found ${spawns.map((entry) => entry.slot).join(", ")})`);
+  }
+  if (issues.length === 0 && hubs.length !== 1) issues.push(`objects: ${hubs.length} hub points, not one`);
+  if (issues.length > 0) return { ok: false, issues };
+  return {
+    ok: true,
+    value: { name, widthTiles: map.width, heightTiles: map.height, rows, islands, spawnSlots: spawns.map((entry) => entry.spawn), hub: hubs[0]!, finalSockets },
+  };
+}
+
+/** The TypeScript module `scripts/build-map.ts` writes for a converted map. Deterministic, so a drift test can compare. */
+export function formatSeaMapModule(source: SeaMapSource, exportName: string, sourcePath: string): string {
+  const island = (entry: IslandSource) =>
+    `    { name: ${JSON.stringify(entry.name)}, theme: ${JSON.stringify(entry.theme)}, tileX: ${entry.tileX}, tileY: ${entry.tileY}, widthTiles: ${entry.widthTiles}, heightTiles: ${entry.heightTiles} },`;
+  const socket = ({ rect, claimTile }: FinalSocket) =>
+    `    { rect: { tileX: ${rect.tileX}, tileY: ${rect.tileY}, widthTiles: ${rect.widthTiles}, heightTiles: ${rect.heightTiles} }, claimTile: { tileX: ${claimTile.tileX}, tileY: ${claimTile.tileY} } },`;
+  const spawn = (entry: SpawnSlot) => `    { tileX: ${entry.tileX}, tileY: ${entry.tileY}, facing: ${JSON.stringify(entry.facing)} },`;
+  return [
+    `// Generated by scripts/build-map.ts from ${sourcePath}. Do not edit: change the map in Tiled, then run`,
+    "// `npm run map:build`. A unit test fails when this file is out of date with the map.",
+    'import type { SeaMapSource } from "../seaMap.js";',
+    "",
+    `export const ${exportName}: SeaMapSource = {`,
+    `  name: ${JSON.stringify(source.name)},`,
+    `  widthTiles: ${source.widthTiles},`,
+    `  heightTiles: ${source.heightTiles},`,
+    "  rows: [",
+    ...source.rows.map((row) => `    ${JSON.stringify(row)},`),
+    "  ],",
+    "  islands: [",
+    ...source.islands.map(island),
+    "  ],",
+    "  spawnSlots: [",
+    ...source.spawnSlots.map(spawn),
+    "  ],",
+    `  hub: { tileX: ${source.hub.tileX}, tileY: ${source.hub.tileY} },`,
+    "  finalSockets: [",
+    ...(source.finalSockets ?? []).map(socket),
+    "  ],",
+    "};",
+    "",
+  ].join("\n");
+}

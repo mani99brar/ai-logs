@@ -1,0 +1,242 @@
+import {
+  GOLD_GRANT_REASONS,
+  grantAmount,
+  itemPrice,
+  SHOP_ITEMS,
+  type GoldGrantReason,
+  type ShopItem,
+} from "@pirate-sea-race/content/objectives";
+import {
+  atTick,
+  isPlayerId,
+  playerRejection,
+  tickRejection,
+  updatePlayer,
+  type LedgerRejection,
+  type LedgerStep,
+} from "./internal.js";
+import {
+  activeDuelOf,
+  findPlayer,
+  MAX_RECORDED_REFUSALS,
+  type GoldGrant,
+  type LedgerPlayer,
+  type LedgerState,
+  type PurchaseOutcome,
+  type PurchaseRecord,
+  type RecordedRefusal,
+  type RefusalRecord,
+} from "./state.js";
+
+function isKey(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function playerOf(state: LedgerState, playerId: unknown): LedgerPlayer | null {
+  return typeof playerId === "string" ? (findPlayer(state, playerId) ?? null) : null;
+}
+
+export interface GrantResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The grant made, or for a `duplicate` or `already-claimed` request the earlier grant that holds the key. */
+  readonly grant: GoldGrant | null;
+  /** The player as they now stand, or null for an unknown player. */
+  readonly player: LedgerPlayer | null;
+}
+
+export interface GrantGoldRequest {
+  readonly playerId: string;
+  readonly reason: GoldGrantReason;
+  /** For `ruin`, the ruin's key `String(island)`; for `supply-cache`, one of the ledger's `supplyCaches`. */
+  readonly sourceKey: string;
+  readonly tick: number;
+}
+
+/** Whether the ledger knows the grant's key: a ruin on one of its sources' islands, or one of its supply caches. */
+export function knownGrantKey(state: LedgerState, reason: GoldGrantReason, sourceKey: string): boolean {
+  if (reason === "supply-cache") return state.supplyCaches.includes(sourceKey);
+  return state.sources.some((source) => String(source.island) === sourceKey);
+}
+
+/** The earlier grant holding this request's key: the same player's for a ruin, anybody's for a supply cache. */
+function grantHolding(state: LedgerState, reason: GoldGrantReason, sourceKey: string, playerId: string): GoldGrant | undefined {
+  return state.grants.find(
+    (grant) => grant.reason === reason && grant.sourceKey === sourceKey && (reason === "supply-cache" || grant.playerId === playerId),
+  );
+}
+
+/**
+ * §11's minted gold: a fresh ruin completion (once per player per ruin) or a supply cache (one global claim). The
+ * amount comes from the rules, and `goldIssued` grows by it. A key the ledger does not know is an `unknown-source`, so
+ * no caller can mint by inventing keys. A repeat of the same player's key is a `duplicate`; a supply cache someone
+ * else already claimed is `already-claimed`. A player who left gets nothing.
+ */
+export function grantGold(state: LedgerState, request: GrantGoldRequest): LedgerStep<GrantResult> {
+  const { playerId, reason, sourceKey, tick } = request;
+  const rejected = (rejection: LedgerRejection, grant: GoldGrant | null = null): LedgerStep<GrantResult> => ({
+    state,
+    result: { ok: false, rejection, grant, player: playerOf(state, playerId) },
+  });
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(bad);
+  if (!GOLD_GRANT_REASONS.includes(reason) || !isKey(sourceKey)) return rejected("invalid-request");
+  if (!knownGrantKey(state, reason, sourceKey)) return rejected("unknown-source");
+  const refusal = playerRejection(state, playerId);
+  if (refusal) return rejected(refusal);
+  const earlier = grantHolding(state, reason, sourceKey, playerId);
+  if (earlier) return rejected(earlier.playerId === playerId ? "duplicate" : "already-claimed", earlier);
+  const amount = grantAmount(state.rules, reason);
+  const grant: GoldGrant = { reason, sourceKey, playerId, amount, tick };
+  const next = updatePlayer(
+    { ...atTick(state, tick), grants: [...state.grants, grant], goldIssued: state.goldIssued + amount },
+    playerId,
+    (player) => ({ ...player, gold: player.gold + amount }),
+  );
+  return { state: next, result: { ok: true, rejection: null, grant, player: findPlayer(next, playerId) ?? null } };
+}
+
+export interface PurchaseResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The purchase: the one just made, or the original one for a repeated request. */
+  readonly purchase: PurchaseRecord | null;
+  /** The refusal kept for this request: the one just decided, or the original one for a repeated request. */
+  readonly refusal: RefusalRecord | null;
+  /** This player already used the request id: the original outcome, and nothing was charged or kept again. */
+  readonly replayed: boolean;
+}
+
+export interface PurchaseRequest {
+  /** Unique per player in the match; a retry of the same purchase reuses it. Another player's ids never interfere. */
+  readonly requestId: string;
+  readonly playerId: string;
+  readonly item: ShopItem;
+  readonly tick: number;
+}
+
+function sameRequest(outcome: PurchaseOutcome, playerId: string, requestId: string): boolean {
+  return outcome.playerId === playerId && outcome.requestId === requestId;
+}
+
+/** Keeps a refusal, dropping the player's oldest kept refusal when they already have `MAX_RECORDED_REFUSALS`. */
+function keepRefusal(state: LedgerState, refusal: RefusalRecord): LedgerState {
+  const kept = state.requests.filter((outcome) => outcome.kind === "refusal" && outcome.playerId === refusal.playerId);
+  const evicted = kept.length >= MAX_RECORDED_REFUSALS ? kept[0] : undefined;
+  const requests = state.requests.filter((outcome) => outcome !== evicted);
+  return { ...atTick(state, refusal.tick), requests: [...requests, refusal] };
+}
+
+/**
+ * A dockside purchase (§11), at the rules' price. The gold is spent: it leaves the buyer's balance for `goldSpent`.
+ * A tonic goes into the buyer's carried count; a rumor is delivered by the caller after an applied purchase.
+ *
+ * Request ids are per player. A (player, request id) already decided returns the original outcome, purchase or
+ * refusal, with `replayed` and the same state, whatever the tick, so a retry never pays twice and never buys what was
+ * refused; reused for another item, it is a `duplicate`. A decision to refuse (gold short, the carry limit, a duel,
+ * a disconnect) is kept, charging nothing, up to `MAX_RECORDED_REFUSALS` per player (oldest dropped first; a
+ * dropped id is decided afresh). Malformed, stale, unknown-player and left-player requests change nothing.
+ */
+export function purchase(state: LedgerState, request: PurchaseRequest): LedgerStep<PurchaseResult> {
+  const { requestId, playerId, item, tick } = request;
+  const rejected = (rejection: LedgerRejection): LedgerStep<PurchaseResult> => ({
+    state,
+    result: { ok: false, rejection, purchase: null, refusal: null, replayed: false },
+  });
+  if (!isKey(requestId) || !isPlayerId(playerId) || !SHOP_ITEMS.includes(item)) return rejected("invalid-request");
+  const original = state.requests.find((outcome) => sameRequest(outcome, playerId, requestId));
+  if (original) {
+    if (original.item !== item) return rejected("duplicate");
+    const result: PurchaseResult =
+      original.kind === "purchase"
+        ? { ok: true, rejection: null, purchase: original, refusal: null, replayed: true }
+        : { ok: false, rejection: original.rejection, purchase: null, refusal: original, replayed: true };
+    return { state, result };
+  }
+  const bad = tickRejection(state, tick) ?? playerRejection(state, playerId);
+  if (bad) return rejected(bad);
+  const buyer = findPlayer(state, playerId)!;
+  const price = itemPrice(state.rules, item);
+  const decided: RecordedRefusal | null =
+    buyer.status === "disconnected"
+      ? "player-disconnected"
+      : activeDuelOf(state, playerId)
+        ? "player-in-duel"
+        : item === "tonic" && buyer.tonics >= state.rules.tonicCarryLimit
+          ? "tonic-limit"
+          : buyer.gold < price
+            ? "insufficient-gold"
+            : null;
+  if (decided !== null) {
+    const refusal: RefusalRecord = { kind: "refusal", requestId, playerId, item, tick, rejection: decided };
+    return { state: keepRefusal(state, refusal), result: { ok: false, rejection: decided, purchase: null, refusal, replayed: false } };
+  }
+  const record: PurchaseRecord = {
+    kind: "purchase",
+    requestId,
+    playerId,
+    item,
+    price,
+    tick,
+    goldAfter: buyer.gold - price,
+    tonicsAfter: item === "tonic" ? buyer.tonics + 1 : buyer.tonics,
+  };
+  const next = updatePlayer(
+    { ...atTick(state, tick), requests: [...state.requests, record], goldSpent: state.goldSpent + price },
+    playerId,
+    (player) => ({ ...player, gold: record.goldAfter, tonics: record.tonicsAfter }),
+  );
+  return { state: next, result: { ok: true, rejection: null, purchase: record, refusal: null, replayed: false } };
+}
+
+export interface TonicResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The player as they now stand, or null for an unknown player. */
+  readonly player: LedgerPlayer | null;
+}
+
+export interface UseTonicRequest {
+  readonly playerId: string;
+  readonly tick: number;
+  /** The player is sailing, not on an island or in a dock interaction. */
+  readonly atSea: boolean;
+  /** The player is being grappled right now (the world knows; the ledger does not). */
+  readonly grappled: boolean;
+}
+
+/** Whether a player's sail tonic is active at `tick`; the sailing code applies its speed bonus (§11). */
+export function activeTonic(state: LedgerState, playerId: string, tick: number): boolean {
+  const effect = findPlayer(state, playerId)?.tonicEffect ?? null;
+  return effect !== null && effect.startTick <= tick && tick < effect.endTick;
+}
+
+/**
+ * Activates one carried tonic at `tick` for `tonicTicks` (§11): active on ticks `tick` to `tick + tonicTicks - 1`.
+ * Refused while one is active (they never stack), in a duel, while disconnected, grappled or not at sea.
+ */
+export function useTonic(state: LedgerState, request: UseTonicRequest): LedgerStep<TonicResult> {
+  const { playerId, tick, atSea, grappled } = request;
+  const rejected = (rejection: LedgerRejection): LedgerStep<TonicResult> => ({
+    state,
+    result: { ok: false, rejection, player: playerOf(state, playerId) },
+  });
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(bad);
+  if (typeof atSea !== "boolean" || typeof grappled !== "boolean") return rejected("invalid-request");
+  const refusal = playerRejection(state, playerId);
+  if (refusal) return rejected(refusal);
+  const player = findPlayer(state, playerId)!;
+  if (player.status === "disconnected") return rejected("player-disconnected");
+  if (activeDuelOf(state, playerId)) return rejected("player-in-duel");
+  if (grappled) return rejected("grappled");
+  if (!atSea) return rejected("not-at-sea");
+  if (player.tonics === 0) return rejected("no-tonic");
+  if (activeTonic(state, playerId, tick)) return rejected("tonic-active");
+  const next = updatePlayer(atTick(state, tick), playerId, (current) => ({
+    ...current,
+    tonics: current.tonics - 1,
+    tonicEffect: { startTick: tick, endTick: tick + state.rules.tonicTicks },
+  }));
+  return { state: next, result: { ok: true, rejection: null, player: findPlayer(next, playerId) ?? null } };
+}

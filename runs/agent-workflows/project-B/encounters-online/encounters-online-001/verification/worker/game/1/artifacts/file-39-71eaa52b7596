@@ -1,0 +1,108 @@
+import { expect } from "vitest";
+import { duelInput as I } from "@pirate-sea-race/simulation/duel";
+import type { DuelFrameBundle } from "@pirate-sea-race/protocol";
+import { logFromBundles, type DuelScript, type HeadlessDuelClient } from "@pirate-sea-race/test-tools";
+
+/**
+ * The impairment harness (§19 "Network and performance targets"), shared by the standalone duel room's run
+ * (`duelHarness.test.ts`) and the duel inside a match room (`seaDuelHarness.test.ts`): two headless duel clients,
+ * running the same rollback core as the browser, fight a scripted duel through a proxy that delays, jitters and loses
+ * messages the way a WebSocket over TCP suffers them. Each scenario must show:
+ *
+ * - zero desyncs: at every bundle's frame (a snapshot or a hash every 50 ms) each client hashes its own simulated
+ *   state, before restoring anything, and compares it with the server's;
+ * - zero input messages dropped by the server's rate cap;
+ * - corrections within the threshold: at most one per change of the opponent's input the server applied, plus one
+ *   per own input the server had to substitute, and never more than CORRECTIONS_PER_SECOND on average.
+ *
+ * The counts are printed and attached to the test as annotations.
+ */
+export const CORRECTIONS_PER_SECOND = 8;
+/** Frames of scripted play (eight seconds); both clients must then confirm SETTLE_FRAMES more. */
+export const PLAY_FRAMES = 480;
+export const SETTLE_FRAMES = 60;
+
+const R = I("right");
+const L = I("left");
+const D = I("down");
+const U = I("up");
+const J = I("light");
+const K = I("heavy");
+
+/**
+ * Player one walks in, then cycles through a tapped jab, a held heavy, a throw pressed with rollover (K a frame after
+ * J), backing off, a low sweep, and a jab timed to trade with player two's.
+ */
+export const attacker: DuelScript = (frame) => {
+  if (frame < 40) return R;
+  const beat = (frame - 40) % 180;
+  if (beat === 10) return J;
+  if (beat >= 30 && beat < 34) return K;
+  if (beat === 60) return J;
+  if (beat > 60 && beat < 65) return J | K;
+  if (beat >= 100 && beat < 120) return L;
+  if (beat >= 120 && beat < 126) return R;
+  if (beat >= 126 && beat < 128) return D | K;
+  if (beat >= 150 && beat < 153) return J;
+  if (beat >= 153) return R;
+  return 0;
+};
+
+/** Player two guards standing and crouching, punishes with a jab, throws, jumps, and jabs into player one's jab. */
+export const defender: DuelScript = (frame) => {
+  if (frame < 40) return 0;
+  const beat = (frame - 40) % 180;
+  if (beat < 30) return R;
+  if (beat === 41) return J;
+  if (beat >= 60 && beat < 63) return R;
+  if (beat === 80) return J;
+  if (beat > 80 && beat < 85) return J | K;
+  if (beat === 90) return U;
+  if (beat >= 100 && beat < 130) return D | R;
+  if (beat === 130 || beat === 150) return J;
+  return 0;
+};
+
+export interface ScenarioReport {
+  readonly scenario: string;
+  readonly inputDelay: number;
+  readonly corrections: [number, number];
+  readonly correctionBound: [number, number];
+  readonly substituted: [number, number];
+  readonly hashChecks: [number, number];
+  readonly desyncs: [number, number];
+  readonly deepestReplay: [number, number];
+  readonly rateLimited: [number, number];
+  readonly lostMessages: number;
+}
+
+/** How often the input a player's opponent actually had applied changed, from the frames the server confirmed. */
+export function opponentChanges(client: Pick<HeadlessDuelClient, "bundles" | "slot">, through: number): number {
+  const log = logFromBundles(client.bundles).inputs.slice(0, through);
+  const opponent = client.slot === 0 ? 1 : 0;
+  return log.filter((pair, index) => index > 0 && pair[opponent] !== log[index - 1]![opponent]).length;
+}
+
+export function expectWithinBudget(report: ScenarioReport): void {
+  expect(report.desyncs).toEqual([0, 0]);
+  expect(report.rateLimited).toEqual([0, 0]);
+  const settled = PLAY_FRAMES + SETTLE_FRAMES;
+  for (const index of [0, 1] as const) {
+    // A bundle every 3 frames, each checked once its frame is confirmed.
+    expect(report.hashChecks[index]).toBeGreaterThanOrEqual(Math.floor(settled / 3) - 5);
+    expect(report.corrections[index]).toBeLessThanOrEqual(report.correctionBound[index]);
+    expect(report.corrections[index]).toBeLessThanOrEqual((CORRECTIONS_PER_SECOND * settled) / 60);
+  }
+}
+
+/** The pairs the server applied, by frame, from the bundles a client received. */
+export function appliedPairs(bundles: readonly DuelFrameBundle[]): Map<number, { pair: readonly [number, number]; substituted: [boolean, boolean] }> {
+  const pairs = new Map<number, { pair: readonly [number, number]; substituted: [boolean, boolean] }>();
+  for (const bundle of bundles) {
+    const first = bundle.frame - bundle.inputs.length + 1;
+    bundle.inputs.forEach((pair, index) => {
+      pairs.set(first + index, { pair, substituted: [((bundle.substituted >> (2 * index)) & 1) === 1, ((bundle.substituted >> (2 * index + 1)) & 1) === 1] });
+    });
+  }
+  return pairs;
+}

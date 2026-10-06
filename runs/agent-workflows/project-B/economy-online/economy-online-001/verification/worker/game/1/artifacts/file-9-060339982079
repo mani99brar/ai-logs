@@ -1,0 +1,143 @@
+import type { TonicPurchaseMessage, TonicPurchaseRefusalName, TonicUsedMessage, TonicUseRefusalName } from "@pirate-sea-race/protocol";
+import type { PurchaseResult, ShopItem, TonicResult } from "@pirate-sea-race/simulation/objectives";
+
+/**
+ * The dockside shop in the room (§11, §16): the book of each player's tonic purchases and drinks by request id, and how
+ * the ledger's answers become the answers players get. Plain data and small classes, no Colyseus: `MatchRoom` owns the
+ * timing.
+ */
+
+/**
+ * The ledger's request id for a client's purchase: the ledger keeps one id space per player for both items, so the
+ * room namespaces it by item. A client id reused for a tonic and a rumor is then two purchases, never a `duplicate`.
+ */
+export const ledgerRequestId = (item: ShopItem, clientId: string): string => `${item}:${clientId}`;
+
+/** A request waiting for its world tick. */
+export interface PendingShopRequest {
+  readonly requestId: string;
+}
+
+export type TonicPurchaseDecision = { readonly outcome: "bought"; readonly price: number; readonly tonics: number } | { readonly outcome: "refused"; readonly reason: TonicPurchaseRefusalName };
+export type TonicUseDecision = { readonly outcome: "active"; readonly endTick: number } | { readonly outcome: "refused"; readonly reason: TonicUseRefusalName };
+
+/** At most this many requests of one kind wait per player; more are refused `busy` and kept nowhere. */
+export const MAX_PENDING_SHOP_REQUESTS = 2;
+/** The refusals of one kind kept per player for replays (the oldest goes first), as the ledger keeps its own. */
+export const KEPT_SHOP_REFUSALS = 16;
+
+interface PlayerRequests<D> {
+  readonly pending: PendingShopRequest[];
+  /** Every applied request id, never evicted (bounded by gold, or by the tonics bought). */
+  readonly applied: Map<string, D>;
+  /** The last `KEPT_SHOP_REFUSALS` refused request ids, oldest first. */
+  readonly refused: Map<string, D>;
+}
+
+/**
+ * One kind of shop request (tonic purchases, or drinks), per player, by the client's request id (§16): an id already
+ * decided is answered from `decided` first; one still pending is merged into it (one answer); at most
+ * `MAX_PENDING_SHOP_REQUESTS` wait per player, and the room takes one per player per world tick, oldest first.
+ */
+export class ShopBook<D extends { readonly outcome: string }> {
+  private readonly books = new Map<string, PlayerRequests<D>>();
+
+  private bookOf(playerId: string): PlayerRequests<D> {
+    let book = this.books.get(playerId);
+    if (book === undefined) {
+      book = { pending: [], applied: new Map(), refused: new Map() };
+      this.books.set(playerId, book);
+    }
+    return book;
+  }
+
+  /** The room's earlier decision on this (player, request id), if it kept one. */
+  decided(playerId: string, requestId: string): D | undefined {
+    const book = this.books.get(playerId);
+    return book?.applied.get(requestId) ?? book?.refused.get(requestId);
+  }
+
+  /** A request arrives whose id this player has no decision for (the caller replays those first). */
+  arrive(playerId: string, requestId: string): "merged" | "busy" | "queued" {
+    const book = this.bookOf(playerId);
+    if (book.pending.some((each) => each.requestId === requestId)) return "merged";
+    if (book.pending.length >= MAX_PENDING_SHOP_REQUESTS) return "busy";
+    book.pending.push({ requestId });
+    return "queued";
+  }
+
+  /** The players with a request waiting. */
+  waiting(): string[] {
+    return [...this.books].filter(([, book]) => book.pending.length > 0).map(([id]) => id);
+  }
+
+  /** This player's oldest waiting request, taken off the queue. */
+  take(playerId: string): PendingShopRequest | undefined {
+    return this.books.get(playerId)?.pending.shift();
+  }
+
+  pendingCount(playerId: string): number {
+    return this.books.get(playerId)?.pending.length ?? 0;
+  }
+
+  /** Every request still waiting, by player, taken off their queues (the match has ended). */
+  drain(): { readonly playerId: string; readonly request: PendingShopRequest }[] {
+    return [...this.books].flatMap(([playerId, book]) => book.pending.splice(0).map((request) => ({ playerId, request })));
+  }
+
+  /** Keeps a decision for replays: every applied one, and the player's last refusals. */
+  decide(playerId: string, requestId: string, decision: D, applied: boolean): void {
+    const book = this.bookOf(playerId);
+    if (applied) {
+      book.applied.set(requestId, decision);
+      return;
+    }
+    book.refused.set(requestId, decision);
+    if (book.refused.size > KEPT_SHOP_REFUSALS) book.refused.delete(book.refused.keys().next().value!);
+  }
+
+  forget(playerId: string): void {
+    this.books.delete(playerId);
+  }
+}
+
+/** The ledger's decided purchase refusals: the ones it keeps, so a retry is refused the same way. */
+const PURCHASE_REFUSALS: readonly string[] = ["player-in-duel", "player-disconnected", "tonic-limit", "insufficient-gold"];
+
+/**
+ * A tonic purchase as the ledger decided it (`purchase` under `ledgerRequestId("tonic", id)`): bought, with the price and
+ * the tonics now carried, or refused with the ledger's decided refusal. The room asks only for a player in the match
+ * with a fresh namespaced id, so any other answer (malformed, stale, an unknown or departed player, a `duplicate`) is a
+ * broken invariant: it throws, and the world tick faults (§12).
+ */
+export function tonicPurchaseOf(result: PurchaseResult): TonicPurchaseDecision {
+  if (result.ok) return { outcome: "bought", price: result.purchase!.price, tonics: result.purchase!.tonicsAfter };
+  if (result.refusal !== null && PURCHASE_REFUSALS.includes(result.refusal.rejection)) return { outcome: "refused", reason: result.refusal.rejection as TonicPurchaseRefusalName };
+  throw new Error(`the ledger did not decide a tonic purchase: ${result.rejection}`);
+}
+
+/** The ledger's refusals of a drink that the players hear. */
+const USE_REFUSALS: readonly string[] = ["tonic-active", "no-tonic", "not-at-sea", "grappled", "player-in-duel", "player-disconnected"];
+
+/**
+ * A drink as the ledger decided it (`useTonic` on tick `tick`): active, its last boosted sailing step `tick + ticks`, or
+ * refused with the ledger's reason. Any other refusal (malformed, stale, an unknown or departed player) is a broken
+ * invariant, as above: it throws.
+ */
+export function tonicUseOf(result: TonicResult, tick: number, ticks: number): TonicUseDecision {
+  if (result.ok) return { outcome: "active", endTick: tick + ticks };
+  if (result.rejection !== null && USE_REFUSALS.includes(result.rejection)) return { outcome: "refused", reason: result.rejection as TonicUseRefusalName };
+  throw new Error(`the ledger did not decide a drink: ${result.rejection}`);
+}
+
+/** The answer to a tonic purchase request, as its player receives it; `replayed` when it answers an id already decided. */
+export function tonicPurchaseMessage(requestId: string, decision: TonicPurchaseDecision, replayed: boolean): TonicPurchaseMessage {
+  return decision.outcome === "bought"
+    ? { requestId, outcome: "bought", price: decision.price, tonics: decision.tonics, replayed }
+    : { requestId, outcome: "refused", reason: decision.reason, replayed };
+}
+
+/** The answer to a drink request, as its player receives it. */
+export function tonicUsedMessage(requestId: string, decision: TonicUseDecision, replayed: boolean): TonicUsedMessage {
+  return decision.outcome === "active" ? { requestId, outcome: "active", endTick: decision.endTick, replayed } : { requestId, outcome: "refused", reason: decision.reason, replayed };
+}

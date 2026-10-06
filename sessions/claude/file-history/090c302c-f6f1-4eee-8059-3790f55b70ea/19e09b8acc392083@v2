@@ -1,0 +1,527 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { isNavigable, seaMap } from "@pirate-sea-race/content";
+import { JournalMessageType, journalMessageSchema, MAX_BUY_RUMOR_PER_SECOND, type JournalMessage } from "@pirate-sea-race/protocol";
+import { startGameServer, type MatchRoom, type RunningGameServer } from "@pirate-sea-race/server";
+import { objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { HeadlessClient, ImpairmentProxy, sleep, type Movement } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, HOST_SEAT, placePair, tuned } from "./rubbingsSetup.js";
+import { collectAt, containsText, HOLD_E, HUB_X, OPEN_ROW, openWater, playersAt, roomOf, startThroughLobby, tracker, until, EAST, type Seat } from "./seaDuelSetup.js";
+
+/**
+ * §3 and §11's intel through the real room: start rumors, fresh and replacement leads, the journal log in each player's
+ * own status, and targeted rumor purchases, read from what the headless clients received (and, for §16, from their raw
+ * frames). Every island seals one Sun and one Moon here (test-only), so collecting an island's Sun leaves a rumor about
+ * it stale. Players start with 40 gold (test-only), so one rumor (25) is affordable and a second is not. The rooms check
+ * `checkLedger` (the gold identity among it) and their own invariant after every world tick (`tracker`). Cases that
+ * need one exact tick line requests up with the room's test hooks (`testBuyRumor`, `stepWorldTicks`) while the clock is
+ * paused.
+ */
+const LAYOUT = [
+  ["sun", "moon"],
+  ["sun", "moon"],
+  ["sun", "moon"],
+  ["sun", "moon"],
+];
+const GOLD = 40;
+const PRICE = objectiveRules.rumorPrice;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  const matchTuning = tuned({
+    sourceLayout: LAYOUT,
+    objectives: { ...objectiveRules, collectTicks: 20, cacheClaimTicks: 20, startingGold: GOLD },
+    testHooks: true,
+  });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+/** Open water in a row south of the hub, one seat per player, out of every dock's way. */
+const seat = (index: number): Seat => ({ tileX: HUB_X - 8 + index * 4, tileY: OPEN_ROW, heading: EAST });
+const dockOf = (island: number, which = 0) => seaMap.docks.filter((dock) => dock.island === island)[which]!;
+
+/** Open water `distance` tiles from a dock, in a straight clear line from it, facing the dock (a grapple's aim). */
+function seatOff(dock: { tileX: number; tileY: number }, distance: number): Seat {
+  for (const [dx, dy] of [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ] as const) {
+    const at = { tileX: dock.tileX + dx * distance, tileY: dock.tileY + dy * distance, heading: 0 };
+    if (!isNavigable(seaMap, at.tileX, at.tileY) || !openWater(at, { ...dock, heading: 0 })) continue;
+    return { ...at, heading: (Math.round((Math.atan2(-dy, -dx) / (2 * Math.PI)) * 64) + 64) % 64 };
+  }
+  throw new Error(`no open water ${distance} tiles off dock ${dock.tileX},${dock.tileY}`);
+}
+
+async function moor(client: HeadlessClient, dock: { id: number; tileX: number; tileY: number }): Promise<void> {
+  await client.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+  await client.holdUntil(HOLD_E, () => client.ship()?.dock === dock.id, 5000);
+}
+
+/** The player's start rumor, once it arrived. */
+async function startRumor(client: HeadlessClient): Promise<Extract<JournalMessage, { kind: "rumor" }>> {
+  await client.waitFor(() => client.leads.some((lead) => lead.kind === "rumor" && lead.reason === "start"));
+  return client.leads.find((lead) => lead.kind === "rumor" && lead.reason === "start") as Extract<JournalMessage, { kind: "rumor" }>;
+}
+
+/** The ledger's purchases for a player. */
+const purchasesOf = (room: MatchRoom, id: string) => room.ledgerState.requests.filter((outcome) => outcome.kind === "purchase" && outcome.playerId === id);
+const goldOf = (room: MatchRoom, id: string) => room.ledgerState.players.find((player) => player.id === id)!.gold;
+
+/** Holds the room's clock after the current world tick. */
+async function pause(room: MatchRoom): Promise<void> {
+  room.pauseAfterTick(room.matchState.worldTick);
+  await until(() => room.worldPaused, 2000, "the pause");
+}
+
+/** The targeted leads a player received (rumors, or sighting entries, bought), each once (a replay resends its lead). */
+const targetedLeads = (client: HeadlessClient) =>
+  [...new Map(client.leads.map((lead) => [JSON.stringify(lead), lead])).values()].flatMap((lead) =>
+    lead.kind === "rumor" && lead.reason === "targeted" ? [lead.type] : lead.kind === "carrier-sighting" ? lead.sightings.filter((each) => each.reason === "targeted").map((each) => each.type) : [],
+  );
+
+describe.concurrent("rumors and the journal (§3, §11)", () => {
+  it("gives every player a start rumor at control start: an island with a sealed source of a type they lack, never a carrier; the journal and the offers show it", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const clients = await playersAt(endpoint, [seat(0), seat(1), seat(2)], track);
+    const room = roomOf(clients[0]!);
+    const controlStart = room.flowState.controlStartTick!;
+    for (const client of clients) {
+      const rumor = await startRumor(client);
+      expect(rumor.tick).toBe(controlStart);
+      expect(rumor.entry).toBe(1);
+      // No cache exists yet, so it names an island, where a source of that type is still sealed.
+      expect(rumor.target.kind).toBe("island");
+      const island = rumor.target.kind === "island" ? rumor.target.island : -1;
+      expect(rumor.target.name).toBe(seaMap.islands[island]!.name);
+      const sealed = room.ledgerState.rubbings.filter((rubbing) => rubbing.location.kind === "source" && rubbing.type === rumor.type);
+      expect(sealed.some((rubbing) => rubbing.location.kind === "source" && room.ledgerState.sources.find((source) => source.id === (rubbing.location as { sourceId: string }).sourceId)!.island === island)).toBe(true);
+      expect(client.rubbings()).not.toContain(rumor.type);
+      // One lead each, and never a carrier.
+      expect(client.leads).toHaveLength(1);
+      expect(client.leads.some((lead) => lead.kind === "carrier-sighting")).toBe(false);
+      // The journal in the player's own status says the same; both types can still be bought.
+      await client.waitFor(() => client.journal().length === 1);
+      expect(client.journal()).toEqual([
+        { n: 1, kind: "island", type: rumor.type, target: rumor.target.name, island, sector: -1, reason: "start", tick: controlStart, seenTick: 0, status: "active", replacedBy: 0 },
+      ]);
+      await client.waitFor(() => client.rumorOffers().length === 2);
+      expect(client.rumorOffers()).toEqual([
+        { type: "sun", offer: "available" },
+        { type: "moon", offer: "available" },
+      ]);
+    }
+    // Known islands: the ones in sight or moored at, with their ruin as last seen (open here) and not solved by them.
+    const [first] = clients as [HeadlessClient];
+    await moor(first, dockOf(3));
+    await first.waitFor(() => first.knownIslands().some((known) => known.island === 3));
+    expect(first.knownIslands().find((known) => known.island === 3)).toEqual({ island: 3, unlocked: true, solved: false });
+    // Listed in island order, whatever order they were sighted in.
+    await moor(first, dockOf(0));
+    await first.waitFor(() => first.knownIslands().length === 2);
+    expect(first.knownIslands().map((known) => known.island)).toEqual([0, 3]);
+  }, 30_000);
+
+  it("replaces a journal rumor whose source is collected, and gives a player who loses a type in a settled theft a fresh rumor; entering the duel is no loss", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The victim never readies its arena: it loses the duel by forfeit.
+    const [thief, victim, collector] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT, seat(0)], track, { clients: [{}, { autoReady: false }, {}] })) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const room = roomOf(victim);
+    const start = await startRumor(victim);
+    const island = start.target.kind === "island" ? start.target.island : -1;
+
+    // Another player collects that island's source of the rumor's type: the rumor goes stale and is replaced.
+    await collectAt(collector, endpoint, dockOf(island), start.type);
+    await victim.waitFor(() => victim.leads.some((lead) => lead.kind === "rumor-stale"));
+    expect(victim.leads.find((lead) => lead.kind === "rumor-stale")).toMatchObject({ entry: 1, type: start.type });
+    await victim.waitFor(() => victim.leads.some((lead) => lead.kind === "rumor" && lead.reason === "replacement"));
+    const replacement = victim.leads.find((lead) => lead.kind === "rumor" && lead.reason === "replacement") as Extract<JournalMessage, { kind: "rumor" }>;
+    expect(replacement).toMatchObject({ type: start.type, entry: 2 });
+    expect(replacement.target).not.toEqual(start.target);
+    await victim.waitFor(() => victim.journal().length === 2);
+    expect(victim.journal().map(({ n, status, replacedBy, reason }) => ({ n, status, replacedBy, reason }))).toEqual([
+      { n: 1, status: "stale", replacedBy: 2, reason: "start" },
+      { n: 2, status: "active", replacedBy: 0, reason: "replacement" },
+    ]);
+
+    // The victim collects a Sun; the thief grapples it and takes it.
+    const other = [0, 1, 2, 3].find((each) => each !== island)!;
+    await collectAt(victim, endpoint, dockOf(other, 1), "sun");
+    const before = victim.leads.length;
+    await placePair(endpoint, thief, victim);
+    thief.tapGrapple();
+    await victim.waitFor(() => victim.fighter.phase === "countdown", 5000);
+    // Reserved in the duel: still held, so no loss and no fresh lead.
+    await sleep(300);
+    expect(room.ledgerState.rubbings.some((rubbing) => rubbing.location.kind === "duel" && rubbing.location.playerId === victim.sessionId)).toBe(true);
+    expect(victim.leads.slice(before).some((lead) => lead.kind !== "rumor-resolved")).toBe(false);
+    await thief.waitFor(() => thief.objectives()?.theftOptions.join(",") === "sun", 10_000);
+    thief.chooseTheft("sun");
+    await victim.waitFor(() => !victim.rubbings().includes("sun"), 5000);
+    // The loser's free fresh lead about the Sun it lost (a sealed Sun is still on the map, so a rumor).
+    await victim.waitFor(() => victim.leads.some((lead) => lead.kind === "rumor" && lead.reason === "fresh"), 3000);
+    const fresh = victim.leads.find((lead) => lead.kind === "rumor" && lead.reason === "fresh")!;
+    // The winner's choice arrived between ticks: the intel step saw the loss on the next one.
+    const settledAt = room.ledgerState.duels.at(-1)!.settlement!.tick;
+    expect(fresh).toMatchObject({ type: "sun", tick: settledAt + 1 });
+    expect(goldOf(room, victim.sessionId)).toBeLessThan(GOLD);
+    expect(purchasesOf(room, victim.sessionId)).toEqual([]);
+  }, 45_000);
+});
+
+describe.concurrent("targeted rumors (§11)", () => {
+  it("sells a rumor for 25 gold at a dock, replays a retried id without charging again, refuses too little gold and replays the refusal", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [buyer] = (await playersAt(endpoint, [seat(0)], track)) as [HeadlessClient];
+    const room = roomOf(buyer);
+    await startRumor(buyer);
+    await moor(buyer, dockOf(0));
+    await buyer.waitFor(() => buyer.rumorOffers().some((offer) => offer.type === "moon" && offer.offer === "available"));
+    const id = buyer.buyRumor("moon");
+    await buyer.waitFor(() => buyer.rumorAnswers(id).length === 1);
+    expect(buyer.rumorAnswers(id)).toEqual([{ requestId: id, type: "moon", outcome: "bought", price: PRICE, replayed: false }]);
+    const bought = buyer.leads.filter((lead) => lead.kind === "rumor" && lead.reason === "targeted");
+    expect(bought).toEqual([expect.objectContaining({ type: "moon" })]);
+    await buyer.waitFor(() => buyer.gold() === GOLD - PRICE);
+    expect(purchasesOf(room, buyer.sessionId)).toEqual([expect.objectContaining({ requestId: id, item: "rumor", price: PRICE })]);
+    await buyer.waitFor(() => buyer.journal().some((entry) => entry.reason === "targeted"));
+
+    // The retry: the same answer and the same lead again, marked replayed, nothing charged (15 gold now, under the price).
+    const leadsBefore = buyer.leads.length;
+    buyer.buyRumor("moon", id);
+    await buyer.waitFor(() => buyer.rumorAnswers(id).length === 2);
+    expect(buyer.rumorAnswers(id)[1]).toEqual({ requestId: id, type: "moon", outcome: "bought", price: PRICE, replayed: true });
+    expect(buyer.leads.slice(leadsBefore)).toEqual(bought);
+    expect(goldOf(room, buyer.sessionId)).toBe(GOLD - PRICE);
+    expect(purchasesOf(room, buyer.sessionId)).toHaveLength(1);
+    // The journal did not log the resent lead again.
+    expect(buyer.journal().filter((entry) => entry.reason === "targeted")).toHaveLength(1);
+
+    // Too little gold: refused, nothing charged; its retry gets the same refusal.
+    const short = buyer.buyRumor("sun");
+    await buyer.waitFor(() => buyer.rumorAnswers(short).length === 1);
+    expect(buyer.rumorAnswers(short)[0]).toMatchObject({ outcome: "refused", reason: "insufficient-gold", replayed: false });
+    buyer.buyRumor("sun", short);
+    await buyer.waitFor(() => buyer.rumorAnswers(short).length === 2);
+    expect(buyer.rumorAnswers(short)[1]).toMatchObject({ outcome: "refused", reason: "insufficient-gold", replayed: true });
+    expect(goldOf(room, buyer.sessionId)).toBe(GOLD - PRICE);
+    expect(purchasesOf(room, buyer.sessionId)).toHaveLength(1);
+    // The ledger never saw the refusal: the room refused it before any charge.
+    expect(room.ledgerState.requests.filter((outcome) => outcome.playerId === buyer.sessionId)).toHaveLength(1);
+  }, 30_000);
+
+  it("resolves requests on exact ticks: one per player per tick, merged retries, a busy third, independent ids per player, no charge without a lead, and a cast-off refusal", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [twice, merger, same1, same2, holder] = (await playersAt(endpoint, [seat(0), seat(1), seat(2), seat(3), seat(4)], track)) as HeadlessClient[] as [
+      HeadlessClient,
+      HeadlessClient,
+      HeadlessClient,
+      HeadlessClient,
+      HeadlessClient,
+    ];
+    const room = roomOf(twice);
+    // The holder takes a Sun: a rumor about the Sun has nothing to sell it, and its offers leave the Sun out.
+    await collectAt(holder, endpoint, dockOf(0, 0), "sun");
+    await holder.waitFor(() => holder.rumorOffers().length === 1);
+    expect(holder.rumorOffers()).toEqual([{ type: "moon", offer: "available" }]);
+    await moor(twice, dockOf(0, 1));
+    await moor(merger, dockOf(1, 0));
+    await moor(same1, dockOf(1, 1));
+    await moor(same2, dockOf(2, 0));
+    // The test hook steps only a paused clock.
+    expect(() => room.stepWorldTicks(1)).toThrow("needs the world paused");
+    await pause(room);
+    const tick = room.matchState.worldTick;
+    // Two types in one tick from 40 gold; a pending id twice, a second id and a busy third; one id for two players;
+    // and a type the player holds.
+    room.testBuyRumor(twice.sessionId, { requestId: "a", type: "sun" });
+    room.testBuyRumor(twice.sessionId, { requestId: "b", type: "moon" });
+    room.testBuyRumor(merger.sessionId, { requestId: "m", type: "moon" });
+    room.testBuyRumor(merger.sessionId, { requestId: "m", type: "moon" });
+    room.testBuyRumor(merger.sessionId, { requestId: "n", type: "sun" });
+    room.testBuyRumor(merger.sessionId, { requestId: "o", type: "sun" });
+    room.testBuyRumor(same1.sessionId, { requestId: "same", type: "moon" });
+    room.testBuyRumor(same2.sessionId, { requestId: "same", type: "moon" });
+    room.testBuyRumor(holder.sessionId, { requestId: "held", type: "sun" });
+    expect(room.pendingRumors(merger.sessionId)).toBe(2);
+    await merger.waitFor(() => merger.rumorAnswers("o").length === 1);
+    expect(merger.rumorAnswers("o")[0]).toMatchObject({ outcome: "refused", reason: "busy" });
+
+    room.stepWorldTicks(1);
+    // The first of two requests is decided and charged on this tick; the second waits.
+    expect(purchasesOf(room, twice.sessionId)).toEqual([expect.objectContaining({ requestId: "a", tick: tick + 1 })]);
+    expect(room.pendingRumors(twice.sessionId)).toBe(1);
+    expect(purchasesOf(room, merger.sessionId)).toEqual([expect.objectContaining({ requestId: "m" })]);
+    // Two players' requests under one client id are independent: both bought, each charged once, under namespaced intel ids.
+    for (const client of [same1, same2]) expect(purchasesOf(room, client.sessionId)).toEqual([expect.objectContaining({ requestId: "same" })]);
+    expect(room.intelState!.requestIds).toEqual(expect.arrayContaining([`${same1.sessionId}:same`, `${same2.sessionId}:same`]));
+    // A type the player holds: refused `none` before the intel step, which never saw it.
+    expect(room.intelState!.requestIds).not.toContain(`${holder.sessionId}:held`);
+    expect(purchasesOf(room, holder.sessionId)).toEqual([]);
+
+    room.stepWorldTicks(1);
+    // The second request of the first player, on the next tick: 15 gold now, refused without a charge.
+    expect(purchasesOf(room, twice.sessionId)).toHaveLength(1);
+    expect(room.pendingRumors(twice.sessionId)).toBe(0);
+    expect(room.intelState!.requestIds).not.toContain(`${twice.sessionId}:b`);
+    expect(goldOf(room, twice.sessionId)).toBe(GOLD - PRICE);
+    expect(room.invariantViolations).toEqual([]);
+
+    // A request queued at a dock and processed after the ship cast off: refused, nothing charged.
+    const castOff: Movement = { moveX: 0, moveY: -1 };
+    twice.sendInput(castOff);
+    await sleep(200);
+    room.testBuyRumor(twice.sessionId, { requestId: "c", type: "moon" });
+    room.stepWorldTicks(1);
+    expect(room.matchState.ships.find((ship) => ship.id === twice.sessionId)!.dock).toBe(-1);
+    room.resumeWorld();
+    twice.sendInput({ moveX: 0, moveY: 0 });
+
+    await twice.waitFor(() => twice.rumorAnswers("c").length === 1 && twice.rumorAnswers("b").length === 1);
+    expect(twice.rumorAnswers("a")).toEqual([expect.objectContaining({ outcome: "bought", replayed: false })]);
+    expect(twice.rumorAnswers("b")).toEqual([expect.objectContaining({ outcome: "refused", reason: "insufficient-gold" })]);
+    expect(twice.rumorAnswers("c")).toEqual([expect.objectContaining({ outcome: "refused", reason: "not-at-dock" })]);
+    // The merged retry was answered once, with the one decision.
+    await merger.waitFor(() => merger.rumorAnswers("n").length === 1);
+    expect(merger.rumorAnswers("m")).toEqual([expect.objectContaining({ outcome: "bought" })]);
+    expect(merger.rumorAnswers("n")).toEqual([expect.objectContaining({ outcome: "refused", reason: "insufficient-gold" })]);
+    await holder.waitFor(() => holder.rumorAnswers("held").length === 1);
+    expect(holder.rumorAnswers("held")[0]).toMatchObject({ outcome: "refused", reason: "none" });
+    for (const client of [twice, merger, same1, same2]) {
+      await client.waitFor(() => client.gold() === GOLD - PRICE);
+      expect(targetedLeads(client)).toHaveLength(1);
+    }
+    expect(goldOf(room, holder.sessionId)).toBe(GOLD);
+  }, 45_000);
+
+  it("refuses without charge a request the intel step answers with nothing on its tick: a stale rumor's free replacement covers it", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [buyer, collector] = (await playersAt(endpoint, [seat(0), seat(2)], track)) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(buyer);
+    const start = await startRumor(buyer);
+    const island = start.target.kind === "island" ? start.target.island : -1;
+    // The buyer at another island's dock; the collector at the rumor's island, about to take its source of that type.
+    await moor(buyer, dockOf((island + 1) % 4));
+    const dock = dockOf(island);
+    await collector.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+    if (start.type === "moon") await collectAt(collector, endpoint, dock, "sun");
+    let done = false;
+    const holding = collector.holdUntil(HOLD_E, () => done, 15_000);
+    await until(() => room.ledgerState.players.find((player) => player.id === collector.sessionId)?.channel?.kind === "collect", 5000, "the collection");
+    const channel = room.ledgerState.players.find((player) => player.id === collector.sessionId)!.channel!;
+    // Held just before the tick the collection completes on.
+    room.pauseAfterTick(channel.startTick + room.ledgerState.rules.collectTicks - 1);
+    await until(() => room.worldPaused, 3000, "the pause");
+    room.testBuyRumor(buyer.sessionId, { requestId: "late", type: start.type });
+    room.stepWorldTicks(1);
+    // On that tick the source went to the collector: the buyer's rumor went stale, its free replacement gives the type,
+    // and the purchase was answered `covered` by the intel step, with no charge.
+    expect(room.ledgerState.rubbings.some((rubbing) => rubbing.type === start.type && rubbing.location.kind === "player" && rubbing.location.playerId === collector.sessionId)).toBe(true);
+    expect(room.intelState!.requestIds).toContain(`${buyer.sessionId}:late`);
+    expect(purchasesOf(room, buyer.sessionId)).toEqual([]);
+    expect(goldOf(room, buyer.sessionId)).toBe(GOLD);
+    room.resumeWorld();
+    done = true;
+    await holding;
+    await buyer.waitFor(() => buyer.rumorAnswers("late").length === 1);
+    expect(buyer.rumorAnswers("late")[0]).toMatchObject({ outcome: "refused", reason: "covered" });
+    expect(buyer.leads.some((lead) => lead.kind === "rumor" && lead.reason === "replacement" && lead.type === start.type)).toBe(true);
+    expect(targetedLeads(buyer)).toEqual([]);
+  }, 30_000);
+
+  it("refuses a purchase during a duel and while waiting to respawn, and replays a bought id meanwhile", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The buyer never readies: it loses by forfeit and waits to respawn.
+    const [buyer, attacker] = (await playersAt(endpoint, [seat(0), seat(3)], track, { clients: [{ autoReady: false }, {}] })) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(buyer);
+    await startRumor(buyer);
+    const dock = dockOf(1, 1);
+    await moor(buyer, dock);
+    const id = buyer.buyRumor("sun");
+    await buyer.waitFor(() => buyer.rumorAnswers(id).length === 1);
+    expect(buyer.rumorAnswers(id)[0]).toMatchObject({ outcome: "bought" });
+    // The attacker comes within range of the moored buyer, facing it, and grapples.
+    await attacker.placeShip(endpoint, seatOff(dock, 4));
+    await attacker.waitFor(() => attacker.ship(buyer.sessionId) !== undefined);
+    attacker.tapGrapple();
+    await buyer.waitFor(() => buyer.status()?.mode === "duel", 5000);
+    const inDuel = buyer.buyRumor("moon");
+    // The bought id is replayed even in the duel (and under the price: 15 gold).
+    buyer.buyRumor("sun", id);
+    await buyer.waitFor(() => buyer.rumorAnswers(inDuel).length === 1 && buyer.rumorAnswers(id).length === 2);
+    expect(buyer.rumorAnswers(inDuel)[0]).toMatchObject({ outcome: "refused", reason: "player-in-duel" });
+    expect(buyer.rumorAnswers(id)[1]).toMatchObject({ outcome: "bought", replayed: true });
+    // Lost by forfeit: out of the world until it respawns, though the ship still sits at the dock.
+    await buyer.waitFor(() => buyer.status()?.mode === "respawning", 15_000);
+    expect(room.matchState.ships.find((ship) => ship.id === buyer.sessionId)!.dock).toBe(dock.id);
+    const waiting = buyer.buyRumor("moon");
+    await buyer.waitFor(() => buyer.rumorAnswers(waiting).length === 1);
+    expect(buyer.rumorAnswers(waiting)[0]).toMatchObject({ outcome: "refused", reason: "not-at-dock" });
+    expect(purchasesOf(room, buyer.sessionId)).toHaveLength(1);
+  }, 45_000);
+
+  it("charges every delivered targeted lead exactly once and nothing else, through bursts of requests across players and ticks", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const clients = (await playersAt(endpoint, [seat(0), seat(1), seat(2)], track)) as HeadlessClient[];
+    const room = roomOf(clients[0]!);
+    for (const [index, client] of clients.entries()) await moor(client, dockOf(index, 1));
+    // Bursts: new ids for both types, retries of earlier ids, and ids another player also uses, over several ticks.
+    const types = ["sun", "moon"] as const;
+    for (let burst = 0; burst < 4; burst++) {
+      for (const [index, client] of clients.entries()) {
+        for (let request = 0; request < 3; request++) client.buyRumor(types[(burst + request + index) % 2]!, `q${(burst * 3 + request) % 5}`);
+      }
+      await sleep(70);
+    }
+    await sleep(600);
+    for (const client of clients) {
+      const bought = new Set(client.rumorResults.filter((result) => result.outcome === "bought").map((result) => result.requestId));
+      // 40 gold: at most one rumor, charged once however often its id came back.
+      expect(bought.size).toBeLessThanOrEqual(1);
+      expect(purchasesOf(room, client.sessionId).map((purchase) => purchase.requestId)).toEqual([...bought]);
+      expect(targetedLeads(client)).toHaveLength(bought.size);
+      expect(goldOf(room, client.sessionId)).toBe(GOLD - PRICE * bought.size);
+      // Every answer about one id is the same decision.
+      for (const id of new Set(client.rumorResults.map((result) => result.requestId))) {
+        const answers = client.rumorAnswers(id).filter((answer) => answer.outcome === "bought" || answer.reason !== "busy");
+        expect(new Set(answers.map(({ outcome, type }) => `${outcome}:${type}`)).size).toBeLessThanOrEqual(1);
+      }
+    }
+    expect(clients.some((client) => purchasesOf(room, client.sessionId).length === 1)).toBe(true);
+    expect(room.invariantViolations).toEqual([]);
+  }, 30_000);
+});
+
+describe.concurrent("purchase requests outside the rules", () => {
+  it("drops malformed and excess requests, and answers not-in-play before the match starts and after it ends, charging nothing", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    // In the lobby: refused, not kept (a retry in play is decided afresh).
+    host.buyRumor("sun", "early");
+    await host.waitFor(() => host.rumorAnswers("early").length === 1);
+    expect(host.rumorAnswers("early")[0]).toMatchObject({ outcome: "refused", reason: "not-in-play", replayed: false });
+    const bench = await startThroughLobby(endpoint, [host]);
+    track(bench!);
+    await moor(host, dockOf(0, 1));
+    // Malformed: dropped without an answer.
+    for (const payload of [{ requestId: "bad id", type: "sun" }, { requestId: "x", type: "gold" }, "buy", null]) host.sendRaw(JournalMessageType.BuyRumor, payload);
+    await sleep(1100);
+    expect(host.rumorResults).toHaveLength(1);
+    // A burst: at most MAX_BUY_RUMOR_PER_SECOND are read in a second (the rest get no answer).
+    for (let index = 0; index < 20; index++) host.buyRumor("moon", `burst${index}`);
+    await sleep(800);
+    expect(host.rumorResults.length - 1).toBe(MAX_BUY_RUMOR_PER_SECOND);
+    // The id refused before the start is decided afresh in play.
+    await sleep(400);
+    host.buyRumor("sun", "early");
+    await host.waitFor(() => host.rumorAnswers("early").length === 2);
+    expect(host.rumorAnswers("early")[1]).toMatchObject({ replayed: false });
+    // Once the match has ended: refused again, not kept.
+    const room = roomOf(host);
+    room.injectFault();
+    await host.waitFor(() => host.phase === "ended");
+    await sleep(1100);
+    host.buyRumor("sun", "late");
+    await host.waitFor(() => host.rumorAnswers("late").length === 1);
+    expect(host.rumorAnswers("late")[0]).toMatchObject({ outcome: "refused", reason: "not-in-play" });
+    expect(purchasesOf(room, host.sessionId).length).toBeLessThanOrEqual(1);
+    expect(goldOf(room, host.sessionId)).toBe(GOLD - PRICE * purchasesOf(room, host.sessionId).length);
+  }, 30_000);
+});
+
+describe.concurrent("the journal's hidden information and reconnection (§16)", () => {
+  it("sends every lead and answer only to its player: across a scripted match with a duel, no raw frame carries another player's rumor, journal, a rubbing id or a position of a source, cache or unseen ship", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The victim never readies its duel; the stranger stays far away all match.
+    const [thief, victim, stranger] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT, seatOff(dockOf(2, 1), 4)], track, {
+      clients: [{}, { autoReady: false }, {}],
+    })) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const room = roomOf(thief);
+    const everyone = [thief, victim, stranger];
+    for (const client of everyone) await startRumor(client);
+    await moor(thief, dockOf(0));
+    await collectAt(victim, endpoint, dockOf(1), "sun");
+    thief.buyRumor("sun");
+    victim.buyRumor("moon");
+    await moor(stranger, dockOf(2, 1));
+    stranger.buyRumor("moon");
+    for (const client of everyone) await client.waitFor(() => client.rumorResults.length === 1);
+    await placePair(endpoint, thief, victim);
+    thief.tapGrapple();
+    await thief.waitFor(() => thief.objectives()?.theftOptions.join(",") === "sun", 10_000);
+    thief.chooseTheft("sun");
+    await victim.waitFor(() => victim.leads.some((lead) => lead.kind === "rumor" && lead.reason === "fresh"), 5000);
+    await sleep(400);
+
+    const ids = everyone.map((client) => client.sessionId);
+    const rubbingIds = room.ledgerState.rubbings.map((rubbing) => rubbing.id);
+    for (const client of everyone) {
+      const frames = client.framesSince(0);
+      const others = ids.filter((id) => id !== client.sessionId);
+      // Messages (Colyseus ROOM_DATA frames): the leads and answers go to their player only, and name no other player.
+      const messages = frames.filter((frame) => (frame[0]! & 0x1f) === 13);
+      expect(messages.filter((frame) => containsText(frame, "journal"))).toHaveLength(client.leads.length);
+      expect(messages.filter((frame) => containsText(frame, "rumor-result"))).toHaveLength(client.rumorResults.length);
+      for (const frame of messages) for (const id of others) expect(containsText(frame, id)).toBe(false);
+      // No frame at all carries a rubbing id. (Ship ids in sight, a grapple's ids and the results' seats are public by
+      // design: the state frames of the two fighters carry each other's id, and that is allowed.)
+      for (const frame of frames) for (const id of rubbingIds) expect(containsText(frame, id)).toBe(false);
+      // Each lead is strictly a lead: types, islands, sectors, names and ticks, never a player id or a position.
+      for (const lead of client.leads) expect(journalMessageSchema.safeParse(lead).success).toBe(true);
+      // The journal in the player's own status is exactly the log of what it received.
+      await client.waitFor(() => JSON.stringify(client.journal()) === JSON.stringify(room.journalOf(client.sessionId)));
+      expect([...(client.room.state.status?.keys() ?? [])]).toEqual([client.sessionId]);
+    }
+    // The stranger never saw the fighters: no frame of its carries either id, so no position of theirs.
+    for (const frame of stranger.framesSince(0)) for (const id of [thief.sessionId, victim.sessionId]) expect(containsText(frame, id)).toBe(false);
+    // Each player's leads are its own: the thief's targeted Sun lead reached only the thief, and so on.
+    expect(targetedLeads(thief)).toEqual(["sun"]);
+    expect(targetedLeads(victim)).toEqual(["moon"]);
+    expect(targetedLeads(stranger)).toEqual(["moon"]);
+    expect(stranger.leads.some((lead) => lead.kind === "rumor" && lead.reason === "fresh")).toBe(false);
+    expect(thief.leads.some((lead) => lead.kind === "rumor" && lead.reason === "fresh")).toBe(false);
+  }, 45_000);
+
+  it("gives a reconnecting player its journal back unchanged", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    const [player] = (await playersAt(endpoint, [seat(1)], track, { endpoints: [proxy.endpoint] })) as [HeadlessClient];
+    const room = roomOf(player);
+    await startRumor(player);
+    await moor(player, dockOf(3, 1));
+    const id = player.buyRumor("sun");
+    await player.waitFor(() => player.rumorAnswers(id).length === 1 && player.journal().length === 2);
+    // The SDK reconnects only a room joined five seconds ago.
+    await sleep(4500);
+    const journal = player.journal();
+    const known = player.knownIslands();
+    // A request waiting when the connection drops is decided on its tick, while the player is away: refused.
+    await pause(room);
+    room.testBuyRumor(player.sessionId, { requestId: "away", type: "moon" });
+    proxy.sever({ refuse: true });
+    await until(() => room.ledgerState.players.find((each) => each.id === player.sessionId)?.status === "disconnected", 3000, "the drop");
+    room.stepWorldTicks(1);
+    room.resumeWorld();
+    await sleep(300);
+    proxy.restore();
+    await player.waitFor(() => player.connected && roomOf(player).ledgerState.players.find((each) => each.id === player.sessionId)?.status === "connected", 10_000);
+    await sleep(300);
+    expect(player.journal()).toEqual(journal);
+    expect(player.knownIslands()).toEqual(known);
+    expect(journal.map((entry) => entry.reason)).toEqual(["start", "targeted"]);
+    // Its retry gets that decision, which the room kept: nothing was charged meanwhile.
+    player.buyRumor("moon", "away");
+    await player.waitFor(() => player.rumorAnswers("away").length === 1);
+    expect(player.rumorAnswers("away")[0]).toMatchObject({ outcome: "refused", reason: "player-disconnected", replayed: true });
+    expect(purchasesOf(room, player.sessionId)).toHaveLength(1);
+  }, 45_000);
+});

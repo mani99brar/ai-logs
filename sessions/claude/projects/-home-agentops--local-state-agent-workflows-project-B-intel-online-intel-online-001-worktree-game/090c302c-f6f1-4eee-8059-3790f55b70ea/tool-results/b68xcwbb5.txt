@@ -1,0 +1,262 @@
+# Match information (intel)
+
+The pure rules behind §2's timed reveals, §3's rumors and journal, §5's final-island announcement and §11's comeback leads. `@pirate-sea-race/simulation/intel` has the config, the state, `stepIntel`, `targetedRumorAvailability`, `freeCoverage`, `replayIntel` and the three lead phases (`gatherLeads`, `decideLeads`, `answerRequests`). `@pirate-sea-race/content/intel` has the constants and the zod validator `validateIntelRules`. The module doesn't import the ledger. It is integer data with no clocks and no `Math.random`, and time is the world tick (20 per second). `objectives-endgame` wires it into `MatchRoom`; nothing calls it yet.
+
+## Constants (`intelRules`)
+
+| Rule | Value |
+| --- | --- |
+| Sector grid | 3 × 3, named row by row from "North-West Reach" to "South-East Reach" |
+| Sighting delay | 600 ticks (30 s), equal to the carrier interval |
+| Carrier interval | 600 ticks (30 s) |
+| Sector reveal | 24,000 ticks (minute 20) after control start |
+| Carrier reveal | 33,600 ticks (minute 28) after control start |
+| Targeted rumor price | 25 gold (the caller charges it) |
+
+The validator refuses a zero interval, reveals out of order, a carrier reveal that isn't a multiple of the interval, a delay that differs from the interval, and names that are missing or repeated. Because the carrier reveal is a multiple of the interval, every broadcast falls on a snapshot boundary, so pending and new sightings can't split across messages.
+
+## Sectors
+
+`sectorOfTile` cuts the map's columns and rows into three bands each by integer division (`floor(tile × 3 / width)`). Every tile is in exactly one sector, and bands differ by at most one tile. On the 224 × 208 slice sea, the columns start at tiles 0, 75 and 150 and the rows at 0, 70 and 139. `sectorOf(position)` is the sector of the position's tile. A position off the map counts in the nearest edge sector. The config computes all of this from the map size, so the same code serves the slice and the 12-island alpha.
+
+## Leads
+
+A rumor names a missing type and a target: an **island**, where a source of that type is still sealed, or a **sector**, where a recovery cache holds one. It never names a rubbing, a player or a position. It picks among the eligible targets, sorted, with the seeded generator (`random.ts`) keyed by (seed, tick, player, type), so the same seed gives the same rumor and no other decision changes it. It tries three tiers in order:
+
+1. the islands with a sealed source of the type;
+2. the sectors with a cached copy;
+3. a **carrier sighting**, and only when every copy of the type is carried by someone else.
+
+Targets already active in the player's journal are skipped, so a player is never given the same lead twice.
+
+Leads are made on four occasions:
+
+- a **start** rumor for each player at control start, or when a player is first seen after it. It only ever names a source or a cache, of any type the player lacks. When every copy of every missing type is carried (a late joiner, say), there is no starting rumor, only a `no-lead`: a start never becomes a carrier sighting;
+- a free **fresh** rumor for each type a player lost (§11);
+- a **targeted** rumor, bought on request;
+- a **replacement**, when a journal rumor goes stale.
+
+Losses and completions come from diffing each player's held types between ticks. A rubbing reserved in a duel still counts as held, so entering a duel is never a loss; only a settled theft is.
+
+**Journal rumors** (island or sector) are the only leads tracked:
+
+- A rumor goes **stale** when its target no longer holds its type: the source was collected or the cache claimed by someone else. The player gets `rumor-stale` with the tick and then a replacement.
+- A rumor whose type the holder obtains, by any means, is **resolved** quietly. It gets no replacement.
+
+**Carrier sightings** are one-shot messages, never tracked, so they can never go stale and can't be used to follow a carrier. At every carrier boundary (control start plus a multiple of 30 s, counted when crossed), the state takes one snapshot of the carried copies: the sector, the type and the internal holder of each. It keeps the latest two. A sighting reads the **older** of the two, so it is 30–60 s old and never the current position. It also skips the requester's own former entries.
+
+Only three triggers ask for a sighting: a loss (`fresh`), a journal replacement and a targeted request. The sighting's reason type (`CarrierSightingReason`) has only these three, so a start can't produce one. A `carrier-sighting` message may list several types: one entry per type (the type, the trigger's reason and a sector), all from the same older snapshot. Before minute 28, a player gets at most **one sighting message per snapshot**, and at any time at most **one per step**.
+
+**Three phases per step.** Every step builds its lead decisions the same way, whatever order the triggers, the requests or the view's arrays come in:
+
+1. **Gather.** Every trigger joins a set keyed by **(player, type)**: a type lost, a stale rumor's replacement, a pending type at a boundary (the pending set is decided again there), a targeted request. An entry keeps one free trigger (the earliest, then `fresh` before `replacement`) and its request ids, sorted. A pending type the player holds a live journal rumor for (bought since it was deferred) is **dropped** at the boundary instead, quietly: no sighting and no `no-lead`.
+2. **Decide.** Per player by id: a starting rumor first (a source or a cache, never a sighting), then each entry in type order. An entry with only requests that free coverage holds for (below) gets nothing sent. Otherwise an entry gets a journal rumor, a `no-lead` (free triggers only), or its type joins the player's one sighting decision. Uncapped (no sighting yet in this snapshot, or minute 28 on), one message lists every such type the older snapshot shows another player carrying; capped, nothing is sent and the free types join the one pending set (a paid type is never queued). A free type the snapshot can't answer yet also waits. Each draw uses a generator keyed by (seed, tick, player, type), and a sighting's sector by (seed, snapshot tick, player, type) among the sorted candidate sectors, so no decision depends on another.
+3. **Answer.** Each (player, type)'s requests, by request id (`answerRequests`):
+   - `covered` (not charged) when a free trigger or the start already gave the player that type in this step, as a rumor or in the sighting message, or when free coverage holds;
+   - otherwise `rumor` or `sighting` for the first request, and `covered` for the rest;
+   - when nothing is delivered for that (player, type), every request gets the same `capped` or `none`.
+
+A type goes out with its free trigger's reason if it has one, otherwise `targeted`. So a player who loses two types on one tick, or at a boundary with a type already pending, or loses one while buying another, learns about all of them in one message, and a purchase is never charged for what the step gives for free. Skipped ticks change nothing: two losses seen in one batched view make one message. Two players' requests never affect each other.
+
+**Free coverage.** `freeCoverage(config, state, view, playerId, type)` is the one predicate the step (phase 2, answered in phase 3) and the UI (`targetedRumorAvailability`) share, so they can't disagree. It is `covered` when the type's only eligible target is a carrier, by the same eligibility rumor generation uses (sources, then caches, then carriers), and either:
+
+- **(a)** the minute-28 reveal has happened (on its tick or later): the free 30 s broadcast is fresher than any paid sighting, which reads the older snapshot; or
+- **(b)** the type is in the player's pending set after gather (no boundary crossed in this step) and still carrier-only: the next boundary gives it free.
+
+Otherwise it is null and the request is decided as before. With a source or cache target a purchase is a charged `rumor`, even for a pending type (whose pending entry is then dropped at the next boundary) and after minute 28. Players never pay for what they already know or would get free.
+
+**Targeted requests** are `{ requestId, playerId, type }`, and each gets exactly one outcome, whatever the order of the batch:
+
+- `rumor` or `sighting`: something was delivered. Charge the 25 gold only for these two.
+- `covered`: this step already gives the player that type, for free or to a request of the same type lower by id, or free coverage holds (nothing is sent). Not charged.
+- `capped`: the player already got a sighting in this snapshot (before this step).
+- `none`: nothing to sell. The player holds the type, or the player is unknown, or it is before control start, or no untracked target exists.
+- `duplicate`: the request id was seen before, or is listed twice in one batch (only its lowest (player, type) is taken). The step answers it without changing the state or drawing from the generator.
+
+`targetedRumorAvailability(config, state, view, playerId, type)` gives the same answer without drawing (`covered` when `freeCoverage` holds), so the UI can show whether buying would yield anything. A later step can differ only if it crosses a snapshot boundary first, or answer `covered` when a free trigger of that player and type in the same step gives the type anyway.
+
+## Reveals (§2, §5)
+
+All reveals fire when their tick is crossed since the last processed tick, so a skipped tick never loses one. Nothing is sent before control start.
+
+- **First full set:** the first player to hold every type of the preset triggers `final-sector` (the final island's sector) to everyone. Each holder of a full set gets `final-route` with the exact point: the first completer, later completers, and anyone who restores a broken set (with `restored: true`). A player who loses a type gets `final-route-inactive`.
+- **Minute 20:** `sector-reveal` to everyone, listing the sectors with sealed sources and the sectors with caches.
+- **Minute 28, then every 30 s:** `carrier-report` to everyone, listing the (sector, type) pairs of the newest snapshot. Skipping several beats sends one report.
+- **Minute 35** belongs to the claim code.
+
+## Messages and hidden information (§16)
+
+`stepIntel(config, state, view, requests) → { state, messages, outcomes }` never writes into its input. Each message is `{ to, body }`, where `to` is `{ kind: "player", playerId }`, `{ kind: "players", playerIds }` or `{ kind: "everyone" }`. Broadcasts are `final-sector`, `sector-reveal` and `carrier-report`; every other kind goes to one player.
+
+Bodies carry sectors, island indexes and names, types, ticks and journal entry numbers. They never carry a player id, a rubbing id, or a source's, cache's or ship's position. The one exact position ever sent is the final island's, in a `final-route` to a full-set holder. The property tests check every message of every run against these rules:
+
+- six seeded runs with compressed reveal times;
+- one slice run with the real constants for 36,660 ticks;
+- one alpha run with the real constants that skips ticks.
+
+The same runs also check, after every step, that each player got at most one sighting message in it, that every free trigger needing a sighting (a loss, or a stale rumor's replacement) is either in that step's message or in the pending set, and that it waits only if the player's sighting was already spent in this snapshot or the older snapshot shows no other carrier of it. They also check that each player has at most one pending sighting message and that every deferred type goes out at the first boundary after it was capped (or is dropped only when the checker finds it ineligible, or kept only when the previous snapshot shows no other carrier of it). Every rumor is checked against the preference: a cache lead only when no sealed source of the type is left outside the player's journal, a carrier sighting only when no source or cache of the type exists. Every sighting's reason is checked to be `fresh`, `targeted` or `replacement`. Per step and (player, type), at most one request is charged, only when the one lead of that type sent to the player has the reason `targeted` (every lead per (player, type) is kept, so a second, charged lead for a covered type fails). A `covered` request has a lead of its type in that step or free coverage, which the checker derives from the view on its own; a request under free coverage is always `covered`. A black-box check replays the compressed runs, with extra purchases added, against the same script with each step's requests and view arrays shuffled, and compares the messages, the outcomes sorted by request id and `hashState`. Their `EXERCISED` check asserts that every message kind, outcome and lead path occurred, including a deferred delivery, a free trigger sighted in its own step, a message with several types and both kinds of free coverage.
+
+## Building the world view from the ledger
+
+On each processed tick, the caller passes `{ tick, players, rubbings }`:
+
+- **`players`:** each player still in the match (`status` not `left`), with the ship's position in sub-units.
+- **`rubbings`:** each ledger rubbing with its `type` and its `location` resolved to a place:
+  - `source` becomes `{ kind: "source", island, x, y }` from its `LedgerSource`;
+  - `cache` becomes `{ kind: "cache", x, y }` from its `LedgerCache`;
+  - `player` becomes `{ kind: "carried", playerId }`;
+  - `duel` becomes `{ kind: "duel", playerId }`.
+
+Held types and claimed-out islands (islands with no sealed source left) follow from the rubbings, so they can't disagree with them. The ledger's sticky `freshRumors` flag isn't read. The config comes from `createIntelConfig({ preset, finalIsland, controlStartTick, map })`. The state comes from `createIntelState(config, seed)`, which starts before control start.
+
+## Tests per branch
+
+Each branch changed across the intel follow-ups has a deterministic test that fails when the branch is removed. Each mutation below is one line that still typechecks. Apply it on a scratch copy, then run `npx vitest run --project unit packages/simulation/src/intel packages/content/src/intel` (for 20, `npm run typecheck`), and the named test fails. "More" counts the other tests that fail too. The mutations are not committed.
+
+1. **gatherLeads keeps the earliest free trigger**, `packages/simulation/src/intel/step.ts:271`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > keep one free trigger of two for one (player, type) in every order: the earliest tick, then fresh before replacement`.
+   ```diff
+   - if (entry.free === null || compareFree(trigger.free, entry.free) < 0) entry.free = trigger.free;
+   + if (entry.free === null || compareFree(trigger.free, entry.free) > 0) entry.free = trigger.free;
+   ```
+2. **gatherLeads sorts an entry's request ids**, `packages/simulation/src/intel/step.ts:275`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > cover a paid request by a free trigger or a lower request id, and deliver two players' purchases of one type` (and 4 more).
+   ```diff
+   - .map(({ playerId, type, free, requestIds }) => ({ playerId, type, free, requestIds: [...requestIds].sort(compareIds) }))
+   + .map(({ playerId, type, free, requestIds }) => ({ playerId, type, free, requestIds: [...requestIds] }))
+   ```
+3. **compareFree: the earliest tick first**, `packages/simulation/src/intel/step.ts:256`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > keep one free trigger of two for one (player, type) in every order: the earliest tick, then fresh before replacement`.
+   ```diff
+   - return a.tick - b.tick || (a.reason === b.reason ? 0 : a.reason === "fresh" ? -1 : 1);
+   + return 0 || (a.reason === b.reason ? 0 : a.reason === "fresh" ? -1 : 1);
+   ```
+4. **compareFree: fresh before replacement on one tick**, `packages/simulation/src/intel/step.ts:256`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > keep one free trigger of two for one (player, type) in every order: the earliest tick, then fresh before replacement`.
+   ```diff
+   - return a.tick - b.tick || (a.reason === b.reason ? 0 : a.reason === "fresh" ? -1 : 1);
+   + return a.tick - b.tick || (a.reason === b.reason ? 0 : a.reason === "fresh" ? 1 : -1);
+   ```
+5. **decideLeads with starting: the start rumor is decided**, `packages/simulation/src/intel/step.ts:420`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > cover paid requests by the start rumor of their type with decideLeads's starting players, and charge them without`.
+   ```diff
+   - return decide(config, world, state.snapshots, state.rng, new Map(state.players.map((player) => [player.id, player])), entries, new Set(starting));
+   + return decide(config, world, state.snapshots, state.rng, new Map(state.players.map((player) => [player.id, player])), entries, new Set<string>());
+   ```
+6. **decideLeads without starting: no start rumor**, `packages/simulation/src/intel/step.ts:341`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > cover paid requests by the start rumor of their type with decideLeads's starting players, and charge them without` (and 27 more).
+   ```diff
+   - if (starting.has(playerId)) {
+   + if (true) {
+   ```
+7. **the start rumor's type covers its purchases**, `packages/simulation/src/intel/step.ts:352`. Breaks `packages/simulation/src/intel/intel.test.ts > control start and starting rumors (§2) > cover a purchase of the type the player's own start rumor gives, on the control-start step and on a late joiner's first` (and 2 more).
+   ```diff
+   - if (entry.type === startType) {
+   + if (false) {
+   ```
+8. **answerRequests: a free delivery covers every request**, `packages/simulation/src/intel/step.ts:432`. Breaks `packages/simulation/src/intel/intel.test.ts > control start and starting rumors (§2) > cover a purchase of the type the player's own start rumor gives, on the control-start step and on a late joiner's first` (and 9 more).
+   ```diff
+   - results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : "covered") : delivery);
+   + results.set(requestId, delivery === "free" ? "rumor" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : "covered") : delivery);
+   ```
+9. **answerRequests: rumor or sighting charged once, the rest covered**, `packages/simulation/src/intel/step.ts:432`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > answer a phase-3 group from its delivery alone` (and 11 more).
+   ```diff
+   - results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : "covered") : delivery);
+   + results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : delivery) : delivery);
+   ```
+10. **answerRequests: a sighting group is charged like a rumor group**, `packages/simulation/src/intel/step.ts:432`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > answer a phase-3 group from its delivery alone` (and 4 more).
+   ```diff
+   - results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : "covered") : delivery);
+   + results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" ? (index === 0 ? delivery : "covered") : delivery);
+   ```
+11. **answerRequests: every request of a none group gets none**, `packages/simulation/src/intel/step.ts:432`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > answer every request of an undeliverable (player, type) none, charging none, in every order` (and 7 more).
+   ```diff
+   - results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : "covered") : delivery);
+   + results.set(requestId, delivery === "free" ? "covered" : delivery !== "capped" ? (index === 0 ? delivery : "covered") : delivery);
+   ```
+12. **answerRequests: every request of a capped group gets capped**, `packages/simulation/src/intel/step.ts:432`. Breaks `packages/simulation/src/intel/intel.test.ts > the three lead phases, over every order of the triggers > give every request of a capped (player, type) the same capped answer, and keep only the free type pending` (and 4 more).
+   ```diff
+   - results.set(requestId, delivery === "free" ? "covered" : delivery === "rumor" || delivery === "sighting" ? (index === 0 ? delivery : "covered") : delivery);
+   + results.set(requestId, delivery === "free" ? "covered" : delivery !== "none" ? (index === 0 ? delivery : "covered") : delivery);
+   ```
+13. **answerRequests: a covered delivery (free coverage) covers every request**, `packages/simulation/src/intel/step.ts:358`. Breaks `packages/simulation/src/intel/intel.test.ts > free coverage (§11): a purchase is never charged for what the broadcast or the pending set gives > cover a carrier-only purchase from the minute-28 reveal on, in the first and in a later interval` (and 9 more).
+   ```diff
+   - deliveries.push({ ...entry, delivery: "covered" });
+   + deliveries.push({ ...entry, delivery: "none" });
+   ```
+14. **the pending set: a capped free type joins it**, `packages/simulation/src/intel/step.ts:399`. Breaks `packages/simulation/src/intel/intel.test.ts > deferred sightings: one pending message per player, holding a set of types > deliver two pending types together in one message at the next boundary` (and 20 more).
+   ```diff
+   - if (entry.free !== null && !sent.includes(entry.type) && !kept.some((waiting) => waiting.type === entry.type)) kept.push(entry.free);
+   + if (entry.free !== null && sent.includes(entry.type) && !kept.some((waiting) => waiting.type === entry.type)) kept.push(entry.free);
+   ```
+15. **the pending set: decided again at a boundary**, `packages/simulation/src/intel/step.ts:574`. Breaks `packages/simulation/src/intel/intel.test.ts > staleness and the journal (§3) > defer a capped free sighting to the next snapshot boundary instead of dropping it` (and 14 more).
+   ```diff
+   - if (crossedBoundary) {
+   + if (false) {
+   ```
+16. **the snapshot cap: one sighting message per snapshot before minute 28**, `packages/simulation/src/intel/step.ts:173`. Breaks `packages/simulation/src/intel/intel.test.ts > staleness and the journal (§3) > defer a capped free sighting to the next snapshot boundary instead of dropping it` (and 15 more).
+   ```diff
+   - const capped = world.tick < config.carrierRevealTick && newest !== undefined && player.lastSightingBoundary === newest.boundary;
+   + const capped = world.tick < config.carrierRevealTick && newest !== undefined && false;
+   ```
+17. **the snapshot cap: lifted from the carrier reveal**, `packages/simulation/src/intel/step.ts:173`. Breaks `packages/simulation/src/intel/intel.test.ts > targeted rumors (§11) > lift the sighting cap from the carrier reveal on` (and 1 more).
+   ```diff
+   - const capped = world.tick < config.carrierRevealTick && newest !== undefined && player.lastSightingBoundary === newest.boundary;
+   + const capped = true && newest !== undefined && player.lastSightingBoundary === newest.boundary;
+   ```
+18. **sightings read the older of the latest two snapshots**, `packages/simulation/src/intel/step.ts:172`. Breaks `packages/simulation/src/intel/intel.test.ts > staleness and the journal (§3) > replace a stale rumor with a sighting from the previous snapshot when every remaining copy is carried` (and 21 more).
+   ```diff
+   - const older = snapshots.length === 2 ? snapshots[0]! : undefined;
+   + const older = snapshots.at(-1);
+   ```
+19. **the reveal alignment: the validator refuses a misaligned carrier reveal**, `packages/content/src/intel/rules.ts:79`. Breaks `packages/content/src/intel/intel.test.ts > intel rules (§2, §3, §11) > refuse a carrier reveal that is not a multiple of the carrier interval`.
+   ```diff
+   - if (rules.carrierIntervalTicks > 0 && rules.carrierRevealTicks % rules.carrierIntervalTicks !== 0) {
+   + if (rules.carrierIntervalTicks > 0 && false) {
+   ```
+20. **the reason narrowing: a CarrierSighting's reason excludes start**, `packages/simulation/src/intel/state.ts:304`. Breaks `npm run typecheck`: TS2578, unused `@ts-expect-error` at `packages/simulation/src/intel/intel.test.ts:977` and `:979` (test *never let a start ask for a sighting, by type*); no vitest test runs types.
+   ```diff
+   - readonly reason: CarrierSightingReason;
+   + readonly reason: IntelLeadReason;
+   ```
+21. **freeCoverage (a): from the minute-28 reveal on**, `packages/simulation/src/intel/step.ts:196`. Breaks `packages/simulation/src/intel/intel.test.ts > free coverage (§11): a purchase is never charged for what the broadcast or the pending set gives > cover a carrier-only purchase from the minute-28 reveal on, in the first and in a later interval` (and 6 more).
+   ```diff
+   - return world.tick >= config.carrierRevealTick || (holder.pending?.types.some((waiting) => waiting.type === type) ?? false);
+   + return false || (holder.pending?.types.some((waiting) => waiting.type === type) ?? false);
+   ```
+22. **freeCoverage (a): on the reveal tick itself**, `packages/simulation/src/intel/step.ts:196`. Breaks `packages/simulation/src/intel/intel.test.ts > free coverage (§11): a purchase is never charged for what the broadcast or the pending set gives > cover a carrier-only purchase from the minute-28 reveal on, in the first and in a later interval`.
+   ```diff
+   - return world.tick >= config.carrierRevealTick || (holder.pending?.types.some((waiting) => waiting.type === type) ?? false);
+   + return world.tick > config.carrierRevealTick || (holder.pending?.types.some((waiting) => waiting.type === type) ?? false);
+   ```
+23. **freeCoverage (b): a pending type**, `packages/simulation/src/intel/step.ts:196`. Breaks `packages/simulation/src/intel/intel.test.ts > free coverage (§11): a purchase is never charged for what the broadcast or the pending set gives > cover a purchase of a pending carrier-only type, which the next boundary gives free` (and 5 more).
+   ```diff
+   - return world.tick >= config.carrierRevealTick || (holder.pending?.types.some((waiting) => waiting.type === type) ?? false);
+   + return world.tick >= config.carrierRevealTick || false;
+   ```
+24. **freeCoverage: only a carrier-only type**, `packages/simulation/src/intel/step.ts:195`. Breaks `packages/simulation/src/intel/intel.test.ts > free coverage (§11): a purchase is never charged for what the broadcast or the pending set gives > still charge a purchase with a cache target after the reveal as a rumor` (and 14 more).
+   ```diff
+   - if (planLead(config, world, snapshots, holder, [type]).kind !== "carrier") return false;
+   + if (planLead(config, world, snapshots, holder, [type]).kind === "journal") return false;
+   ```
+25. **freeCoverage in the step: only for an entry without a free trigger**, `packages/simulation/src/intel/step.ts:357`. Breaks `packages/simulation/src/intel/intel.test.ts > targeted rumors (§11) > lift the sighting cap from the carrier reveal on` (and 4 more).
+   ```diff
+   - if (entry.free === null && coveredFree(config, world, snapshots, { ...holder, pending: known?.pending ?? null }, entry.type)) {
+   + if (true && coveredFree(config, world, snapshots, { ...holder, pending: known?.pending ?? null }, entry.type)) {
+   ```
+26. **freeCoverage in targetedRumorAvailability**, `packages/simulation/src/intel/step.ts:226`. Breaks `packages/simulation/src/intel/intel.test.ts > free coverage (§11): a purchase is never charged for what the broadcast or the pending set gives > cover a purchase of a pending carrier-only type, which the next boundary gives free` (and 2 more).
+   ```diff
+   - if (freeCoverage(config, state, view, playerId, type) !== null) return "covered";
+   + if (false) return "covered";
+   ```
+27. **the pending drop: a type with a live rumor leaves the pending set at the boundary**, `packages/simulation/src/intel/step.ts:577`. Breaks `packages/simulation/src/intel/intel.test.ts > free coverage (§11): a purchase is never charged for what the broadcast or the pending set gives > charge a rumor for a pending type whose cache appears mid-interval, and drop the pending entry at the boundary without a no-lead`.
+   ```diff
+   - if (player.journal.some((rumor) => rumor.status === "active" && rumor.type === pending.type)) continue;
+   + if (false) continue;
+   ```
+
+## Decisions taken here
+
+- Held types and claimed-out islands are derived from the view's rubbings rather than passed separately.
+- A pending sighting is one message per player holding a set of types, so two types that need a sighting at once are delivered together at the next boundary, not one interval apart, and the cap stays one sighting message per 30 s before minute 28.
+- Every trigger of a step joins the step's set of (player, type) entries, with one sighting decision per player, so "learns about both at once" holds on every path: several losses, a loss with a replacement or a purchase, a batched view, and the boundary tick.
+- A start points only at sources and caches. Sightings come only from a loss, a targeted rumor or a journal replacement.
+- A free trigger that finds every copy carried but no snapshot entry to read yet waits like a capped one.
+- A targeted request whose type a free trigger (or the start) of the same step gives the player is `covered` and not charged; the type goes out with the free reason. Of two requests for one (player, type) in one step, the first by id is charged and the other `covered`. Before, both were charged.
+- Leads are decided in three phases (gather by (player, type), decide with keyed draws, answer grouped by (player, type)), so order independence holds by construction, and one player's purchase never changes another's result or draw.
+- The state's `rng` is the seed of the keyed draws and no longer advances.
+- After the minute-28 reveal a purchase of a carrier-only type is `covered`, since the broadcast is fresher; this is stateless, with no per-player memory. A purchase of a pending carrier-only type is `covered`, since the boundary gives it free. Both come from `freeCoverage`, shared by the step and the UI. A purchase with a source or cache target stays a charged rumor and drops a pending entry of its type at the next boundary.

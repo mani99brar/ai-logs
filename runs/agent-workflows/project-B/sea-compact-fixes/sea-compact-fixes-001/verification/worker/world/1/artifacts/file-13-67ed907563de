@@ -1,0 +1,446 @@
+import { privateMatch, rulesPresets, type ValidationResult } from "./rules.js";
+import {
+  ENGAGEMENT_RANGE_TILES,
+  SIGHT_RADIUS_TILES,
+  travelTargets,
+  WORLD_STEPS_PER_SECOND,
+  type ShipTuning,
+} from "./sailing.js";
+import { insideIsland, isNavigable, Terrain, terrainAt, type SeaMapDefinition } from "./seaMap.js";
+
+const UNREACHABLE = Number.MAX_SAFE_INTEGER;
+
+/** No island rectangle may be larger than this many tiles on a side: the slice's islands are small (§18). */
+export const MAX_ISLAND_SIDE_TILES = 16;
+
+/** The slice sea is compact (§3's travel times at three tiles a second): at most this many tiles on a side. */
+export const MAX_SEA_SIDE_TILES = 112;
+
+/**
+ * Octile path costs for one tile step, in sub-units: straight is a tile's side, diagonal its side times √2, rounded to
+ * the nearest integer by an integer square root (no floating-point `Math.sqrt` in the pure packages). For 256
+ * sub-units a tile, 256 and 362.
+ */
+export function octileStepCosts(subUnitsPerTile: number): { readonly straight: number; readonly diagonal: number } {
+  const square = 2 * subUnitsPerTile * subUnitsPerTile;
+  let root = 0;
+  while ((root + 1) * (root + 1) <= square) root++;
+  // Round half up: √square ≥ root + ½ exactly when square − root² > root.
+  return { straight: subUnitsPerTile, diagonal: square - root * root > root ? root + 1 : root };
+}
+
+/**
+ * Shortest sea-path cost in sub-units from one tile to every tile, over navigable tiles, moving in eight directions.
+ * A diagonal step needs both tiles beside it free, since a hull cannot squeeze between two blocked corners. Tiles
+ * marked in `blocked` (row-major, 1 for blocked) count as obstacles too.
+ */
+export function seaPathCosts(map: SeaMapDefinition, fromX: number, fromY: number, blocked?: Uint8Array): Float64Array {
+  const width = map.widthTiles;
+  const costs = new Float64Array(width * map.heightTiles).fill(UNREACHABLE);
+  const open = (x: number, y: number) => isNavigable(map, x, y) && blocked?.[y * width + x] !== 1;
+  if (!open(fromX, fromY)) return costs;
+  const step = octileStepCosts(map.subUnitsPerTile);
+  const heap = new MinHeap();
+  const start = fromY * width + fromX;
+  costs[start] = 0;
+  heap.push(0, start);
+  while (heap.size > 0) {
+    const [cost, index] = heap.pop();
+    if (cost > costs[index]!) continue;
+    const x = index % width;
+    const y = (index - x) / width;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (!open(nx, ny)) continue;
+        const diagonal = dx !== 0 && dy !== 0;
+        if (diagonal && (!open(x + dx, y) || !open(x, y + dy))) continue;
+        const next = cost + (diagonal ? step.diagonal : step.straight);
+        const target = ny * width + nx;
+        if (next < costs[target]!) {
+          costs[target] = next;
+          heap.push(next, target);
+        }
+      }
+    }
+  }
+  return costs;
+}
+
+/** Seconds at full speed for a path cost, rounded down to milliseconds. */
+export function travelSeconds(cost: number, tuning: ShipTuning): number {
+  return Math.floor((cost * 1000) / (tuning.maxSpeed * WORLD_STEPS_PER_SECOND)) / 1000;
+}
+
+export interface PointOfInterest {
+  readonly label: string;
+  readonly tileX: number;
+  readonly tileY: number;
+}
+
+export interface SeaMapReport {
+  /** Each island's nearest other island by sea, dock to dock. */
+  readonly nearestIsland: readonly { island: string; nearest: string; seconds: number }[];
+  /** The longest shortest trip between any two docks or spawn slots. */
+  readonly longestCrossing: { from: string; to: string; seconds: number };
+  /** Each spawn slot's nearest dock. */
+  readonly firstDock: readonly { slot: number; dock: string; seconds: number }[];
+  /** The largest squared distance, in tiles, from a navigable tile to the nearest land, shoal or dock tile. */
+  readonly largestObstacleDistanceSquared: number;
+  /** The share of the map's tiles that are open sea, from 0 to 1. */
+  readonly openSeaShare: number;
+  /** For each pair of docks on different islands, how close one of its shortest routes comes to the hub (squared tiles). */
+  readonly hubApproach: readonly { from: string; to: string; squaredTiles: number }[];
+}
+
+export interface SeaMapRules {
+  readonly islands: number;
+  readonly spawnSlots: number;
+}
+
+export const sliceSeaRules: SeaMapRules = { islands: rulesPresets.slice.islands, spawnSlots: privateMatch.maxPlayers };
+
+/**
+ * The squared distance, in tiles from tile centre to tile centre, from each tile to the nearest land, shoal or dock tile
+ * (row-major). The map edge is not an obstacle. The search stops at the sight radius: a tile with nothing that close
+ * reads UNREACHABLE.
+ */
+export function obstacleDistancesSquared(map: SeaMapDefinition): Float64Array {
+  const width = map.widthTiles;
+  const height = map.heightTiles;
+  const distances = new Float64Array(width * height).fill(UNREACHABLE);
+  const obstacle = (x: number, y: number) => {
+    const kind = terrainAt(map, x, y);
+    return kind !== undefined && kind !== Terrain.Sea;
+  };
+  for (let tileY = 0; tileY < height; tileY++) {
+    for (let tileX = 0; tileX < width; tileX++) {
+      let best = UNREACHABLE;
+      // Ring by ring outwards: every tile of ring r is at least r away, so once r² reaches the best, nothing beats it.
+      for (let ring = 0; ring <= SIGHT_RADIUS_TILES && ring * ring < best; ring++) {
+        for (let dy = -ring; dy <= ring; dy++) {
+          // The ring's top and bottom rows in full; between them, only its two ends.
+          const step = Math.abs(dy) === ring ? 1 : 2 * ring;
+          for (let dx = -ring; dx <= ring; dx += step) {
+            if (obstacle(tileX + dx, tileY + dy)) best = Math.min(best, dx * dx + dy * dy);
+          }
+        }
+      }
+      distances[tileY * width + tileX] = best;
+    }
+  }
+  return distances;
+}
+
+/**
+ * Whether a tile lies in the hub's disc: its centre within half the sight radius of the hub tile's centre, so the
+ * centres of any two tiles in the disc are within sight of each other.
+ */
+export function inHubDisc(map: SeaMapDefinition, tileX: number, tileY: number): boolean {
+  const dx = 2 * (tileX - map.hub.tileX);
+  const dy = 2 * (tileY - map.hub.tileY);
+  return dx * dx + dy * dy <= SIGHT_RADIUS_TILES * SIGHT_RADIUS_TILES;
+}
+
+/**
+ * Checks a map against §2 and §3: a compact sea, at most MAX_SEA_SIDE_TILES on a side; four small islands, each with
+ * a dock; shoals; eight outer-sea spawn slots out of each other's engagement range; every dock and slot reachable by
+ * sea; neighbouring islands 20–40 s apart and no useful crossing over 90 s at full speed; and a dock within 40 s of
+ * every slot. No empty stretches: every navigable
+ * tile lies within the sight radius of land, a shoal or a dock. Routes meet: the hub is open sea near the centre, and
+ * every shortest route between docks on different islands crosses its disc (closing the disc lengthens or cuts
+ * every one of them).
+ */
+export function validateSeaMap(map: SeaMapDefinition, tuning: ShipTuning, rules: SeaMapRules = sliceSeaRules): ValidationResult<SeaMapReport> {
+  const issues: string[] = [];
+  const { islands, docks, spawnSlots } = map;
+  const tileCentre = Math.floor(map.subUnitsPerTile / 2);
+
+  if (tuning.hullHalfSize >= tileCentre) issues.push(`ship hull half-size ${tuning.hullHalfSize} does not fit inside one tile`);
+  if (SIGHT_RADIUS_TILES <= ENGAGEMENT_RANGE_TILES) issues.push("the sight radius must be larger than the engagement range");
+
+  if (map.widthTiles > MAX_SEA_SIDE_TILES || map.heightTiles > MAX_SEA_SIDE_TILES) {
+    issues.push(`${map.widthTiles} × ${map.heightTiles} tiles is larger than ${MAX_SEA_SIDE_TILES} × ${MAX_SEA_SIDE_TILES}`);
+  }
+  if (islands.length !== rules.islands) issues.push(`${islands.length} islands, not ${rules.islands}`);
+  islands.forEach((island, index) => {
+    if (island.widthTiles > MAX_ISLAND_SIDE_TILES || island.heightTiles > MAX_ISLAND_SIDE_TILES) {
+      issues.push(`${island.name}: ${island.widthTiles} × ${island.heightTiles} tiles is not a small island`);
+    }
+    if (island.tileX < 0 || island.tileY < 0 || island.tileX + island.widthTiles > map.widthTiles || island.tileY + island.heightTiles > map.heightTiles) {
+      issues.push(`${island.name}: outside the map`);
+    }
+    for (const other of islands.slice(index + 1)) {
+      const apart =
+        island.tileX + island.widthTiles <= other.tileX ||
+        other.tileX + other.widthTiles <= island.tileX ||
+        island.tileY + island.heightTiles <= other.tileY ||
+        other.tileY + other.heightTiles <= island.tileY;
+      if (!apart) issues.push(`${island.name} and ${other.name} overlap`);
+    }
+    if (!docks.some((dock) => dock.island === index)) issues.push(`${island.name}: no dock`);
+  });
+
+  let landTiles = 0;
+  let shoalTiles = 0;
+  for (let tileY = 0; tileY < map.heightTiles; tileY++) {
+    for (let tileX = 0; tileX < map.widthTiles; tileX++) {
+      const kind = terrainAt(map, tileX, tileY);
+      if (kind === Terrain.Shoal) shoalTiles++;
+      if (kind !== Terrain.Land) continue;
+      landTiles++;
+      const owners = islands.filter((island) => insideIsland(island, tileX, tileY)).length;
+      if (owners !== 1) issues.push(`land at ${tileX},${tileY} lies in ${owners} island rectangles, not one`);
+    }
+  }
+  if (landTiles === 0) issues.push("no land");
+  if (shoalTiles === 0) issues.push("no shoals");
+
+  const obstacleDistances = obstacleDistancesSquared(map);
+  let largestObstacleDistanceSquared = 0;
+  let empty = { count: 0, tileX: 0, tileY: 0 };
+  obstacleDistances.forEach((distance, index) => {
+    const tileX = index % map.widthTiles;
+    const tileY = (index - tileX) / map.widthTiles;
+    if (!isNavigable(map, tileX, tileY)) return;
+    largestObstacleDistanceSquared = Math.max(largestObstacleDistanceSquared, distance);
+    if (distance > SIGHT_RADIUS_TILES * SIGHT_RADIUS_TILES) empty = { count: empty.count + 1, tileX, tileY };
+  });
+  if (empty.count > 0) {
+    issues.push(`${empty.count} sea tiles lie farther than ${SIGHT_RADIUS_TILES} tiles from any land, shoal or dock, such as ${empty.tileX},${empty.tileY}`);
+  }
+
+  const { hub } = map;
+  // Doubled coordinates keep the map's centre on an integer: the hub lies within half the sight radius of it.
+  const offCentreX = 2 * hub.tileX + 1 - map.widthTiles;
+  const offCentreY = 2 * hub.tileY + 1 - map.heightTiles;
+  if (terrainAt(map, hub.tileX, hub.tileY) !== Terrain.Sea) issues.push(`the hub at ${hub.tileX},${hub.tileY} is not on open sea`);
+  else if (offCentreX * offCentreX + offCentreY * offCentreY > SIGHT_RADIUS_TILES * SIGHT_RADIUS_TILES) {
+    issues.push(`the hub at ${hub.tileX},${hub.tileY} is not near the map's centre`);
+  }
+
+  const neighbours = (tileX: number, tileY: number) => [
+    [tileX + 1, tileY],
+    [tileX - 1, tileY],
+    [tileX, tileY + 1],
+    [tileX, tileY - 1],
+  ] as const;
+  for (const dock of docks) {
+    const where = `dock at ${dock.tileX},${dock.tileY}`;
+    const island = islands[dock.island];
+    if (island === undefined) {
+      issues.push(`${where}: outside every island rectangle`);
+      continue;
+    }
+    const touches = (kind: Terrain) =>
+      neighbours(dock.tileX, dock.tileY).some(([x, y]) => terrainAt(map, x, y) === kind && (kind !== Terrain.Land || insideIsland(island, x, y)));
+    if (!touches(Terrain.Land)) issues.push(`${where}: not beside ${island.name}'s land`);
+    if (!touches(Terrain.Sea)) issues.push(`${where}: no open sea beside it`);
+  }
+
+  if (spawnSlots.length !== rules.spawnSlots) issues.push(`${spawnSlots.length} spawn slots, not ${rules.spawnSlots}`);
+  const archipelago = boundsOf(islands);
+  spawnSlots.forEach((slot, index) => {
+    const where = `spawn slot ${index} at ${slot.tileX},${slot.tileY}`;
+    if (terrainAt(map, slot.tileX, slot.tileY) !== Terrain.Sea) issues.push(`${where}: not on open sea`);
+    if (
+      archipelago !== undefined &&
+      slot.tileX >= archipelago.minX &&
+      slot.tileX <= archipelago.maxX &&
+      slot.tileY >= archipelago.minY &&
+      slot.tileY <= archipelago.maxY
+    ) {
+      issues.push(`${where}: inside the archipelago, not on the outer sea`);
+    }
+    spawnSlots.slice(index + 1).forEach((other, offset) => {
+      const dx = other.tileX - slot.tileX;
+      const dy = other.tileY - slot.tileY;
+      if (dx * dx + dy * dy <= ENGAGEMENT_RANGE_TILES * ENGAGEMENT_RANGE_TILES) {
+        issues.push(`${where}: within engagement range of slot ${index + 1 + offset}`);
+      }
+    });
+  });
+  if (issues.length > 0) return { ok: false, issues };
+
+  // Travel: one shortest-path search from every dock and spawn slot.
+  const points: PointOfInterest[] = [
+    ...docks.map((dock) => ({ label: `${islands[dock.island]!.name} ${dock.side} dock`, tileX: dock.tileX, tileY: dock.tileY })),
+    ...spawnSlots.map((slot, index) => ({ label: `spawn slot ${index}`, tileX: slot.tileX, tileY: slot.tileY })),
+  ];
+  const costs = points.map((point) => seaPathCosts(map, point.tileX, point.tileY));
+  const between = (from: number, to: number) => costs[from]![points[to]!.tileY * map.widthTiles + points[to]!.tileX]!;
+
+  const origin = docks.length;
+  points.forEach((point, index) => {
+    if (between(origin, index) === UNREACHABLE) issues.push(`${point.label} at ${point.tileX},${point.tileY}: not reachable by sea from spawn slot 0`);
+  });
+  if (issues.length > 0) return { ok: false, issues };
+
+  const nearestIsland = islands.map((island, index) => {
+    let best = { nearest: "", cost: UNREACHABLE };
+    docks.forEach((from, fromIndex) => {
+      if (from.island !== index) return;
+      docks.forEach((to, toIndex) => {
+        if (to.island === index) return;
+        const cost = between(fromIndex, toIndex);
+        if (cost < best.cost) best = { nearest: islands[to.island]!.name, cost };
+      });
+    });
+    return { island: island.name, nearest: best.nearest, seconds: travelSeconds(best.cost, tuning) };
+  });
+  for (const entry of nearestIsland) {
+    if (entry.seconds < travelTargets.neighbourIslandMinSeconds || entry.seconds > travelTargets.neighbourIslandMaxSeconds) {
+      issues.push(
+        `${entry.island}: its nearest island, ${entry.nearest}, is ${entry.seconds} s away, outside ${travelTargets.neighbourIslandMinSeconds}–${travelTargets.neighbourIslandMaxSeconds} s`,
+      );
+    }
+  }
+
+  let longest = { from: "", to: "", cost: 0 };
+  points.forEach((from, fromIndex) => {
+    points.forEach((to, toIndex) => {
+      const cost = between(fromIndex, toIndex);
+      if (cost > longest.cost) longest = { from: from.label, to: to.label, cost };
+    });
+  });
+  const longestCrossing = { from: longest.from, to: longest.to, seconds: travelSeconds(longest.cost, tuning) };
+  if (longestCrossing.seconds > travelTargets.longestCrossingMaxSeconds) {
+    issues.push(`the crossing from ${longest.from} to ${longest.to} takes ${longestCrossing.seconds} s, over ${travelTargets.longestCrossingMaxSeconds} s`);
+  }
+
+  const firstDock = spawnSlots.map((_, slot) => {
+    let best = { dock: "", cost: UNREACHABLE };
+    docks.forEach((_, dockIndex) => {
+      const cost = between(origin + slot, dockIndex);
+      if (cost < best.cost) best = { dock: points[dockIndex]!.label, cost };
+    });
+    return { slot, dock: best.dock, seconds: travelSeconds(best.cost, tuning) };
+  });
+  for (const entry of firstDock) {
+    if (entry.seconds > travelTargets.firstDockMaxSeconds) {
+      issues.push(`spawn slot ${entry.slot}: the nearest dock is ${entry.seconds} s away, over ${travelTargets.firstDockMaxSeconds} s`);
+    }
+  }
+
+  // Routes meet: with the hub's disc closed, every route between docks on different islands grows longer or is cut.
+  const disc = new Uint8Array(map.widthTiles * map.heightTiles);
+  disc.forEach((_, index) => {
+    const tileX = index % map.widthTiles;
+    disc[index] = inHubDisc(map, tileX, (index - tileX) / map.widthTiles) ? 1 : 0;
+  });
+  const hubApproach: { from: string; to: string; squaredTiles: number }[] = [];
+  docks.forEach((from, fromIndex) => {
+    const detour = seaPathCosts(map, from.tileX, from.tileY, disc);
+    docks.forEach((to, toIndex) => {
+      if (to.island === from.island) return;
+      const direct = between(fromIndex, toIndex);
+      if (detour[to.tileY * map.widthTiles + to.tileX]! <= direct) {
+        issues.push(`${points[fromIndex]!.label} to ${points[toIndex]!.label}: a shortest route avoids the hub at ${hub.tileX},${hub.tileY}`);
+      }
+      if (toIndex > fromIndex) {
+        const route = shortestRoute(map, costs[fromIndex]!, to.tileX, to.tileY);
+        const squaredTiles = Math.min(...route.map(([x, y]) => (x - hub.tileX) * (x - hub.tileX) + (y - hub.tileY) * (y - hub.tileY)));
+        hubApproach.push({ from: points[fromIndex]!.label, to: points[toIndex]!.label, squaredTiles });
+      }
+    });
+  });
+
+  let openSea = 0;
+  for (const kind of map.terrain) if (kind === Terrain.Sea) openSea++;
+  const openSeaShare = openSea / map.terrain.length;
+
+  return issues.length > 0
+    ? { ok: false, issues }
+    : { ok: true, value: { nearestIsland, longestCrossing, firstDock, largestObstacleDistanceSquared, openSeaShare, hubApproach } };
+}
+
+/**
+ * One shortest route to a tile, as the tiles it visits from the target back to the search's start: each step goes to
+ * the first neighbour (in a fixed order) whose cost plus the step equals the current cost.
+ */
+export function shortestRoute(map: SeaMapDefinition, costs: Float64Array, toX: number, toY: number): [number, number][] {
+  const width = map.widthTiles;
+  const step = octileStepCosts(map.subUnitsPerTile);
+  const route: [number, number][] = [[toX, toY]];
+  let [x, y] = [toX, toY];
+  while (costs[y * width + x]! > 0 && costs[y * width + x]! < UNREACHABLE) {
+    const cost = costs[y * width + x]!;
+    let next: [number, number] | undefined;
+    for (let dy = -1; dy <= 1 && next === undefined; dy++) {
+      for (let dx = -1; dx <= 1 && next === undefined; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= map.heightTiles) continue;
+        const diagonal = dx !== 0 && dy !== 0;
+        if (diagonal && (!isNavigable(map, x + dx, y) || !isNavigable(map, x, y + dy))) continue;
+        if (costs[ny * width + nx]! + (diagonal ? step.diagonal : step.straight) === cost) next = [nx, ny];
+      }
+    }
+    if (next === undefined) break;
+    route.push(next);
+    [x, y] = next;
+  }
+  return route;
+}
+
+function boundsOf(islands: SeaMapDefinition["islands"]) {
+  if (islands.length === 0) return undefined;
+  return {
+    minX: Math.min(...islands.map((island) => island.tileX)),
+    minY: Math.min(...islands.map((island) => island.tileY)),
+    maxX: Math.max(...islands.map((island) => island.tileX + island.widthTiles - 1)),
+    maxY: Math.max(...islands.map((island) => island.tileY + island.heightTiles - 1)),
+  };
+}
+
+/** A binary min-heap of (cost, index) pairs for the path search. */
+class MinHeap {
+  private readonly costs: number[] = [];
+  private readonly indexes: number[] = [];
+
+  get size(): number {
+    return this.costs.length;
+  }
+
+  push(cost: number, index: number): void {
+    this.costs.push(cost);
+    this.indexes.push(index);
+    let child = this.costs.length - 1;
+    while (child > 0) {
+      const parent = (child - 1) >> 1;
+      if (this.costs[parent]! <= cost) break;
+      this.swap(child, parent);
+      child = parent;
+    }
+  }
+
+  pop(): [number, number] {
+    const top: [number, number] = [this.costs[0]!, this.indexes[0]!];
+    const lastCost = this.costs.pop()!;
+    const lastIndex = this.indexes.pop()!;
+    if (this.costs.length > 0) {
+      this.costs[0] = lastCost;
+      this.indexes[0] = lastIndex;
+      let parent = 0;
+      for (;;) {
+        const left = 2 * parent + 1;
+        const right = left + 1;
+        let smallest = parent;
+        if (left < this.costs.length && this.costs[left]! < this.costs[smallest]!) smallest = left;
+        if (right < this.costs.length && this.costs[right]! < this.costs[smallest]!) smallest = right;
+        if (smallest === parent) break;
+        this.swap(parent, smallest);
+        parent = smallest;
+      }
+    }
+    return top;
+  }
+
+  private swap(a: number, b: number): void {
+    [this.costs[a], this.costs[b]] = [this.costs[b]!, this.costs[a]!];
+    [this.indexes[a], this.indexes[b]] = [this.indexes[b]!, this.indexes[a]!];
+  }
+}

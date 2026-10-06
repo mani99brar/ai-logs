@@ -1,0 +1,581 @@
+"""Local, isolated check execution and artifact capture. Never launches agents."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .sessions import git, save_json, terminate
+from .verification import evaluate_worker, policy_digest
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def execute(argv: list[str], cwd: Path, log: Path, timeout: int, env: dict) -> tuple[int, str, str]:
+    started = now()
+    with log.open("wb") as output:
+        process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            terminate(process)
+            output.write(b"\nWORKFLOW: timeout; process group terminated\n")
+            code = 124
+        except BaseException:
+            terminate(process)
+            raise
+        finally:
+            # Test runners must not leave servers or descendant writers alive.
+            # terminate also signals the group after the group leader has exited.
+            terminate(process)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            output.flush()
+            os.fsync(output.fileno())
+    return code, started, now()
+
+
+def text_test_counts(log: str) -> dict | None:
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", log)
+    unit = re.search(r"^Ran (\d+) tests? in .+$", text, re.MULTILINE)
+    if unit:
+        total = int(unit[1])
+        skipped = re.search(r"\bskipped=(\d+)", text)
+        skipped = int(skipped[1]) if skipped else 0
+        failures = sum(int(value) for value in re.findall(r"\b(?:failures|errors|unexpected successes)=(\d+)", text))
+        if not re.search(r"^(?:OK(?:\s|$)|FAILED\s*\()", text, re.MULTILINE):
+            return None
+        return {"passed": max(0, total - skipped - failures), "failed": failures, "skipped": skipped}
+    # Node's TAP and spec reporters. Require a complete self-consistent summary.
+    counts = {}
+    for key in ("tests", "pass", "fail", "skipped", "cancelled", "todo"):
+        found = re.findall(rf"^[#ℹ]\s+{key}\s+(\d+)\s*$", text, re.MULTILINE)
+        if found:
+            counts[key] = int(found[-1])
+    if {"tests", "pass", "fail", "skipped"} <= counts.keys():
+        if sum(counts.get(key, 0) for key in ("pass", "fail", "skipped", "cancelled", "todo")) == counts["tests"]:
+            return {"passed": counts["pass"], "failed": counts["fail"] + counts.get("cancelled", 0),
+                    "skipped": counts["skipped"] + counts.get("todo", 0)}
+    return None
+
+
+class Capture:
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.artifacts = []
+        self.paths = {}
+
+    def add(self, source: Path, kind: str) -> str:
+        if not source.is_file() or source.is_symlink():
+            raise ValueError("Evidence must be a regular file")
+        content = source.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        artifact_id = f"{kind}-{len(self.artifacts)}-{digest[:12]}"
+        destination = self.directory / artifact_id
+        with destination.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        destination.chmod(0o400)
+        self.artifacts.append({"artifact_id": artifact_id, "kind": kind,
+                               "uri": destination.name, "sha256": digest})
+        self.paths[artifact_id] = destination
+        return artifact_id
+
+
+def browser_evidence(report_path: Path, output_root: Path, requirement: dict, capture: Capture) -> tuple[dict, list]:
+    report = json.loads(report_path.read_text())
+    if report.get("errors"):
+        raise ValueError("Playwright reported global errors")
+    specs = []
+    def walk(suite):
+        specs.extend(suite.get("specs", []))
+        for child in suite.get("suites", []):
+            walk(child)
+    walk(report)
+    required = {case["id"] for case in requirement["scenarios"]}
+    found = {}
+    counts = {"passed": 0, "failed": 0, "skipped": 0}
+    for spec in specs:
+        for test in spec.get("tests", []):
+            results = test.get("results", [])
+            # No flaky retries or expected failures counted as passing verification.
+            passed = test.get("status") == "expected" and test.get("expectedStatus") == "passed" and len(results) == 1 and results[0].get("status") == "passed"
+            skipped = test.get("status") == "skipped"
+            counts["passed" if passed else "skipped" if skipped else "failed"] += 1
+            matches = set(re.findall(r"\[scenario:([^\]]+)\]", spec.get("title", ""))) & required
+            for scenario_id in matches:
+                if scenario_id in found:
+                    raise ValueError(f"Duplicate browser scenario/project result: {scenario_id}")
+                screenshot = None
+                if passed:
+                    attachments = [item for item in results[0].get("attachments", [])
+                                   if item.get("name") == f"screenshot:{scenario_id}" and item.get("contentType") == "image/png"]
+                    if len(attachments) != 1:
+                        raise ValueError(f"Expected one screenshot attachment for {scenario_id}")
+                    path = Path(attachments[0].get("path", "")).resolve(strict=True)
+                    if not path.is_relative_to(output_root.resolve()):
+                        raise ValueError("Screenshot attachment outside isolated browser output directory")
+                    screenshot = capture.add(path, "screenshot")
+                found[scenario_id] = {"id": scenario_id, "status": "passed" if passed else "skipped" if skipped else "failed",
+                                      "screenshot_artifact_id": screenshot}
+    if set(found) != required:
+        raise ValueError("Playwright report does not cover every required scenario")
+    return counts, list(found.values())
+
+
+def verify_revision(run: Path, plan: dict, policy: dict, node: str, commit: str, changed: list[str],
+                    session_id: str, phase: str = "worker", attempt: int = 1) -> dict:
+    """One fresh verification worktree per node/phase/attempt, artifacts retained."""
+    worker = next(worker for worker in policy["workers"] if worker["node_id"] == node)
+    directory = run / "verification" / phase / node / str(attempt)
+    packet_path = directory / "packet.json"
+    if packet_path.exists():
+        packet = json.loads(packet_path.read_text())
+        if packet["expected"]["output_commit"] != commit or packet["evidence"]["policy_sha256"] != policy_digest(policy):
+            raise ValueError("Existing verification belongs to a different revision/policy")
+        return recheck_packet(packet, policy, run)
+    if directory.exists():
+        raise RuntimeError("Interrupted check attempt exists; use an explicitly incremented attempt")
+    directory.mkdir(parents=True, mode=0o700)
+    worktree = directory / "worktree"
+    subprocess.run(["git", "-C", plan["repository"], "worktree", "add", "--detach", str(worktree), commit], check=True, capture_output=True)
+    if git(worktree, "rev-parse", "HEAD") != commit or git(worktree, "status", "--porcelain"):
+        raise RuntimeError("Verification worktree did not start clean at expected revision")
+    artifacts_dir = directory / "artifacts"
+    artifacts_dir.mkdir()
+    capture = Capture(artifacts_dir)
+    env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+    for key in list(env):
+        if key.startswith("PLAYWRIGHT_JSON_OUTPUT"):
+            del env[key]  # The runner owns JSON capture, not inherited reporter paths.
+    # Share installed browser executables read-only, not profiles or test caches.
+    if sys.platform == "linux":
+        env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path(env.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ms-playwright"))
+    env.update(PATH=str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", ""),
+               PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", FORCE_COLOR="0", CI="1",
+               WORKFLOW_VERIFICATION_PHASE=phase)
+    for name in ("XDG_CACHE_HOME", "npm_config_cache"):
+        path = directory / name.lower()
+        path.mkdir()
+        env[name] = str(path)
+    # Unix domain sockets (tsx IPC, Chromium) are limited to ~107 bytes of path, so the
+    # lane's TMPDIR cannot live under the run directory. It is private to this lane,
+    # holds no evidence, and is removed once the checks finish.
+    tmpdir = lane_tmpdir()
+    env["TMPDIR"] = str(tmpdir)
+    executions, receipts, errors, effective_commands = [], [], [], []
+    try:
+        run_lane_commands(policy, worker, worktree, directory, env, capture, executions, receipts, errors, effective_commands)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    # Source edits by checks invalidate the evidence. Ignored caches are allowed.
+    if git(worktree, "rev-parse", "HEAD") != commit or git(worktree, "status", "--porcelain"):
+        errors.append("Verification modified the tested source revision")
+    expected = {"run_id": plan["run_id"], "node_id": node, "attempt": attempt, "base_commit": plan["base_commit"],
+                "output_commit": commit, "verification_cwd": str(worktree)}
+    result = {"contract_version": "1.0.0", **{key: value for key, value in expected.items() if key != "verification_cwd"},
+              "session_id": session_id, "status": "succeeded", "changed_files": changed,
+              "checks": executions, "open_assumptions": [], "artifacts": capture.artifacts,
+              "summary": f"Trusted {phase} check capture; not integration approval", "error": None}
+    evidence = {"version": "1.0.0", "policy_sha256": policy_digest(policy),
+                **{key: expected[key] for key in ("run_id", "node_id", "attempt", "output_commit")}, "checks": receipts}
+    packet = {"phase": phase, "expected": expected, "result": result, "evidence": evidence,
+              "artifact_root": str(artifacts_dir), "artifact_paths": {key: str(path) for key, path in capture.paths.items()},
+              "capture_errors": errors, "effective_commands": effective_commands, "tmpdir": str(tmpdir)}
+    packet = recheck_packet(packet, policy, run)
+    save_json(packet_path, packet)
+    return packet
+
+
+SOCKET_PATH_LIMIT = 107  # sun_path on Linux, excluding the terminating NUL.
+SOCKET_NAME_ALLOWANCE = len("/tsx-4294967295/4294967295.pipe")
+
+
+def lane_tmpdir() -> Path:
+    """A short private temp directory whose sockets fit within sun_path."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="mdwf-"))
+    if len(str(tmpdir)) + SOCKET_NAME_ALLOWANCE > SOCKET_PATH_LIMIT:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError(f"System temp directory is too deep for Unix sockets: {tmpdir.parent}")
+    return tmpdir
+
+
+def run_lane_commands(policy: dict, worker: dict, worktree: Path, directory: Path, env: dict, capture: "Capture",
+                      executions: list, receipts: list, errors: list, effective_commands: list) -> None:
+    for index, setup in enumerate(policy.get("setup", [])):
+        log = directory / f"setup-{index}.log"
+        code, _, _ = execute(setup["argv"], worktree, log, setup["timeout_seconds"], env)
+        capture.add(log, "log")
+        if code != 0:
+            errors.append(f"Setup {index} failed with exit {code}")
+            break
+    if not errors:
+        for index, check in enumerate(worker["checks"]):
+            argv = list(check["argv"])
+            log = directory / f"check-{index}.log"
+            browser_output = directory / f"browser-{index}"
+            browser_report = directory / f"browser-report-{index}.json"
+            check_env = dict(env)
+            if check["kind"] == "browser":
+                # Runtime-owned reporter/output flags override project defaults.
+                argv.extend(["--reporter=json", f"--output={browser_output}", "--workers=1", "--retries=0"])
+                check_env["PLAYWRIGHT_JSON_OUTPUT_FILE"] = str(browser_report)
+            effective_commands.append(argv)
+            code, start, finish = execute(argv, worktree, log, check["timeout_seconds"], check_env)
+            log_id = capture.add(log, "log")
+            executions.append({"command": shlex.join(check["argv"]), "cwd": str(worktree),
+                               "started_at": start, "finished_at": finish, "exit_code": code, "log_artifact_id": log_id})
+            tests, scenarios = None, []
+            try:
+                if check["kind"] == "browser":
+                    # Keep structured results separate from npm/Node warnings in logs.
+                    tests, scenarios = browser_evidence(browser_report, browser_output, check, capture)
+                    capture.add(browser_report, "test_report")
+                elif check["kind"] in {"unit", "contract", "integration"}:
+                    tests = text_test_counts(log.read_text(errors="replace"))
+                if code != 0:
+                    errors.append(f"{check['id']}: exit {code}")
+            except (ValueError, OSError, KeyError, TypeError) as error:
+                errors.append(f"{check['id']}: {error}")
+            receipts.append({"id": check["id"], "worker_check_index": index, "tests": tests, "scenarios": scenarios})
+
+
+def recheck_packet(packet: dict, policy: dict, run: Path) -> dict:
+    root = Path(packet["artifact_root"]).resolve()
+    if not root.is_relative_to(run.resolve()):
+        raise ValueError("Artifact root outside run")
+    gate = evaluate_worker(policy, packet["result"], packet["evidence"], expected=packet["expected"],
+                           artifact_root=root, artifact_paths={key: Path(value) for key, value in packet["artifact_paths"].items()},
+                           enforce_ownership=packet["phase"] == "worker")
+    gate["reasons"].extend(packet["capture_errors"])
+    if gate["reasons"]:
+        gate["status"] = "blocked"
+    packet["gate"] = gate
+    return packet
+=== verification.py ===
+"""Reusable policy/evidence gates. No agents, browsers, shells or graph launches.
+
+Inputs must come from a trusted verifier plus backend-owned artifact registry, not
+unchecked agent prose. Passing this evidence gate never authorizes integration.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import shlex
+from datetime import datetime
+from pathlib import Path
+
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import ValidationError
+
+CONTRACTS = Path(__file__).resolve().parents[1] / "contracts" / "workflow"
+
+
+def validate_schema(name: str, value: dict) -> None:
+    schema = json.loads((CONTRACTS / f"{name}.schema.json").read_text())
+    Draft202012Validator(schema, format_checker=FormatChecker()).validate(value)
+
+
+def policy_digest(policy: dict) -> str:
+    """Canonical UTF-8 JSON: sorted keys, no whitespace, literal Unicode."""
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def safe_path(value: str) -> str:
+    normalized = value.rstrip("/")
+    if not normalized or normalized.startswith("/") or any(char in normalized for char in "\\:*?[]") or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ValueError(f"Not an exact repository-relative path/prefix: {value}")
+    return normalized
+
+
+def owns(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def unique(items: list[dict], key: str) -> dict:
+    result = {item[key]: item for item in items}
+    if len(result) != len(items):
+        raise ValueError(f"Duplicate {key}")
+    return result
+
+
+def validate_policy(policy: dict) -> dict:
+    validate_schema("verification", policy)
+    workers = unique(policy["workers"], "node_id")
+    claimed = []
+    for worker in workers.values():
+        paths = [safe_path(path) for path in worker["owned_paths"]]
+        for other_node, other_path in claimed:
+            if any(owns(path, other_path) or owns(other_path, path) for path in paths):
+                raise ValueError(f"Overlapping ownership: {worker['node_id']} and {other_node}")
+        claimed.extend((worker["node_id"], path) for path in paths)
+        checks = unique(worker["checks"], "id")
+        if len({tuple(check["argv"]) for check in checks.values()}) != len(checks):
+            raise ValueError("Each check needs a distinct command")
+        kinds = {check["kind"] for check in checks.values()}
+        required = {"build", "browser"} if worker["role"] == "frontend" else {"unit"}
+        if not required <= kinds:
+            raise ValueError(f"{worker['role']} requires {sorted(required)} checks")
+        for check in checks.values():
+            unique(check["scenarios"], "id")
+            if (check["kind"] == "browser") != bool(check["scenarios"]):
+                raise ValueError("Browser checks require named scenarios; other checks must not have scenarios")
+    drill = policy.get("failure_drill")
+    if drill and (drill["node_id"] not in workers or policy.get("max_verification_attempts", 3) < 2):
+        raise ValueError("Failure drill requires a configured worker and at least two allowed verification attempts")
+    return policy
+
+
+def evaluate_worker(policy: dict, result: dict, evidence: dict, *, expected: dict,
+                    artifact_root: Path, artifact_paths: dict[str, Path], enforce_ownership: bool = True) -> dict:
+    """Fail closed on absent, stale or inconsistent evidence.
+
+    `expected` is backend-owned: run_id, node_id, attempt, base_commit,
+    output_commit and verification_cwd. Caller must freeze edits and independently
+    derive the full Git diff/commit before invoking; this function cannot prove
+    that an agent has reported all changed files.
+    """
+    reasons = []
+    try:
+        validate_policy(policy)
+        validate_schema("workerResult", result)
+        validate_schema("verificationEvidence", evidence)
+        workers = {worker["node_id"]: worker for worker in policy["workers"]}
+        worker = workers[expected["node_id"]]
+        for field in ("run_id", "node_id", "attempt", "base_commit", "output_commit"):
+            if result[field] != expected[field]:
+                raise ValueError(f"Worker result has stale/mismatched {field}")
+        for field in ("run_id", "node_id", "attempt", "output_commit"):
+            if evidence[field] != expected[field]:
+                raise ValueError(f"Verification evidence has stale/mismatched {field}")
+        if evidence["policy_sha256"] != policy_digest(policy):
+            raise ValueError("Verification policy changed after evidence capture")
+        if result["status"] != "succeeded" or result["output_commit"] is None or result["error"] is not None:
+            raise ValueError("Worker did not produce a successful durable result")
+        prefixes = [safe_path(path) for path in worker["owned_paths"]]
+        for changed in result["changed_files"]:
+            if enforce_ownership and not any(owns(safe_path(changed), prefix) for prefix in prefixes):
+                reasons.append(f"Changed file outside ownership: {changed}")
+        artifacts = unique(result["artifacts"], "artifact_id")
+        root = artifact_root.resolve(strict=True)
+        resolved = {}
+        for artifact_id, artifact in artifacts.items():
+            path = artifact_paths[artifact_id].resolve(strict=True)
+            if not path.is_relative_to(root) or not path.is_file():
+                raise ValueError(f"Artifact escapes registry root: {artifact_id}")
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            if digest != artifact["sha256"]:
+                raise ValueError(f"Artifact hash mismatch: {artifact_id}")
+            resolved[artifact_id] = path
+        for check in result["checks"]:
+            if artifacts.get(check["log_artifact_id"], {}).get("kind") != "log":
+                reasons.append("Executed check is missing a log artifact")
+            if datetime.fromisoformat(check["finished_at"]) < datetime.fromisoformat(check["started_at"]):
+                reasons.append("Check finish precedes start")
+            if check["exit_code"] != 0:
+                reasons.append(f"Executed check failed: {check['command']}")
+        supplied = unique(evidence["checks"], "id")
+        required = {check["id"]: check for check in worker["checks"]}
+        if set(supplied) != set(required):
+            raise ValueError("Required check evidence missing or contains unknown check IDs")
+        indexes = [check["worker_check_index"] for check in supplied.values()]
+        if len(set(indexes)) != len(indexes):
+            raise ValueError("A command execution cannot satisfy multiple check IDs")
+        for check_id, requirement in required.items():
+            receipt = supplied[check_id]
+            execution = result["checks"][receipt["worker_check_index"]]
+            if execution["command"] != shlex.join(requirement["argv"]):
+                reasons.append(f"{check_id}: executed command differs from approved argv")
+            if Path(execution["cwd"]).resolve() != Path(expected["verification_cwd"]).resolve():
+                reasons.append(f"{check_id}: wrong verification worktree")
+            duration = (datetime.fromisoformat(execution["finished_at"]) - datetime.fromisoformat(execution["started_at"])).total_seconds()
+            if duration > requirement["timeout_seconds"]:
+                reasons.append(f"{check_id}: execution exceeded approved timeout")
+            if requirement["kind"] in {"unit", "browser", "integration", "contract"}:
+                tests = receipt["tests"]
+                if tests is None or tests["passed"] < 1 or tests["failed"] > 0:
+                    reasons.append(f"{check_id}: no passing test evidence or failed tests")
+            scenarios = unique(receipt["scenarios"], "id")
+            if requirement["kind"] == "browser" and receipt["tests"] is not None and receipt["tests"]["passed"] < len(requirement["scenarios"]):
+                reasons.append(f"{check_id}: fewer passing tests than required browser scenarios")
+            if set(scenarios) != {scenario["id"] for scenario in requirement["scenarios"]}:
+                reasons.append(f"{check_id}: missing/unknown browser scenarios")
+            screenshot_ids = []
+            for scenario in scenarios.values():
+                artifact_id = scenario["screenshot_artifact_id"]
+                if scenario["status"] != "passed":
+                    reasons.append(f"{check_id}/{scenario['id']}: browser scenario did not pass")
+                if artifact_id is None or artifacts.get(artifact_id, {}).get("kind") != "screenshot":
+                    reasons.append(f"{check_id}/{scenario['id']}: screenshot required")
+                    continue
+                screenshot_ids.append(artifact_id)
+                # Format sanity only, not proof of visual correctness/authenticity.
+                with resolved[artifact_id].open("rb") as image:
+                    header = image.read(24)
+                if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR" or int.from_bytes(header[16:20], "big") == 0 or int.from_bytes(header[20:24], "big") == 0:
+                    reasons.append(f"{check_id}/{scenario['id']}: expected a PNG screenshot")
+            if len(set(screenshot_ids)) != len(screenshot_ids):
+                reasons.append(f"{check_id}: each scenario needs a distinct screenshot artifact")
+    except (ValueError, KeyError, IndexError, TypeError, OSError) as error:
+        reasons.append(str(error))
+    except ValidationError as error:
+        reasons.append(error.message)
+    return {"status": "blocked" if reasons else "passed", "reasons": reasons,
+            "pending_gates": ["independent_review", "integration_approval"],
+            "integration_allowed": False}
+=== observer.py ===
+"""Read-only observer. Closing this process/pane cannot signal a Claude worker."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from .sessions import NODES, TERMINAL, read_json, save_json
+
+
+def safe_text(value: str) -> str:
+    # Strip terminal escape/control bytes before displaying model-controlled output.
+    value = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", value)
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    return "".join(char for char in value if char in "\n\t" or (char.isprintable() and char != "\x1b"))
+
+
+def render(line: str) -> str:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return safe_text(line.rstrip())
+    if not isinstance(event, dict):
+        return ""
+    if event.get("type") == "assistant":
+        blocks = event.get("message", {}).get("content", [])
+        return "\n".join(safe_text(block.get("text", "")) if block.get("type") == "text"
+                         else f"[tool: {safe_text(str(block.get('name', 'unknown')))}]"
+                         for block in blocks if isinstance(block, dict))
+    if event.get("type") == "result":
+        return safe_text(f"[{event.get('subtype', 'result')}] {event.get('result', '')}")
+    if event.get("type") == "system":
+        return safe_text(f"[system: {event.get('subtype', '')}]")
+    return ""
+
+
+def herdr(*args: str) -> dict:
+    if os.environ.get("HERDR_ENV") != "1":
+        raise RuntimeError("Herdr controls require a Herdr-managed caller pane (HERDR_ENV=1)")
+    result = subprocess.run(["herdr", *args], capture_output=True, text=True, check=True, timeout=15)
+    # Inspection/creation commands return JSON; rename/run may succeed silently.
+    return json.loads(result.stdout) if result.stdout.strip() else {}
+
+
+def open_panels(directory: Path) -> dict:
+    """Only run the observer command in newly created panes; never Claude itself."""
+    directory = directory.resolve()
+    read_json(directory / "plan.json")
+    mapping_path = directory / "observers.json"
+    if mapping_path.exists():
+        raise RuntimeError("Observer mapping already exists; inspect it before opening duplicate panes")
+    current = herdr("pane", "current", "--current")["result"]["pane"]
+    source = Path(__file__).resolve().parents[1]
+    created = herdr("tab", "create", "--workspace", current["workspace_id"],
+                    "--cwd", str(source), "--label", f"Workflow: {directory.name}", "--no-focus")["result"]
+    tab_id = created["tab"]["tab_id"]
+    pane = created["root_pane"]["pane_id"]
+    mapping = {}
+    for index, node in enumerate(NODES):
+        if index == 0:
+            new_pane = pane
+        else:
+            split = herdr("pane", "split", "--pane", pane, "--direction", "right",
+                          "--cwd", str(source), "--no-focus")
+            new_pane = split["result"]["pane"]["pane_id"]
+        mapping[node] = {"pane_id": new_pane, "tab_id": tab_id, "mode": "read-only-observer"}
+        save_json(mapping_path, mapping)  # Retain ownership even if the next command fails.
+        herdr("pane", "rename", new_pane, f"Workflow {directory.name}: {node}")
+        command = shlex.join([sys.executable, "-m", "workflow.observer", str(directory), node])
+        herdr("pane", "run", new_pane, command)
+        pane = new_pane
+    return mapping
+
+
+def watch(directory: Path, node: str, once: bool = False) -> None:
+    print(f"READ-ONLY OBSERVER | {directory.name} / {node}\nClosing this pane does not stop Claude.", flush=True)
+    offset = 0
+    last_status = None
+    while True:
+        log = directory / f"{node}.stream.jsonl"
+        if log.exists():
+            with log.open("rb") as handle:
+                handle.seek(offset)
+                while True:
+                    line = handle.readline()
+                    if not line or not line.endswith(b"\n"):
+                        break
+                    offset = handle.tell()
+                    text = render(line.decode(errors="replace"))
+                    if text:
+                        print(text, flush=True)
+        state_path = directory / f"{node}.json"
+        state = read_json(state_path) if state_path.exists() else {"status": "pending"}
+        if state["status"] != last_status:
+            last_status = state["status"]
+            print(safe_text(f"[{last_status}] session={state.get('session_id', 'not launched')}"), flush=True)
+            if state.get("error"):
+                print(safe_text(state["error"]), flush=True)
+        if once or last_status in TERMINAL:
+            # Drain bytes written between the first read and the terminal receipt.
+            if last_status in TERMINAL and log.exists():
+                with log.open("rb") as handle:
+                    handle.seek(offset)
+                    for line in handle:
+                        text = render(line.decode(errors="replace"))
+                        if text:
+                            print(text, flush=True)
+            if not once and last_status in TERMINAL and os.environ.get("HERDR_ENV") == "1":
+                try:
+                    herdr("notification", "show", f"Workflow {node}: {last_status}",
+                          "--body", f"Run {directory.name}; verification/review still required", "--sound", "none")
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass  # Notification delivery never controls agent execution.
+            print("Session receipt only — browser checks, review and integration are separate.", flush=True)
+            return
+        time.sleep(0.25)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("node", choices=NODES)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    try:
+        watch(args.directory.resolve(), args.node, args.once)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

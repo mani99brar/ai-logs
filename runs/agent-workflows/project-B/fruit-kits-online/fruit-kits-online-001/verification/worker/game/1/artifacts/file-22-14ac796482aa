@@ -1,0 +1,280 @@
+import type { ClaimStatus } from "./flowHud.js";
+import { INTERPOLATION_DELAY_MS, SnapshotBuffer } from "./interpolation.js";
+
+/** A ship as the server last sent it: only the client's own ship and ships in its sight ever arrive (§16). */
+export interface ShipSnapshot {
+  readonly id: string;
+  readonly slot: number;
+  readonly x: number;
+  readonly y: number;
+  readonly heading: number;
+  readonly speed: number;
+  /** The dock it is moored at, or -1 at sea. */
+  readonly dock: number;
+}
+
+/** A telegraphed grapple (§6) as the server last sent it: only those whose attacker is in sight, or aimed at us. */
+export interface GrappleSnapshot {
+  readonly attackerId: string;
+  readonly defenderId: string;
+  /** The aim, a heading of 64 locked when the grapple started. */
+  readonly aim: number;
+  readonly startTick: number;
+  readonly landTick: number;
+}
+
+/** A duel marker (§6) as the server last sent it: only those in sight. */
+export interface MarkerSnapshot {
+  readonly x: number;
+  readonly y: number;
+  /** The world tick the duel began; its elapsed time counts from here. */
+  readonly startTick: number;
+}
+
+/** This player's own encounter status (§6): its mode, protection, grapple cooldown and respawn, in world ticks. */
+export interface StatusSnapshot {
+  readonly mode: string;
+  readonly protection: string;
+  readonly protectedUntil: number;
+  readonly cooldownUntil: number;
+  readonly respawnAt: number;
+}
+
+/**
+ * This player's own rubbings and gold (§4, §11, §12), as the server last sent them in its private status: only the
+ * player's own entry ever arrives (§16). Lists are rubbing type names in type order; the island's and the cache's
+ * types are empty unless the ship is moored there.
+ */
+export interface ObjectivesSnapshot {
+  readonly gold: number;
+  readonly rubbings: readonly string[];
+  readonly islandTypes: readonly string[];
+  readonly cacheTypes: readonly string[];
+  /** What holding E works on here: "collect:<type>", "claim:<type>", or "". */
+  readonly target: string;
+  /** The hold in progress ("collect" or "claim", or ""), its type, and its ticks held and needed. */
+  readonly channel: string;
+  readonly channelType: string;
+  readonly channelHeld: number;
+  readonly channelTotal: number;
+  /** The last finished hold ("collected:<type>", "claimed:<type>", "failed:<reason>" or "") and its world tick. */
+  readonly channelResult: string;
+  readonly channelResultAt: number;
+  /** While this player chooses what to steal: the duel's lobby key, the eligible types and the deadline tick. */
+  readonly theftDuel: string;
+  readonly theftOptions: readonly string[];
+  readonly theftDeadline: number;
+  /** The last duel settlement: "winner", "loser", "draw" or "", the type stolen, the gold change and its tick. */
+  readonly settledRole: string;
+  readonly stolen: string;
+  readonly goldChange: number;
+  readonly settledAt: number;
+  /** Who picked the stolen type ("winner", "default", "none" or "") and that duel's choice deadline tick. */
+  readonly settledChoice: string;
+  readonly choiceDeadline: number;
+}
+
+/** The private status fields as the server sends them (lists comma-separated). */
+export interface ObjectivesStatusFields {
+  readonly gold: number;
+  readonly rubbings: string;
+  readonly islandTypes: string;
+  readonly cacheTypes: string;
+  readonly target: string;
+  readonly channel: string;
+  readonly channelType: string;
+  readonly channelHeld: number;
+  readonly channelTotal: number;
+  readonly channelResult: string;
+  readonly channelResultAt: number;
+  readonly theftDuel: string;
+  readonly theftOptions: string;
+  readonly theftDeadline: number;
+  readonly settledRole: string;
+  readonly stolen: string;
+  readonly goldChange: number;
+  readonly settledAt: number;
+  readonly settledChoice: string;
+  readonly choiceDeadline: number;
+}
+
+const typeList = (text: string): string[] => (text === "" ? [] : text.split(","));
+
+/** The decoded private status as an `ObjectivesSnapshot`. */
+export function objectivesOf(status: ObjectivesStatusFields): ObjectivesSnapshot {
+  return {
+    gold: status.gold,
+    rubbings: typeList(status.rubbings),
+    islandTypes: typeList(status.islandTypes),
+    cacheTypes: typeList(status.cacheTypes),
+    target: status.target,
+    channel: status.channel,
+    channelType: status.channelType,
+    channelHeld: status.channelHeld,
+    channelTotal: status.channelTotal,
+    channelResult: status.channelResult,
+    channelResultAt: status.channelResultAt,
+    theftDuel: status.theftDuel,
+    theftOptions: typeList(status.theftOptions),
+    theftDeadline: status.theftDeadline,
+    settledRole: status.settledRole,
+    stolen: status.stolen,
+    goldChange: status.goldChange,
+    settledAt: status.settledAt,
+    settledChoice: status.settledChoice,
+    choiceDeadline: status.choiceDeadline,
+  };
+}
+
+/** A fruit pedestal's marker (§9) as the server last sent it: only those in sight, full or empty, never its fruit. */
+export interface PedestalSnapshot {
+  readonly island: number;
+  readonly x: number;
+  readonly y: number;
+  readonly full: boolean;
+}
+
+/** A recovery cache's marker (§12) as the server last sent it: only those in sight, with no contents. */
+export interface CacheSnapshot {
+  readonly x: number;
+  readonly y: number;
+  readonly dock: number;
+}
+
+/** Placeholder ship colours by spawn slot. */
+const SLOT_COLORS = [0xf4b942, 0xe5484d, 0x46a758, 0xb66ee8, 0xf76b15, 0x3dd6d0, 0xf2f2f2, 0xd6409f] as const;
+
+export function slotColor(slot: number): number {
+  return SLOT_COLORS[slot % SLOT_COLORS.length]!;
+}
+
+export function cssColor(color: number): string {
+  return `#${color.toString(16).padStart(6, "0")}`;
+}
+
+/**
+ * The client's picture of the match: the latest decoded server state of each visible ship (for the HUD) and a
+ * snapshot history per ship (for interpolated drawing). A ship that leaves the decoded state is forgotten at once.
+ */
+export class MatchView {
+  private readonly latest = new Map<string, ShipSnapshot>();
+  private readonly buffers = new Map<string, SnapshotBuffer>();
+  private encounter: { grapples: GrappleSnapshot[]; markers: MarkerSnapshot[]; status: StatusSnapshot | undefined; worldTick: number } = {
+    grapples: [],
+    markers: [],
+    status: undefined,
+    worldTick: 0,
+  };
+  private objectivesState: { objectives: ObjectivesSnapshot | undefined; caches: CacheSnapshot[] } = { objectives: undefined, caches: [] };
+  private pedestalState: PedestalSnapshot[] = [];
+  private flowState: { claim: ClaimStatus | undefined; claiming: ReadonlyMap<string, number>; radius: number } = { claim: undefined, claiming: new Map(), radius: 0 };
+
+  constructor(readonly selfId: string) {}
+
+  /** The encounter state the server last sent: grapples and markers in sight, and this player's status. */
+  ingestEncounters(grapples: Iterable<GrappleSnapshot>, markers: Iterable<MarkerSnapshot>, status: StatusSnapshot | undefined, worldTick: number): void {
+    this.encounter = {
+      grapples: [...grapples].map(({ attackerId, defenderId, aim, startTick, landTick }) => ({ attackerId, defenderId, aim, startTick, landTick })),
+      markers: [...markers].map(({ x, y, startTick }) => ({ x, y, startTick })),
+      status: status === undefined ? undefined : { ...pickStatus(status) },
+      worldTick,
+    };
+  }
+
+  /** This player's rubbings and gold, and the cache markers in sight, as the server last sent them. */
+  ingestObjectives(status: ObjectivesStatusFields | undefined, caches: Iterable<CacheSnapshot>): void {
+    this.objectivesState = {
+      objectives: status === undefined ? undefined : objectivesOf(status),
+      caches: [...caches].map(({ x, y, dock }) => ({ x, y, dock })),
+    };
+  }
+
+  /** The fruit pedestals in sight, as the server last sent them (§9). */
+  ingestPedestals(pedestals: Iterable<PedestalSnapshot>): void {
+    this.pedestalState = [...pedestals].map(({ island, x, y, full }) => ({ island, x, y, full })).sort((a, b) => a.island - b.island);
+  }
+
+  pedestals(): readonly PedestalSnapshot[] {
+    return this.pedestalState;
+  }
+
+  /**
+   * The final island as this player knows it (§5): their route and claim from their private status, the ships in
+   * sight channelling a claim (with the ticks held), and the treasure circle's radius.
+   */
+  ingestFlow(claim: ClaimStatus | undefined, claiming: ReadonlyMap<string, number>, radius: number): void {
+    this.flowState = { claim, claiming: new Map(claiming), radius };
+  }
+
+  claim(): ClaimStatus | undefined {
+    return this.flowState.claim;
+  }
+
+  /** Ships in sight channelling the claim, with the ticks they have held. */
+  claimingShips(): ReadonlyMap<string, number> {
+    return this.flowState.claiming;
+  }
+
+  treasureRadius(): number {
+    return this.flowState.radius;
+  }
+
+  objectives(): ObjectivesSnapshot | undefined {
+    return this.objectivesState.objectives;
+  }
+
+  caches(): readonly CacheSnapshot[] {
+    return this.objectivesState.caches;
+  }
+
+  grapples(): readonly GrappleSnapshot[] {
+    return this.encounter.grapples;
+  }
+
+  markers(): readonly MarkerSnapshot[] {
+    return this.encounter.markers;
+  }
+
+  status(): StatusSnapshot | undefined {
+    return this.encounter.status;
+  }
+
+  /** The world tick of the last patch (20 a second). */
+  worldTick(): number {
+    return this.encounter.worldTick;
+  }
+
+  ingest(ships: Iterable<ShipSnapshot>, now: number): void {
+    const seen = new Set<string>();
+    for (const ship of ships) {
+      seen.add(ship.id);
+      const { id, slot, x, y, heading, speed, dock } = ship;
+      this.latest.set(id, { id, slot, x, y, heading, speed, dock });
+      let buffer = this.buffers.get(id);
+      if (buffer === undefined) this.buffers.set(id, (buffer = new SnapshotBuffer()));
+      buffer.push(now, x, y);
+    }
+    for (const id of [...this.latest.keys()]) {
+      if (seen.has(id)) continue;
+      this.latest.delete(id);
+      this.buffers.delete(id);
+    }
+  }
+
+  ships(): ShipSnapshot[] {
+    return [...this.latest.values()];
+  }
+
+  ship(id: string): ShipSnapshot | undefined {
+    return this.latest.get(id);
+  }
+
+  /** Where to draw a ship at `now`, interpolated INTERPOLATION_DELAY_MS in the past. */
+  renderPosition(id: string, now: number): { x: number; y: number } | undefined {
+    return this.buffers.get(id)?.sample(now - INTERPOLATION_DELAY_MS);
+  }
+}
+
+function pickStatus({ mode, protection, protectedUntil, cooldownUntil, respawnAt }: StatusSnapshot): StatusSnapshot {
+  return { mode, protection, protectedUntil, cooldownUntil, respawnAt };
+}

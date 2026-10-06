@@ -1,0 +1,94 @@
+# Match flow
+
+§2's match lifecycle as pure, integer rules: the phases from lobby to results, the match timer, the four ways a match ends, and the per-player results. The rules live in `packages/simulation/src/match` (`@pirate-sea-race/simulation/match`) and their tuning in `packages/content/src/match` (`@pirate-sea-race/content/match`). Nothing is wired into the match room yet: `objectives-endgame` will drive them and show the lobby countdown, the timer and the results screen.
+
+## Content
+
+`matchRules` holds the tuning in world ticks (20 a second) and seats, and `validateMatchRules` checks it with zod:
+
+| Rule | Value | Source |
+| --- | --- | --- |
+| `readyTicks` | 400 (the 20 s ready check, while clients preload); must be positive | `READY_COUNTDOWN_SECONDS` |
+| `departureTicks` | 900 (45 s): the encounter rules' `SPAWN_PROTECTION_SECONDS`, not a copy | `DEPARTURE_SECONDS` |
+| `publicSeats` | 8, the alpha preset's `maxPlayers`: public matches never start short-handed | `PUBLIC_SEATS` |
+| `privateMinPlayers` / `privateMaxPlayers` | 2 / 8 (§2: private tests start with two to eight) | `PRIVATE_MIN_PLAYERS`, `privateMatch.maxPlayers` |
+
+`createMatchConfig({ kind, rules?, durationTicks?, startingGold? })` builds a match's `MatchConfig`. `kind` is `public` or `private`, and a private match is `custom`. `durationTicks` defaults to the claim rules' `deadlineTicks` (42 000) and only feeds the timer: the deadline itself comes from the claim module. `startingGold` defaults to the objective rules' 50.
+
+## Phases
+
+`lobby` → `ready` → `departure` → `exploration` → `ended`. Only `ready` can go back, to `lobby`.
+
+- **`lobby`.** Players join and leave. A join beyond the seats is refused (`full`). A public match enters `ready` on the tick its eighth seat fills, and a start request in it is refused (`public`). In a private match the first joiner is the host (when the host leaves, the earliest joiner still present takes over, `host-changed`). The host's `start` enters `ready` with 2 or more players present. Otherwise it is refused (`too-few`, or `not-host` from anyone else).
+- **`ready`.** Lasts `readyTicks`. A join is refused (`started`), and so is any join after the lobby (§2: late arrivals wait for another match). When players leave, a private match keeps counting down with 2 or more present, a public one needs all 8, and otherwise it returns to `lobby`. A later start begins a new countdown.
+- **`departure`.** Starts at control start, `readyTick + readyTicks`. The step emits `control-started` with that tick, exactly once. `departure` lasts `departureTicks`, then becomes `exploration`. This is only a HUD label and changes no gameplay.
+- **`exploration`.** Runs until the match ends. The module never ends it by time alone.
+- **`ended`.** Has an `end` (`reason`, `winner`, `tick`) and the `results`.
+
+A player who leaves before control start is removed. After it, they stay in the state, marked `left`, and appear in the results. `leave` means the seat is released (§12: an explicit quit or an expired 60 s reservation), not a disconnection.
+
+## A step
+
+`stepMatch(config, state, input)` returns `{state, events}` and never changes its arguments. `input` is `{tick, reports}`:
+
+- `tick` must be after the state's tick. Later ticks may skip ahead. A tick at or before the state's, whether stale or repeated, returns the same state object and no events, as does any input once the match has ended. So the first end wins, and nothing arriving later changes it.
+- A step runs in a fixed order:
+  1. The timed transitions due by `tick`, each on its own scheduled tick (a skipped-over control start is still reported at `readyTick + readyTicks`).
+  2. The reports, in list order.
+  3. The end, if any.
+  4. With no end, the lobby and ready rules. Start requests are judged after all joins and leaves of the tick.
+- Malformed reports throw a `RangeError`: an empty id, negative or fractional gold, a duel against oneself or won by an outsider, an accomplishment by an unknown player, a claim for an unknown winner, a claim end whose `tick` is not the input's, or an unknown kind.
+
+### Reports
+
+| Report | Fields | Effect |
+| --- | --- | --- |
+| `join` / `leave` | `playerId` | As in the phases above. A repeat join, or a leave by someone absent, is ignored |
+| `start` | `playerId` | The private host asks to start |
+| `collected`, `stole`, `lost`, `cache-claimed` | `playerId` | Count one rubbing collected from a source, taken from a duel loser, lost (to a thief or into a recovery cache), or claimed from a cache |
+| `island-visited` | `playerId`, `island` | Adds a distinct island id |
+| `gold` | `playerId`, `gold` | Sets the balance |
+| `duel-ended` | `playerIds: [a, b]`, `winner` or `null` | A win and a loss, or a draw for both |
+| `match-ended` | the claim module's event, unchanged: `tick`, `reason` (`claim` or `deadline`), `winner` | Ends the match. Ignored before control start |
+| `fault` | none | §12's server fault: `aborted` |
+
+Accomplishments count only from control start until the end.
+
+### Endings
+
+| Reason | When | Winner |
+| --- | --- | --- |
+| `claim` | The claim module's `match-ended` with a winner | That player |
+| `deadline` | The claim module's `match-ended` at its deadline (§2) | None |
+| `aborted` | A `fault`, in any phase (§12: no competitive penalty) | None |
+| `abandoned` | No player is present after the lobby (§12). An empty lobby just stays open | None |
+
+On one tick the precedence is claim, then deadline, then aborted, then abandoned. A claim completing on the deadline tick therefore beats the deadline, as the claim module orders it.
+
+### Events
+
+`player-joined`, `join-refused` (`started` or `full`), `player-left`, `host-changed` (`playerId` or `null`), `start-refused` (`public`, `not-host`, `too-few`), `phase-changed` (`from`, `to`), `control-started`, and `match-ended` (`reason`, `winner`, `results`). The results are emitted once and are the same object as `state.results`. Every event carries `tick`.
+
+## Wiring with the claim and encounter rules
+
+The room steps the match every world tick with that tick's reports. On `control-started` it:
+
+1. builds the claim config with `createClaimConfig({ claimPoint, controlStartTick: tick })`, whose `deadlineTick` is `tick + 42 000`;
+2. grants every ship the encounter rules' spawn protection (45 s) from the same tick;
+3. starts the intel and objective clocks from it.
+
+It then steps the claim rules on each tick and passes their `match-ended` event into the same tick's match input. It never duplicates the deadline, the protection or the claim ordering. It also forwards ledger outcomes (collections, thefts and losses, cache claims, gold) and duel settlements as reports, and `fault` when the process detects one.
+
+## Timer
+
+`elapsed(state, tick)` and `remaining(state, tick)` are world ticks counted from control start, so the HUD shows 35:00 counting down. Before control start, `elapsed` is 0 and `remaining` the full duration. The timer never pauses (§2). It is frozen at the end tick once the match has ended, and neither value goes below 0.
+
+## Results
+
+`MatchResults`: `reason`, `winner` (or `null`: "no winner"), `tick`, `custom`, `elapsedTicks` (from control start to the end, 0 if control never started), and `players`. Each player line has `id`, `winner`, `left`, `rubbingsHeld` (collected + thefts + cachesClaimed − lost, at least 0), `collected`, `thefts`, `lost`, `duelsWon`, `duelsLost`, `duelsDrawn`, `gold`, `cachesClaimed` and `islandsVisited`. Lines are ordered with the winner first, then by rubbings held (most first), then by id in UTF-16 order. The state is plain integer data that `hashState` covers. `replayMatch(config, state, inputs)` steps a list of inputs and returns the final state, every event and the hash.
+
+## Tests
+
+- `packages/simulation/src/match/match.test.ts`: scripted tests with frozen inputs covering every transition, the public and private start rules, late joiners, leaving during `ready`, `control-started` (also when skipped over), each ending and its precedence, the timer, and the exact results of a match that feeds every report kind.
+- `property.test.ts`: 60 seeded matches (public and private, with skipped ticks, repeated inputs, joins, leaves, starts, accomplishments, claims, faults and deadlines). It checks that the phase only moves forward (except `ready` → `lobby`), that there is at most one end, and that the results are built exactly once and match an independent tally. It also checks replay hashes, including replays with repeated inputs, and an `EXERCISED` check over every phase, end reason and refusal.
+- `packages/content/src/match/match.test.ts`: the constants and the validator, including a refused ready countdown of 0.

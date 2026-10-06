@@ -1,0 +1,589 @@
+import { matchMaker } from "colyseus";
+import { expect } from "vitest";
+import { isNavigable, seaMap } from "@pirate-sea-race/content";
+import type { MatchRoom } from "@pirate-sea-race/server";
+import { defaultSimulationConfig, hullPathIsClear, tileCentre } from "@pirate-sea-race/simulation";
+import { duelInput } from "@pirate-sea-race/simulation/duel";
+import { HeadlessClient, type DuelScript, type HeadlessClientOptions } from "@pirate-sea-race/test-tools";
+
+/**
+ * What the duel-at-sea tests share: the open stretch of sea they sail on, a pair of players placed on it, and the
+ * scripted fighters. Each test file starts its own server; tests in a file run at once, one match each.
+ */
+
+/** The row three tiles south of the hub, which the map keeps clear for a hull 20 tiles either side of the hub. */
+export const OPEN_ROW = seaMap.hub.tileY + 3;
+export const HUB_X = seaMap.hub.tileX;
+export const TILE = seaMap.subUnitsPerTile;
+/** Headings of 64: east, south, west, north. */
+export const EAST = 0;
+export const SOUTH = 16;
+export const WEST = 32;
+export const NORTH = 48;
+
+/** Collects a test's clients and has them leave when that test finishes (tests in a file run at once). */
+export function tracker(onTestFinished: (fn: () => Promise<void>) => void): (client: HeadlessClient) => void {
+  const clients: HeadlessClient[] = [];
+  onTestFinished(async () => {
+    await Promise.all(clients.map((client) => client.leave()));
+  });
+  return (client) => void clients.push(client);
+}
+
+export function roomOf(client: HeadlessClient): MatchRoom {
+  return matchMaker.getLocalRoomById(client.room.roomId) as unknown as MatchRoom;
+}
+
+export interface Seat {
+  readonly tileX: number;
+  readonly tileY: number;
+  readonly heading: number;
+}
+
+/** Whether a hull can sail the straight line between two tile centres (and so the tiles between see each other). */
+export function openWater(from: Seat, to: Seat): boolean {
+  const a = tileCentre(defaultSimulationConfig, from.tileX, from.tileY);
+  const b = tileCentre(defaultSimulationConfig, to.tileX, to.tileY);
+  return isNavigable(seaMap, from.tileX, from.tileY) && hullPathIsClear(defaultSimulationConfig, a.x, a.y, b.x, b.y);
+}
+
+/** Players in one match, created in order (the first creates it), then placed at rest on their seats. */
+export async function playersAt(
+  endpoint: string,
+  seats: readonly Seat[],
+  track: (client: HeadlessClient) => void,
+  options: { readonly endpoints?: readonly string[]; readonly clients?: readonly HeadlessClientOptions[] } = {},
+): Promise<HeadlessClient[]> {
+  const clients: HeadlessClient[] = [];
+  for (const [index, seat] of seats.entries()) {
+    const via = options.endpoints?.[index] ?? endpoint;
+    const client = index === 0 ? await HeadlessClient.create(via, options.clients?.[0]) : await HeadlessClient.join(via, clients[0]!.code, options.clients?.[index]);
+    track(client);
+    clients.push(client);
+    expect(openWater(seat, seat)).toBe(true);
+  }
+  await clients[0]!.waitFor(() => clients[0]!.playerCount === seats.length);
+  for (const [index, seat] of seats.entries()) await clients[index]!.placeShip(endpoint, seat);
+  return clients;
+}
+
+/**
+ * The host (attacker) and the guest in grapple range on the open row, `apart` tiles apart around the hub: the host
+ * west facing east, the guest east facing `guestHeading` (west by default, toward the host).
+ */
+export async function pairInRange(
+  endpoint: string,
+  track: (client: HeadlessClient) => void,
+  options: {
+    readonly apart?: number;
+    readonly guestHeading?: number;
+    readonly endpoints?: readonly string[];
+    readonly clients?: readonly HeadlessClientOptions[];
+  } = {},
+): Promise<{ host: HeadlessClient; guest: HeadlessClient }> {
+  const apart = options.apart ?? 6;
+  const host: Seat = { tileX: HUB_X - Math.floor(apart / 2), tileY: OPEN_ROW, heading: EAST };
+  const guest: Seat = { tileX: host.tileX + apart, tileY: OPEN_ROW, heading: options.guestHeading ?? WEST };
+  expect(openWater(host, guest)).toBe(true);
+  const [first, second] = await playersAt(endpoint, [host, guest], track, options);
+  await first!.waitFor(() => first!.ship(second!.sessionId) !== undefined);
+  return { host: first!, guest: second! };
+}
+
+/** Grapples: the host taps J, and both fighters' duel reaches its countdown. */
+export async function grapple(host: HeadlessClient, guest: HeadlessClient): Promise<void> {
+  host.tapGrapple();
+  for (const client of [host, guest]) await client.waitFor(() => client.fighter.phase === "countdown", 3000);
+}
+
+const R = duelInput("right");
+const L = duelInput("left");
+const K = duelInput("heavy");
+
+/**
+ * A fighter who walks in, then swings a heavy every 50 frames and steps forward before each: from either side, the
+ * mirror of the other side's (player one starts on the left). Against a fighter who stands still it wins by KO in
+ * about 500 frames; played by both, the mirrored fight ends in a double KO.
+ */
+export function brawler(slot: 0 | 1): DuelScript {
+  const toward = slot === 0 ? R : L;
+  return (frame) => {
+    if (frame < 30) return toward;
+    const beat = (frame - 30) % 50;
+    if (beat === 0) return K;
+    return beat > 44 ? toward : 0;
+  };
+}
+
+/** The lobby a fighter sees, as plain values. */
+export function lobbyOf(client: HeadlessClient): { phase: string; winner: number; reason: string } | undefined {
+  const lobby = client.fighter.lobby;
+  return lobby === undefined ? undefined : { phase: lobby.phase, winner: lobby.winner, reason: lobby.reason };
+}
+
+/** The fighters' result, once both see it (the same in both). */
+export async function resultOf(host: HeadlessClient, guest: HeadlessClient, timeoutMs = 20_000): Promise<{ phase: string; winner: number; reason: string }> {
+  for (const client of [host, guest]) await client.waitFor(() => client.fighter.phase === "over", timeoutMs);
+  expect(lobbyOf(guest)).toEqual(lobbyOf(host));
+  return lobbyOf(host)!;
+}
+
+/** Every grapple and marker a client decoded from now on, as the patches arrive. */
+export function recordSightings(client: HeadlessClient): { grapples: Set<string>; markers: number; duelLobbies: number } {
+  const seen = { grapples: new Set<string>(), markers: 0, duelLobbies: 0 };
+  client.room.onStateChange(() => {
+    for (const grapple of client.grapples()) seen.grapples.add(`${grapple.attackerId}>${grapple.defenderId}`);
+    seen.markers = Math.max(seen.markers, client.markers().length);
+    seen.duelLobbies = Math.max(seen.duelLobbies, client.duelCount);
+  });
+  return seen;
+}
+
+export function containsText(frame: Uint8Array, text: string): boolean {
+  return Buffer.from(frame).includes(Buffer.from(text, "utf8"));
+}
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { isNavigable, seaMap, SIGHT_RADIUS_TILES } from "@pirate-sea-race/content";
+import { DuelMessageType, INPUT_HOLD_FRAMES } from "@pirate-sea-race/protocol";
+import { DUEL_RESULT_TICKS, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { createEncounterConfig, encounterRules } from "@pirate-sea-race/simulation/encounters";
+import { MAX_INPUT_DELAY, MIN_INPUT_DELAY } from "@pirate-sea-race/simulation/netcode";
+import { duelInput, hashState } from "@pirate-sea-race/simulation/duel";
+import { AHEAD, ImpairmentProxy, replayRecordedDuel, sleep, type HeadlessClient } from "@pirate-sea-race/test-tools";
+import { appliedPairs } from "./harness.js";
+import {
+  brawler,
+  resultOf,
+  tracker,
+  containsText,
+  EAST,
+  grapple,
+  HUB_X,
+  lobbyOf,
+  NORTH,
+  OPEN_ROW,
+  openWater,
+  pairInRange,
+  playersAt,
+  recordSightings,
+  roomOf,
+  SOUTH,
+  TILE,
+  WEST,
+} from "./seaDuelSetup.js";
+
+/**
+ * Duels at sea (§6, §14): the grapple's telegraph and escape, the duel inside the match room, the return, and §12
+ * inside the match room: a fighter who drops keeps the seat for ten seconds while the fight goes on with their input
+ * substituted (neutral after 250 ms); back in time they resume the same fight, otherwise they forfeit. A quit forfeits
+ * at once; both gone on the same frame cancels. And §6's ready check: a fighter not ready ten seconds after the grapple
+ * forfeits, both not ready cancels, and a late one delays the fight. Each test plays its own match; they run at once.
+ * (The draw, whose mirrored inputs want a quiet machine, is in `seaDuelHarness.test.ts`.)
+ */
+let server: RunningGameServer;
+let endpoint: string;
+const rules = createEncounterConfig();
+const { grapple: grappleRules } = encounterRules;
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+describe.concurrent("the grapple (§6 at sea)", () => {
+  it("telegraphs a one-second windup to both players, then reserves both ships, which stop and ignore sailing", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track);
+    const start = { host: host.ship()!, guest: guest.ship()! };
+    host.tapGrapple();
+    // The attacker sees its aim; the target sees the grapple aimed at it, from the attacker's side.
+    await host.waitFor(() => host.grapples().length === 1, 2000);
+    await guest.waitFor(() => guest.grapples().length === 1, 2000);
+    const telegraph = host.grapples()[0]!;
+    expect(telegraph).toMatchObject({ attackerId: host.sessionId, defenderId: guest.sessionId, aim: EAST });
+    expect(telegraph.landTick - telegraph.startTick).toBe(grappleRules.windupTicks);
+    expect(guest.grapples()).toEqual([telegraph]);
+
+    for (const client of [host, guest]) await client.waitFor(() => client.status()?.mode === "duel", 3000);
+    expect(host.grapples()).toEqual([]);
+    expect(lobbyOf(host)).toMatchObject({ phase: "countdown" });
+    expect(host.fighter.slot).toBe(0);
+    expect(guest.fighter.slot).toBe(1);
+    // Both ships are held where the grapple landed: full ahead does nothing.
+    await Promise.all([host.hold(AHEAD, 600), guest.hold(AHEAD, 600)]);
+    expect(host.ship()).toMatchObject({ x: start.host.x, y: start.host.y, speed: 0 });
+    expect(guest.ship()).toMatchObject({ x: start.guest.x, y: start.guest.y, speed: 0 });
+    // A fighter's own ship stays in its view; the other's, and every grapple and marker, are out of it.
+    expect(host.visibleShipIds()).toEqual([host.sessionId]);
+    expect(guest.visibleShipIds()).toEqual([guest.sessionId]);
+    expect(roomOf(host).refusedDuelReports).toBe(0);
+  });
+
+  it("lets a target that sails out of range during the windup escape, and starts the attacker's cooldown", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track, { guestHeading: EAST });
+    expect(openWater({ tileX: HUB_X + 3, tileY: OPEN_ROW, heading: EAST }, { tileX: HUB_X + 9, tileY: OPEN_ROW, heading: EAST })).toBe(true);
+    host.tapGrapple();
+    await guest.waitFor(() => guest.grapples().length === 1, 2000);
+    const { landTick } = guest.grapples()[0]!;
+    // The guest runs east, away: in a second under sail it makes two tiles, out of the six-tile range.
+    await guest.holdUntil(AHEAD, () => host.worldTick > landTick + 2, 4000);
+    await host.waitFor(() => host.grapples().length === 0 && (host.status()?.cooldownUntil ?? 0) > 0, 2000);
+    expect(host.status()).toMatchObject({ mode: "sea", cooldownUntil: landTick + grappleRules.missCooldownTicks });
+    expect(guest.status()).toMatchObject({ mode: "sea" });
+    expect(host.duelCount + guest.duelCount).toBe(0);
+    // In cooldown, J does nothing, even with the guest back in range and in front.
+    await guest.placeShip(endpoint, { tileX: HUB_X + 3, tileY: OPEN_ROW, heading: WEST });
+    host.tapGrapple();
+    await sleep(400);
+    expect(host.grapples()).toEqual([]);
+  });
+
+  it("lets a target that sails out of the aim during the windup escape", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // Three tiles apart, the guest heading south: in the second of windup it moves two tiles, 35° off the aim.
+    const seats = [
+      { tileX: HUB_X - 1, tileY: OPEN_ROW, heading: EAST },
+      { tileX: HUB_X + 2, tileY: OPEN_ROW, heading: SOUTH },
+    ];
+    expect(openWater(seats[1]!, { ...seats[1]!, tileY: OPEN_ROW + 3 })).toBe(true);
+    const [host, guest] = (await playersAt(endpoint, seats, track)) as [HeadlessClient, HeadlessClient];
+    await host.waitFor(() => host.ship(guest.sessionId) !== undefined);
+    host.tapGrapple();
+    await guest.waitFor(() => guest.grapples().length === 1, 2000);
+    const { landTick } = guest.grapples()[0]!;
+    await guest.holdUntil(AHEAD, () => host.worldTick > landTick + 2, 4000);
+    await host.waitFor(() => (host.status()?.cooldownUntil ?? 0) > 0, 2000);
+    const off = guest.ship()!;
+    const onShip = host.ship()!;
+    // Still in range, but outside ±22.5° of the aim.
+    expect(Math.hypot(off.x - onShip.x, off.y - onShip.y)).toBeLessThan(grappleRules.rangeTiles * TILE);
+    expect((Math.atan2(off.y - onShip.y, off.x - onShip.x) * 180) / Math.PI).toBeGreaterThan(22.5);
+    expect(host.status()).toMatchObject({ mode: "sea", cooldownUntil: landTick + grappleRules.missCooldownTicks });
+    expect(guest.status()?.mode).toBe("sea");
+  });
+
+  it("does nothing, and costs nothing, when J is pressed with nobody in range and in front", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // One player out of range ahead, one in range but behind the attacker.
+    const seats = [
+      { tileX: HUB_X, tileY: OPEN_ROW, heading: EAST },
+      { tileX: HUB_X + 8, tileY: OPEN_ROW, heading: WEST },
+      { tileX: HUB_X - 3, tileY: OPEN_ROW, heading: EAST },
+    ];
+    const [host, ahead, behind] = (await playersAt(endpoint, seats, track)) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const sightings = [host, ahead, behind].map(recordSightings);
+    for (let press = 0; press < 3; press++) {
+      host.tapGrapple();
+      await sleep(300);
+    }
+    await sleep(600);
+    for (const seen of sightings) expect(seen.grapples.size).toBe(0);
+    expect(host.status()).toMatchObject({ mode: "sea", cooldownUntil: 0 });
+    expect(roomOf(host).encounterState.attempts).toEqual([]);
+  });
+
+  it("never grapples a protected target: a duel's winner, until the protection runs out", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // Host west, guest east (the duel), and a third player four tiles south of the host, facing north at it.
+    const seats = [
+      { tileX: HUB_X - 3, tileY: OPEN_ROW, heading: EAST },
+      { tileX: HUB_X + 3, tileY: OPEN_ROW, heading: WEST },
+      { tileX: HUB_X - 3, tileY: OPEN_ROW + 4, heading: NORTH },
+    ];
+    for (let tileY = OPEN_ROW; tileY <= OPEN_ROW + 4; tileY++) expect(isNavigable(seaMap, HUB_X - 3, tileY)).toBe(true);
+    const [host, guest, third] = (await playersAt(endpoint, seats, track)) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    await grapple(host, guest);
+    // The guest quits: the host wins at once by forfeit and sails on with the winner's protection.
+    await guest.leave();
+    await host.waitFor(() => host.status()?.protection === "win", 3000);
+    const { protectedUntil } = host.status()!;
+    const sightings = recordSightings(third);
+    third.tapGrapple();
+    await sleep(500);
+    expect(sightings.grapples.size).toBe(0);
+    expect(third.status()).toMatchObject({ mode: "sea", cooldownUntil: 0 });
+    // Once the eight seconds are over, the same press starts a grapple.
+    await third.waitFor(() => third.worldTick > protectedUntil + 1, 12_000);
+    expect(host.status()).toMatchObject({ protection: "", protectedUntil: 0 });
+    third.tapGrapple();
+    await third.waitFor(() => third.grapples().some((each) => each.defenderId === host.sessionId), 2000);
+  }, 30_000);
+});
+
+describe.concurrent("the duel inside the match room", () => {
+  it("counts down three seconds, measures the round trip, then fights over the standalone duel's netcode to a KO", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track);
+    const reservedAt = Date.now();
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "fighting", 5000);
+    expect(Date.now() - reservedAt).toBeGreaterThanOrEqual(2700);
+    const room = roomOf(host);
+    const diagnostics = room.seaDuelDiagnostics(host.sessionId)!;
+    // The shared input delay, chosen from 20-odd probes of each fighter, within §15's 3 to 8 frames (locally near 3;
+    // the tests of this file run at once, so the exact value is not pinned).
+    expect(diagnostics.inputDelay).toBeGreaterThanOrEqual(MIN_INPUT_DELAY);
+    expect(diagnostics.inputDelay).toBeLessThanOrEqual(MAX_INPUT_DELAY);
+    expect(guest.fighter.lobby?.inputDelay).toBe(diagnostics.inputDelay);
+    expect(diagnostics.rttSamples["0"]!.length).toBeGreaterThanOrEqual(20);
+    expect(diagnostics.rttSamples["1"]!.length).toBeGreaterThanOrEqual(20);
+
+    host.fighter.play(brawler(0));
+    const result = await resultOf(host, guest);
+    expect(result).toEqual({ phase: "over", winner: 0, reason: "ko" });
+    for (const client of [host, guest]) {
+      expect(client.fighter.bundles[0]).toMatchObject({ frame: 0, inputs: [] });
+      expect(client.fighter.stats).toMatchObject({ desyncs: 0 });
+      expect(client.fighter.stats!.hashChecks).toBeGreaterThanOrEqual(100);
+      expect(client.fighter.confirmedState?.result).toMatchObject({ winner: 0, reason: "ko" });
+    }
+    expect(room.seaDuelDiagnostics(host.sessionId)!.dropped["0"]).toMatchObject({ "rate-limited": 0, "future-frame": 0 });
+  }, 30_000);
+
+  it("shows a third player in sight the duel marker but no duel messages, and one out of sight neither; both keep sailing", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The fight between the hub's -3 and +3 tiles; a watcher 4 tiles south of the hub (in sight of the marker) and a
+    // stranger 12 tiles further east (out of sight of everything).
+    const seats = [
+      { tileX: HUB_X - 3, tileY: OPEN_ROW, heading: EAST },
+      { tileX: HUB_X + 3, tileY: OPEN_ROW, heading: WEST },
+      { tileX: HUB_X - 6, tileY: OPEN_ROW + 4, heading: EAST },
+      { tileX: HUB_X + 3 + SIGHT_RADIUS_TILES + 2, tileY: OPEN_ROW, heading: EAST },
+    ];
+    const [host, guest, watcher, stranger] = (await playersAt(endpoint, seats, track)) as HeadlessClient[] as [HeadlessClient, HeadlessClient, HeadlessClient, HeadlessClient];
+    await watcher.waitFor(() => watcher.ship(host.sessionId) !== undefined && watcher.ship(guest.sessionId) !== undefined);
+    const seen = { watcher: recordSightings(watcher), stranger: recordSightings(stranger) };
+    const marks = { watcher: watcher.frameCount, stranger: stranger.frameCount };
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "fighting", 5000);
+    // The watcher saw the telegraph and sees the marker where the fight is, and no fighter's ship any more.
+    expect([...seen.watcher.grapples]).toEqual([`${host.sessionId}>${guest.sessionId}`]);
+    await watcher.waitFor(() => watcher.markers().length === 1);
+    const [marker] = watcher.markers();
+    expect(marker).toMatchObject({ x: HUB_X * TILE + TILE / 2, y: OPEN_ROW * TILE + TILE / 2 });
+    expect(watcher.visibleShipIds()).toEqual([watcher.sessionId]);
+    // The world goes on: the watcher sails during the fight.
+    const before = watcher.ship()!;
+    await watcher.hold(AHEAD, 800);
+    await watcher.waitFor(() => watcher.ship()!.x > before.x);
+    await host.fighter.waitForConfirmed(60);
+
+    // Neither onlooker got the duel's lobby or any of its messages; the stranger saw no telegraph and no marker.
+    for (const [name, client] of [["watcher", watcher], ["stranger", stranger]] as const) {
+      expect(seen[name].duelLobbies, name).toBe(0);
+      const frames = client.framesSince(marks[name]);
+      expect(frames.length).toBeGreaterThan(0);
+      for (const type of [DuelMessageType.Frames, DuelMessageType.Probe]) expect(frames.some((frame) => containsText(frame, type)), `${name} ${type}`).toBe(false);
+    }
+    expect(seen.stranger.grapples.size).toBe(0);
+    expect(seen.stranger.markers).toBe(0);
+    // The fighters did get them.
+    expect(host.framesSince(0).some((frame) => containsText(frame, DuelMessageType.Frames))).toBe(true);
+
+    // The duel ends (the guest quits): the marker goes.
+    await guest.leave();
+    await watcher.waitFor(() => watcher.markers().length === 0, 3000);
+    await watcher.waitFor(() => watcher.ship(host.sessionId) !== undefined, 3000);
+  }, 30_000);
+});
+
+describe.concurrent("the return to the world (§6)", () => {
+  it("returns the winner to its encounter position with 8 s of protection, and respawns the loser at the rules' dock 15 s after the end with 20 s", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track);
+    const at = { host: host.ship()!, guest: guest.ship()! };
+    await grapple(host, guest);
+    host.fighter.play(brawler(0));
+    expect(await resultOf(host, guest)).toMatchObject({ winner: 0, reason: "ko" });
+    const room = roomOf(host);
+
+    // The same tick: the winner is back where it was with protection, the loser waits out of the world.
+    await host.waitFor(() => host.status()?.protection === "win", 2000);
+    await guest.waitFor(() => guest.status()?.mode === "respawning", 2000);
+    const settled = host.status()!.protectedUntil - encounterRules.winProtectionTicks;
+    expect(guest.status()!.respawnAt).toBe(settled + encounterRules.respawnDelayTicks);
+    expect(host.status()!.mode).toBe("sea");
+    expect(host.ship()).toMatchObject({ x: at.host.x, y: at.host.y, speed: 0 });
+    // The loser's ship is gone from every view, its own included; the result stays in the lobby for a moment.
+    await host.waitFor(() => host.ship(guest.sessionId) === undefined);
+    expect(guest.ship()).toBeUndefined();
+    expect(room.viewedShipIds(host.sessionId)).toEqual([host.sessionId]);
+    await host.waitFor(() => host.duelCount === 0, 5000);
+    expect(host.worldTick).toBeGreaterThan(settled + DUEL_RESULT_TICKS);
+
+    // Fifteen seconds after the end, the loser is moored at the dock the rules choose, with 20 s of protection.
+    const { respawnAt } = guest.status()!;
+    await guest.waitFor(() => guest.ship() !== undefined, 20_000);
+    const expected = rules.modes.ship.rules.respawnPoint({
+      encounter: { x: Math.floor((at.host.x + at.guest.x) / 2), y: Math.floor((at.host.y + at.guest.y) / 2) },
+      own: at.guest,
+      opponents: [host.ship()!],
+      clearRadius: rules.respawnClearRadius,
+    });
+    expect(guest.ship()).toMatchObject({ x: expected.x, y: expected.y, dock: expected.dockId, speed: 0 });
+    expect(guest.status()).toMatchObject({ mode: "sea", protection: "respawn", protectedUntil: respawnAt + encounterRules.respawnProtectionTicks });
+    expect(host.status()).toMatchObject({ protection: "", protectedUntil: 0 });
+  }, 45_000);
+
+});
+
+const LEFT = duelInput("left");
+const hold = (frames: number, bits = 0) => Array.from({ length: frames }, () => bits);
+const seatConnected = (host: HeadlessClient, slot: number) => [...(host.fighter.lobby?.seats ?? [])].find((seat) => seat.slot === slot)?.connected;
+
+/** A duel at sea with the guest (and, if asked, the host) behind its own proxy, fighting for three seconds. */
+async function fightBehindProxies(track: (client: HeadlessClient) => void, both = false) {
+  const [hostProxy, guestProxy] = await Promise.all([ImpairmentProxy.start(server.port), ImpairmentProxy.start(server.port)]);
+  const { host, guest } = await pairInRange(endpoint, track, { endpoints: [both ? hostProxy.endpoint : endpoint, guestProxy.endpoint] });
+  // The guest walks towards the host all the time, so its held input is left.
+  guest.fighter.play(() => LEFT);
+  await grapple(host, guest);
+  await host.waitFor(() => host.fighter.phase === "fighting", 5000);
+  // The SDK reconnects only a room joined at least five seconds ago.
+  await host.fighter.waitForConfirmed(180);
+  return { host, guest, hostProxy, guestProxy, close: () => Promise.all([hostProxy.close(), guestProxy.close()]) };
+}
+
+describe.concurrent("a fighter who drops (§12)", () => {
+  it("gets neutral input after the held-input timeout, and resumes the same fight on reconnecting within ten seconds", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest, guestProxy, close } = await fightBehindProxies(track);
+    onTestFinished(async () => void (await close()));
+    const room = roomOf(host);
+    const dropFrame = room.seaDuelDiagnostics(host.sessionId)!.frame;
+    guestProxy.sever({ refuse: true });
+    await host.waitFor(() => seatConnected(host, 1) === false, 5000);
+    // While the guest is away the server substitutes: its held input (left) for 15 frames, then neutral.
+    await host.fighter.waitForConfirmed(dropFrame + 50);
+    const during = [...appliedPairs(host.fighter.bundles).entries()].filter(([frame]) => frame > dropFrame && frame <= dropFrame + 50);
+    const substituted = during.filter(([, entry]) => entry.substituted[1]).map(([, entry]) => entry.pair[1]);
+    expect(substituted.slice(0, INPUT_HOLD_FRAMES)).toEqual(hold(INPUT_HOLD_FRAMES, LEFT));
+    expect(substituted.slice(INPUT_HOLD_FRAMES).length).toBeGreaterThan(0);
+    expect(substituted.slice(INPUT_HOLD_FRAMES).every((bits) => bits === 0)).toBe(true);
+    await sleep(500);
+    guestProxy.restore();
+    // The SDK reconnects on its own through the same address, within the ten seconds, into the same fight.
+    await guest.waitFor(() => guest.fighter.connected && seatConnected(host, 1) === true, 9000);
+    const back = room.seaDuelDiagnostics(host.sessionId)!.frame;
+    await guest.fighter.waitForConfirmed(back + 60);
+    expect(lobbyOf(host)?.phase).toBe("fighting");
+    expect(guest.fighter.stats!.snapshotRestores).toBeGreaterThanOrEqual(1);
+    expect(guest.fighter.stats!.desyncs).toBe(0);
+    const duel = room.seaDuelDiagnostics(guest.sessionId)!;
+    const frame = guest.fighter.duel!.rollback.confirmedFrame;
+    const replayed = await replayRecordedDuel({ ...duel.inputLog, inputs: duel.inputLog.inputs.slice(0, frame) }, { seed: duel.seed });
+    expect(hashState(guest.fighter.duel!.confirmedState)).toBe(replayed.hash);
+    // Its own input counts again, and it is still in the match.
+    const pairs = appliedPairs(host.fighter.bundles);
+    expect([...pairs.entries()].some(([f, entry]) => f > back + 10 && !entry.substituted[1] && entry.pair[1] === LEFT)).toBe(true);
+    expect(guest.status()?.mode).toBe("duel");
+    expect(host.playerCount).toBe(2);
+  }, 40_000);
+
+  it("forfeits after ten seconds absent, and leaves the match", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guestProxy, close } = await fightBehindProxies(track);
+    onTestFinished(async () => void (await close()));
+    guestProxy.sever({ refuse: true });
+    const droppedAt = Date.now();
+    await host.waitFor(() => host.fighter.phase === "over", 15_000);
+    expect(Date.now() - droppedAt).toBeGreaterThanOrEqual(9500);
+    expect(lobbyOf(host)).toEqual({ phase: "over", winner: 0, reason: "forfeit" });
+    await host.waitFor(() => host.status()?.protection === "win", 2000);
+    await host.waitFor(() => host.playerCount === 1, 2000);
+  }, 40_000);
+
+  it("forfeits at once when the fighter quits", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track);
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "fighting", 5000);
+    const quitAt = Date.now();
+    await guest.leave();
+    await host.waitFor(() => host.fighter.phase === "over", 2000);
+    expect(Date.now() - quitAt).toBeLessThan(1000);
+    expect(lobbyOf(host)).toEqual({ phase: "over", winner: 0, reason: "forfeit" });
+    await host.waitFor(() => host.status()?.protection === "win", 2000);
+  });
+
+  it("cancels the duel when both fighters are gone on the same frame, in whichever order they are processed", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const both = async (order: readonly [0, 1] | readonly [1, 0]) => {
+      const { host, guest, hostProxy, guestProxy, close } = await fightBehindProxies(track, true);
+      onTestFinished(async () => void (await close()));
+      const room = roomOf(host);
+      const byIndex = [host, guest].map((client) => room.clients.get(client.sessionId)!);
+      // One network outage takes both fighters down at once.
+      hostProxy.sever({ refuse: true });
+      guestProxy.sever({ refuse: true });
+      await host.waitFor(() => room.clients.length === 0, 5000);
+      // Both reconnection windows run out between two frames: Colyseus calls the room's onLeave for each, one after
+      // the other, in some order. Neither call decides anything by itself.
+      for (const index of order) room.onLeave(byIndex[index]!);
+      expect(room.seaDuelDiagnostics(host.sessionId)!.phase).toBe("fighting");
+      await host.waitFor(() => room.seaDuelDiagnostics(host.sessionId)?.phase === "over", 1000);
+      const outcome = room.seaDuelDiagnostics(host.sessionId)!.outcome;
+      // The rules got a cancellation: no winner, no loser waiting to respawn, both returned as from a draw.
+      await host.waitFor(() => room.encounterState.duels.length === 0, 1000);
+      const records = room.encounterState.players.filter((player) => player.id === host.sessionId || player.id === guest.sessionId);
+      expect(room.refusedDuelReports).toBe(0);
+      return { outcome, returns: records.map((player) => [player.protection?.source, player.respawn]) };
+    };
+    const results = await Promise.all([both([0, 1]), both([1, 0])]);
+    for (const result of results) {
+      expect(result.outcome).toMatchObject({ winner: null, reason: "forfeit" });
+      expect(result.returns).toEqual([
+        ["draw", null],
+        ["draw", null],
+      ]);
+    }
+  }, 40_000);
+});
+
+describe.concurrent("the ready check (§6)", () => {
+  it("forfeits a fighter whose arena is not ready ten seconds after the grapple", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track, { clients: [{}, { autoReady: false }] });
+    const reservedAt = Date.now();
+    await grapple(host, guest);
+    // The countdown ends with the guest still loading: the duel waits for it.
+    await host.waitFor(() => host.fighter.phase === "waiting", 5000);
+    await host.waitFor(() => host.fighter.phase === "over", 12_000);
+    expect(Date.now() - reservedAt).toBeGreaterThanOrEqual(9500);
+    expect(lobbyOf(guest)).toEqual({ phase: "over", winner: 0, reason: "forfeit" });
+    // The loser of a forfeit is still in the match, waiting to respawn.
+    await guest.waitFor(() => guest.status()?.mode === "respawning", 2000);
+    await host.waitFor(() => host.status()?.protection === "win", 2000);
+  }, 30_000);
+
+  it("cancels the duel when neither fighter is ready in time", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track, { clients: [{ autoReady: false }, { autoReady: false }] });
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "over", 13_000);
+    expect(lobbyOf(host)).toEqual({ phase: "over", winner: -1, reason: "cancelled" });
+    for (const client of [host, guest]) await client.waitFor(() => client.status()?.protection === "draw", 2000);
+  }, 30_000);
+
+  it("starts the fight once a late fighter is ready, on the same netcode", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track, { clients: [{}, { autoReady: false }] });
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "waiting", 5000);
+    await sleep(1500);
+    expect(host.fighter.phase).toBe("waiting");
+    guest.ready();
+    for (const client of [host, guest]) await client.waitFor(() => client.fighter.phase === "fighting", 2000);
+    guest.fighter.play(() => LEFT);
+    for (const client of [host, guest]) await client.fighter.waitForConfirmed(180);
+    const duel = roomOf(host).seaDuelDiagnostics(host.sessionId)!;
+    for (const slot of ["0", "1"]) expect(duel.dropped[slot]).toMatchObject({ "future-frame": 0, "rate-limited": 0 });
+    for (const client of [host, guest]) expect(client.fighter.stats).toMatchObject({ desyncs: 0 });
+    expect(duel.authority.received[1]).toBeGreaterThan(150);
+  }, 30_000);
+});

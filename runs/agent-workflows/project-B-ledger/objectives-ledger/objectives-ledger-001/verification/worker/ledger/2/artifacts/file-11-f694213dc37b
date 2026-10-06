@@ -1,0 +1,182 @@
+import {
+  findPlayer,
+  type LedgerCache,
+  type LedgerPlayer,
+  type LedgerRubbing,
+  type LedgerState,
+  type Position,
+  type RubbingLocation,
+} from "./state.js";
+
+/**
+ * Why a request changed nothing (§16: duplicate, stale, unauthorised or already-resolved requests return the current
+ * result without mutating state). A rejected request always returns the very state object it was given.
+ */
+export type LedgerRejection =
+  | "invalid-request"
+  | "stale-tick"
+  | "duplicate"
+  | "unknown-player"
+  | "player-left"
+  | "player-disconnected"
+  | "player-in-duel"
+  | "same-player"
+  | "unknown-source"
+  | "source-locked"
+  | "source-empty"
+  | "type-held"
+  | "unknown-cache"
+  | "not-in-cache"
+  | "no-channel"
+  | "unknown-duel"
+  | "not-a-participant"
+  | "already-resolved"
+  | "not-choosing"
+  | "not-winner"
+  | "choice-window-closed"
+  | "ineligible-type"
+  | "not-disconnected"
+  | "reservation-active"
+  | "reservation-expired";
+
+/** One rubbing move, for §16's transfer record. `revisionAfter` is always `revisionBefore + 1`. */
+export interface Transfer {
+  readonly rubbingId: string;
+  readonly from: RubbingLocation;
+  readonly to: RubbingLocation;
+  readonly revisionBefore: number;
+  readonly revisionAfter: number;
+}
+
+/** What every operation returns: the next state (the same object when nothing changed) and its result. */
+export interface LedgerStep<R> {
+  readonly state: LedgerState;
+  readonly result: R;
+}
+
+/** Moves made so far by one operation, and the caches it opened. */
+export interface Effects {
+  readonly transfers: Transfer[];
+  readonly cacheIds: string[];
+}
+
+export function noEffects(): Effects {
+  return { transfers: [], cacheIds: [] };
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+export function isPlayerId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+export function isPosition(value: unknown): value is Position {
+  if (typeof value !== "object" || value === null) return false;
+  const { x, y } = value as Record<string, unknown>;
+  return isSafeInteger(x) && isSafeInteger(y);
+}
+
+/** A request's tick must be a non-negative integer no earlier than the ledger's latest. */
+export function tickRejection(state: LedgerState, tick: unknown): LedgerRejection | null {
+  if (!isSafeInteger(tick) || tick < 0) return "invalid-request";
+  return tick < state.tick ? "stale-tick" : null;
+}
+
+export function atTick(state: LedgerState, tick: number): LedgerState {
+  return tick === state.tick ? state : { ...state, tick };
+}
+
+/** Why a player cannot act in the world right now, if they cannot. */
+export function playerRejection(state: LedgerState, playerId: unknown): LedgerRejection | null {
+  if (!isPlayerId(playerId)) return "invalid-request";
+  const player = findPlayer(state, playerId);
+  if (!player) return "unknown-player";
+  return player.status === "left" ? "player-left" : null;
+}
+
+export function updatePlayer(
+  state: LedgerState,
+  playerId: string,
+  update: (player: LedgerPlayer) => LedgerPlayer,
+): LedgerState {
+  return { ...state, players: state.players.map((player) => (player.id === playerId ? update(player) : player)) };
+}
+
+/** Moves each listed rubbing to its target, bumping its revision, and drops any cache the moves emptied. */
+export function moveRubbings(
+  state: LedgerState,
+  moves: readonly { readonly rubbingId: string; readonly to: RubbingLocation }[],
+  effects: Effects,
+): LedgerState {
+  if (moves.length === 0) return state;
+  const targets = new Map(moves.map((move) => [move.rubbingId, move.to]));
+  if (targets.size !== moves.length) throw new Error("a rubbing cannot move twice in one step");
+  const rubbings = state.rubbings.map((rubbing): LedgerRubbing => {
+    const to = targets.get(rubbing.id);
+    if (to === undefined) return rubbing;
+    targets.delete(rubbing.id);
+    effects.transfers.push({
+      rubbingId: rubbing.id,
+      from: rubbing.location,
+      to,
+      revisionBefore: rubbing.revision,
+      revisionAfter: rubbing.revision + 1,
+    });
+    return { ...rubbing, location: to, revision: rubbing.revision + 1 };
+  });
+  if (targets.size > 0) throw new Error(`unknown rubbings ${[...targets.keys()].join(", ")}`);
+  return dropEmptyCaches({ ...state, rubbings });
+}
+
+function dropEmptyCaches(state: LedgerState): LedgerState {
+  const used = new Set(
+    state.rubbings.flatMap((rubbing) => (rubbing.location.kind === "cache" ? [rubbing.location.cacheId] : [])),
+  );
+  const caches = state.caches.filter((cache) => used.has(cache.id));
+  return caches.length === state.caches.length ? state : { ...state, caches };
+}
+
+/** Opens a recovery cache holding the listed rubbings at a position; with none, no cache appears. */
+export function openCache(
+  state: LedgerState,
+  position: { readonly x: number; readonly y: number },
+  rubbingIds: readonly string[],
+  tick: number,
+  effects: Effects,
+): LedgerState {
+  if (rubbingIds.length === 0) return state;
+  const cache: LedgerCache = { id: `cache-${state.nextCacheNumber}`, x: position.x, y: position.y, createdTick: tick };
+  effects.cacheIds.push(cache.id);
+  const opened = { ...state, caches: [...state.caches, cache], nextCacheNumber: state.nextCacheNumber + 1 };
+  return moveRubbings(
+    opened,
+    rubbingIds.map((rubbingId) => ({ rubbingId, to: { kind: "cache", cacheId: cache.id } as const })),
+    effects,
+  );
+}
+
+/**
+ * Returns rubbings to a player, or, when that player has left the match, into a recovery cache at the place they
+ * left from, so a rubbing never follows a player out of the match.
+ */
+export function releaseTo(
+  state: LedgerState,
+  playerId: string,
+  rubbingIds: readonly string[],
+  tick: number,
+  effects: Effects,
+): LedgerState {
+  const player = findPlayer(state, playerId);
+  if (!player) throw new Error(`unknown player ${playerId}`);
+  if (player.status === "left") {
+    if (player.exit === null) throw new Error(`player ${playerId} left without an exit position`);
+    return openCache(state, player.exit, rubbingIds, tick, effects);
+  }
+  return moveRubbings(
+    state,
+    rubbingIds.map((rubbingId) => ({ rubbingId, to: { kind: "player", playerId } as const })),
+    effects,
+  );
+}

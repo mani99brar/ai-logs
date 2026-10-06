@@ -1,0 +1,855 @@
+     1	import assert from 'node:assert/strict'
+     2	import { createHash } from 'node:crypto'
+     3	import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+     4	import { tmpdir } from 'node:os'
+     5	import { join } from 'node:path'
+     6	import { test } from 'node:test'
+     7	import { schemas as projectSchemas, validateDefinition, validateRunDetail, type RunDetail } from '../contracts/projects/v1.ts'
+     8	import { eventSchema, validateWorkerResult } from '../contracts/workflow/v1.ts'
+     9	import { createApp } from './app.ts'
+    10	import { defaultFixtureRoot, fixtureLocations } from './config.ts'
+    11	import { PROJECTS_CONFIG_ENV, ProjectsConfigError, canonicalJson, definitionRevision, loadProjectsConfig, parseProjectsConfig } from './projectsConfig.ts'
+    12	
+    13	/**
+    14	 * Every test builds disposable run roots in the documented producer format (plan.json, atomic run-state.json,
+    15	 * events.jsonl and verification/<phase>/<node>/<attempt>/packet.json with artifacts beside it). No live
+    16	 * application, skills or workflow data is read, and the API must never write into a run root.
+    17	 */
+    18	
+    19	const GRAPH_NODES = [
+    20	  { node_id: 'launch_ui', label: 'Launch UI worker', kind: 'worker', depends_on: [] },
+    21	  { node_id: 'launch_adapter', label: 'Launch adapter worker', kind: 'worker', depends_on: [] },
+    22	  { node_id: 'handoff', label: 'Freeze worker handoffs', kind: 'prepare', depends_on: ['launch_ui', 'launch_adapter'] },
+    23	  { node_id: 'verify_ui', label: 'Verify UI', kind: 'verification', depends_on: ['handoff'] },
+    24	  { node_id: 'verify_adapter', label: 'Verify adapter', kind: 'verification', depends_on: ['handoff'] },
+    25	  { node_id: 'candidate', label: 'Verify combined candidate', kind: 'verification', depends_on: ['verify_ui', 'verify_adapter'] },
+    26	  { node_id: 'review', label: 'Independent review', kind: 'review', depends_on: ['candidate'] },
+    27	  { node_id: 'approval', label: 'Integration approval', kind: 'integration', depends_on: ['review'] },
+    28	  { node_id: 'integrate', label: 'Integrate candidate', kind: 'integration', depends_on: ['approval'] },
+    29	]
+    30	const DEFINITION = { name: 'Feature implementation', nodes: GRAPH_NODES }
+    31	const BASE = 'a'.repeat(40)
+    32	const OUTPUT = 'b'.repeat(40)
+    33	const T0 = '2026-03-01T10:00:00.000000Z'
+    34	const T1 = '2026-03-01T10:05:00.000000Z'
+    35	const T2 = '2026-03-01T10:10:00.000000Z'
+    36	const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('synthetic png body')])
+    37	
+    38	const sha256 = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
+    39	const json = (value: unknown) => JSON.stringify(value, null, 2)
+    40	
+    41	type RawEvent = { sequence: number; time: string; node: string; status: string; message: string }
+    42	type Registration = { phase: 'worker' | 'candidate'; node_id: string; attempt: number; path: string; sha256: string }
+    43	
+    44	type PacketSpec = {
+    45	  phase?: 'worker' | 'candidate'
+    46	  node: 'ui' | 'adapter'
+    47	  attempt?: number
+    48	  gate?: { status: 'passed' | 'blocked'; reasons: string[] }
+    49	  artifacts?: { id: string; kind: 'log' | 'screenshot' | 'test_report' | 'patch' | 'other'; content: Buffer | string; uri?: string; registeredSha?: string; skipWrite?: boolean }[]
+    50	  session?: string
+    51	  summary?: string
+    52	  assumptions?: string[]
+    53	  changed?: string[]
+    54	  /** Mutates the packet JSON just before it is written (the registration hash follows the mutation). */
+    55	  mutate?: (packet: Record<string, unknown>) => void
+    56	  /** Corrupts the file after its hash was registered. */
+    57	  tamper?: boolean
+    58	}
+    59	
+    60	type RunSpec = {
+    61	  runId: string
+    62	  definition?: { name: string; nodes: typeof GRAPH_NODES }
+    63	  values?: Record<string, unknown>
+    64	  next?: string[]
+    65	  tasks?: { node_id: string; error: string | null; interrupts: Record<string, unknown>[]; result: Record<string, unknown> | null }[]
+    66	  events?: RawEvent[]
+    67	  eventsFile?: boolean | string
+    68	  packets?: PacketSpec[]
+    69	  created?: string
+    70	  updated?: string
+    71	  planRunId?: string
+    72	  exportRunId?: string
+    73	  skipPlan?: boolean
+    74	  registrations?: (registrations: Registration[]) => Registration[]
+    75	  stateText?: string
+    76	}
+    77	
+    78	/** One run directory exactly as workflow/export_state.py and workflow/checks.py persist it. */
+    79	async function writeRun(root: string, spec: RunSpec): Promise<string> {
+    80	  const dir = join(root, spec.runId)
+    81	  await mkdir(dir, { recursive: true })
+    82	  const runId = spec.exportRunId ?? spec.runId
+    83	  const registrations: Registration[] = []
+    84	  for (const packetSpec of spec.packets ?? []) {
+    85	    const phase = packetSpec.phase ?? 'worker'
+    86	    const attempt = packetSpec.attempt ?? 1
+    87	    const packetDir = join(dir, 'verification', phase, packetSpec.node, String(attempt))
+    88	    const artifactsDir = join(packetDir, 'artifacts')
+    89	    await mkdir(artifactsDir, { recursive: true })
+    90	    const artifacts = []
+    91	    const paths: Record<string, string> = {}
+    92	    for (const artifact of packetSpec.artifacts ?? []) {
+    93	      const content = Buffer.isBuffer(artifact.content) ? artifact.content : Buffer.from(artifact.content)
+    94	      const uri = artifact.uri ?? artifact.id
+    95	      if (!artifact.skipWrite) await writeFile(join(artifactsDir, uri), content)
+    96	      artifacts.push({ artifact_id: artifact.id, kind: artifact.kind, uri, sha256: artifact.registeredSha ?? sha256(content) })
+    97	      paths[artifact.id] = join(artifactsDir, uri)
+    98	    }
+    99	    const logs = artifacts.filter(item => item.kind === 'log')
+   100	    const checks = logs.map((log, index) => ({
+   101	      command: `npm run check-${index}`, cwd: join(packetDir, 'worktree'), started_at: T0, finished_at: T1, exit_code: 0, log_artifact_id: log.artifact_id,
+   102	    }))
+   103	    const expected = { run_id: runId, node_id: packetSpec.node, attempt, base_commit: BASE, output_commit: OUTPUT, verification_cwd: join(packetDir, 'worktree') }
+   104	    const packet: Record<string, unknown> = {
+   105	      phase,
+   106	      expected,
+   107	      result: {
+   108	        contract_version: '1.0.0', run_id: runId, node_id: packetSpec.node, attempt, session_id: packetSpec.session ?? `${packetSpec.node}-session-0001`,
+   109	        status: 'succeeded', base_commit: BASE, output_commit: OUTPUT, changed_files: packetSpec.changed ?? [`src/${packetSpec.node}.ts`],
+   110	        checks, open_assumptions: packetSpec.assumptions ?? [], artifacts,
+   111	        summary: packetSpec.summary ?? `Trusted ${phase} check capture; not integration approval`, error: null,
+   112	      },
+   113	      evidence: { version: '1.0.0', policy_sha256: 'c'.repeat(64), run_id: runId, node_id: packetSpec.node, attempt, output_commit: OUTPUT, checks: [] },
+   114	      artifact_root: artifactsDir, artifact_paths: paths, capture_errors: [], effective_commands: [],
+   115	      gate: { ...(packetSpec.gate ?? { status: 'passed', reasons: [] }), pending_gates: ['independent_review', 'integration_approval'], integration_allowed: false },
+   116	    }
+   117	    packetSpec.mutate?.(packet)
+   118	    const text = json(packet)
+   119	    await writeFile(join(packetDir, 'packet.json'), text)
+   120	    registrations.push({ phase, node_id: packetSpec.node, attempt, path: `verification/${phase}/${packetSpec.node}/${attempt}/packet.json`, sha256: sha256(text) })
+   121	    if (packetSpec.tamper) await writeFile(join(packetDir, 'packet.json'), text + '\n')
+   122	  }
+   123	  const created = spec.created ?? T0
+   124	  if (!spec.skipPlan) {
+   125	    await writeFile(join(dir, 'plan.json'), json({
+   126	      run_id: spec.planRunId ?? runId, repository: '/synthetic/repository', base_commit: BASE, allow_edits: true, mode: 'interactive',
+   127	      nodes: { ui: { worktree: join(dir, 'worktree-ui') }, adapter: { worktree: join(dir, 'worktree-adapter') } },
+   128	      policy_sha256: 'c'.repeat(64), created_at: created, source_branch: 'feature/synthetic',
+   129	    }))
+   130	  }
+   131	  const events = spec.events ?? []
+   132	  if (spec.eventsFile !== false) {
+   133	    const text = typeof spec.eventsFile === 'string' ? spec.eventsFile : events.map(event => JSON.stringify(event) + '\n').join('')
+   134	    if (text.length > 0) await writeFile(join(dir, 'events.jsonl'), text)
+   135	  }
+   136	  const state = {
+   137	    version: '1.0.0', run_id: runId, base_commit: BASE, created_at: created, definition: spec.definition ?? DEFINITION,
+   138	    values: { run_id: runId, ...(spec.values ?? {}) }, next: spec.next ?? [], tasks: spec.tasks ?? [], events,
+   139	    verification_packets: spec.registrations ? spec.registrations(registrations) : registrations, updated_at: spec.updated ?? T1,
+   140	  }
+   141	  await writeFile(join(dir, 'run-state.json'), spec.stateText ?? json(state))
+   142	  return dir
+   143	}
+   144	
+   145	const receipt = (node: 'ui' | 'adapter') => ({
+   146	  node_id: node, session_id: `${node}-session-0001`, launch_token: '00000000-0000-4000-8000-000000000000', plan_digest: 'd'.repeat(64),
+   147	  worktree: `/synthetic/run/worktree-${node}`, base_commit: BASE, status: 'attached_session_available', attempt: 1, launcher_invocations: 1,
+   148	  launch_requested_at: T0, background_id: `bg-${node}`, observed_state: 'working', native_started_at: 1_700_000_000,
+   149	})
+   150	const snapshots = { ui: { commit: OUTPUT, changed_files: ['src/ui.ts'], session_id: 'ui-session-0001', summary: 'UI done', open_assumptions: [] },
+   151	  adapter: { commit: OUTPUT, changed_files: ['src/adapter.ts'], session_id: 'adapter-session-0001', summary: 'Adapter done', open_assumptions: [] } }
+   152	const launchEvents: RawEvent[] = [
+   153	  { sequence: 1, time: T0, node: 'adapter', status: 'running', message: 'Launching or reconciling the exact native session' },
+   154	  { sequence: 2, time: T0, node: 'ui', status: 'running', message: 'Launching or reconciling the exact native session' },
+   155	  { sequence: 3, time: T1, node: 'adapter', status: 'interactive', message: 'Awaiting explicit completion signal; idle is not acceptance' },
+   156	  { sequence: 4, time: T1, node: 'ui', status: 'interactive', message: 'Awaiting explicit completion signal; idle is not acceptance' },
+   157	]
+   158	
+   159	type Harness = { root: string; app: ReturnType<typeof createApp>; runsRoot: (project: string, workflow: string) => string }
+   160	
+   161	function registry(root: string, projects: { id: string; name?: string; workflows: { id: string; definition?: unknown; runsRoot?: string }[] }[]) {
+   162	  return {
+   163	    version: 1,
+   164	    projects: projects.map(project => ({
+   165	      project_id: project.id, name: project.name ?? project.id, repository: join(root, 'repo', project.id),
+   166	      workflows: project.workflows.map(workflow => ({ workflow_id: workflow.id, runs_root: workflow.runsRoot ?? join(root, 'runs', project.id, workflow.id), definition: workflow.definition ?? DEFINITION })),
+   167	    })),
+   168	  }
+   169	}
+   170	
+   171	async function harness(run: (h: Harness) => Promise<void>, projects: Parameters<typeof registry>[1] = [{ id: 'alpha', name: 'Alpha', workflows: [{ id: 'main' }] }], options: Parameters<typeof createApp>[1] = {}) {
+   172	  const root = await mkdtemp(join(tmpdir(), 'md-manager-projects-'))
+   173	  try {
+   174	    for (const project of projects) for (const workflow of project.workflows) {
+   175	      const runsRoot = workflow.runsRoot ?? join(root, 'runs', project.id, workflow.id)
+   176	      if (runsRoot.startsWith(root)) await mkdir(runsRoot, { recursive: true })
+   177	    }
+   178	    const config = await parseProjectsConfig(JSON.stringify(registry(root, projects)), 'test registry')
+   179	    const app = createApp([], { ...options, projects: config })
+   180	    try {
+   181	      await run({ root, app, runsRoot: (project, workflow) => join(root, 'runs', project, workflow) })
+   182	    } finally { await app.close() }
+   183	  } finally { await rm(root, { recursive: true, force: true }) }
+   184	}
+   185	
+   186	/** Contract paths: a project lists workflows, a workflow lists runs, a run has detail plus sub-resources in `rest`. */
+   187	const url = (project: string, workflow?: string, run?: string, rest = '') =>
+   188	  `/api/projects/${encodeURIComponent(project)}/workflows${workflow ? `/${encodeURIComponent(workflow)}/runs` : ''}${run ? `/${encodeURIComponent(run)}` : ''}${rest}`
+   189	
+   190	async function get(app: Harness['app'], path: string) {
+   191	  const response = await app.inject({ method: 'GET', url: path })
+   192	  return { status: response.statusCode, body: response.body, json: () => response.json(), headers: response.headers }
+   193	}
+   194	
+   195	function assertError(response: { status: number; body: string; json: () => unknown }, status: number, code: string, root?: string) {
+   196	  assert.equal(response.status, status, response.body)
+   197	  const body = response.json() as { error: { code: string; message: string } }
+   198	  assert.deepEqual(Object.keys(body), ['error'])
+   199	  assert.equal(body.error.code, code)
+   200	  assert.ok(typeof body.error.message === 'string' && body.error.message.length > 0)
+   201	  if (root) assert.ok(!response.body.includes(root), `absolute paths are never disclosed: ${response.body}`)
+   202	  assert.ok(!/\/(?:home|tmp|var)\//.test(body.error.message), `message leaks a path: ${body.error.message}`)
+   203	}
+   204	
+   205	// ---------------------------------------------------------------------------------------------------------------
+   206	// Configuration
+   207	
+   208	test('unset or blank MD_MANAGER_PROJECTS_CONFIG means an empty registry; an explicit file must exist and be valid', async () => {
+   209	  assert.deepEqual(await loadProjectsConfig({}), { projects: [], configPath: null })
+   210	  assert.deepEqual(await loadProjectsConfig({ [PROJECTS_CONFIG_ENV]: '   ' }), { projects: [], configPath: null })
+   211	  const root = await mkdtemp(join(tmpdir(), 'md-manager-projects-config-'))
+   212	  try {
+   213	    await assert.rejects(loadProjectsConfig({ [PROJECTS_CONFIG_ENV]: join(root, 'missing.json') }), ProjectsConfigError)
+   214	    await writeFile(join(root, 'bad.json'), '{ not json')
+   215	    await assert.rejects(loadProjectsConfig({ [PROJECTS_CONFIG_ENV]: join(root, 'bad.json') }), ProjectsConfigError)
+   216	    await writeFile(join(root, 'good.json'), JSON.stringify(registry(root, [{ id: 'p', workflows: [{ id: 'w' }] }])))
+   217	    const loaded = await loadProjectsConfig({ [PROJECTS_CONFIG_ENV]: join(root, 'good.json') })
+   218	    assert.equal(loaded.configPath, join(root, 'good.json'))
+   219	    assert.equal(loaded.projects.length, 1)
+   220	    assert.equal(loaded.projects[0].workflows[0].runs_root, join(root, 'runs', 'p', 'w'))
+   221	    validateDefinition(loaded.projects[0].workflows[0].definition)
+   222	  } finally { await rm(root, { recursive: true, force: true }) }
+   223	})
+   224	
+   225	test('rejects malformed registries: shape, IDs, paths, duplicate scopes, overlapping roots and invalid graphs', async () => {
+   226	  const root = await mkdtemp(join(tmpdir(), 'md-manager-projects-config-'))
+   227	  const base = () => registry(root, [{ id: 'p', workflows: [{ id: 'w' }] }])
+   228	  const cases: [string, (config: ReturnType<typeof registry>) => unknown][] = [
+   229	    ['wrong version', config => ({ ...config, version: 2 })],
+   230	    ['missing projects', config => ({ version: config.version })],
+   231	    ['unknown top-level key', config => ({ ...config, extra: true })],
+   232	    ['unknown project key', config => ({ ...config, projects: [{ ...config.projects[0], demo: true }] })],
+   233	    ['project ID with a slash', config => ({ ...config, projects: [{ ...config.projects[0], project_id: 'a/b' }] })],
+   234	    ['project ID starting with a dot', config => ({ ...config, projects: [{ ...config.projects[0], project_id: '.hidden' }] })],
+   235	    ['blank name', config => ({ ...config, projects: [{ ...config.projects[0], name: '  ' }] })],
+   236	    ['relative repository', config => ({ ...config, projects: [{ ...config.projects[0], repository: 'relative/path' }] })],
+   237	    ['tilde runs_root', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], runs_root: '~/runs' }] }] })],
+   238	    ['root runs_root', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], runs_root: '/' }] }] })],
+   239	    ['duplicate project', config => ({ ...config, projects: [config.projects[0], { ...config.projects[0], workflows: [] }] })],
+   240	    ['duplicate workflow', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [config.projects[0].workflows[0], { ...config.projects[0].workflows[0], runs_root: join(root, 'other') }] }] })],
+   241	    ['identical runs_root across projects', config => ({ ...config, projects: [config.projects[0], { ...config.projects[0], project_id: 'q' }] })],
+   242	    ['nested runs_root', config => ({ ...config, projects: [config.projects[0], { ...config.projects[0], project_id: 'q', workflows: [{ ...config.projects[0].workflows[0], runs_root: join(config.projects[0].workflows[0].runs_root, 'nested') }] }] })],
+   243	    ['definition without nodes', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], definition: { name: 'x', nodes: [] } }] }] })],
+   244	    ['definition with a revision field', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], definition: { ...DEFINITION, definition_revision: 'a'.repeat(64) } }] }] })],
+   245	    ['unknown dependency', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], definition: { name: 'x', nodes: [{ node_id: 'a', label: 'A', kind: 'worker', depends_on: ['b'] }] } }] }] })],
+   246	    ['cycle', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], definition: { name: 'x', nodes: [{ node_id: 'a', label: 'A', kind: 'worker', depends_on: ['b'] }, { node_id: 'b', label: 'B', kind: 'worker', depends_on: ['a'] }] } }] }] })],
+   247	    ['duplicate node', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], definition: { name: 'x', nodes: [GRAPH_NODES[0], GRAPH_NODES[0]] } }] }] })],
+   248	    ['unknown node kind', config => ({ ...config, projects: [{ ...config.projects[0], workflows: [{ ...config.projects[0].workflows[0], definition: { name: 'x', nodes: [{ node_id: 'a', label: 'A', kind: 'agent', depends_on: [] }] } }] }] })],
+   249	  ]
+   250	  try {
+   251	    for (const [label, mutate] of cases) {
+   252	      await assert.rejects(parseProjectsConfig(JSON.stringify(mutate(base())), label), ProjectsConfigError, label)
+   253	    }
+   254	    // Two spellings of one directory (a symlink alias) are also an overlap once the roots exist.
+   255	    await mkdir(join(root, 'real'))
+   256	    await symlink(join(root, 'real'), join(root, 'alias'))
+   257	    const aliased = registry(root, [{ id: 'p', workflows: [{ id: 'w', runsRoot: join(root, 'real') }, { id: 'x', runsRoot: join(root, 'alias') }] }])
+   258	    await assert.rejects(parseProjectsConfig(JSON.stringify(aliased), 'alias'), ProjectsConfigError)
+   259	    // Zero projects and a project with zero workflows are valid registries.
+   260	    assert.deepEqual(await parseProjectsConfig(JSON.stringify({ version: 1, projects: [] }), 'empty'), { projects: [] })
+   261	    const empty = await parseProjectsConfig(JSON.stringify(registry(root, [{ id: 'p', workflows: [] }])), 'no workflows')
+   262	    assert.deepEqual(empty.projects[0].workflows, [])
+   263	  } finally { await rm(root, { recursive: true, force: true }) }
+   264	})
+   265	
+   266	test('the definition revision is the SHA-256 of canonical JSON (sorted keys, compact, literal Unicode) without the revision field', async () => {
+   267	  const stored = { name: 'Vérification ✓', nodes: [{ node_id: 'z', label: 'Z', kind: 'worker', depends_on: [] }, { node_id: 'a', label: 'A', kind: 'review', depends_on: ['z'] }] }
+   268	  const config = await parseProjectsConfig(JSON.stringify(registry('/synthetic', [{ id: 'p', workflows: [{ id: 'w', definition: stored }] }])), 'unicode')
+   269	  const definition = config.projects[0].workflows[0].definition
+   270	  const canonical = '{"contract_version":"1.0.0","name":"Vérification ✓","nodes":[{"depends_on":[],"kind":"worker","label":"Z","node_id":"z"},'
+   271	    + '{"depends_on":["z"],"kind":"review","label":"A","node_id":"a"}],"project_id":"p","workflow_id":"w"}'
+   272	  assert.equal(canonicalJson({ contract_version: '1.0.0', project_id: 'p', workflow_id: 'w', name: stored.name, nodes: stored.nodes }), canonical)
+   273	  assert.equal(definition.definition_revision, sha256(Buffer.from(canonical, 'utf8')))
+   274	  assert.equal(definitionRevision(definition), definition.definition_revision)
+   275	  // Array order is retained (not sorted) and the scope participates, so the same graph differs per workflow.
+   276	  assert.deepEqual(definition.nodes.map(node => node.node_id), ['z', 'a'])
+   277	  const other = await parseProjectsConfig(JSON.stringify(registry('/synthetic', [{ id: 'p', workflows: [{ id: 'other', definition: stored }] }])), 'scope')
+   278	  assert.notEqual(other.projects[0].workflows[0].definition.definition_revision, definition.definition_revision)
+   279	})
+   280	
+   281	// ---------------------------------------------------------------------------------------------------------------
+   282	// Surface: methods, error shapes, empty registry and legacy compatibility
+   283	
+   284	test('without project configuration the Projects root is empty, scoped routes are 404 and the legacy API is unchanged', async () => {
+   285	  const app = createApp(fixtureLocations(defaultFixtureRoot))
+   286	  try {
+   287	    const projects = await get(app, '/api/projects')
+   288	    assert.equal(projects.status, 200)
+   289	    assert.deepEqual(projects.json(), { projects: [] })
+   290	    projectSchemas.projectList.parse(projects.json())
+   291	    assertError(await get(app, url('md-manager')), 404, 'PROJECT_NOT_FOUND')
+   292	    assertError(await get(app, url('md-manager', 'feature-implementation')), 404, 'PROJECT_NOT_FOUND')
+   293	    assertError(await get(app, url('md-manager', 'feature-implementation', 'run-001')), 404, 'PROJECT_NOT_FOUND')
+   294	    assertError(await get(app, '/api/projects/unknown/other'), 404, 'NOT_FOUND')
+   295	    // Legacy routes keep their own error shape and behaviour.
+   296	    assert.equal((await get(app, '/api/entries')).status, 200)
+   297	    const legacy = await get(app, '/api/file')
+   298	    assert.equal(legacy.status, 400)
+   299	    assert.deepEqual(Object.keys(legacy.json()).sort(), ['code', 'error'])
+   300	    assert.equal((await get(app, '/api/files')).status, 404)
+   301	  } finally { await app.close() }
+   302	})
+   303	
+   304	test('the project API is read-only: writes are 405 with Allow, HEAD works, and nothing is written into run roots', async () => {
+   305	  await harness(async ({ app, runsRoot }) => {
+   306	    await writeRun(runsRoot('alpha', 'main'), { runId: 'run-001', values: { ui: receipt('ui') }, next: ['launch_adapter'], events: launchEvents.slice(0, 2),
+   307	      packets: [{ node: 'ui', artifacts: [{ id: 'log-0-abc', kind: 'log', content: 'ok\n' }] }] })
+   308	    const before = await snapshotTree(runsRoot('alpha', 'main'))
+   309	    const routes = ['/api/projects', url('alpha'), url('alpha', 'main'), url('alpha', 'main', 'run-001'), url('alpha', 'main', 'run-001', '/events'),
+   310	      url('alpha', 'main', 'run-001', '/results/ui/1'), url('alpha', 'main', 'run-001', '/artifacts/log-0-abc')]
+   311	    for (const route of routes) {
+   312	      for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const) {
+   313	        const response = await app.inject({ method, url: route, payload: method === 'OPTIONS' ? undefined : { approve: true } })
+   314	        assert.equal(response.statusCode, 405, `${method} ${route}: ${response.body}`)
+   315	        assert.equal(response.headers.allow, 'GET, HEAD')
+   316	        assert.equal(response.json().error.code, 'METHOD_NOT_ALLOWED')
+   317	      }
+   318	      const head = await app.inject({ method: 'HEAD', url: route })
+   319	      assert.equal(head.statusCode, 200, `HEAD ${route}`)
+   320	      assert.equal((await get(app, route)).status, 200, route)
+   321	    }
+   322	    assert.deepEqual(await snapshotTree(runsRoot('alpha', 'main')), before, 'reads never create, modify or delete run storage')
+   323	  })
+   324	})
+   325	
+   326	async function snapshotTree(dir: string): Promise<[string, number, number][]> {
+   327	  const entries: [string, number, number][] = []
+   328	  for (const entry of await readdir(dir, { withFileTypes: true, recursive: true })) {
+   329	    const path = join(entry.parentPath ?? dir, entry.name)
+   330	    const info = await stat(path)
+   331	    entries.push([path, info.size, info.mtimeMs])
+   332	  }
+   333	  return entries.sort()
+   334	}
+   335	
+   336	test('invalid IDs, limits, cursors, attempts and after values are 400 without touching storage', async () => {
+   337	  await harness(async ({ app }) => {
+   338	    for (const bad of ['.hidden', 'a%20b', 'x'.repeat(129), 'x'.repeat(300), 'a%2Fb', '%00']) {
+   339	      assertError(await get(app, `/api/projects/${bad}/workflows`), 400, 'INVALID_ID')
+   340	      assertError(await get(app, `/api/projects/alpha/workflows/${bad}/runs`), 400, 'INVALID_ID')
+   341	      assertError(await get(app, `/api/projects/alpha/workflows/main/runs/${bad}`), 400, 'INVALID_ID')
+   342	      assertError(await get(app, `/api/projects/alpha/workflows/main/runs/run-001/artifacts/${bad}`), 400, 'INVALID_ID')
+   343	    }
+   344	    assertError(await get(app, url('alpha', 'main', undefined, '?limit=0')), 400, 'INVALID_LIMIT')
+   345	    assertError(await get(app, url('alpha', 'main', undefined, '?limit=101')), 400, 'INVALID_LIMIT')
+   346	    assertError(await get(app, url('alpha', 'main', undefined, '?limit=abc')), 400, 'INVALID_LIMIT')
+   347	    assertError(await get(app, url('alpha', 'main', undefined, '?limit=5&limit=6')), 400, 'INVALID_LIMIT')
+   348	    assertError(await get(app, url('alpha', 'main', undefined, '?cursor=not-a-token')), 400, 'INVALID_CURSOR')
+   349	    assertError(await get(app, url('alpha', 'main', undefined, `?cursor=${Buffer.from('/etc/passwd').toString('base64url')}`)), 400, 'INVALID_CURSOR')
+   350	    assertError(await get(app, url('alpha', 'main', 'run-001', '/events?after=-1')), 400, 'INVALID_AFTER')
+   351	    assertError(await get(app, url('alpha', 'main', 'run-001', '/events?after=x')), 400, 'INVALID_AFTER')
+   352	    assertError(await get(app, url('alpha', 'main', 'run-001', '/results/ui/0')), 400, 'INVALID_ATTEMPT')
+   353	    assertError(await get(app, url('alpha', 'main', 'run-001', '/results/ui/one')), 400, 'INVALID_ATTEMPT')
+   354	    // Dot segments are normalized away before routing, so they can only miss; they never reach a run.
+   355	    const traversal = await get(app, url('alpha', 'main', 'run-001', '/results/../1'))
+   356	    assert.ok([400, 404].includes(traversal.status), traversal.body)
+   357	    assert.deepEqual(Object.keys(traversal.json() as object), ['error'])
+   358	  })
+   359	})
+   360	
+   361	test('an empty project, an empty workflow and a missing scope are distinguishable', async () => {
+   362	  await harness(async ({ app }) => {
+   363	    const projects = await get(app, '/api/projects')
+   364	    assert.deepEqual(projects.json(), { projects: [{ project_id: 'alpha', name: 'Alpha' }, { project_id: 'bare', name: 'Bare project' }] })
+   365	    const noWorkflows = await get(app, url('bare'))
+   366	    assert.equal(noWorkflows.status, 200)
+   367	    assert.deepEqual(noWorkflows.json(), { workflows: [] })
+   368	    const noRuns = await get(app, url('alpha', 'main'))
+   369	    assert.equal(noRuns.status, 200)
+   370	    assert.deepEqual(noRuns.json(), { runs: [], next_cursor: null })
+   371	    projectSchemas.runList.parse(noRuns.json())
+   372	    assertError(await get(app, url('missing')), 404, 'PROJECT_NOT_FOUND')
+   373	    assertError(await get(app, url('alpha', 'missing')), 404, 'WORKFLOW_NOT_FOUND')
+   374	    assertError(await get(app, url('alpha', 'main', 'missing')), 404, 'RUN_NOT_FOUND')
+   375	    assertError(await get(app, url('alpha', 'main', 'missing', '/events')), 404, 'RUN_NOT_FOUND')
+   376	    assertError(await get(app, url('alpha', 'main', 'missing', '/results/ui/1')), 404, 'RUN_NOT_FOUND')
+   377	    assertError(await get(app, url('alpha', 'main', 'missing', '/artifacts/log-0')), 404, 'RUN_NOT_FOUND')
+   378	    // Registered but unusable storage is a 503, never an empty success.
+   379	    assertError(await get(app, url('alpha', 'absent')), 503, 'RUNS_ROOT_UNAVAILABLE')
+   380	  }, [{ id: 'alpha', name: 'Alpha', workflows: [{ id: 'main' }, { id: 'absent', runsRoot: '/nonexistent/md-manager-projects-test/runs' }] }, { id: 'bare', name: 'Bare project', workflows: [] }])
+   381	})
+   382	
+   383	// ---------------------------------------------------------------------------------------------------------------
+   384	// Isolation and identity
+   385	
+   386	test('runs are associated only through the configured project/workflow root; same basenames stay separate', async () => {
+   387	  const other = { name: 'Other graph', nodes: [{ node_id: 'solo', label: 'Solo', kind: 'worker', depends_on: [] }] }
+   388	  await harness(async ({ app, runsRoot, root }) => {
+   389	    await writeRun(runsRoot('alpha', 'main'), { runId: 'run-001', values: { ui: receipt('ui'), adapter: receipt('adapter') }, next: ['handoff'], events: launchEvents,
+   390	      packets: [{ node: 'ui', artifacts: [{ id: 'log-0-alpha', kind: 'log', content: 'alpha log\n' }] }] })
+   391	    await writeRun(runsRoot('beta', 'main'), { runId: 'run-001', definition: other, values: {}, next: ['solo'], events: [], updated: T2 })
+   392	    const alpha = await get(app, url('alpha', 'main', 'run-001'))
+   393	    const beta = await get(app, url('beta', 'main', 'run-001'))
+   394	    assert.equal(alpha.status, 200, alpha.body)
+   395	    assert.equal(beta.status, 200, beta.body)
+   396	    const alphaDetail = validateRunDetail(alpha.json())
+   397	    const betaDetail = validateRunDetail(beta.json())
+   398	    assert.equal(alphaDetail.summary.project_id, 'alpha')
+   399	    assert.equal(betaDetail.summary.project_id, 'beta')
+   400	    assert.notEqual(alphaDetail.summary.definition_revision, betaDetail.summary.definition_revision)
+   401	    assert.deepEqual(betaDetail.snapshot.nodes.map(node => node.node_id), ['solo'])
+   402	    assert.equal(alphaDetail.snapshot.nodes.length, GRAPH_NODES.length)
+   403	    // The run is invisible from the sibling workflow and from the other project's routes.
+   404	    assertError(await get(app, url('alpha', 'second', 'run-001')), 404, 'RUN_NOT_FOUND', root)
+   405	    assert.deepEqual((await get(app, url('alpha', 'second'))).json(), { runs: [], next_cursor: null })
+   406	    assertError(await get(app, url('beta', 'main', 'run-001', '/results/ui/1')), 404, 'RESULT_NOT_FOUND', root)
+   407	    assertError(await get(app, url('beta', 'main', 'run-001', '/artifacts/log-0-alpha')), 404, 'ARTIFACT_NOT_FOUND', root)
+   408	    assertError(await get(app, url('alpha', 'second', 'run-001', '/artifacts/log-0-alpha')), 404, 'RUN_NOT_FOUND', root)
+   409	    assert.equal((await get(app, url('alpha', 'main', 'run-001', '/artifacts/log-0-alpha'))).status, 200)
+   410	    // A run root symlinked into another workflow's root is never followed.
+   411	    await symlink(join(runsRoot('alpha', 'main'), 'run-001'), join(runsRoot('alpha', 'second'), 'run-001'))
+   412	    assertError(await get(app, url('alpha', 'second', 'run-001')), 404, 'RUN_NOT_FOUND', root)
+   413	    assert.deepEqual((await get(app, url('alpha', 'second'))).json(), { runs: [], next_cursor: null })
+   414	    // Result and artifact links inside the payload are scoped to the run that owns them.
+   415	    const ui = alphaDetail.snapshot.nodes.find(node => node.node_id === 'launch_ui')!
+   416	    assert.equal(ui.result_uri, '/api/projects/alpha/workflows/main/runs/run-001/results/ui/1')
+   417	    assert.ok(!alpha.body.includes(root))
+   418	  }, [{ id: 'alpha', workflows: [{ id: 'main' }, { id: 'second' }] }, { id: 'beta', workflows: [{ id: 'main', definition: other }] }])
+   419	})
+   420	
+   421	test('run detail returns the pinned definition even after the workflow definition changed; lists return the current one', async () => {
+   422	  const current = { name: 'Feature implementation v2', nodes: [...GRAPH_NODES, { node_id: 'publish', label: 'Publish', kind: 'integration', depends_on: ['integrate'] }] }
+   423	  await harness(async ({ app, runsRoot }) => {
+   424	    await writeRun(runsRoot('alpha', 'main'), { runId: 'old-run', values: { ui: receipt('ui'), adapter: receipt('adapter') }, next: ['handoff'], events: launchEvents })
+   425	    const workflows = await get(app, url('alpha'))
+   426	    assert.equal(workflows.status, 200)
+   427	    const list = projectSchemas.workflowList.parse(workflows.json())
+   428	    validateDefinition(list.workflows[0])
+   429	    assert.equal(list.workflows[0].nodes.length, GRAPH_NODES.length + 1)
+   430	    const detail = validateRunDetail((await get(app, url('alpha', 'main', 'old-run'))).json())
+   431	    assert.equal(detail.definition.name, 'Feature implementation')
+   432	    assert.equal(detail.definition.nodes.length, GRAPH_NODES.length)
+   433	    assert.notEqual(detail.definition.definition_revision, list.workflows[0].definition_revision)
+   434	    assert.equal(detail.summary.definition_revision, detail.definition.definition_revision)
+   435	    assert.equal(detail.summary.project_id, detail.definition.project_id)
+   436	    assert.equal(detail.summary.workflow_id, detail.definition.workflow_id)
+   437	    const runs = projectSchemas.runList.parse((await get(app, url('alpha', 'main'))).json())
+   438	    assert.deepEqual(runs.runs, [detail.summary])
+   439	    assert.deepEqual(detail.snapshot.nodes.map(node => [node.node_id, node.kind, node.depends_on]), GRAPH_NODES.map(node => [node.node_id, node.kind, node.depends_on]))
+   440	  }, [{ id: 'alpha', workflows: [{ id: 'main', definition: current }] }])
+   441	})
+   442	
+   443	// ---------------------------------------------------------------------------------------------------------------
+   444	// State projection from actual persisted evidence
+   445	
+   446	test('projects a fresh run, a live run awaiting handoff, and an integrated run from persisted state', async () => {
+   447	  await harness(async ({ app, runsRoot }) => {
+   448	    const rootDir = runsRoot('alpha', 'main')
+   449	    await writeRun(rootDir, { runId: 'fresh', next: ['launch_ui', 'launch_adapter'], updated: T0 })
+   450	    await writeRun(rootDir, { runId: 'live', values: { ui: receipt('ui'), adapter: receipt('adapter') }, next: ['handoff'], events: launchEvents,
+   451	      tasks: [{ node_id: 'handoff', error: null, interrupts: [{ kind: 'worker_handoff', message: 'Awaiting explicit completion signals and automatic freeze.' }], result: null }] })
+   452	    const done = [...launchEvents,
+   453	      { sequence: 5, time: T1, node: 'freeze', status: 'stopped', message: 'Both native workers stopped before snapshot capture' },
+   454	      { sequence: 6, time: T1, node: 'freeze', status: 'succeeded', message: 'Immutable snapshots captured; worker-reported checks are not trusted' },
+   455	      { sequence: 7, time: T1, node: 'verify_ui', status: 'running', message: `Attempt 1; revision ${OUTPUT}` },
+   456	      { sequence: 8, time: T1, node: 'verify_ui', status: 'passed', message: 'Required tests and artifacts passed' },
+   457	      { sequence: 9, time: T1, node: 'verify_adapter', status: 'running', message: `Attempt 1; revision ${OUTPUT}` },
+   458	      { sequence: 10, time: T1, node: 'verify_adapter', status: 'passed', message: 'Required tests and artifacts passed' },
+   459	      { sequence: 11, time: T1, node: 'candidate_ui', status: 'passed', message: `Combined revision ${OUTPUT}` },
+   460	      { sequence: 12, time: T1, node: 'candidate_adapter', status: 'passed', message: `Combined revision ${OUTPUT}` },
+   461	      { sequence: 13, time: T1, node: 'review', status: 'approved', message: 'claude-reviewer' },
+   462	      { sequence: 14, time: T2, node: 'integrate', status: 'succeeded', message: `Fast-forwarded to ${OUTPUT}; no push performed` }]
+   463	    await writeRun(rootDir, { runId: 'integrated', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/synthetic/ui/packet.json', adapter_packet: '/synthetic/adapter/packet.json',
+   464	      bundle: '/synthetic/review-bundle.json', review: { reviewer: 'claude-reviewer', decision: 'approve' }, approved_bundle: 'e'.repeat(64), integrated_commit: OUTPUT },
+   465	      next: [], events: done, updated: T2,
+   466	      packets: [{ node: 'ui' }, { node: 'adapter' }, { node: 'ui', phase: 'candidate' }, { node: 'adapter', phase: 'candidate' }] })
+   467	
+   468	    const fresh = validateRunDetail((await get(app, url('alpha', 'main', 'fresh'))).json())
+   469	    assert.equal(fresh.summary.status, 'running')
+   470	    assert.ok(fresh.snapshot.nodes.every(node => node.status === 'pending' && node.attempt === 0 && node.session_id === null && node.result_uri === null))
+   471	    assert.equal(fresh.snapshot.last_sequence, 0)
+   472	    assert.equal(fresh.summary.created_at, T0)
+   473	    assert.equal(fresh.summary.updated_at, T0)
+   474	
+   475	    const live = validateRunDetail((await get(app, url('alpha', 'main', 'live'))).json())
+   476	    assert.equal(live.summary.status, 'awaiting_approval')
+   477	    const status = Object.fromEntries(live.snapshot.nodes.map(node => [node.node_id, node.status]))
+   478	    assert.deepEqual(status, { launch_ui: 'succeeded', launch_adapter: 'succeeded', handoff: 'awaiting_approval', verify_ui: 'pending', verify_adapter: 'pending', candidate: 'pending', review: 'pending', approval: 'pending', integrate: 'pending' })
+   479	    const launchUi = live.snapshot.nodes.find(node => node.node_id === 'launch_ui')!
+   480	    assert.deepEqual([launchUi.attempt, launchUi.session_id, launchUi.result_uri], [1, 'ui-session-0001', null], 'launch means a session, not a worker result')
+   481	    assert.equal(live.snapshot.last_sequence, 4)
+   482	    assert.equal(live.summary.updated_at, T1)
+   483	
+   484	    const integrated = validateRunDetail((await get(app, url('alpha', 'main', 'integrated'))).json())
+   485	    assert.equal(integrated.summary.status, 'succeeded')
+   486	    assert.ok(integrated.snapshot.nodes.every(node => node.status === 'succeeded' && node.attempt === 1), JSON.stringify(integrated.snapshot.nodes))
+   487	    const verifyUi = integrated.snapshot.nodes.find(node => node.node_id === 'verify_ui')!
+   488	    assert.equal(verifyUi.result_uri, '/api/projects/alpha/workflows/main/runs/integrated/results/ui/1')
+   489	    assert.equal(verifyUi.session_id, 'ui-session-0001')
+   490	    assert.equal(integrated.summary.updated_at, T2)
+   491	    assert.equal(integrated.snapshot.last_sequence, 14)
+   492	    // Sorted newest first, then run_id ascending.
+   493	    const runs = projectSchemas.runList.parse((await get(app, url('alpha', 'main'))).json())
+   494	    assert.deepEqual(runs.runs.map(run => run.run_id), ['integrated', 'live', 'fresh'])
+   495	  })
+   496	})
+   497	
+   498	test('a blocked verification is failed with a retrievable failed result; a sibling success held in a task result counts', async () => {
+   499	  await harness(async ({ app, runsRoot, root }) => {
+   500	    const events = [...launchEvents,
+   501	      { sequence: 5, time: T1, node: 'freeze', status: 'succeeded', message: 'Immutable snapshots captured' },
+   502	      { sequence: 6, time: T1, node: 'verify_ui', status: 'running', message: `Attempt 1; revision ${OUTPUT}` },
+   503	      { sequence: 7, time: T1, node: 'verify_adapter', status: 'running', message: `Attempt 1; revision ${OUTPUT}` },
+   504	      { sequence: 8, time: T1, node: 'verify_ui', status: 'passed', message: 'Required tests and artifacts passed' },
+   505	      { sequence: 9, time: T2, node: 'verify_adapter', status: 'blocked', message: `Intentional lab drill: verification branch failure, not a worker or test failure; see ${root}/runs/alpha/main/drill/verification/worker/adapter/1/packet.json` }]
+   506	    await writeRun(runsRoot('alpha', 'main'), { runId: 'drill', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots }, next: ['verify_adapter'], events, updated: T1,
+   507	      tasks: [
+   508	        { node_id: 'verify_ui', error: null, interrupts: [], result: { ui_packet: `${root}/runs/alpha/main/drill/verification/worker/ui/1/packet.json` } },
+   509	        { node_id: 'verify_adapter', error: `adapter verification blocked; see ${root}/runs/alpha/main/drill/verification/worker/adapter/1/packet.json. Retry explicitly or start a revised run.`, interrupts: [], result: null },
+   510	      ],
+   511	      packets: [
+   512	        { node: 'ui', summary: 'UI worker handoff summary', assumptions: ['Mock routes only in worker phase', ''], artifacts: [
+   513	          { id: 'log-0-111111111111', kind: 'log', content: 'build ok\n' }, { id: 'screenshot-1-222222222222', kind: 'screenshot', content: PNG }, { id: 'test_report-2-333333333333', kind: 'test_report', content: '{"ok":true}' }] },
+   514	        { node: 'adapter', gate: { status: 'blocked', reasons: ['backend-unit: exit 1', `Intentional lab drill: verification branch failure, not a worker or test failure; see ${root}/x/packet.json`] },
+   515	          artifacts: [{ id: 'log-0-444444444444', kind: 'log', content: 'FAIL\n' }] },
+   516	      ] })
+   517	    const detail = validateRunDetail((await get(app, url('alpha', 'main', 'drill'))).json())
+   518	    assert.equal(detail.summary.status, 'failed')
+   519	    const nodes = Object.fromEntries(detail.snapshot.nodes.map(node => [node.node_id, node]))
+   520	    assert.equal(nodes.verify_ui.status, 'succeeded', 'pending writes of the successful sibling are evidence')
+   521	    assert.equal(nodes.verify_adapter.status, 'failed')
+   522	    assert.equal(nodes.verify_adapter.attempt, 1)
+   523	    assert.equal(nodes.verify_adapter.result_uri, '/api/projects/alpha/workflows/main/runs/drill/results/adapter/1')
+   524	    assert.equal(nodes.handoff.status, 'succeeded')
+   525	    assert.equal(nodes.candidate.status, 'pending')
+   526	    assert.equal(detail.summary.updated_at, T2, 'the newest persisted event time is the update time')
+   527	    assert.ok(!JSON.stringify(detail).includes(root))
+   528	
+   529	    const failed = await get(app, url('alpha', 'main', 'drill', '/results/adapter/1'))
+   530	    assert.equal(failed.status, 200, failed.body)
+   531	    const adapterResult = validateWorkerResult(failed.json())
+   532	    assert.equal(adapterResult.status, 'failed')
+   533	    assert.equal(adapterResult.error?.code, 'VERIFICATION_BLOCKED')
+   534	    assert.match(adapterResult.error!.message, /backend-unit: exit 1/)
+   535	    assert.ok(!failed.body.includes(root), 'gate reasons are redacted')
+   536	    assert.ok(failed.body.includes('<path>'))
+   537	    assert.equal(adapterResult.checks[0].cwd, 'verification/worker/adapter/1/worktree')
+   538	
+   539	    const ok = await get(app, url('alpha', 'main', 'drill', '/results/ui/1'))
+   540	    const uiResult = validateWorkerResult(ok.json())
+   541	    assert.equal(uiResult.status, 'succeeded')
+   542	    assert.equal(uiResult.summary, 'UI worker handoff summary')
+   543	    assert.deepEqual(uiResult.open_assumptions, ['Mock routes only in worker phase'])
+   544	    assert.deepEqual(uiResult.changed_files, ['src/ui.ts'])
+   545	    assert.deepEqual(uiResult.artifacts.map(artifact => artifact.uri), [
+   546	      '/api/projects/alpha/workflows/main/runs/drill/artifacts/log-0-111111111111',
+   547	      '/api/projects/alpha/workflows/main/runs/drill/artifacts/screenshot-1-222222222222',
+   548	      '/api/projects/alpha/workflows/main/runs/drill/artifacts/test_report-2-333333333333'])
+   549	    assert.ok(!ok.body.includes(root))
+   550	    assertError(await get(app, url('alpha', 'main', 'drill', '/results/ui/2')), 404, 'RESULT_NOT_FOUND')
+   551	    assertError(await get(app, url('alpha', 'main', 'drill', '/results/review/1')), 404, 'RESULT_NOT_FOUND')
+   552	    assertError(await get(app, url('alpha', 'main', 'drill', '/results/candidate_ui/1')), 404, 'RESULT_NOT_FOUND')
+   553	  })
+   554	})
+   555	
+   556	test('a retried verification shows the latest attempt and keeps the earlier failed result reachable', async () => {
+   557	  await harness(async ({ app, runsRoot }) => {
+   558	    const events = [...launchEvents,
+   559	      { sequence: 5, time: T1, node: 'verify_adapter', status: 'running', message: `Attempt 1; revision ${OUTPUT}` },
+   560	      { sequence: 6, time: T1, node: 'verify_adapter', status: 'blocked', message: 'Intentional lab drill' },
+   561	      { sequence: 7, time: T2, node: 'verify_adapter', status: 'running', message: `Attempt 2; revision ${OUTPUT}` },
+   562	      { sequence: 8, time: T2, node: 'verify_adapter', status: 'passed', message: 'Required tests and artifacts passed' }]
+   563	    await writeRun(runsRoot('alpha', 'main'), { runId: 'retry', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/x', adapter_packet: '/y' }, next: ['candidate'], events, updated: T2,
+   564	      packets: [{ node: 'ui' }, { node: 'adapter', attempt: 1, gate: { status: 'blocked', reasons: ['drill'] } }, { node: 'adapter', attempt: 2 }] })
+   565	    const detail = validateRunDetail((await get(app, url('alpha', 'main', 'retry'))).json())
+   566	    assert.equal(detail.summary.status, 'running')
+   567	    const adapter = detail.snapshot.nodes.find(node => node.node_id === 'verify_adapter')!
+   568	    assert.deepEqual([adapter.status, adapter.attempt, adapter.result_uri], ['succeeded', 2, '/api/projects/alpha/workflows/main/runs/retry/results/adapter/2'])
+   569	    assert.equal(validateWorkerResult((await get(app, url('alpha', 'main', 'retry', '/results/adapter/1'))).json()).status, 'failed')
+   570	    assert.equal(validateWorkerResult((await get(app, url('alpha', 'main', 'retry', '/results/adapter/2'))).json()).status, 'succeeded')
+   571	    const candidate = detail.snapshot.nodes.find(node => node.node_id === 'candidate')!
+   572	    assert.deepEqual([candidate.status, candidate.attempt], ['pending', 0])
+   573	  })
+   574	})
+   575	
+   576	test('contradictory evidence is paused, never succeeded: tampered packets, a claimed packet with no registration, integration with pending work', async () => {
+   577	  await harness(async ({ app, runsRoot, root }) => {
+   578	    const rootDir = runsRoot('alpha', 'main')
+   579	    await writeRun(rootDir, { runId: 'tampered', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/x' }, next: ['verify_adapter'], events: launchEvents,
+   580	      packets: [{ node: 'ui', tamper: true, artifacts: [{ id: 'log-0-555555555555', kind: 'log', content: 'x' }] }] })
+   581	    await writeRun(rootDir, { runId: 'unregistered', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/x' }, next: ['verify_adapter'], events: launchEvents })
+   582	    await writeRun(rootDir, { runId: 'blocked-claim', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/x' }, next: [], events: launchEvents,
+   583	      packets: [{ node: 'ui', gate: { status: 'blocked', reasons: ['tests failed'] } }] })
+   584	    await writeRun(rootDir, { runId: 'half-integrated', values: { ui: receipt('ui'), adapter: receipt('adapter'), integrated_commit: OUTPUT }, next: ['review'], events: launchEvents })
+   585	    await writeRun(rootDir, { runId: 'event-only', values: { ui: receipt('ui'), adapter: receipt('adapter') }, next: [], events: [...launchEvents, { sequence: 5, time: T1, node: 'freeze', status: 'succeeded', message: 'Immutable snapshots captured' }] })
+   586	    for (const [runId, node] of [['tampered', 'verify_ui'], ['unregistered', 'verify_ui'], ['blocked-claim', 'verify_ui'], ['half-integrated', 'integrate'], ['event-only', 'handoff']] as const) {
+   587	      const detail = validateRunDetail((await get(app, url('alpha', 'main', runId))).json())
+   588	      assert.equal(detail.summary.status, 'paused', runId)
+   589	      assert.equal(detail.snapshot.nodes.find(item => item.node_id === node)!.status, runId === 'half-integrated' ? 'succeeded' : 'paused', runId)
+   590	    }
+   591	    // A tampered packet's result and artifacts are refused rather than served.
+   592	    assertError(await get(app, url('alpha', 'main', 'tampered', '/results/ui/1')), 500, 'EVIDENCE_MISMATCH', root)
+   593	    assertError(await get(app, url('alpha', 'main', 'tampered', '/artifacts/log-0-555555555555')), 500, 'EVIDENCE_MISMATCH', root)
+   594	    const runs = projectSchemas.runList.parse((await get(app, url('alpha', 'main'))).json())
+   595	    assert.ok(runs.runs.every(run => run.status === 'paused'))
+   596	  })
+   597	})
+   598	
+   599	test('legacy run directories without a supported export are neither listed nor shown as successful', async () => {
+   600	  await harness(async ({ app, runsRoot, root }) => {
+   601	    const rootDir = runsRoot('alpha', 'main')
+   602	    await mkdir(join(rootDir, 'legacy-run'))
+   603	    await writeFile(join(rootDir, 'legacy-run', 'plan.json'), json({ run_id: 'legacy-run', repository: join(root, 'somewhere'), base_commit: BASE }))
+   604	    await mkdir(join(rootDir, 'candidate'))
+   605	    await writeFile(join(rootDir, 'stray.json'), '{}')
+   606	    await writeRun(rootDir, { runId: 'supported', values: { ui: receipt('ui') }, next: ['launch_adapter'] })
+   607	    const runs = projectSchemas.runList.parse((await get(app, url('alpha', 'main'))).json())
+   608	    assert.deepEqual(runs.runs.map(run => run.run_id), ['supported'])
+   609	    assertError(await get(app, url('alpha', 'main', 'legacy-run')), 404, 'RUN_UNSUPPORTED', root)
+   610	    assertError(await get(app, url('alpha', 'main', 'candidate')), 404, 'RUN_NOT_FOUND', root)
+   611	  })
+   612	})
+   613	
+   614	test('events are normalized to workflow v1 with graph attribution, redaction and cursor filtering', async () => {
+   615	  await harness(async ({ app, runsRoot, root }) => {
+   616	    const events = [...launchEvents,
+   617	      { sequence: 5, time: T1, node: 'freeze', status: 'stopped', message: 'Both native workers stopped before snapshot capture' },
+   618	      { sequence: 6, time: T1, node: 'verify_adapter', status: 'running', message: `Attempt 2; revision ${OUTPUT}` },
+   619	      { sequence: 7, time: T2, node: 'verify_adapter', status: 'blocked', message: `see ${root}/runs/alpha/main/ev/verification/worker/adapter/2/packet.json and ~/state/x.json` },
+   620	      { sequence: 8, time: T2, node: 'mystery', status: 'running', message: 'unknown alias must not invent a node' }]
+   621	    await writeRun(runsRoot('alpha', 'main'), { runId: 'ev', values: { ui: receipt('ui'), adapter: receipt('adapter') }, next: ['handoff'], events })
+   622	    const response = await get(app, url('alpha', 'main', 'ev', '/events'))
+   623	    assert.equal(response.status, 200, response.body)
+   624	    const body = response.json() as { events: unknown[] }
+   625	    assert.deepEqual(Object.keys(body), ['events'])
+   626	    const parsed = body.events.map(event => eventSchema.parse(event))
+   627	    assert.deepEqual(parsed.map(event => event.sequence), [1, 2, 3, 4, 5, 6, 7, 8])
+   628	    assert.deepEqual(parsed.map(event => event.node_id), ['launch_adapter', 'launch_ui', 'launch_adapter', 'launch_ui', 'handoff', 'verify_adapter', 'verify_adapter', null])
+   629	    assert.deepEqual(parsed.map(event => event.status), ['running', 'running', 'running', 'running', null, 'running', 'failed', null])
+   630	    assert.deepEqual(parsed.map(event => event.type), ['status_changed', 'status_changed', 'status_changed', 'status_changed', 'log', 'status_changed', 'status_changed', 'log'])
+   631	    assert.deepEqual(parsed.map(event => event.attempt), [1, 1, 1, 1, 1, 2, 2, 0])
+   632	    assert.equal(parsed[6].message, 'see <path> and <path>')
+   633	    assert.ok(parsed.every(event => event.run_id === 'ev' && event.artifact === null && event.result_uri === null && event.reused_from_attempt === null))
+   634	    assert.equal(new Set(parsed.map(event => event.event_id)).size, 8)
+   635	    assert.ok(!response.body.includes(root))
+   636	    const after = (await get(app, url('alpha', 'main', 'ev', '/events?after=6'))).json() as { events: { sequence: number }[] }
+   637	    assert.deepEqual(after.events.map(event => event.sequence), [7, 8])
+   638	    assert.deepEqual((await get(app, url('alpha', 'main', 'ev', '/events?after=99'))).json(), { events: [] })
+   639	    const detail = validateRunDetail((await get(app, url('alpha', 'main', 'ev'))).json())
+   640	    assert.equal(detail.snapshot.last_sequence, 8)
+   641	    assert.equal(detail.snapshot.nodes.find(node => node.node_id === 'verify_adapter')!.attempt, 2)
+   642	    assert.equal(detail.snapshot.nodes.find(node => node.node_id === 'verify_adapter')!.status, 'failed')
+   643	  })
+   644	})
+   645	
+   646	test('a run without events.jsonl falls back to the export copy; a partially appended last line is ignored', async () => {
+   647	  await harness(async ({ app, runsRoot }) => {
+   648	    await writeRun(runsRoot('alpha', 'main'), { runId: 'embedded', values: { ui: receipt('ui') }, next: ['launch_adapter'], events: launchEvents.slice(0, 2), eventsFile: false })
+   649	    await writeRun(runsRoot('alpha', 'main'), { runId: 'partial', values: { ui: receipt('ui') }, next: ['launch_adapter'], events: launchEvents.slice(0, 2),
+   650	      eventsFile: launchEvents.slice(0, 2).map(event => JSON.stringify(event) + '\n').join('') + '{"sequence": 3, "time": "2026' })
+   651	    for (const runId of ['embedded', 'partial']) {
+   652	      const events = (await get(app, url('alpha', 'main', runId, '/events'))).json() as { events: { sequence: number }[] }
+   653	      assert.deepEqual(events.events.map(event => event.sequence), [1, 2], runId)
+   654	    }
+   655	  })
+   656	})
+   657	
+   658	// ---------------------------------------------------------------------------------------------------------------
+   659	// Pagination
+   660	
+   661	test('runs paginate newest-first with opaque workflow-bound cursors, default 50 and maximum 100', async () => {
+   662	  await harness(async ({ app, runsRoot }) => {
+   663	    const rootDir = runsRoot('alpha', 'main')
+   664	    const ids: string[] = []
+   665	    for (let index = 0; index < 53; index += 1) {
+   666	      const runId = `run-${String(index).padStart(3, '0')}`
+   667	      ids.push(runId)
+   668	      // Pairs share an updated_at so the tie-break by run_id is exercised across page boundaries.
+   669	      const minute = String(Math.floor(index / 2)).padStart(2, '0')
+   670	      await writeRun(rootDir, { runId, values: { ui: receipt('ui') }, next: ['launch_adapter'], updated: `2026-03-02T11:${minute}:00Z` })
+   671	    }
+   672	    const expected = [...ids].sort((a, b) => {
+   673	      const ma = Math.floor(Number(a.slice(4)) / 2), mb = Math.floor(Number(b.slice(4)) / 2)
+   674	      return mb - ma || (a < b ? -1 : 1)
+   675	    })
+   676	    const first = projectSchemas.runList.parse((await get(app, url('alpha', 'main'))).json())
+   677	    assert.equal(first.runs.length, 50)
+   678	    assert.ok(first.next_cursor)
+   679	    const second = projectSchemas.runList.parse((await get(app, url('alpha', 'main', undefined, `?cursor=${encodeURIComponent(first.next_cursor!)}`))).json())
+   680	    assert.equal(second.runs.length, 3)
+   681	    assert.equal(second.next_cursor, null)
+   682	    assert.deepEqual([...first.runs, ...second.runs].map(run => run.run_id), expected)
+   683	    const all = projectSchemas.runList.parse((await get(app, url('alpha', 'main', undefined, '?limit=100'))).json())
+   684	    assert.equal(all.runs.length, 53)
+   685	    assert.equal(all.next_cursor, null)
+   686	    // Walk in pages of 7 without overlap or omission; cursors are never paths and cannot cross workflows.
+   687	    const walked: string[] = []
+   688	    let cursor: string | null = null
+   689	    let pages = 0
+   690	    do {
+   691	      const page: { runs: { run_id: string }[]; next_cursor: string | null } = projectSchemas.runList.parse((await get(app, url('alpha', 'main', undefined, `?limit=7${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`))).json())
+   692	      walked.push(...page.runs.map(run => run.run_id))
+   693	      assert.ok(cursor === null || !Buffer.from(cursor, 'base64url').toString().includes(rootDir))
+   694	      cursor = page.next_cursor
+   695	      pages += 1
+   696	    } while (cursor)
+   697	    assert.equal(pages, 8)
+   698	    assert.deepEqual(walked, expected)
+   699	    assertError(await get(app, url('alpha', 'other', undefined, `?cursor=${encodeURIComponent(first.next_cursor!)}`)), 400, 'INVALID_CURSOR')
+   700	    assertError(await get(app, url('alpha', 'main', undefined, '?cursor=')), 400, 'INVALID_CURSOR')
+   701	  }, [{ id: 'alpha', workflows: [{ id: 'main' }, { id: 'other' }] }])
+   702	})
+   703	
+   704	// ---------------------------------------------------------------------------------------------------------------
+   705	// Malformed and missing storage
+   706	
+   707	test('malformed or contradictory run storage is a 5xx that names the run but never a path, for lists and detail alike', async () => {
+   708	  const cases: [string, RunSpec][] = [
+   709	    ['not-json', { runId: 'not-json', stateText: '{ oops' }],
+   710	    ['wrong-version', { runId: 'wrong-version', stateText: json({ version: '0.9.0', run_id: 'wrong-version' }) }],
+   711	    ['id-mismatch', { runId: 'id-mismatch', exportRunId: 'other-run', planRunId: 'other-run' }],
+   712	    ['plan-mismatch', { runId: 'plan-mismatch', planRunId: 'someone-else' }],
+   713	    ['plan-missing', { runId: 'plan-missing', skipPlan: true }],
+   714	    ['bad-definition', { runId: 'bad-definition', definition: { name: 'x', nodes: [{ node_id: 'a', label: 'A', kind: 'worker', depends_on: ['zzz'] }] } }],
+   715	    ['bad-events', { runId: 'bad-events', events: launchEvents.slice(0, 1), eventsFile: '{"sequence": 1}\n{bad json}\n' }],
+   716	    ['non-monotonic-events', { runId: 'non-monotonic-events', events: [launchEvents[1], launchEvents[0]] }],
+   717	    ['packet-outside', { runId: 'packet-outside', packets: [{ node: 'ui' }], registrations: items => items.map(item => ({ ...item, path: 'plan.json' })) }],
+   718	    ['packet-traversal', { runId: 'packet-traversal', packets: [{ node: 'ui' }], registrations: items => items.map(item => ({ ...item, path: '../packet-outside/verification/worker/ui/1/packet.json' })) }],
+   719	    ['packet-duplicate', { runId: 'packet-duplicate', packets: [{ node: 'ui' }], registrations: items => [...items, ...items] }],
+   720	    ['bad-timestamp', { runId: 'bad-timestamp', updated: 'yesterday' }],
+   721	  ]
+   722	  for (const [label, spec] of cases) {
+   723	    await harness(async ({ app, runsRoot, root }) => {
+   724	      await writeRun(runsRoot('alpha', 'main'), spec)
+   725	      assertError(await get(app, url('alpha', 'main', spec.runId)), 500, 'RUN_STORAGE_INVALID', root)
+   726	      const list = await get(app, url('alpha', 'main'))
+   727	      assertError(list, 500, 'RUN_STORAGE_INVALID', root)
+   728	      assert.ok(list.body.includes(spec.runId), `${label}: the run directory name is the only locator given`)
+   729	    })
+   730	  }
+   731	})
+   732	
+   733	test('unavailable or symlinked run roots are 503; oversized exports are refused rather than truncated', async () => {
+   734	  const outside = await mkdtemp(join(tmpdir(), 'md-manager-projects-outside-'))
+   735	  try {
+   736	    await harness(async ({ app, runsRoot, root }) => {
+   737	      await rm(runsRoot('alpha', 'main'), { recursive: true })
+   738	      await symlink(outside, runsRoot('alpha', 'main'))
+   739	      assertError(await get(app, url('alpha', 'main')), 503, 'RUNS_ROOT_UNAVAILABLE', root)
+   740	      assertError(await get(app, url('alpha', 'main', 'anything')), 503, 'RUNS_ROOT_UNAVAILABLE', root)
+   741	      await writeRun(runsRoot('alpha', 'big'), { runId: 'big', values: { ui: receipt('ui'), padding: 'x'.repeat(4096) }, next: [] })
+   742	      assertError(await get(app, url('alpha', 'big', 'big')), 500, 'FILE_TOO_LARGE', root)
+   743	      assertError(await get(app, url('alpha', 'big')), 500, 'FILE_TOO_LARGE', root)
+   744	      if (process.getuid?.() !== 0) {
+   745	        await chmod(runsRoot('alpha', 'locked'), 0o000)
+   746	        try {
+   747	          assertError(await get(app, url('alpha', 'locked')), 503, 'RUNS_ROOT_UNAVAILABLE', root)
+   748	        } finally { await chmod(runsRoot('alpha', 'locked'), 0o755) }
+   749	      }
+   750	    }, [{ id: 'alpha', workflows: [{ id: 'main' }, { id: 'big' }, { id: 'locked' }] }], { runStore: { exportByteLimit: 2048 } })
+   751	  } finally { await rm(outside, { recursive: true, force: true }) }
+   752	})
+   753	
+   754	// ---------------------------------------------------------------------------------------------------------------
+   755	// Artifacts
+   756	
+   757	test('registered artifacts are served with safe content types; unknown, tampered, escaped and oversized artifacts are refused', async () => {
+   758	  const outside = await mkdtemp(join(tmpdir(), 'md-manager-projects-secret-'))
+   759	  await writeFile(join(outside, 'secret.txt'), 'top secret')
+   760	  try {
+   761	    await harness(async ({ app, runsRoot, root }) => {
+   762	      const rootDir = runsRoot('alpha', 'main')
+   763	      const secret = await import('node:fs/promises').then(fs => fs.readFile(join(outside, 'secret.txt')))
+   764	      await writeRun(rootDir, { runId: 'art', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/x' }, next: ['verify_adapter'], events: launchEvents,
+   765	        packets: [{ node: 'ui', artifacts: [
+   766	          { id: 'log-0-aaaaaaaaaaaa', kind: 'log', content: 'line one\n<script>alert(1)</script>\n' },
+   767	          { id: 'screenshot-1-bbbbbbbbbbbb', kind: 'screenshot', content: PNG },
+   768	          { id: 'screenshot-2-cccccccccccc', kind: 'screenshot', content: '<html>not a png</html>' },
+   769	          { id: 'test_report-3-dddddddddddd', kind: 'test_report', content: '{"suites":[]}' },
+   770	          { id: 'patch-4-eeeeeeeeeeee', kind: 'patch', content: 'diff --git a b\n' },
+   771	          { id: 'other-5-ffffffffffff', kind: 'other', content: Buffer.from([0, 1, 2]) },
+   772	          { id: 'log-6-hash-mismatch', kind: 'log', content: 'real content', registeredSha: 'f'.repeat(64) },
+   773	          { id: 'log-7-missing', kind: 'log', content: 'never written', skipWrite: true },
+   774	          { id: 'log-8-symlink', kind: 'log', content: secret, uri: 'log-8-symlink', skipWrite: true },
+   775	          { id: 'log-9-traversal', kind: 'log', content: secret, uri: '../../../../../plan.json', skipWrite: true },
+   776	          { id: 'log-10-large', kind: 'log', content: 'y'.repeat(600) },
+   777	        ] }] })
+   778	      await symlink(join(outside, 'secret.txt'), join(rootDir, 'art', 'verification', 'worker', 'ui', '1', 'artifacts', 'log-8-symlink'))
+   779	      const artifact = (id: string) => get(app, url('alpha', 'main', 'art', `/artifacts/${id}`))
+   780	
+   781	      const log = await artifact('log-0-aaaaaaaaaaaa')
+   782	      assert.equal(log.status, 200, log.body)
+   783	      assert.equal(log.headers['content-type'], 'text/plain; charset=utf-8')
+   784	      assert.equal(log.headers['x-content-type-options'], 'nosniff')
+   785	      assert.equal(log.headers['content-security-policy'], "default-src 'none'; sandbox")
+   786	      assert.match(String(log.headers['content-disposition']), /^inline; filename="log-0-aaaaaaaaaaaa"$/)
+   787	      assert.equal(log.body, 'line one\n<script>alert(1)</script>\n')
+   788	      const png = await app.inject({ method: 'GET', url: url('alpha', 'main', 'art', '/artifacts/screenshot-1-bbbbbbbbbbbb') })
+   789	      assert.equal(png.statusCode, 200)
+   790	      assert.equal(png.headers['content-type'], 'image/png')
+   791	      assert.ok(png.rawPayload.equals(PNG))
+   792	      const notPng = await artifact('screenshot-2-cccccccccccc')
+   793	      assert.equal(notPng.status, 200)
+   794	      assert.equal(notPng.headers['content-type'], 'application/octet-stream', 'a screenshot that is not a PNG is never served as an image or HTML')
+   795	      assert.match(String(notPng.headers['content-disposition']), /^attachment/)
+   796	      assert.equal((await artifact('test_report-3-dddddddddddd')).headers['content-type'], 'application/json; charset=utf-8')
+   797	      assert.equal((await artifact('patch-4-eeeeeeeeeeee')).headers['content-type'], 'text/plain; charset=utf-8')
+   798	      const other = await artifact('other-5-ffffffffffff')
+   799	      assert.equal(other.headers['content-type'], 'application/octet-stream')
+   800	      assert.match(String(other.headers['content-disposition']), /^attachment/)
+   801	
+   802	      assertError(await artifact('log-6-hash-mismatch'), 500, 'ARTIFACT_HASH_MISMATCH', root)
+   803	      assertError(await artifact('log-7-missing'), 500, 'ARTIFACT_UNAVAILABLE', root)
+   804	      const viaSymlink = await artifact('log-8-symlink')
+   805	      assertError(viaSymlink, 500, 'ARTIFACT_UNAVAILABLE', root)
+   806	      assert.ok(!viaSymlink.body.includes('top secret'))
+   807	      const traversal = await artifact('log-9-traversal')
+   808	      assertError(traversal, 500, 'EVIDENCE_MISMATCH', root)
+   809	      assert.ok(!traversal.body.includes('synthetic'))
+   810	      assertError(await artifact('log-10-large'), 500, 'ARTIFACT_TOO_LARGE', root)
+   811	      assertError(await artifact('unknown-artifact'), 404, 'ARTIFACT_NOT_FOUND', root)
+   812	      assertError(await artifact('plan.json'), 404, 'ARTIFACT_NOT_FOUND', root)
+   813	      assertError(await get(app, url('alpha', 'main', 'art', '/artifacts/..%2F..%2Fplan.json')), 400, 'INVALID_ID', root)
+   814	      assertError(await get(app, url('alpha', 'main', 'art', '/artifacts/')), 400, 'INVALID_ID', root)
+   815	      assertError(await get(app, url('alpha', 'main', 'art', '/artifacts')), 404, 'NOT_FOUND', root)
+   816	    }, undefined, { runStore: { artifactByteLimit: 512 } })
+   817	  } finally { await rm(outside, { recursive: true, force: true }) }
+   818	})
+   819	
+   820	test('the same artifact ID registered twice is served only when both registrations agree on content', async () => {
+   821	  await harness(async ({ app, runsRoot, root }) => {
+   822	    await writeRun(runsRoot('alpha', 'main'), { runId: 'dup', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots }, next: ['verify_ui'], events: launchEvents,
+   823	      packets: [
+   824	        { node: 'ui', attempt: 1, artifacts: [{ id: 'log-0-same', kind: 'log', content: 'identical' }, { id: 'log-1-differs', kind: 'log', content: 'first' }] },
+   825	        { node: 'ui', attempt: 2, artifacts: [{ id: 'log-0-same', kind: 'log', content: 'identical' }, { id: 'log-1-differs', kind: 'log', content: 'second' }] },
+   826	      ] })
+   827	    const same = await get(app, url('alpha', 'main', 'dup', '/artifacts/log-0-same'))
+   828	    assert.equal(same.status, 200)
+   829	    assert.equal(same.body, 'identical')
+   830	    assertError(await get(app, url('alpha', 'main', 'dup', '/artifacts/log-1-differs')), 500, 'EVIDENCE_MISMATCH', root)
+   831	  })
+   832	})
+   833	
+   834	test('every successful payload conforms to the committed contract schemas', async () => {
+   835	  await harness(async ({ app, runsRoot }) => {
+   836	    await writeRun(runsRoot('alpha', 'main'), { runId: 'conform', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots, ui_packet: '/x' }, next: ['verify_adapter'], events: launchEvents,
+   837	      packets: [{ node: 'ui', artifacts: [{ id: 'log-0-abc', kind: 'log', content: 'ok' }] }] })
+   838	    projectSchemas.projectList.parse((await get(app, '/api/projects')).json())
+   839	    const workflows = projectSchemas.workflowList.parse((await get(app, url('alpha'))).json())
+   840	    workflows.workflows.forEach(validateDefinition)
+   841	    const runs = projectSchemas.runList.parse((await get(app, url('alpha', 'main'))).json())
+   842	    const detail: RunDetail = validateRunDetail((await get(app, url('alpha', 'main', 'conform'))).json())
+   843	    assert.deepEqual(runs.runs[0], detail.summary)
+   844	    assert.deepEqual(detail.definition, workflows.workflows[0])
+   845	    const events = (await get(app, url('alpha', 'main', 'conform', '/events'))).json() as { events: unknown[] }
+   846	    events.events.forEach(event => eventSchema.parse(event))
+   847	    validateWorkerResult((await get(app, url('alpha', 'main', 'conform', '/results/ui/1'))).json())
+   848	    // A packet whose result cannot satisfy the worker-result contract is a 500, not a partial payload.
+   849	    await writeRun(runsRoot('alpha', 'main'), { runId: 'broken', values: { ui: receipt('ui'), adapter: receipt('adapter'), snapshots }, next: ['verify_ui'], events: launchEvents,
+   850	      packets: [{ node: 'ui', mutate: packet => { (packet.result as Record<string, unknown>).changed_files = ['/absolute/leak.ts'] } }] })
+   851	    const broken = await get(app, url('alpha', 'main', 'broken', '/results/ui/1'))
+   852	    assertError(broken, 500, 'RESULT_INVALID')
+   853	    assert.ok(!broken.body.includes('/absolute/leak.ts'))
+   854	  })
+   855	})

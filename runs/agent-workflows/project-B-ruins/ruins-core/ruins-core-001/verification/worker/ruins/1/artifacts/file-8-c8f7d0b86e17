@@ -1,0 +1,227 @@
+import { ruinRules } from "@pirate-sea-race/content/ruins";
+import { describe, expect, it } from "vitest";
+import {
+  answerRuin,
+  createRuins,
+  openRuin,
+  reportPresence,
+  type Ruin,
+  type RuinAttempt,
+  type RuinsState,
+} from "./index.js";
+
+/** Scripted solving (§3, §11, §16). The server-side tests take the right answer from the secret puzzle. */
+
+const ISLANDS = [0, 1, 2, 3].map((island) => ({ island, sourceIds: [`source-${island}-0`, `source-${island}-1`] }));
+const LOCKOUT = ruinRules.lockoutTicks;
+
+/** Deep-freezes a state, so an operation that wrote into its input would throw. */
+function frozen<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const item of Object.values(value)) frozen(item);
+  }
+  return value;
+}
+
+/** The first seed whose island 0 has a ruin of this kind. */
+function stateWith(kind: Ruin["puzzle"]["kind"]): RuinsState {
+  for (let seed = 1; ; seed++) {
+    const state = createRuins({ seed, islands: ISLANDS });
+    if (state.ruins["0"]!.puzzle.kind === kind) return frozen(state);
+  }
+}
+
+function rightAnswer(ruin: Ruin): RuinAttempt {
+  if (ruin.puzzle.kind === "sequence") return { kind: "sequence", symbols: [...ruin.puzzle.answer] };
+  // A shortest route, found here by trying move strings of the minimum length.
+  const moves = ["N", "E", "S", "W"] as const;
+  const length = ruin.puzzle.minMoves;
+  for (let code = 0; code < 4 ** length; code++) {
+    const attempt: RuinAttempt = { kind: "navigation", moves: Array.from({ length }, (_, place) => moves[Math.floor(code / 4 ** place) % 4]!) };
+    const trial = createProbe(ruin, attempt);
+    if (trial) return attempt;
+  }
+  throw new Error("no route");
+}
+
+function createProbe(ruin: Ruin, attempt: RuinAttempt): boolean {
+  const state: RuinsState = { rules: ruinRules, tick: 0, ruins: { [String(ruin.island)]: { ...ruin, solvedBy: [], lockouts: [], sessions: [] } }, presence: [] };
+  const at = reportPresence(state, { playerId: "probe", island: ruin.island, inDuel: false, tick: 0 }).state;
+  const open = openRuin(at, { playerId: "probe", island: ruin.island, tick: 0 }).state;
+  return answerRuin(open, { playerId: "probe", island: ruin.island, tick: 0, attempt }).result.outcome === "solved";
+}
+
+function wrongAnswer(ruin: Ruin): RuinAttempt {
+  if (ruin.puzzle.kind === "sequence") {
+    const [a, b, c] = ruin.puzzle.answer;
+    return { kind: "sequence", symbols: [b!, a!, c!] };
+  }
+  // One move: every minimum route is at least four moves long.
+  return { kind: "navigation", moves: ["N"] };
+}
+
+/** Moors a player at an island and opens its ruin at `tick`. */
+function arrive(state: RuinsState, playerId: string, island: number, tick: number): RuinsState {
+  const present = reportPresence(state, { playerId, island, inDuel: false, tick });
+  expect(present.result.ok).toBe(true);
+  const opened = openRuin(present.state, { playerId, island, tick });
+  expect(opened.result.ok).toBe(true);
+  return frozen(opened.state);
+}
+
+for (const kind of ["sequence", "navigation"] as const) {
+  describe(`a ${kind} ruin`, () => {
+    const initial = stateWith(kind);
+    const ruin = initial.ruins["0"]!;
+    const right = rightAnswer(ruin);
+    const wrong = wrongAnswer(ruin);
+
+    it("is solved by the right answer: the first solve unlocks the island's sources once and pays 40 gold", () => {
+      const state = arrive(initial, "p1", 0, 5);
+      const solved = answerRuin(state, { playerId: "p1", island: 0, tick: 6, attempt: right });
+      expect(solved.result).toEqual({
+        ok: true,
+        rejection: null,
+        outcome: "solved",
+        lockedUntil: 0,
+        events: [
+          { kind: "sources-unlocked", island: 0, sourceIds: ["source-0-0", "source-0-1"], playerId: "p1", tick: 6 },
+          { kind: "gold-awarded", island: 0, playerId: "p1", amount: 40, tick: 6 },
+        ],
+      });
+      expect(solved.state.ruins["0"]).toMatchObject({ unlocked: true, solvedBy: [{ playerId: "p1", tick: 6 }] });
+      // Other ruins are untouched.
+      for (const island of ["1", "2", "3"]) expect(solved.state.ruins[island]).toBe(initial.ruins[island]);
+
+      // A second player solving later gets the gold but unlocks nothing again.
+      const second = answerRuin(arrive(solved.state, "p2", 0, 30), { playerId: "p2", island: 0, tick: 31, attempt: right });
+      expect(second.result.events).toEqual([{ kind: "gold-awarded", island: 0, playerId: "p2", amount: 40, tick: 31 }]);
+      expect(second.state.ruins["0"]!.solvedBy).toEqual([
+        { playerId: "p1", tick: 6 },
+        { playerId: "p2", tick: 31 },
+      ]);
+
+      // Solving again gives nothing, and changes nothing.
+      const again = answerRuin(frozen(second.state), { playerId: "p1", island: 0, tick: 40, attempt: right });
+      expect([again.result.rejection, again.result.events]).toEqual(["already-solved", []]);
+      expect(again.state).toBe(second.state);
+      // Nor does leaving and coming back.
+      const back = arrive(reportPresence(second.state, { playerId: "p1", island: null, inDuel: false, tick: 41 }).state, "p1", 0, 42);
+      const reopened = answerRuin(back, { playerId: "p1", island: 0, tick: 43, attempt: right });
+      expect(reopened.result.rejection).toBe("already-solved");
+      expect(reopened.state).toBe(back);
+    });
+
+    it("locks out a wrong answer for three seconds, for that player only", () => {
+      let state = arrive(arrive(initial, "p1", 0, 5), "p2", 0, 5);
+      const failed = answerRuin(state, { playerId: "p1", island: 0, tick: 10, attempt: wrong });
+      expect(failed.result).toEqual({ ok: true, rejection: null, outcome: "wrong", lockedUntil: 10 + LOCKOUT, events: [] });
+      state = frozen(failed.state);
+      expect(state.ruins["0"]!.lockouts).toEqual([{ playerId: "p1", until: 70 }]);
+
+      // Every attempt during the lockout is refused, right or wrong, without extending it.
+      for (const tick of [10, 11, 69]) {
+        for (const attempt of [right, wrong]) {
+          const refused = answerRuin(state, { playerId: "p1", island: 0, tick, attempt });
+          expect([refused.result.rejection, refused.result.lockedUntil]).toEqual(["locked-out", 70]);
+          expect(refused.state).toBe(state);
+        }
+      }
+      // The other player is not affected.
+      const other = answerRuin(state, { playerId: "p2", island: 0, tick: 11, attempt: right });
+      expect(other.result.outcome).toBe("solved");
+      // The lockout ends exactly three seconds on.
+      const later = answerRuin(other.state, { playerId: "p1", island: 0, tick: 70, attempt: right });
+      expect(later.result.outcome).toBe("solved");
+      expect(later.result.events).toEqual([{ kind: "gold-awarded", island: 0, playerId: "p1", amount: 40, tick: 70 }]);
+    });
+
+    it("refuses attempts without a session, away from the ruin, after leaving, and in a duel", () => {
+      // Moored but never opened.
+      const moored = frozen(reportPresence(initial, { playerId: "p1", island: 0, inDuel: false, tick: 5 }).state);
+      const unopened = answerRuin(moored, { playerId: "p1", island: 0, tick: 6, attempt: right });
+      expect(unopened.result.rejection).toBe("no-session");
+      expect(unopened.state).toBe(moored);
+      // Opening from elsewhere, or at an island without a ruin.
+      expect(openRuin(moored, { playerId: "p1", island: 1, tick: 6 }).result.rejection).toBe("not-at-ruin");
+      expect(openRuin(initial, { playerId: "p1", island: 0, tick: 6 }).result.rejection).toBe("not-at-ruin");
+      expect(openRuin(moored, { playerId: "p1", island: 9, tick: 6 }).result.rejection).toBe("unknown-ruin");
+
+      // After leaving: the session is closed.
+      const opened = arrive(initial, "p1", 0, 5);
+      const left = reportPresence(opened, { playerId: "p1", island: null, inDuel: false, tick: 6 });
+      expect(left.result).toEqual({ ok: true, rejection: null, closed: [0] });
+      expect(left.state.ruins["0"]!.sessions).toEqual([]);
+      const afterLeaving = answerRuin(frozen(left.state), { playerId: "p1", island: 0, tick: 7, attempt: right });
+      expect(afterLeaving.result.rejection).toBe("not-at-ruin");
+      // Coming back without reopening still has no session.
+      const returned = frozen(reportPresence(left.state, { playerId: "p1", island: 0, inDuel: false, tick: 8 }).state);
+      expect(answerRuin(returned, { playerId: "p1", island: 0, tick: 9, attempt: right }).result.rejection).toBe("no-session");
+      // Moving to another island's dock closes the session too.
+      const moved = reportPresence(opened, { playerId: "p1", island: 1, inDuel: false, tick: 6 });
+      expect(moved.result.closed).toEqual([0]);
+
+      // Entering a duel ends the session, even while moored at the ruin.
+      const duel = reportPresence(opened, { playerId: "p1", island: 0, inDuel: true, tick: 6 });
+      expect(duel.result.closed).toEqual([0]);
+      const inDuel = frozen(duel.state);
+      const duelAttempt = answerRuin(inDuel, { playerId: "p1", island: 0, tick: 7, attempt: right });
+      expect(duelAttempt.result.rejection).toBe("in-duel");
+      expect(duelAttempt.state).toBe(inDuel);
+      expect(openRuin(inDuel, { playerId: "p1", island: 0, tick: 7 }).result.rejection).toBe("in-duel");
+      // After the duel the player must open the ruin again.
+      const after = frozen(reportPresence(inDuel, { playerId: "p1", island: 0, inDuel: false, tick: 8 }).state);
+      expect(answerRuin(after, { playerId: "p1", island: 0, tick: 9, attempt: right }).result.rejection).toBe("no-session");
+      expect(openRuin(after, { playerId: "p1", island: 0, tick: 9 }).result.ok).toBe(true);
+    });
+
+    it("returns the very same state for repeated, stale and malformed requests", () => {
+      const state = arrive(initial, "p1", 0, 20);
+      // A repeated open keeps the original session and hands the clue again.
+      const repeated = openRuin(state, { playerId: "p1", island: 0, tick: 21 });
+      expect(repeated.result.rejection).toBe("duplicate");
+      expect(repeated.result.clue).not.toBeNull();
+      expect(repeated.state).toBe(state);
+      // A repeated presence report.
+      const same = reportPresence(state, { playerId: "p1", island: 0, inDuel: false, tick: 21 });
+      expect(same.result.rejection).toBe("duplicate");
+      expect(same.state).toBe(state);
+      // Stale ticks.
+      for (const step of [
+        answerRuin(state, { playerId: "p1", island: 0, tick: 19, attempt: right }),
+        openRuin(state, { playerId: "p2", island: 0, tick: 19 }),
+        reportPresence(state, { playerId: "p2", island: 0, inDuel: false, tick: 19 }),
+      ]) {
+        expect(step.result.rejection).toBe("stale-tick");
+        expect(step.state).toBe(state);
+      }
+      // Malformed attempts are refused for their shape, not treated as wrong answers: no lockout.
+      const malformed: unknown[] = [
+        null,
+        { kind: kind === "sequence" ? "navigation" : "sequence", moves: ["N"], symbols: ["sun", "moon", "tide"] },
+        kind === "sequence" ? { kind, symbols: ["sun", "sun", "moon"] } : { kind, moves: [] },
+        kind === "sequence" ? { kind, symbols: ["sun", "moon"] } : { kind, moves: ["N", "Q"] },
+        kind === "sequence" ? { kind, symbols: ["sun", "moon", "kraken"] } : { kind, moves: Array.from({ length: 17 }, () => "N") },
+      ];
+      for (const attempt of malformed) {
+        const refused = answerRuin(state, { playerId: "p1", island: 0, tick: 21, attempt: attempt as RuinAttempt });
+        expect(refused.result.rejection).toBe("invalid-request");
+        expect(refused.state).toBe(state);
+      }
+      for (const bad of [
+        { playerId: "", island: 0, tick: 21 },
+        { playerId: "p1", island: -1, tick: 21 },
+        { playerId: "p1", island: 0, tick: 1.5 },
+      ]) {
+        expect(answerRuin(state, { ...bad, attempt: right }).state).toBe(state);
+        expect(openRuin(state, bad).state).toBe(state);
+      }
+      // The same wrong answer twice on one tick: the second is refused by the lockout the first set.
+      const once = answerRuin(state, { playerId: "p1", island: 0, tick: 22, attempt: wrong });
+      const twice = answerRuin(frozen(once.state), { playerId: "p1", island: 0, tick: 22, attempt: wrong });
+      expect([twice.result.rejection, twice.result.lockedUntil]).toEqual(["locked-out", 22 + LOCKOUT]);
+      expect(twice.state).toBe(once.state);
+    });
+  });
+}

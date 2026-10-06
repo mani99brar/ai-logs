@@ -1,0 +1,1063 @@
+import { describe, expect, it } from "vitest";
+import {
+  compassHeading,
+  createSeaMap,
+  dockLabel,
+  HEADING_COUNT,
+  isNavigable,
+  seaMap,
+  SUB_UNITS_PER_TILE,
+  Terrain,
+  terrainAt,
+  TILE_PIXELS,
+  WORLD_STEPS_PER_SECOND,
+  type SeaMapSource,
+  type ShipTuning,
+} from "@pirate-sea-race/content";
+import {
+  addShip,
+  AXIS_SCALE,
+  canSee,
+  createMatchState,
+  defaultSimulationConfig as config,
+  divTrunc,
+  dockInReach,
+  drinkTonic,
+  HEADING_DX,
+  HEADING_DY,
+  HEADING_SCALE,
+  hashState,
+  hullIsClear,
+  hullPathIsClear,
+  FRUIT_BUTTON,
+  GRAPPLE_BUTTON,
+  INTERACT_BUTTON,
+  nextRandom,
+  NOT_DOCKED,
+  placeShip,
+  pointInSight,
+  quantizeAxis,
+  removeShip,
+  returnShip,
+  sail,
+  step,
+  stopShip,
+  tileCentre,
+  tonicSpeedBonus,
+  topSpeed,
+  toTilePosition,
+  visibleShipIds,
+  WORLD_STEP_INTERVAL,
+  type MatchState,
+  type PlayerInput,
+  type ShipState,
+  type SimulationConfig,
+} from "./index.js";
+
+interface LoggedInput {
+  readonly frame: number;
+  readonly shipId: string;
+  readonly input: PlayerInput;
+}
+
+/** Replays an input log: each entry becomes that ship's held input from its frame on. */
+function run(initial: MatchState, log: readonly LoggedInput[], steps: number, stepConfig: SimulationConfig = config): MatchState {
+  let state = initial;
+  const held: Record<string, PlayerInput> = {};
+  for (let index = 0; index < steps; index++) {
+    const frame = state.frame + 1;
+    for (const entry of log) if (entry.frame === frame) held[entry.shipId] = entry.input;
+    state = step(stepConfig, state, held);
+  }
+  return state;
+}
+
+function matchWithShips(seed: number, ids: readonly string[]): MatchState {
+  return ids.reduce((state, id) => addShip(config, state, id), createMatchState(seed));
+}
+
+/** `turn` and `throttle` in [-1, 1]; throttle forward is up on the keyboard, a negative moveY. */
+const helm = (turn: number, throttle: number, buttons = 0): PlayerInput => ({
+  buttons,
+  moveX: turn * AXIS_SCALE,
+  moveY: -throttle * AXIS_SCALE,
+});
+const FULL_AHEAD = helm(0, 1);
+const INTERACT = helm(0, 0, INTERACT_BUTTON);
+
+/** Runs one ship through `worldSteps` world steps with a fixed input, returning every intermediate ship. */
+function sailFor(ship: ShipState, input: PlayerInput, worldSteps: number, sailConfig: SimulationConfig = config): ShipState[] {
+  const trail: ShipState[] = [];
+  let current = ship;
+  for (let index = 0; index < worldSteps; index++) trail.push((current = sail(sailConfig, current, input)));
+  return trail;
+}
+
+const tile = config.map.subUnitsPerTile;
+
+function shipAt(tileX: number, tileY: number, heading: number, sailConfig: SimulationConfig = config): ShipState {
+  return { id: "a", slot: 0, ...tileCentre(sailConfig, tileX, tileY), heading, speed: 0, dock: NOT_DOCKED, mooredThrottle: 0, tonicUntil: 0 };
+}
+
+/** A small test sea: open water with the obstacles drawn in `rows` (`.` sea, `#` land, `%` shoal, `D` dock). */
+function testConfig(rows: readonly string[], overrides: Partial<SimulationConfig["ship"]> = {}): SimulationConfig {
+  const source: SeaMapSource = {
+    name: "test",
+    widthTiles: rows[0]!.length,
+    heightTiles: rows.length,
+    rows,
+    islands: [{ name: "Test Isle", theme: "tropical", tileX: 0, tileY: 0, widthTiles: rows[0]!.length, heightTiles: rows.length }],
+    spawnSlots: [{ tileX: 1, tileY: 1, facing: "E" }],
+    hub: { tileX: 1, tileY: 1 },
+  };
+  const map = createSeaMap(source);
+  return { ...config, map, spawnSlots: map.spawnSlots, ship: { ...config.ship, ...overrides } };
+}
+
+const inputLog: LoggedInput[] = [
+  { frame: 1, shipId: "a", input: FULL_AHEAD },
+  { frame: 10, shipId: "b", input: helm(1, 1) },
+  { frame: 90, shipId: "a", input: helm(-1, 1) },
+  { frame: 200, shipId: "c", input: helm(0, -0.6) },
+  { frame: 320, shipId: "b", input: helm(0, 0) },
+  { frame: 450, shipId: "a", input: helm(0, -1, INTERACT_BUTTON) },
+];
+
+describe("determinism", () => {
+  it("gives the same hash for the same initial state and input log after 600 steps", () => {
+    const first = run(matchWithShips(1234, ["a", "b", "c"]), inputLog, 600);
+    const second = run(matchWithShips(1234, ["a", "b", "c"]), inputLog, 600);
+    expect(first.frame).toBe(600);
+    expect(hashState(first)).toBe(hashState(second));
+    expect(first).toEqual(second);
+  });
+
+  it("gives a different hash when one input changes", () => {
+    const changed = inputLog.map((entry, index) => (index === 1 ? { ...entry, input: helm(-1, 1) } : entry));
+    const original = run(matchWithShips(1234, ["a", "b", "c"]), inputLog, 600);
+    const altered = run(matchWithShips(1234, ["a", "b", "c"]), changed, 600);
+    expect(hashState(altered)).not.toBe(hashState(original));
+  });
+
+  it("hashes the complete state, including the generator and the dock", () => {
+    const state = matchWithShips(1, ["a"]);
+    expect(hashState({ ...state, rng: state.rng + 1 })).not.toBe(hashState(state));
+    expect(hashState({ ...state, frame: 1 })).not.toBe(hashState(state));
+    const docked = { ...state, ships: state.ships.map((ship) => ({ ...ship, dock: 0 })) };
+    expect(hashState(docked)).not.toBe(hashState(state));
+  });
+
+  it("does not depend on key order", () => {
+    const state = matchWithShips(99, ["a", "b"]);
+    const reordered = {
+      ships: state.ships.map((ship) => {
+        const { tonicUntil, mooredThrottle, dock, speed, heading, y, x, slot, id } = ship;
+        return { tonicUntil, mooredThrottle, dock, speed, heading, y, x, slot, id };
+      }),
+      rng: state.rng,
+      worldTick: state.worldTick,
+      frame: state.frame,
+    };
+    expect(hashState(reordered)).toBe(hashState(state));
+  });
+
+  it("keeps every number in the state an integer", () => {
+    const state = run(matchWithShips(7, ["a", "b", "c"]), inputLog, 600);
+    for (const ship of state.ships) {
+      for (const value of [ship.x, ship.y, ship.heading, ship.speed, ship.dock, ship.slot, ship.tonicUntil]) expect(Number.isInteger(value)).toBe(true);
+    }
+    expect(state.ships.some((ship) => ship.speed !== 0)).toBe(true);
+  });
+
+  it("does not mutate the state it is given", () => {
+    const state = Object.freeze(matchWithShips(5, ["a"]));
+    expect(() => step(config, state, { a: FULL_AHEAD })).not.toThrow();
+    expect(state.frame).toBe(0);
+  });
+});
+
+describe("clock", () => {
+  it("advances world logic only on every third step", () => {
+    let state = matchWithShips(42, ["a"]);
+    const inputs = { a: FULL_AHEAD };
+    for (let frame = 1; frame <= 30; frame++) {
+      const before = state;
+      state = step(config, state, inputs);
+      expect(state.frame).toBe(frame);
+      if (frame % WORLD_STEP_INTERVAL === 0) {
+        expect(state.worldTick).toBe(before.worldTick + 1);
+        expect(state.ships[0]!.speed).toBe(before.ships[0]!.speed + config.ship.acceleration);
+      } else {
+        expect(state.worldTick).toBe(before.worldTick);
+        expect(state.ships).toBe(before.ships);
+      }
+    }
+    expect(state.worldTick).toBe(10);
+  });
+});
+
+describe("heading table", () => {
+  it("has HEADING_COUNT unit vectors, east first, turning clockwise with y down", () => {
+    expect(HEADING_DX).toHaveLength(HEADING_COUNT);
+    expect([HEADING_DX[0], HEADING_DY[0]]).toEqual([HEADING_SCALE, 0]);
+    expect([HEADING_DX[16], HEADING_DY[16]]).toEqual([0, HEADING_SCALE]);
+    expect([HEADING_DX[32], HEADING_DY[32]]).toEqual([-HEADING_SCALE, 0]);
+    expect([HEADING_DX[48], HEADING_DY[48]]).toEqual([0, -HEADING_SCALE]);
+    expect(HEADING_DX[8]).toBe(HEADING_DY[8]);
+    for (let heading = 0; heading < HEADING_COUNT; heading++) {
+      const dx = HEADING_DX[heading]!;
+      const dy = HEADING_DY[heading]!;
+      expect(Number.isInteger(dx) && Number.isInteger(dy)).toBe(true);
+      // Each entry is a rounded unit vector: its length is within a unit of HEADING_SCALE.
+      expect(Math.abs(dx * dx + dy * dy - HEADING_SCALE * HEADING_SCALE)).toBeLessThanOrEqual(2 * HEADING_SCALE);
+      // Mirror symmetry about the x axis.
+      expect(HEADING_DX[(HEADING_COUNT - heading) % HEADING_COUNT]).toBe(dx);
+      expect(HEADING_DY[(HEADING_COUNT - heading) % HEADING_COUNT]).toBe(dy === 0 ? 0 : -dy);
+    }
+  });
+
+  it("matches the compass directions spawn slots are authored with", () => {
+    expect(compassHeading("E")).toBe(0);
+    expect(compassHeading("S")).toBe(16);
+    expect(compassHeading("NW")).toBe(40);
+  });
+});
+
+describe("sailing", () => {
+  const open = testConfig(Array.from({ length: 40 }, () => ".".repeat(200)));
+  const start = shipAt(20, 20, 0, open);
+
+  it("accelerates under throttle to the maximum speed and holds it", () => {
+    const trail = sailFor(start, FULL_AHEAD, 40, open);
+    expect(trail[0]!.speed).toBe(config.ship.acceleration);
+    expect(trail[1]!.speed).toBe(2 * config.ship.acceleration);
+    const stepsToFull = config.ship.maxSpeed / config.ship.acceleration;
+    expect(trail[stepsToFull - 1]!.speed).toBe(config.ship.maxSpeed);
+    expect(trail.at(-1)!.speed).toBe(config.ship.maxSpeed);
+    expect(Math.max(...trail.map((ship) => ship.speed))).toBe(config.ship.maxSpeed);
+    // At full speed a ship heading east covers maxSpeed sub-units per world step, along its heading only.
+    expect(trail.at(-1)!.x - trail.at(-2)!.x).toBe(config.ship.maxSpeed);
+    expect(trail.at(-1)!.y).toBe(start.y);
+  });
+
+  it("brakes faster than it coasts, then reverses slowly from a stop", () => {
+    const underWay = sailFor(start, FULL_AHEAD, 30, open).at(-1)!;
+    const braking = sailFor(underWay, helm(0, -1), 40, open);
+    const coasting = sailFor(underWay, helm(0, 0), 40, open);
+    const stopAt = (trail: ShipState[]) => trail.findIndex((ship) => ship.speed === 0);
+    expect(braking[0]!.speed).toBe(config.ship.maxSpeed - config.ship.braking);
+    expect(coasting[0]!.speed).toBe(config.ship.maxSpeed - config.ship.drag);
+    expect(stopAt(braking)).toBe(config.ship.maxSpeed / config.ship.braking - 1);
+    expect(stopAt(coasting)).toBe(config.ship.maxSpeed / config.ship.drag - 1);
+    expect(stopAt(braking)).toBeLessThan(stopAt(coasting));
+    // Holding brake from a stop reverses, no faster than the reverse limit.
+    expect(braking.at(-1)!.speed).toBe(-config.ship.maxReverseSpeed);
+    expect(braking.at(-1)!.x).toBeLessThan(braking[stopAt(braking)]!.x);
+    expect(coasting.at(-1)!.speed).toBe(0);
+  });
+
+  it("turns the integer heading at the turn rate, both ways, wrapping around", () => {
+    const starboard = sailFor(start, helm(1, 0), HEADING_COUNT + 3, open);
+    expect(starboard.slice(0, 3).map((ship) => ship.heading)).toEqual([1, 2, 3].map((turns) => turns * config.ship.turnRate));
+    expect(starboard[HEADING_COUNT / config.ship.turnRate - 1]!.heading).toBe(0);
+    const port = sailFor(start, helm(-1, 0), 2, open);
+    expect(port.map((ship) => ship.heading)).toEqual([HEADING_COUNT - config.ship.turnRate, HEADING_COUNT - 2 * config.ship.turnRate]);
+    // A half-strength stick turns just the same: the rate is fixed, the stick picks the way.
+    expect(sail(open, start, { buttons: 0, moveX: 300, moveY: 0 }).heading).toBe(config.ship.turnRate);
+  });
+
+  it("sails along its heading", () => {
+    const south = sailFor(shipAt(20, 5, 16, open), FULL_AHEAD, 30, open).at(-1)!;
+    expect(south.x).toBe(tileCentre(open, 20, 5).x);
+    expect(south.y).toBeGreaterThan(tileCentre(open, 20, 5).y);
+    const northWest = sailFor(shipAt(100, 30, 40, open), FULL_AHEAD, 20, open);
+    const [before, after] = [northWest.at(-2)!, northWest.at(-1)!];
+    expect(after.x - before.x).toBe(after.y - before.y);
+    expect(after.x).toBeLessThan(before.x);
+  });
+
+  it("quantizes protocol axes into integer simulation units", () => {
+    expect(quantizeAxis(1)).toBe(AXIS_SCALE);
+    expect(quantizeAxis(-0.5)).toBe(-AXIS_SCALE / 2);
+    expect(quantizeAxis(7)).toBe(AXIS_SCALE);
+    expect(quantizeAxis(Number.NaN)).toBe(0);
+  });
+
+  it("treats an out-of-range simulation axis as clamped", () => {
+    const wild = step(config, step(config, step(config, matchWithShips(3, ["a"]), {}), {}), { a: { buttons: 0, moveX: 0, moveY: -50 * AXIS_SCALE } });
+    expect(wild.ships[0]!.speed).toBe(config.ship.acceleration);
+  });
+
+  it("reads a position as a tile plus an offset", () => {
+    expect(toTilePosition(config, 3 * tile + 5, 2 * tile)).toEqual({ tileX: 3, tileY: 2, offsetX: 5, offsetY: 0 });
+  });
+});
+
+describe("handling on screen", () => {
+  // The feel before the sea was made compact (§3): five tiles a second on 16 px tiles, every field as it was then
+  // (`git show e2a80af:packages/content/src/sailing.ts`), so the comparisons below fail if today's tuning drifts. The
+  // compact sea sails at about three tiles a second on TILE_PIXELS tiles, so on screen a ship should handle much as it did.
+  const BEFORE: ShipTuning = {
+    maxSpeed: 64,
+    maxReverseSpeed: 16,
+    acceleration: 4,
+    reverseAcceleration: 2,
+    braking: 8,
+    drag: 2,
+    turnRate: 1,
+    hullHalfSize: 80,
+    dockRadius: 384,
+    dockMaxSpeed: 24,
+  };
+  const BEFORE_TILE_PIXELS = 16;
+  const open = testConfig(Array.from({ length: 60 }, () => ".".repeat(200)));
+
+  /** Time to full speed, braking distance from full speed, a full turn, and the turning circle, sailed on open water. */
+  function measure(ship: ShipTuning, tilePixels: number) {
+    const sea = { ...open, ship };
+    const underWay = sailFor(shipAt(20, 30, 0, sea), FULL_AHEAD, 60, sea);
+    const stepsToFull = underWay.findIndex((each) => each.speed === ship.maxSpeed) + 1;
+    const full = underWay.at(-1)!;
+    const braking = sailFor(full, helm(0, -1), 60, sea);
+    const stopped = braking.find((each) => each.speed === 0)!;
+    const turnSteps = HEADING_COUNT / ship.turnRate;
+    const circle = sailFor(full, helm(1, 1), turnSteps, sea);
+    const across = (axis: "x" | "y") => Math.max(...circle.map((each) => each[axis])) - Math.min(...circle.map((each) => each[axis]));
+    return {
+      secondsToFull: stepsToFull / WORLD_STEPS_PER_SECOND,
+      stoppingTiles: (stopped.x - full.x) / SUB_UNITS_PER_TILE,
+      turnSeconds: turnSteps / WORLD_STEPS_PER_SECOND,
+      headingAfterTurn: circle.at(-1)!.heading,
+      circlePixels: (Math.max(across("x"), across("y")) / SUB_UNITS_PER_TILE) * tilePixels,
+      pixelsPerSecond: ((ship.maxSpeed * WORLD_STEPS_PER_SECOND) / SUB_UNITS_PER_TILE) * tilePixels,
+    };
+  }
+  const now = measure(config.ship, TILE_PIXELS);
+  const before = measure(BEFORE, BEFORE_TILE_PIXELS);
+  const within = (value: number, reference: number, share: number) => {
+    expect(value).toBeGreaterThanOrEqual(reference * (1 - share));
+    expect(value).toBeLessThanOrEqual(reference * (1 + share));
+  };
+
+  it("sails at about three tiles a second, about as fast on screen as before", () => {
+    expect(config.ship.maxSpeed * WORLD_STEPS_PER_SECOND).toBeGreaterThanOrEqual(3 * SUB_UNITS_PER_TILE);
+    expect(config.ship.maxSpeed * WORLD_STEPS_PER_SECOND).toBeLessThan((3 + 0.1) * SUB_UNITS_PER_TILE);
+    within(now.pixelsPerSecond, before.pixelsPerSecond, 0.1);
+  });
+
+  it("reaches full speed and brakes to a stop within about a quarter of the old time and distance", () => {
+    within(now.secondsToFull, before.secondsToFull, 0.25);
+    within(now.stoppingTiles, before.stoppingTiles, 0.25);
+    expect(now.stoppingTiles).toBeGreaterThan(0);
+  });
+
+  it("still turns full circle in 3.2 s, in about as wide a circle on screen", () => {
+    expect(now.turnSeconds).toBe(before.turnSeconds);
+    expect(now.turnSeconds).toBe(3.2);
+    expect(now.headingAfterTurn).toBe(0);
+    within(now.circlePixels, before.circlePixels, 0.25);
+  });
+
+  it("docks within the same reach, which does not depend on speed", () => {
+    expect(config.ship.dockRadius).toBeGreaterThanOrEqual(BEFORE.dockRadius);
+    expect(config.ship.dockRadius).toBeGreaterThanOrEqual(384);
+    expect(config.ship.hullHalfSize).toBe(BEFORE.hullHalfSize);
+    expect(config.ship.turnRate).toBe(BEFORE.turnRate);
+    // The dock speed keeps its share of full speed, rounded up.
+    expect(config.ship.dockMaxSpeed * BEFORE.maxSpeed).toBeGreaterThanOrEqual(BEFORE.dockMaxSpeed * config.ship.maxSpeed);
+    expect((config.ship.dockMaxSpeed - 1) * BEFORE.maxSpeed).toBeLessThan(BEFORE.dockMaxSpeed * config.ship.maxSpeed);
+  });
+});
+
+describe("collisions", () => {
+  // A one-tile shoal wall at column 10 and a land block to the south.
+  const walledRows = [
+    "..........%.........",
+    "..........%.........",
+    "..........%.........",
+    "..........%.........",
+    "..........%.........",
+    "..........%.........",
+    "....................",
+    "....................",
+    "######..............",
+    "######..............",
+  ];
+  const walled = testConfig(walledRows);
+
+  it("stops a ship at full speed flush against a shoal, without passing through", () => {
+    const trail = sailFor(shipAt(2, 3, 0, walled), FULL_AHEAD, 200, walled);
+    const last = trail.at(-1)!;
+    expect(last.x).toBe(10 * tile - 1 - config.ship.hullHalfSize);
+    expect(last.speed).toBe(0);
+    for (const ship of trail) {
+      expect(toTilePosition(walled, ship.x + config.ship.hullHalfSize, ship.y).tileX).toBeLessThan(10);
+      expect(hullIsClear(walled, ship.x, ship.y)).toBe(true);
+    }
+  });
+
+  it("never tunnels, even at a speed of several tiles per step", () => {
+    // A shoal wall across the whole sea at column 10, and a ship five tiles a step.
+    const fast = testConfig(Array.from({ length: 12 }, () => "..........%........."), { maxSpeed: 5 * tile, acceleration: 5 * tile });
+    for (const heading of [0, 4, 8, 60, 56]) {
+      const trail = sailFor(shipAt(2, 6, heading, fast), FULL_AHEAD, 50, fast);
+      expect(trail[0]!.speed).toBe(5 * tile);
+      for (const ship of trail) {
+        expect(ship.x + fast.ship.hullHalfSize).toBeLessThan(10 * tile);
+        expect(hullIsClear(fast, ship.x, ship.y)).toBe(true);
+      }
+    }
+    // Heading west from beyond the wall, it stops against the wall's east face.
+    const back = sailFor(shipAt(18, 6, 32, fast), FULL_AHEAD, 5, fast).at(-1)!;
+    expect(back.x).toBe(11 * tile + fast.ship.hullHalfSize);
+    expect(back.speed).toBe(0);
+  });
+
+  it("slides along an obstacle it meets at an angle, and runs aground head-on", () => {
+    // South-east into the land block's north face: blocked on y, it keeps sailing east along it.
+    const trail = sailFor(shipAt(0, 5, 8, walled), FULL_AHEAD, 60, walled);
+    const againstLand = trail.filter((ship) => ship.y === 8 * tile - 1 - config.ship.hullHalfSize);
+    expect(againstLand.length).toBeGreaterThan(2);
+    expect(againstLand.at(-1)!.x).toBeGreaterThan(againstLand[0]!.x);
+    expect(againstLand.at(-1)!.speed).toBeGreaterThan(0);
+    // Due south into the same face: it stops.
+    const headOn = sailFor(shipAt(2, 5, 16, walled), FULL_AHEAD, 60, walled).at(-1)!;
+    expect(headOn.y).toBe(8 * tile - 1 - config.ship.hullHalfSize);
+    expect(headOn.speed).toBe(0);
+  });
+
+  it("keeps the hull off land and shoals on the real map under random helm, from every spawn slot and each dock", () => {
+    const starts = [
+      ...config.spawnSlots.map((slot) => shipAt(slot.tileX, slot.tileY, compassHeading(slot.facing))),
+      ...config.map.docks.map((dock) => shipAt(dock.tileX, dock.tileY, 0)),
+    ];
+    let rng = 20260924;
+    let collisions = 0;
+    for (const start of starts) {
+      let ship = start;
+      let input = FULL_AHEAD;
+      for (let index = 0; index < 1500; index++) {
+        if (index % 15 === 0) {
+          const drawn = nextRandom(rng);
+          rng = drawn.state;
+          // Mostly full ahead, turning either way or holding course.
+          input = helm((drawn.value % 3) - 1, drawn.value % 7 === 0 ? -1 : 1);
+        }
+        const next = sail(config, ship, input);
+        if (next.speed === 0 && ship.speed > 0) collisions++;
+        const { tileX, tileY } = toTilePosition(config, next.x, next.y);
+        expect(isNavigable(config.map, tileX, tileY)).toBe(true);
+        expect(hullIsClear(config, next.x, next.y)).toBe(true);
+        ship = next;
+      }
+    }
+    // The walk really did meet obstacles.
+    expect(collisions).toBeGreaterThan(0);
+  });
+});
+
+describe("docking", () => {
+  const harbourRows = [
+    "..........",
+    "..........",
+    "...####...",
+    "...##D....",
+    "..........",
+    "..........",
+  ];
+  const harbour = testConfig(harbourRows);
+  // A dock on the corner of an island, as the slice sea's docks are: land to its west and north, open sea to its east
+  // and south, with room to run up to it.
+  const cornerIsland = testConfig([
+    "................",
+    "................",
+    "................",
+    "................",
+    "....######......",
+    "....######......",
+    "....######......",
+    "....#####D......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+  ]);
+  const dock = harbour.map.docks[0]!;
+  const berth = tileCentre(harbour, dock.tileX, dock.tileY);
+  const nearby = { ...shipAt(5, 5, 0, harbour), y: berth.y + tile, x: berth.x + 40 };
+
+  it("moors a slow ship near a dock with interact: it stops at the dock and records it", () => {
+    const moored = sail(harbour, { ...nearby, speed: harbour.ship.dockMaxSpeed }, INTERACT);
+    expect(moored).toMatchObject({ x: berth.x, y: berth.y, speed: 0, dock: dock.id });
+    // It stays moored without throttle, turning or not, interact held or not.
+    for (const input of [INTERACT, helm(0, 0), helm(1, 0)]) {
+      expect(sailFor(moored, input, 20, harbour).at(-1)).toEqual(moored);
+    }
+  });
+
+  it("docks at any speed, but not too far or without interact", () => {
+    expect(sail(harbour, { ...nearby, speed: harbour.ship.maxSpeed }, INTERACT)).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+    expect(sail(harbour, { ...nearby, speed: -harbour.ship.maxReverseSpeed }, INTERACT)).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+    expect(sail(harbour, { ...nearby, y: berth.y + 2 * tile }, INTERACT).dock).toBe(NOT_DOCKED);
+    expect(sail(harbour, nearby, helm(0, 0)).dock).toBe(NOT_DOCKED);
+    expect(sail(harbour, nearby, FULL_AHEAD).dock).toBe(NOT_DOCKED);
+  });
+
+  it("docks with the throttle held, ahead or astern, at any speed", () => {
+    expect(sail(harbour, nearby, helm(0, -1, INTERACT_BUTTON))).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+    expect(sail(harbour, nearby, helm(0, 1, INTERACT_BUTTON))).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+    expect(sail(harbour, { ...nearby, speed: harbour.ship.maxSpeed }, helm(0, 1, INTERACT_BUTTON))).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+  });
+
+  it("docks a ship driven at its dock with ahead held as soon as it is within reach, still at full speed", () => {
+    // Heading north (48) from three tiles south of the dock at full speed, full ahead and interact held throughout, as
+    // a player drives in: it moors on the first step it starts within the dock's reach, without slowing down first.
+    const approach = { ...shipAt(dock.tileX, dock.tileY + 3, 48, harbour), speed: harbour.ship.maxSpeed };
+    const course = sailFor(approach, helm(0, 1, INTERACT_BUTTON), 40, harbour);
+    const moored = course.findIndex((ship) => ship.dock !== NOT_DOCKED);
+    expect(course[moored - 1]!.speed).toBe(harbour.ship.maxSpeed);
+    expect(dockInReach(harbour, course[moored - 2]!.x, course[moored - 2]!.y)).toBeUndefined();
+    expect(dockInReach(harbour, course[moored - 1]!.x, course[moored - 1]!.y)).toBe(dock);
+    expect(course.at(-1)).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+  });
+
+  it("moors beside the berth across a corner of land, and checks the straight run to the berth for the hull", () => {
+    // South-west of the dock, diagonally: the straight run to the berth crosses the corner of the land tile west of the
+    // dock, but the tile south of the dock is open, so the ship is beside the berth and moors.
+    const diagonal = shipAt(dock.tileX - 1, dock.tileY + 1, 0, harbour);
+    expect((berth.x - diagonal.x) ** 2 + (berth.y - diagonal.y) ** 2).toBeLessThanOrEqual(harbour.ship.dockRadius ** 2);
+    expect(hullIsClear(harbour, diagonal.x, diagonal.y)).toBe(true);
+    expect(terrainAt(harbour.map, dock.tileX - 1, dock.tileY)).toBe(Terrain.Land);
+    expect(terrainAt(harbour.map, dock.tileX, dock.tileY + 1)).toBe(Terrain.Sea);
+    expect(hullPathIsClear(harbour, diagonal.x, diagonal.y, berth.x, berth.y)).toBe(false);
+    expect(sail(harbour, diagonal, INTERACT)).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+    // Straight up from the tile south of the dock the run is clear, and it moors.
+    const below = shipAt(dock.tileX, dock.tileY + 1, 0, harbour);
+    expect(hullPathIsClear(harbour, below.x, below.y, berth.x, berth.y)).toBe(true);
+    expect(sail(harbour, below, INTERACT)).toMatchObject({ ...berth, dock: dock.id });
+    // The check follows the whole segment, not just its ends: both ends clear, a shoal between them.
+    const shoaled = testConfig(["..........", "..........", "....%.....", ".........."]);
+    expect(hullIsClear(shoaled, 3 * tile + tile / 2, 2 * tile + tile / 2)).toBe(true);
+    expect(hullPathIsClear(shoaled, 3 * tile + tile / 2, 2 * tile + tile / 2, 5 * tile + tile / 2, 2 * tile + tile / 2)).toBe(false);
+    expect(hullPathIsClear(shoaled, 3 * tile + tile / 2, 1 * tile + tile / 2, 5 * tile + tile / 2, 1 * tile + tile / 2)).toBe(true);
+  });
+
+  it("moors beside the berth only if a diagonal neighbour is not pinched between land or shoal on both shared sides", () => {
+    // South-west of the dock, with land west of it, and south of it land in one test sea and a shoal in the other.
+    for (const [kind, south] of [["land", "#"], ["shoal", "%"]] as const) {
+      const pinched = testConfig(["..........", "...####...", "...##D....", `.....${south}....`, ".........."]);
+      const pinchedDock = pinched.map.docks[0]!;
+      const pinchedBerth = tileCentre(pinched, pinchedDock.tileX, pinchedDock.tileY);
+      const diagonal = shipAt(pinchedDock.tileX - 1, pinchedDock.tileY + 1, 0, pinched);
+      expect(hullIsClear(pinched, diagonal.x, diagonal.y), kind).toBe(true);
+      expect((pinchedBerth.x - diagonal.x) ** 2 + (pinchedBerth.y - diagonal.y) ** 2, kind).toBeLessThanOrEqual(pinched.ship.dockRadius ** 2);
+      expect(dockInReach(pinched, diagonal.x, diagonal.y), kind).toBeUndefined();
+      expect(sail(pinched, diagonal, INTERACT), kind).toEqual(diagonal);
+      // East of the dock, the orthogonal neighbour, it moors.
+      expect(sail(pinched, shipAt(pinchedDock.tileX + 1, pinchedDock.tileY, 0, pinched), INTERACT).dock, kind).toBe(pinchedDock.id);
+    }
+  });
+
+  it("does not moor behind land from within a longer reach, unless beside the berth or with a clear run", () => {
+    // A 640 reach (the shipped reach stays 384, which the berth's neighbours already cover).
+    const far = testConfig(harbourRows, { dockRadius: 640 });
+    const farDock = far.map.docks[0]!;
+    const farBerth = tileCentre(far, farDock.tileX, farDock.tileY);
+    // Two rows north of the dock, beyond the land north of it: within reach, not beside the berth, no clear run.
+    const behind = shipAt(farDock.tileX, farDock.tileY - 2, 0, far);
+    expect((farBerth.y - behind.y) ** 2).toBeLessThanOrEqual(far.ship.dockRadius ** 2);
+    expect(terrainAt(far.map, farDock.tileX, farDock.tileY - 1)).toBe(Terrain.Land);
+    expect(sail(far, behind, INTERACT)).toEqual(behind);
+    // Two rows south, the run is clear, and it moors from the longer reach.
+    expect(sail(far, shipAt(farDock.tileX, farDock.tileY + 2, 0, far), INTERACT)).toMatchObject({ ...farBerth, dock: farDock.id });
+  });
+
+  it("moors a ship driven head-on at the land beside a corner dock, on the test island and at the real dock (23, 27)", () => {
+    const southDock = config.map.docks.find((each) => each.tileX === 23 && each.tileY === 27)!;
+    expect(southDock).toBeDefined();
+    for (const [name, sea, target] of [["test island", cornerIsland, cornerIsland.map.docks[0]!], ["slice sea", config, southDock]] as const) {
+      // Land directly west of the dock and open sea south of it: heading north (48), the lanes 336 and 368 sub-units
+      // west of the berth run into that land's south face, about 395 sub-units from the berth, outside the reach.
+      expect(terrainAt(sea.map, target.tileX - 1, target.tileY), name).toBe(Terrain.Land);
+      expect(terrainAt(sea.map, target.tileX, target.tileY + 1), name).toBe(Terrain.Sea);
+      const centre = tileCentre(sea, target.tileX, target.tileY);
+      for (const offset of [-336, -368]) {
+        for (const speed of [0, sea.ship.maxSpeed]) {
+          const label = `${name}, offset ${offset}, speed ${speed}`;
+          const start = { ...shipAt(target.tileX, target.tileY + 4, 48, sea), x: centre.x + offset, speed };
+          expect(hullIsClear(sea, start.x, start.y), label).toBe(true);
+          const course = sailFor(start, helm(0, 1, INTERACT_BUTTON), 60, sea);
+          expect(course.at(-1), label).toMatchObject({ ...centre, speed: 0, dock: target.id, mooredThrottle: 1 });
+        }
+      }
+    }
+  });
+
+  it("moors a ship that grounds in the real dock (23, 27)'s own row with its hull beside the berth", () => {
+    // Heading north in column 25, two tiles east of the dock: the ship runs into the island's south face in the dock's
+    // row, 384 or more sub-units from the berth, its hull over the tile east of the dock, (24, 27).
+    const southDock = config.map.docks.find((each) => each.tileX === 23 && each.tileY === 27)!;
+    const centre = tileCentre(config, southDock.tileX, southDock.tileY);
+    expect(terrainAt(config.map, 24, 26)).toBe(Terrain.Land);
+    expect(terrainAt(config.map, 25, 26)).toBe(Terrain.Land);
+    for (let x = 6400; x < 6480; x++) {
+      const start = { ...shipAt(25, 30, 48), x };
+      const withoutInteract = sailFor(start, FULL_AHEAD, 60).at(-1)!;
+      expect(withoutInteract, `x ${x}`).toMatchObject({ y: 27 * tile + config.ship.hullHalfSize, speed: 0 });
+      expect((withoutInteract.x - centre.x) ** 2 + (withoutInteract.y - centre.y) ** 2).toBeGreaterThan(config.ship.dockRadius ** 2);
+      expect(toTilePosition(config, withoutInteract.x - config.ship.hullHalfSize, withoutInteract.y).tileX).toBe(24);
+      expect(sailFor(start, helm(0, 1, INTERACT_BUTTON), 60).at(-1), `x ${x}`).toMatchObject({ ...centre, speed: 0, dock: southDock.id });
+    }
+  });
+
+  it("casts off on any throttle without interact and sails in the same step", () => {
+    const moored = sail(harbour, nearby, INTERACT);
+    const ahead = sail(harbour, { ...moored, heading: 0 }, FULL_AHEAD);
+    expect(ahead.dock).toBe(NOT_DOCKED);
+    expect(ahead.speed).toBe(harbour.ship.acceleration);
+    const astern = sail(harbour, moored, helm(0, -1));
+    expect(astern.dock).toBe(NOT_DOCKED);
+    expect(astern.speed).toBe(-harbour.ship.reverseAcceleration);
+  });
+
+  it("stays moored while interact or the throttle it moored with is held; that throttle casts off only after release", () => {
+    // Driven in with ahead held: interact released, ahead still held, the ship stays moored.
+    const moored = sail(harbour, nearby, helm(0, 1, INTERACT_BUTTON));
+    expect(moored.mooredThrottle).toBe(1);
+    expect(sailFor(moored, helm(0, 1, INTERACT_BUTTON), 20, harbour).at(-1)).toEqual(moored);
+    expect(sailFor(moored, FULL_AHEAD, 20, harbour).at(-1)).toEqual(moored);
+    // Astern is a fresh throttle: it casts off at once.
+    expect(sail(harbour, moored, helm(0, -1)).dock).toBe(NOT_DOCKED);
+    // Releasing ahead, then pressing it again, casts off.
+    const released = sail(harbour, moored, helm(0, 0));
+    expect(released).toMatchObject({ dock: dock.id, mooredThrottle: 0 });
+    expect(sail(harbour, released, FULL_AHEAD)).toMatchObject({ dock: NOT_DOCKED, mooredThrottle: 0 });
+  });
+
+  it("keeps a moored ship's throttle latch when its input entry is missing, as the server leaves it after a lapse", () => {
+    const realDock = config.map.docks[0]!;
+    const moored = sail(config, shipAt(realDock.tileX, realDock.tileY, 0), helm(0, 1, INTERACT_BUTTON));
+    expect(moored).toMatchObject({ dock: realDock.id, mooredThrottle: 1 });
+    const stalled = run({ ...createMatchState(1), ships: [moored] }, [], 10 * WORLD_STEP_INTERVAL);
+    expect(stalled.ships[0]).toEqual(moored);
+    // Unchanged ahead held on resuming does not cast off; neutral input releases the latch, and ahead then casts off.
+    const resumed = run(stalled, [{ frame: stalled.frame + 1, shipId: moored.id, input: FULL_AHEAD }], 10 * WORLD_STEP_INTERVAL);
+    expect(resumed.ships[0]).toEqual(moored);
+    const neutral = run(stalled, [{ frame: stalled.frame + 1, shipId: moored.id, input: helm(0, 0) }], WORLD_STEP_INTERVAL);
+    expect(neutral.ships[0]).toMatchObject({ dock: realDock.id, mooredThrottle: 0 });
+    // A ship at sea with no entry still sails as neutral: it coasts.
+    const slot = config.spawnSlots[0]!;
+    const underWay = run({ ...createMatchState(1), ships: [{ ...shipAt(slot.tileX, slot.tileY, compassHeading(slot.facing)), speed: 10 }] }, [], WORLD_STEP_INTERVAL);
+    expect(underWay.ships[0]!.speed).toBe(10 - config.ship.drag);
+  });
+
+  it("moors from any lateral offset when driven into the corner of the shore beside a dock, tilted toward the land", () => {
+    // A south dock with land beside it to the west in its row, open sea to the east, and the coast running on east of it
+    // one row further north: an inside corner of the shore.
+    const map = config.map;
+    const corner = map.docks.find(
+      (each) => each.side === "S" && terrainAt(map, each.tileX - 1, each.tileY) === Terrain.Land && terrainAt(map, each.tileX + 1, each.tileY) === Terrain.Sea,
+    )!;
+    const berth = tileCentre(config, corner.tileX, corner.tileY);
+    for (let column = corner.tileX; column <= corner.tileX + 4; column++) expect(terrainAt(map, column, corner.tileY - 1)).toBe(Terrain.Land);
+    for (let row = corner.tileY; row <= corner.tileY + 3; row++) {
+      for (let column = corner.tileX + 1; column <= corner.tileX + 3; column++) expect(terrainAt(map, column, row)).toBe(Terrain.Sea);
+    }
+    // The approach the browser test sails: from 1–3 tiles east and 2–4 tiles south of the dock, at a heading one or two
+    // units west of north, ahead and interact held together from a slow start. Every lateral offset across those tiles,
+    // 16 sub-units apart, moors on the first step it starts within the dock's reach with a clear run to the berth,
+    // never touching the shore.
+    const north = compassHeading("N");
+    let approaches = 0;
+    for (const heading of [north - 1, north - 2]) {
+      for (let x = (corner.tileX + 1) * tile; x < (corner.tileX + 4) * tile; x += 16) {
+        for (const [rowsOut, speed] of [[2, config.ship.dockMaxSpeed], [3, 0], [3, config.ship.dockMaxSpeed], [4, 0]] as const) {
+          const start = { ...shipAt(corner.tileX + 2, corner.tileY + rowsOut, heading), x, speed };
+          const course = sailFor(start, helm(0, 1, INTERACT_BUTTON), 30 * WORLD_STEPS_PER_SECOND);
+          const moored = course.findIndex((ship) => ship.dock !== NOT_DOCKED);
+          expect(moored, `heading ${heading}, x ${x}, speed ${speed}`).toBeGreaterThan(0);
+          expect(course[moored]).toMatchObject({ ...berth, speed: 0, dock: corner.id, mooredThrottle: 1 });
+          const before = [start, ...course.slice(0, moored)];
+          expect(dockInReach(config, before.at(-1)!.x, before.at(-1)!.y)).toBe(corner);
+          for (const ship of before.slice(0, -1)) expect(dockInReach(config, ship.x, ship.y)).toBeUndefined();
+          for (const ship of before.slice(1)) expect(ship.speed).toBeGreaterThan(0);
+          for (const ship of course) expect(hullIsClear(config, ship.x, ship.y)).toBe(true);
+          approaches++;
+        }
+      }
+    }
+    expect(approaches).toBe(2 * 3 * (tile / 16) * 4);
+  }, 30_000);
+
+  it("moors every approach into a berth's open sides on the first step the terrain allows, at every dock", async ({ annotate }) => {
+    // The oracle: from terrain lookups alone, the nearest dock a ship at (x, y) may moor at. A tile the hull overlaps is
+    // the berth tile or an orthogonal neighbour, or a diagonal neighbour with one of its two shared tiles navigable; or
+    // the berth centre is within reach and the hull stays on navigable tiles along the straight run to it.
+    const hullOnSea = (sea: SimulationConfig, x: number, y: number) => {
+      const half = sea.ship.hullHalfSize;
+      for (let row = Math.floor((y - half) / tile); row <= Math.floor((y + half) / tile); row++) {
+        for (let column = Math.floor((x - half) / tile); column <= Math.floor((x + half) / tile); column++) {
+          if (!isNavigable(sea.map, column, row)) return false;
+        }
+      }
+      return true;
+    };
+    const oracle = (sea: SimulationConfig, x: number, y: number) => {
+      const half = sea.ship.hullHalfSize;
+      let best: (typeof sea.map.docks)[number] | undefined;
+      let bestDistance = Infinity;
+      for (const each of sea.map.docks) {
+        const centre = tileCentre(sea, each.tileX, each.tileY);
+        const distance = (centre.x - x) ** 2 + (centre.y - y) ** 2;
+        if (distance >= bestDistance) continue;
+        let beside = false;
+        for (let row = Math.floor((y - half) / tile); row <= Math.floor((y + half) / tile); row++) {
+          for (let column = Math.floor((x - half) / tile); column <= Math.floor((x + half) / tile); column++) {
+            const dx = column - each.tileX;
+            const dy = row - each.tileY;
+            if (Math.abs(dx) > 1 || Math.abs(dy) > 1) continue;
+            if (dx === 0 || dy === 0 || isNavigable(sea.map, each.tileX + dx, each.tileY) || isNavigable(sea.map, each.tileX, each.tileY + dy)) beside = true;
+          }
+        }
+        let clearRun = false;
+        if (!beside && distance <= sea.ship.dockRadius ** 2) {
+          const steps = Math.max(Math.abs(centre.x - x), Math.abs(centre.y - y));
+          clearRun = true;
+          for (let index = 0; index <= steps && clearRun; index++) {
+            const along = (delta: number) => (steps === 0 ? 0 : Math.trunc((delta * index) / steps));
+            clearRun = hullOnSea(sea, x + along(centre.x - x), y + along(centre.y - y));
+          }
+        }
+        if (beside || clearRun) {
+          best = each;
+          bestDistance = distance;
+        }
+      }
+      return best;
+    };
+
+    // Where a lane may come to rest near a berth without mooring (holding ahead, aground, within the 5 × 5 tiles around
+    // the berth), by dock and tile: each is a coast the lane's heading drives into, out of reach of the berth.
+    const allowedRests: Record<string, string> = {
+      "synthetic island (10, 5)": "the island's east coast, two tiles north of the berth",
+      "synthetic island (7, 8)": "the island's south coast, two tiles west of the berth and a row south",
+      "Palm Key, west dock (17, 19)": "the island's west coast, two tiles north of the berth",
+      "Palm Key, west dock (17, 23)": "the island's west coast, two tiles south of the berth",
+      "Palm Key, south dock (25, 27)": "the island's south coast in the berth's row, two tiles east of it",
+      "Palm Key, south dock (21, 28)": "the island's south coast, two tiles west of the berth and a row south",
+      "Ember Rock, east dock (93, 19)": "the island's east coast, two tiles north of the berth",
+      "Ember Rock, east dock (93, 23)": "the island's east coast, two tiles south of the berth",
+      "Ember Rock, south dock (85, 27)": "the island's south coast in the berth's row, two tiles west of it",
+      "Ember Rock, south dock (89, 28)": "the island's south coast, two tiles east of the berth and a row south",
+      "Old Stones, west dock (17, 87)": "the island's west coast, two tiles north of the berth",
+      "Old Stones, west dock (17, 91)": "the island's west coast, two tiles south of the berth",
+      "Old Stones, north dock (25, 83)": "the island's north coast in the berth's row, two tiles east of it",
+      "Old Stones, north dock (21, 82)": "the island's north coast, two tiles west of the berth and a row north",
+      "Mist Cay, east dock (93, 87)": "the island's east coast, two tiles north of the berth",
+      "Mist Cay, east dock (93, 91)": "the island's east coast, two tiles south of the berth",
+      "Mist Cay, north dock (85, 83)": "the island's north coast in the berth's row, two tiles west of it",
+      "Mist Cay, north dock (89, 82)": "the island's north coast, two tiles east of the berth and a row north",
+    };
+
+    const docks = [
+      { name: "synthetic island", sea: cornerIsland, dock: cornerIsland.map.docks[0]! },
+      ...config.map.docks.map((each) => ({ name: dockLabel(config.map, each.id), sea: config, dock: each })),
+    ];
+    const failures: string[] = [];
+    const rests = new Set<string>();
+    let lanes = 0;
+    let moorings = 0;
+    let restsNear = 0;
+    let sailedPast = 0;
+    for (const { name, sea, dock: berthDock } of docks) {
+      const centre = tileCentre(sea, berthDock.tileX, berthDock.tileY);
+      const openSides = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }, { dx: -1, dy: 0 }, { dx: 0, dy: -1 }].filter(({ dx, dy }) =>
+        isNavigable(sea.map, berthDock.tileX + dx, berthDock.tileY + dy),
+      );
+      const headings: number[] = [];
+      for (let heading = 0; heading < HEADING_COUNT; heading += 8) {
+        // Pointing into an open side: sailing against that side's outward direction.
+        if (openSides.some(({ dx, dy }) => dx * HEADING_DX[heading]! + dy * HEADING_DY[heading]! < 0)) headings.push(heading);
+      }
+      if (headings.length === 0) failures.push(`${name}: no open side`);
+      // Every sea position on a 64-sub-unit grid whose tile is 2 to 4 tiles (Chebyshev) from the berth tile.
+      const starts: { x: number; y: number }[] = [];
+      for (let y = (berthDock.tileY - 4) * tile; y < (berthDock.tileY + 5) * tile; y += 64) {
+        for (let x = (berthDock.tileX - 4) * tile; x < (berthDock.tileX + 5) * tile; x += 64) {
+          const ring = Math.max(Math.abs(Math.floor(x / tile) - berthDock.tileX), Math.abs(Math.floor(y / tile) - berthDock.tileY));
+          if (ring >= 2 && hullIsClear(sea, x, y)) starts.push({ x, y });
+        }
+      }
+      for (const { x, y } of starts) {
+        for (const heading of headings) {
+          for (const speed of [0, divTrunc(sea.ship.maxSpeed, 2), sea.ship.maxSpeed]) {
+            const label = `${name}, from (${x}, ${y}), heading ${heading}, speed ${speed}`;
+            lanes++;
+            let ship: ShipState = { ...shipAt(0, 0, heading, sea), x, y, speed };
+            let outcome: "moored" | "rest" | "away" | "sailing" = "sailing";
+            for (let index = 0; index < 400 && outcome === "sailing"; index++) {
+              const expected = oracle(sea, ship.x, ship.y);
+              const next = sail(sea, ship, helm(0, 1, INTERACT_BUTTON));
+              if (expected !== undefined) {
+                const target = tileCentre(sea, expected.tileX, expected.tileY);
+                if (next.dock !== expected.id || next.x !== target.x || next.y !== target.y || next.speed !== 0) {
+                  failures.push(`${label}: step ${index} from (${ship.x}, ${ship.y}) may moor at dock ${expected.id} but gave dock ${next.dock}`);
+                }
+                outcome = "moored";
+                moorings++;
+              } else if (next.dock !== NOT_DOCKED) {
+                failures.push(`${label}: step ${index} from (${ship.x}, ${ship.y}) moored at dock ${next.dock}, which the oracle refuses`);
+                outcome = "moored";
+              } else if (next.speed === 0) {
+                // At rest with ahead held: aground, and it stays there.
+                outcome = "rest";
+                const rest = toTilePosition(sea, next.x, next.y);
+                if (Math.abs(rest.tileX - berthDock.tileX) <= 2 && Math.abs(rest.tileY - berthDock.tileY) <= 2) {
+                  restsNear++;
+                  const key = `${name} (${rest.tileX}, ${rest.tileY})`;
+                  rests.add(key);
+                  if (!(key in allowedRests)) failures.push(`${label}: came to rest unmoored on ${key}, at (${next.x}, ${next.y})`);
+                } else sailedPast++;
+              } else {
+                // With its heading fixed, a ship moves one way along each axis, so once it is more than six tiles from
+                // the berth it never comes back.
+                const at = toTilePosition(sea, next.x, next.y);
+                if (Math.max(Math.abs(at.tileX - berthDock.tileX), Math.abs(at.tileY - berthDock.tileY)) > 6) {
+                  outcome = "away";
+                  sailedPast++;
+                }
+              }
+              ship = next;
+            }
+            if (outcome === "sailing") failures.push(`${label}: still under way near the berth after 400 steps`);
+          }
+        }
+      }
+    }
+    for (const key of Object.keys(allowedRests)) if (!rests.has(key)) failures.push(`${key}: listed, but no lane comes to rest there`);
+    // Every lane is accounted for: moored, at rest near the berth on a listed tile, or past the berth.
+    await annotate(`${lanes} lanes over ${docks.length} docks: ${moorings} moored, ${restsNear} came to rest on a listed tile, ${sailedPast} sailed past or grounded away from the berth`);
+    if (moorings + restsNear + sailedPast !== lanes) failures.push(`${lanes} lanes, but ${moorings + restsNear + sailedPast} outcomes`);
+    expect(failures.length === 0 ? [] : [`${failures.length} failures`, ...failures.slice(0, 40)]).toEqual([]);
+  }, 30_000);
+
+  it("docks on the real map at every dock", () => {
+    for (const each of config.map.docks) {
+      const centre = tileCentre(config, each.tileX, each.tileY);
+      expect(sail(config, { ...shipAt(each.tileX, each.tileY, 0), x: centre.x + 1, y: centre.y }, INTERACT).dock).toBe(each.id);
+      expect(terrainAt(config.map, each.tileX, each.tileY)).toBe(Terrain.Dock);
+    }
+  });
+});
+
+describe("visibility", () => {
+  const sight = config.sightRadius;
+
+  it("sees ships within the sight radius and not beyond it", () => {
+    const viewer = shipAt(50, 100, 0);
+    expect(sight).toBe(10 * tile);
+    expect(canSee(config, viewer, { ...viewer, id: "b", x: viewer.x + sight })).toBe(true);
+    expect(canSee(config, viewer, { ...viewer, id: "b", x: viewer.x + sight + 1 })).toBe(false);
+    // Diagonals compare true distance: 6-8-10 is on the circle, 6-9 is outside it.
+    expect(canSee(config, viewer, { ...viewer, id: "b", x: viewer.x + 6 * tile, y: viewer.y + 8 * tile })).toBe(true);
+    expect(canSee(config, viewer, { ...viewer, id: "b", x: viewer.x + 6 * tile, y: viewer.y + 9 * tile })).toBe(false);
+  });
+
+  it("always includes the viewer's own ship", () => {
+    // On the open row three tiles south of the hub: b is in sight of a and c, a and c are out of each other's sight.
+    const row = seaMap.hub.tileY + 3;
+    const [a, b, c] = [seaMap.hub.tileX - 10, seaMap.hub.tileX - 5, seaMap.hub.tileX + 10];
+    let state = matchWithShips(8, ["a", "b", "c"]);
+    state = placeShip(config, state, "a", { tileX: a, tileY: row, heading: 0 });
+    state = placeShip(config, state, "b", { tileX: b, tileY: row, heading: 0 });
+    state = placeShip(config, state, "c", { tileX: c, tileY: row, heading: 0 });
+    expect([...visibleShipIds(config, state, "a")].sort()).toEqual(["a", "b"]);
+    expect([...visibleShipIds(config, state, "c")]).toEqual(["c"]);
+    expect(visibleShipIds(config, state, "nobody").size).toBe(0);
+  });
+});
+
+describe("placement", () => {
+  it("puts a ship at rest on a navigable tile and refuses land", () => {
+    const moving = run(matchWithShips(3, ["a"]), [{ frame: 1, shipId: "a", input: FULL_AHEAD }], 30);
+    const land = config.map.islands[0]!;
+    const { hub } = config.map;
+    expect(terrainAt(seaMap, hub.tileX, hub.tileY)).toBe(Terrain.Sea);
+    const placed = placeShip(config, moving, "a", { ...hub, heading: HEADING_COUNT + 2 });
+    expect(placed.ships[0]).toMatchObject({ ...tileCentre(config, hub.tileX, hub.tileY), heading: 2, speed: 0, dock: NOT_DOCKED });
+    const centreOfLand = { tileX: land.tileX + Math.floor(land.widthTiles / 2), tileY: land.tileY + Math.floor(land.heightTiles / 2) };
+    expect(terrainAt(seaMap, centreOfLand.tileX, centreOfLand.tileY)).toBe(Terrain.Land);
+    expect(() => placeShip(config, moving, "a", { ...centreOfLand, heading: 0 })).toThrow(/not navigable/);
+    expect(() => placeShip(config, moving, "zz", { ...hub, heading: 0 })).toThrow();
+    expect(() => placeShip(config, moving, "a", { tileX: config.map.widthTiles, tileY: hub.tileY, heading: 0 })).toThrow(/not navigable/);
+  });
+});
+
+describe("spawning", () => {
+  it("gives eight ships eight different slots, chosen by the seeded generator, at rest facing the slot's heading", () => {
+    const ids = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const state = matchWithShips(2024, ids);
+    expect(new Set(state.ships.map((ship) => ship.slot)).size).toBe(8);
+    for (const ship of state.ships) {
+      const slot = config.spawnSlots[ship.slot]!;
+      expect(ship).toMatchObject({ ...tileCentre(config, slot.tileX, slot.tileY), heading: compassHeading(slot.facing), speed: 0, dock: NOT_DOCKED });
+    }
+    expect(() => addShip(config, state, "i")).toThrow(/no free spawn slot/);
+    const other = matchWithShips(2025, ids);
+    expect(other.ships.map((ship) => ship.slot)).not.toEqual(state.ships.map((ship) => ship.slot));
+  });
+
+  it("frees a slot when a ship leaves", () => {
+    const state = removeShip(matchWithShips(1, ["a", "b"]), "a");
+    expect(state.ships.map((ship) => ship.id)).toEqual(["b"]);
+  });
+
+  it("refuses a duplicate ship id", () => {
+    expect(() => addShip(config, matchWithShips(1, ["a"]), "a")).toThrow();
+  });
+});
+
+describe("ships in encounters (§6)", () => {
+  const berth = config.map.docks[0]!;
+  const sailing = () => {
+    let state = addShip(config, createMatchState(7), "a");
+    state = placeShip(config, state, "a", { ...config.map.hub, heading: 0 });
+    for (let frame = 0; frame < 30; frame++) state = step(config, state, { a: { buttons: 0, moveX: 0, moveY: -AXIS_SCALE } });
+    return state;
+  };
+
+  it("keeps the grapple button apart from interact, and sailing ignores it", () => {
+    expect(GRAPPLE_BUTTON & INTERACT_BUTTON).toBe(0);
+    const state = sailing();
+    const ship = state.ships[0]!;
+    const input = { buttons: 0, moveX: 0, moveY: -AXIS_SCALE };
+    expect(sail(config, ship, { ...input, buttons: GRAPPLE_BUTTON })).toEqual(sail(config, ship, input));
+  });
+
+  it("keeps the fruit button apart from interact and the grapple, and sailing ignores it", () => {
+    expect(FRUIT_BUTTON & (INTERACT_BUTTON | GRAPPLE_BUTTON)).toBe(0);
+    const ship = sailing().ships[0]!;
+    const input = { buttons: 0, moveX: 0, moveY: -AXIS_SCALE };
+    expect(sail(config, ship, { ...input, buttons: FRUIT_BUTTON })).toEqual(sail(config, ship, input));
+  });
+
+  it("stops a reserved ship where it is, and it stays put on neutral input", () => {
+    const state = sailing();
+    expect(state.ships[0]!.speed).toBeGreaterThan(0);
+    let held = stopShip(state, "a");
+    const at = held.ships[0]!;
+    expect(at).toMatchObject({ x: state.ships[0]!.x, y: state.ships[0]!.y, speed: 0 });
+    for (let frame = 0; frame < 30; frame++) held = step(config, held, { a: { buttons: 0, moveX: 0, moveY: 0 } });
+    expect(held.ships[0]).toEqual(at);
+    expect(() => stopShip(state, "nobody")).toThrow();
+  });
+
+  it("returns a ship at rest to a point, or moored at its respawn dock, and refuses a point a hull does not fit", () => {
+    const state = sailing();
+    const dock = tileCentre(config, berth.tileX, berth.tileY);
+    const moored = returnShip(config, state, "a", { ...dock, dock: berth.id });
+    expect(moored.ships[0]).toMatchObject({ ...dock, speed: 0, dock: berth.id, mooredThrottle: 0, heading: state.ships[0]!.heading });
+    // Moored, it stays on neutral input.
+    expect(step(config, step(config, step(config, moored, {}), {}), {}).ships[0]).toEqual(moored.ships[0]);
+    const open = tileCentre(config, config.map.hub.tileX, config.map.hub.tileY);
+    expect(returnShip(config, state, "a", { ...open, dock: NOT_DOCKED }).ships[0]).toMatchObject({ ...open, speed: 0, dock: NOT_DOCKED });
+    const landIndex = config.map.terrain.findIndex((_, index) => terrainAt(config.map, index % config.map.widthTiles, Math.floor(index / config.map.widthTiles)) === Terrain.Land);
+    const inland = tileCentre(config, landIndex % config.map.widthTiles, Math.floor(landIndex / config.map.widthTiles));
+    expect(() => returnShip(config, state, "a", { ...inland, dock: NOT_DOCKED })).toThrow(RangeError);
+    expect(() => returnShip(config, state, "a", { ...open, dock: 999 })).toThrow(RangeError);
+    expect(() => returnShip(config, state, "a", { x: open.x + 0.5, y: open.y, dock: NOT_DOCKED })).toThrow(RangeError);
+  });
+
+  it("sees a point (a duel marker) by the ships' sight rule, boundary included", () => {
+    const viewer = { x: 10_000, y: 10_000 };
+    expect(pointInSight(config, viewer, { x: viewer.x + config.sightRadius, y: viewer.y })).toBe(true);
+    expect(pointInSight(config, viewer, { x: viewer.x + config.sightRadius + 1, y: viewer.y })).toBe(false);
+    const diagonal = Math.floor(config.sightRadius / Math.SQRT2);
+    expect(pointInSight(config, viewer, { x: viewer.x + diagonal, y: viewer.y - diagonal })).toBe(true);
+  });
+});
+
+describe("the sail tonic (§11)", () => {
+  /** A long open sea: a ship can sail 60 tiles east at a tonic's speed without meeting anything. */
+  const lane = testConfig(Array.from({ length: 5 }, () => ".".repeat(90)));
+  const TICKS = 240;
+
+  /** One ship at full speed heading `heading` from the lane's west end, and the state's world tick. */
+  function cruising(heading: number): MatchState {
+    let state: MatchState = { ...createMatchState(1), ships: [{ ...shipAt(2, 2, heading, lane), speed: lane.ship.maxSpeed }] };
+    for (let frame = 0; frame < 30; frame++) state = step(lane, state, { a: FULL_AHEAD });
+    expect(state.ships[0]!.speed).toBe(lane.ship.maxSpeed);
+    return state;
+  }
+
+  it("raises the top speed by a tenth of maxSpeed, rounded to an integer, following the tuning: 39 + 4 = 43", () => {
+    expect(config.ship.maxSpeed).toBe(39);
+    expect(tonicSpeedBonus(config.ship)).toBe(4);
+    expect(topSpeed(config, false)).toBe(39);
+    expect(topSpeed(config, true)).toBe(43);
+    for (const [maxSpeed, bonus] of [[40, 4], [45, 5], [44, 4], [50, 5], [15, 2], [5, 1], [4, 0]] as const) expect(tonicSpeedBonus({ maxSpeed })).toBe(bonus);
+    expect(topSpeed(testConfig(["....."], { maxSpeed: 60 }), true)).toBe(66);
+  });
+
+  it("drunk on tick t, lifts the cap to 43 for the steps of ticks t + 1 to t + 240 on a cardinal heading, then clamps back to 39 on tick t + 241", () => {
+    let state = cruising(0);
+    const t = state.worldTick;
+    state = drinkTonic(state, "a", t + TICKS);
+    expect(state.ships[0]!.tonicUntil).toBe(t + TICKS);
+    const moves: number[] = [];
+    while (state.worldTick < t + TICKS + 3) {
+      const before = state.ships[0]!;
+      state = step(lane, state, { a: FULL_AHEAD });
+      if (isWorldTick(state)) moves.push(state.ships[0]!.x - before.x);
+    }
+    // Tick t + 1 accelerates from 39 by the tuning's 3; ticks t + 2 to t + 240 sail at the cap, 43.
+    expect(moves[0]).toBe(39 + lane.ship.acceleration);
+    expect(moves.slice(1, TICKS)).toEqual(Array.from({ length: TICKS - 1 }, () => 43));
+    // Tick t + 241: the plain cap again, and the speed clamped to it at once (no drag down from 43).
+    expect(moves.slice(TICKS)).toEqual([39, 39, 39]);
+    expect(state.ships[0]!.speed).toBe(39);
+  });
+
+  it("keeps the heading table's rounding on a diagonal heading", () => {
+    const heading = 8;
+    let state = drinkTonic(cruising(heading), "a", 10_000);
+    for (let frame = 0; frame < 9; frame++) state = step(lane, state, { a: FULL_AHEAD });
+    const before = state.ships[0]!;
+    state = step(lane, step(lane, step(lane, state, { a: FULL_AHEAD }), { a: FULL_AHEAD }), { a: FULL_AHEAD });
+    const after = state.ships[0]!;
+    expect(after.speed).toBe(43);
+    expect(after.x - before.x).toBe(divTrunc(43 * HEADING_DX[heading]!, HEADING_SCALE));
+    expect(after.y - before.y).toBe(divTrunc(43 * HEADING_DY[heading]!, HEADING_SCALE));
+    expect([after.x - before.x, after.y - before.y]).toEqual([30, 30]);
+  });
+
+  it("is part of the state: the hash covers it, and replaying the same inputs and drinks gives the same hash", () => {
+    const base = cruising(0);
+    expect(hashState(drinkTonic(base, "a", base.worldTick + TICKS))).not.toBe(hashState(base));
+    const replay = () => {
+      let state = drinkTonic(base, "a", base.worldTick + TICKS);
+      for (let frame = 0; frame < 300; frame++) state = step(lane, state, { a: frame < 150 ? FULL_AHEAD : helm(1, 1) });
+      return state;
+    };
+    expect(hashState(replay())).toBe(hashState(replay()));
+    expect(() => drinkTonic(base, "nobody", 5)).toThrow();
+    expect(() => drinkTonic(base, "a", 1.5)).toThrow(RangeError);
+    expect(() => drinkTonic(base, "a", -1)).toThrow(RangeError);
+  });
+
+  it("boosts a ship that no input reaches too (a lapsed client), and never a moored one", () => {
+    let state = drinkTonic(cruising(0), "a", 10_000);
+    const before = state.ships[0]!;
+    for (let frame = 0; frame < 3; frame++) state = step(lane, state, {});
+    // No input: it coasts (drag 1) under the raised cap, not clamped to 39.
+    expect(state.ships[0]!.speed).toBe(before.speed - lane.ship.drag);
+    const moored = { ...state, ships: [{ ...state.ships[0]!, speed: 0, dock: 0 }] };
+    expect(step(lane, step(lane, step(lane, moored, {}), {}), {}).ships[0]).toEqual(moored.ships[0]);
+  });
+});
+
+function isWorldTick(state: MatchState): boolean {
+  return state.frame % WORLD_STEP_INTERVAL === 0;
+}

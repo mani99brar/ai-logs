@@ -1,0 +1,569 @@
+     1	"""`python -m workflow repair`: an operator's fix commit becomes a new lane snapshot after freeze, before review.
+     2	
+     3	Frozen snapshots never change, so a lane blocked at `verify_<lane>` or at the combined candidate used to need a new
+     4	run. `repair` records the fix in `repairs.json`, builds one deterministic snapshot commit per named lane (the lane's
+     5	snapshot with the fix's files it owns, parent the run's base), raises the attempt counters past the existing evidence
+     6	and forks the run's LangGraph thread at the freeze boundary with the new snapshots. It launches no session, runs no
+     7	check and never invokes the graph: `automatic --live` (or `retry` for a manual run) re-verifies the repaired lanes,
+     8	rechecks the others, checks a new candidate generation for every lane and only then reaches review. Every apply step
+     9	is idempotent, so a crash is completed by rerunning the identical command. `--workspace` makes a detached worktree at
+    10	the right base to commit the fix in, never in the source checkout.
+    11	"""
+    12	from __future__ import annotations
+    13	
+    14	import argparse
+    15	import hashlib
+    16	import os
+    17	import shlex
+    18	import subprocess
+    19	import sys
+    20	import tempfile
+    21	from datetime import datetime
+    22	from pathlib import Path
+    23	
+    24	from langgraph.checkpoint.sqlite import SqliteSaver
+    25	
+    26	from .checks import now
+    27	from .pipeline import Pipeline, build_pipeline, commit_env, digest_file, graph_config, report
+    28	from .sessions import git, read_json, run_lock, save_json
+    29	from .verification import owns, safe_path
+    30	from .worktrees import git_worktree
+    31	
+    32	MAX_REPAIRS = 3
+    33	JOURNAL_VERSION = "1.0.0"
+    34	# Once any of these exists a reviewer has seen a candidate: code changes then need a new run.
+    35	REVIEW_FILES = ("review-bundle.json", "review.json", "integration-intent.json")
+    36	
+    37	
+    38	# ---- The journal, as the graph reads it --------------------------------------------------------------------------
+    39	
+    40	def load_repairs(directory: Path) -> list[dict]:
+    41	    path = directory / "repairs.json"
+    42	    return read_json(path)["repairs"] if path.exists() else []
+    43	
+    44	
+    45	def applied_repairs(directory: Path) -> list[dict]:
+    46	    return [entry for entry in load_repairs(directory) if entry["status"] == "applied"]
+    47	
+    48	
+    49	def attempt_floor(directory: Path, phase: str, node: str) -> int:
+    50	    """The first attempt of the lane's current revision in this phase: the latest applied repair's floor for it, else 1.
+    51	
+    52	    The attempt limit counts from here, so it is per lane, phase and revision; MAX_REPAIRS bounds the revisions.
+    53	    """
+    54	    for entry in reversed(applied_repairs(directory)):
+    55	        if f"{phase}:{node}" in entry["attempt_floors"]:
+    56	            return entry["attempt_floors"][f"{phase}:{node}"]
+    57	    return 1
+    58	
+    59	
+    60	def candidate_paths(directory: Path, generation: int) -> tuple[Path, Path]:
+    61	    """`candidate.json` and `candidate/` before any repair; `candidate-<g>.json` and `candidate-<g>/` after g applied repairs."""
+    62	    suffix = f"-{generation}" if generation else ""
+    63	    return directory / f"candidate{suffix}.json", directory / f"candidate{suffix}"
+    64	
+    65	
+    66	def repair_command(directory: Path, entry: dict) -> str:
+    67	    return (f"{sys.executable} -m workflow repair {shlex.quote(str(directory))} {','.join(entry['lanes'])} "
+    68	            f"--commit {entry['source_commit']} --reason {shlex.quote(entry['reason'])}")
+    69	
+    70	
+    71	def refuse_recorded(directory: Path) -> None:
+    72	    """While a repair is recorded its refs and counters may already exist: the failed branch never resumes, completing it is the way on."""
+    73	    for entry in load_repairs(directory):
+    74	        if entry["status"] == "recorded":
+    75	            raise RuntimeError(f"Repair {entry['n']} is recorded but not applied; rerun exactly: {repair_command(directory, entry)}")
+    76	
+    77	
+    78	def repair_note(directory: Path) -> str:
+    79	    """The reviewer prompt's line per applied repair: the lanes the operator changed, why, and where that change is."""
+    80	    note = ""
+    81	    for entry in applied_repairs(directory):
+    82	        diff = directory / f"repair-{entry['n']}.diff"
+    83	        note += (f" Lane(s) {', '.join(entry['lanes'])} were repaired by the operator before review (repair {entry['n']}: {entry['reason']}); "
+    84	                 f"the operator's change is {diff}; the rest of review.diff is the workers' work.")
+    85	    return note
+    86	
+    87	
+    88	def repaired_snapshot(previous: dict, entry: dict, lane: str) -> dict:
+    89	    """The lane's snapshot after `entry`: the new commit and files, the worker's own session and handoff, the provenance."""
+    90	    item = entry["lanes"][lane]
+    91	    summary = (f"{previous['summary']}\n\nOperator repair {entry['n']}: {entry['reason']} (files {', '.join(item['fix_files'])}; "
+    92	               f"source {entry['source_commit']} on {entry['base_kind']} {entry['base_commit'][:8]})")
+    93	    return {"commit": item["commit"], "changed_files": item["changed_files"], "session_id": previous["session_id"],
+    94	            "summary": summary, "open_assumptions": previous["open_assumptions"],
+    95	            "repair": {"n": entry["n"], "mode": entry["mode"], "base_kind": entry["base_kind"], "base_commit": entry["base_commit"],
+    96	                       "previous_commit": item["previous_commit"], "source_commit": entry["source_commit"], "fix_files": item["fix_files"],
+    97	                       "reason": entry["reason"], "recorded_at": entry["recorded_at"]}}
+    98	
+    99	
+   100	def effective_snapshots(directory: Path, entries: list[dict]) -> dict:
+   101	    """snapshots.json, the generation-0 record that is never rewritten, overlaid by `entries` in order."""
+   102	    snapshots = read_json(directory / "snapshots.json")
+   103	    for entry in entries:
+   104	        for lane in entry["lanes"]:
+   105	            snapshots[lane] = repaired_snapshot(snapshots[lane], entry, lane)
+   106	    return snapshots
+   107	
+   108	
+   109	def continuation(runtime, executable: str = sys.executable) -> str:
+   110	    """Automatic plans continue only under the supervisor; manual plans with retry, up to the review gate."""
+   111	    directory = shlex.quote(str(runtime.directory))
+   112	    if runtime.plan.get("automatic"):
+   113	        return f"{executable} -m workflow automatic {directory} --live"
+   114	    return f"{executable} -m workflow retry {directory}"
+   115	
+   116	
+   117	# ---- State refusals (S0) -----------------------------------------------------------------------------------------
+   118	
+   119	def parse_lanes(value: str, workers: list[str]) -> list[str]:
+   120	    """`<lane>[,<lane>]`: distinct lanes of this run, returned in the run's lane order."""
+   121	    named = [item.strip() for item in value.split(",")]
+   122	    if any(not item for item in named):
+   123	        raise ValueError(f"The lanes are a comma-separated list of lane ids, like ui or ui,adapter; got {value!r}")
+   124	    if len(set(named)) != len(named):
+   125	        raise ValueError(f"The lane list names a lane twice: {value}")
+   126	    unknown = [item for item in named if item not in workers]
+   127	    if unknown:
+   128	        raise ValueError(f"Not a lane of this run: {', '.join(unknown)} (lanes: {', '.join(workers)})")
+   129	    return [node for node in workers if node in named]
+   130	
+   131	
+   132	def raw_attempt(directory: Path, phase: str, node: str) -> int:
+   133	    path = directory / "attempts.json"
+   134	    return read_json(path).get(f"{phase}:{node}", 1) if path.exists() else 1
+   135	
+   136	
+   137	def attempt_directories(directory: Path, phase: str, node: str) -> list[int]:
+   138	    folder = directory / "verification" / phase / node
+   139	    return sorted(int(item.name) for item in folder.iterdir() if item.is_dir() and item.name.isdigit()) if folder.is_dir() else []
+   140	
+   141	
+   142	def check_before_review(runtime, state) -> None:
+   143	    pending = [item.value.get("kind") for task in state.tasks for item in task.interrupts]
+   144	    if (any((runtime.directory / name).exists() for name in REVIEW_FILES) or state.values.get("integrated_commit")
+   145	            or {"independent_review", "integration_approval"} & set(pending)):
+   146	        raise ValueError("Reviewers have seen a candidate; code changes need a new run")
+   147	
+   148	
+   149	def blocked_step(runtime, state) -> dict:
+   150	    """The check verdict the run stopped at: a blocked packet of the candidate, or of a failed verify_<lane>."""
+   151	    directory = runtime.directory
+   152	    pending = [item.value.get("kind") for task in state.tasks for item in task.interrupts]
+   153	    if not state.values:
+   154	        raise ValueError("The run was never started; there is no frozen lane to repair")
+   155	    if any(step.startswith("launch_") for step in state.next):
+   156	        raise ValueError("A launch step is pending or failed; use reconcile")
+   157	    if pending == ["worker_handoff"] or not (directory / "snapshots.json").exists():
+   158	        raise ValueError("A lane blocked before freeze: repair needs frozen snapshots, and an automatic run blocked there needs a new run "
+   159	                         "(RUNBOOK, Blocked after freeze: repair a lane)")
+   160	    for phase in ("worker", "candidate"):
+   161	        for node in runtime.workers:
+   162	            folder = directory / "verification" / phase / node / str(raw_attempt(directory, phase, node))
+   163	            if folder.is_dir() and not (folder / "packet.json").exists():
+   164	                raise ValueError(f"Interrupted check at {folder}; use retry --phase {phase} --node {node}")
+   165	    failed = [task.name for task in state.tasks if task.error and task.name in state.next]
+   166	    verifies = {f"verify_{node}" for node in runtime.workers}
+   167	    if failed == ["candidate"] and tuple(state.next) == ("candidate",):
+   168	        phase, nodes = "candidate", runtime.workers
+   169	    elif failed and set(state.next) <= verifies:
+   170	        phase, nodes = "worker", [name.removeprefix("verify_") for name in failed]
+   171	    else:
+   172	        raise ValueError("The run did not stop at a check verdict of the candidate or a verify_<lane> step; inspect, then retry")
+   173	    packets = []
+   174	    for node in nodes:
+   175	        attempt = raw_attempt(directory, phase, node)
+   176	        path = directory / "verification" / phase / node / str(attempt) / "packet.json"
+   177	        packet = read_json(path) if path.exists() else None
+   178	        if packet and packet["gate"]["status"] == "blocked":
+   179	            packets.append({"phase": phase, "node_id": node, "path": str(path.relative_to(directory)), "sha256": digest_file(path),
+   180	                            "attempt": attempt, "output_commit": packet["expected"]["output_commit"], "reasons": packet["gate"]["reasons"]})
+   181	    if not packets:
+   182	        raise ValueError("The failed step has no blocked packet at its current attempt, so it is not a check verdict "
+   183	                         "(an infrastructure error, a cherry-pick conflict, a partial candidate); inspect, then retry")
+   184	    return {"step": "candidate" if phase == "candidate" else ", ".join(failed), "packets": packets}
+   185	
+   186	
+   187	def check_source(runtime) -> None:
+   188	    """integrate()'s own checks, done early: a fix committed on the pinned source branch is outside every gate."""
+   189	    plan, repo = runtime.plan, Path(runtime.plan["repository"])
+   190	    elsewhere = f"commit fixes in a repair workspace (repair {runtime.directory} <lane> --workspace), never in the source checkout"
+   191	    branch = subprocess.run(["git", "-C", str(repo), "symbolic-ref", "-q", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+   192	    if branch != plan["source_branch"]:
+   193	        raise ValueError(f"The source checkout is on {branch or 'a detached HEAD'}, not the run's branch {plan['source_branch']}; {elsewhere}")
+   194	    head = git(repo, "rev-parse", "HEAD")
+   195	    if head != plan["base_commit"]:
+   196	        raise ValueError(f"The source branch {branch} moved from the run's base {plan['base_commit'][:8]} to {head[:8]}, which integration "
+   197	                         f"refuses; {elsewhere}")
+   198	    if git(repo, "status", "--porcelain"):
+   199	        raise ValueError(f"The source checkout has uncommitted changes, which integration refuses; {elsewhere}")
+   200	
+   201	
+   202	def fork_point(graph, config, runtime, previous: dict, checkpoint_id: str | None = None):
+   203	    """The freeze boundary: the newest checkpoint whose next step is exactly the verify fan-out (the handoff's output or the
+   204	    previous repair's fork), or the recorded one. Its snapshots must be snapshots.json overlaid by the applied repairs."""
+   205	    fan_out = {f"verify_{node}" for node in runtime.workers}
+   206	    fork = next((item for item in graph.get_state_history(config)
+   207	                 if (item.config["configurable"]["checkpoint_id"] == checkpoint_id if checkpoint_id else set(item.next) == fan_out)), None)
+   208	    if fork is None or set(fork.next) != fan_out or fork.values.get("snapshots") != previous:
+   209	        raise RuntimeError("Contradictory run state: no freeze-boundary checkpoint holds snapshots.json plus the applied repairs; inspect")
+   210	    return fork
+   211	
+   212	
+   213	def blocked_run(runtime, graph, config, applied: list[dict]) -> tuple:
+   214	    """Every state refusal. Returns the head, the blocked step, the fork point and the effective snapshots."""
+   215	    state = graph.get_state(config)
+   216	    check_before_review(runtime, state)
+   217	    if len(applied) >= MAX_REPAIRS:
+   218	        raise ValueError(f"{len(applied)} repairs are already applied to this run (at most {MAX_REPAIRS}); start a revised run")
+   219	    if applied and state.config["configurable"]["checkpoint_id"] == applied[-1]["head_after"]:
+   220	        raise ValueError(f"Repair {applied[-1]['n']} is applied and the run has not continued from it; an applied repair is not "
+   221	                         f"replaced. Continue with: {continuation(runtime)}")
+   222	    blocked = blocked_step(runtime, state)
+   223	    check_source(runtime)
+   224	    previous = effective_snapshots(runtime.directory, applied)
+   225	    return state, blocked, fork_point(graph, config, runtime, previous), previous
+   226	
+   227	
+   228	# ---- The commit: its base, the fix per lane, each lane's tree (S0) -----------------------------------------------
+   229	
+   230	def resolve_commit(repo: Path, value: str) -> str:
+   231	    result = None if value.startswith("-") else subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"],
+   232	                                                                capture_output=True, text=True)
+   233	    if result is None or result.returncode != 0 or not result.stdout.strip():
+   234	        raise ValueError(f"--commit {value} is not a commit in {repo}")
+   235	    return result.stdout.strip()
+   236	
+   237	
+   238	def descends(repo: Path, ancestor: str, commit: str) -> bool:
+   239	    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, commit], capture_output=True).returncode == 0
+   240	
+   241	
+   242	def changed_paths(repo: Path, old: str, new: str) -> list[str]:
+   243	    output = subprocess.check_output(["git", "-C", str(repo), "diff-tree", "-r", "--no-renames", "--name-only", "-z", old, new]).decode()
+   244	    return sorted(filter(None, output.split("\0")))
+   245	
+   246	
+   247	def lane_owner(runtime, path: str) -> str | None:
+   248	    """The declared lane (selected or excluded) whose owned paths hold `path`; lanes never overlap."""
+   249	    return next((worker["node_id"] for worker in runtime.policy["workers"]
+   250	                 if any(owns(path, safe_path(prefix)) for prefix in worker["owned_paths"])), None)
+   251	
+   252	
+   253	def tree_entries(repo: Path, commit: str, paths: list[str]) -> dict:
+   254	    """`path -> ls-tree line` for the paths present in `commit`."""
+   255	    if not paths:
+   256	        return {}
+   257	    output = subprocess.check_output(["git", "-C", str(repo), "ls-tree", "-r", "-z", commit, "--", *paths]).decode()
+   258	    return {line.split("\t", 1)[1]: line for line in filter(None, output.split("\0"))}
+   259	
+   260	
+   261	def overlay_tree(repo: Path, snapshot: str, paths: list[str], entries: dict) -> str:
+   262	    """The snapshot's tree with `paths` as the fix has them (removed where it deletes them), built in a private index.
+   263	
+   264	    The index lives in a temporary directory: the source checkout's own index and the run directory are never written.
+   265	    """
+   266	    with tempfile.TemporaryDirectory(prefix="workflow-repair-") as scratch:
+   267	        env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+   268	        command = ["git", "-C", str(repo)]
+   269	        subprocess.run([*command, "read-tree", snapshot], env=env, check=True, capture_output=True)
+   270	        removed = [path for path in paths if path not in entries]
+   271	        if removed:
+   272	            subprocess.run([*command, "update-index", "--force-remove", "--", *removed], env=env, check=True, capture_output=True)
+   273	        present = "".join(entries[path] + "\0" for path in paths if path in entries)
+   274	        if present:
+   275	            subprocess.run([*command, "update-index", "-z", "--index-info"], input=present.encode(), env=env, check=True, capture_output=True)
+   276	        return subprocess.check_output([*command, "write-tree"], env=env, text=True).strip()
+   277	
+   278	
+   279	def derive(runtime, lanes: list[str], source: str, phase: str, previous: dict) -> dict:
+   280	    """The fix's base, the files of each named lane and each lane's new tree, checked with freeze's rules. Read only
+   281	    (Git writes the trees' objects, which nothing references)."""
+   282	    directory, repo = runtime.directory, Path(runtime.plan["repository"])
+   283	    generation = len(applied_repairs(directory))
+   284	    saved = [candidate_paths(directory, number)[0] for number in range(generation + 1)]
+   285	    commits = [read_json(path)["commit"] if path.exists() else None for path in saved]
+   286	    current, older = commits[-1], [commit for commit in commits[:-1] if commit]
+   287	    if phase == "candidate" and current and descends(repo, current, source):
+   288	        base_kind, base = "candidate", current
+   289	    elif any(descends(repo, commit, source) for commit in older):
+   290	        raise ValueError(f"--commit {source[:8]} is on the candidate of an earlier generation, not the current one ({(current or 'none')[:8]}); "
+   291	                         "commit the fix on the current candidate")
+   292	    elif any(descends(repo, previous[lane]["commit"], source) for lane in lanes):
+   293	        if len(lanes) > 1:
+   294	            raise ValueError("A fix on a lane snapshot repairs one lane only: overlaying base content onto another lane would discard its "
+   295	                             "changes. Commit a fix spanning lanes on the failing candidate (repair <run> <lanes> --workspace)")
+   296	        base_kind, base = "snapshot", previous[lanes[0]]["commit"]
+   297	    else:
+   298	        bases = ([f"the current candidate {current[:8]}"] if phase == "candidate" and current else []) + \
+   299	                [f"the {lane} snapshot {previous[lane]['commit'][:8]}" for lane in lanes]
+   300	        raise ValueError(f"--commit {source[:8]} descends from neither {' nor '.join(bases)}; make it in a repair workspace "
+   301	                         f"(repair {directory} <lane> --workspace)")
+   302	    fix = changed_paths(repo, base, source)
+   303	    for path in fix:
+   304	        safe_path(path)
+   305	        owner = lane_owner(runtime, path)
+   306	        if owner is None:
+   307	            raise ValueError(f"The fix changes {path}, which no lane owns")
+   308	        if owner in runtime.excluded:
+   309	            raise ValueError(f"Ownership violation: the fix changes {path}, owned by excluded lane {owner}")
+   310	        if owner not in lanes:
+   311	            raise ValueError(f"The fix changes {path}, owned by lane {owner}, which this repair does not name; name {owner} too or leave the file alone")
+   312	    entries = tree_entries(repo, source, fix)
+   313	    for path, line in entries.items():
+   314	        mode = line.split(" ", 1)[0]
+   315	        if mode == "120000":
+   316	            raise ValueError(f"Symlink changes require manual review before snapshot: {path}")
+   317	        if mode == "160000":
+   318	            raise ValueError(f"Gitlink (submodule) changes are refused: {path}")
+   319	    result = {}
+   320	    for lane in lanes:
+   321	        snapshot = previous[lane]["commit"]
+   322	        paths = [path for path in fix if lane_owner(runtime, path) == lane]
+   323	        tree = overlay_tree(repo, snapshot, paths, entries)
+   324	        if tree == git(repo, "rev-parse", f"{snapshot}^{{tree}}"):
+   325	            raise ValueError(f"The fix changes nothing in the {lane} snapshot {snapshot[:8]}: a repair is not a retry (use retry for a transient failure)")
+   326	        changed = changed_paths(repo, runtime.plan["base_commit"], tree)
+   327	        runtime.check_ownership(lane, changed)
+   328	        result[lane] = {"previous_commit": snapshot, "fix_files": paths, "tree": tree, "changed_files": changed}
+   329	    return {"base_kind": base_kind, "base_commit": base, "lanes": result,
+   330	            "expected_candidate_tree": git(repo, "rev-parse", f"{source}^{{tree}}") if base_kind == "candidate" else None}
+   331	
+   332	
+   333	def attempt_targets(directory: Path, lanes: list[str], workers: list[str]) -> dict:
+   334	    """The worker phase of each repaired lane and the candidate phase of every lane that has a candidate attempt directory
+   335	    start past their counter and past every existing attempt: nothing is moved, and no attempt directory is reused."""
+   336	    targets = {}
+   337	    for phase, nodes in (("worker", lanes), ("candidate", workers)):
+   338	        for node in nodes:
+   339	            existing = attempt_directories(directory, phase, node)
+   340	            if phase == "worker" or existing:
+   341	                targets[f"{phase}:{node}"] = max(raw_attempt(directory, phase, node), max(existing, default=0) + 1)
+   342	    return targets
+   343	
+   344	
+   345	# ---- Apply (S1 to S6), each step idempotent -----------------------------------------------------------------------
+   346	
+   347	def save_entry(directory: Path, entry: dict) -> None:
+   348	    repairs = [item for item in load_repairs(directory) if item["n"] != entry["n"]] + [entry]
+   349	    save_json(directory / "repairs.json", {"version": JOURNAL_VERSION, "repairs": sorted(repairs, key=lambda item: item["n"])})
+   350	
+   351	
+   352	def record_repair(directory: Path, entry: dict) -> None:
+   353	    """S1: the entry, `recorded`: from here drive() and retry refuse until the identical command completes it."""
+   354	    save_entry(directory, entry)
+   355	
+   356	
+   357	def commit_snapshots(runtime, entry: dict, derived: dict) -> None:
+   358	    """S2: one commit per lane, parent the run's base, dated at the recorded time so a rerun makes the same commit; refs keep
+   359	    it and the operator's commit. Beside refs/workflow/, where no lane id can name them."""
+   360	    repo, plan = runtime.plan["repository"], runtime.plan
+   361	    stamp = f"{int(datetime.fromisoformat(entry['recorded_at']).timestamp())} +0000"
+   362	    env = {**commit_env(), "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+   363	    prefix = f"refs/workflow-repair/{hashlib.sha256(str(runtime.directory).encode()).hexdigest()[:16]}/{entry['n']}"
+   364	    for lane, item in derived["lanes"].items():
+   365	        commit = plan["base_commit"]  # As freeze records a lane that changed nothing.
+   366	        if item["changed_files"]:
+   367	            commit = subprocess.check_output(["git", "-C", repo, "-c", "commit.gpgsign=false", "commit-tree", item["tree"], "-p", plan["base_commit"],
+   368	                                              "-m", f"Workflow {plan['run_id']}: {lane} repair {entry['n']}"], env=env, text=True).strip()
+   369	        item["commit"] = commit
+   370	        subprocess.run(["git", "-C", repo, "update-ref", f"{prefix}/{lane}", commit], check=True)
+   371	    subprocess.run(["git", "-C", repo, "update-ref", f"{prefix}/source_commit", entry["source_commit"]], check=True)
+   372	
+   373	
+   374	def save_lanes(runtime, entry: dict, derived: dict) -> None:
+   375	    """S3: each lane's commit and files into the journal, and the operator's change per lane as repair-<n>.diff."""
+   376	    for lane, item in derived["lanes"].items():
+   377	        entry["lanes"][lane].update(commit=item["commit"], changed_files=item["changed_files"])
+   378	    save_entry(runtime.directory, entry)
+   379	    with (runtime.directory / f"repair-{entry['n']}.diff").open("wb") as handle:
+   380	        for item in entry["lanes"].values():
+   381	            handle.write(subprocess.check_output(["git", "-C", runtime.plan["repository"], "diff", "--binary", item["previous_commit"], item["commit"]]))
+   382	
+   383	
+   384	def raise_attempts(directory: Path, entry: dict) -> None:
+   385	    """S4: each target counter raised, never lowered."""
+   386	    path = directory / "attempts.json"
+   387	    attempts = read_json(path) if path.exists() else {}
+   388	    for key, target in entry["attempt_targets"].items():
+   389	        attempts[key] = max(attempts.get(key, 1), target)
+   390	    save_json(path, attempts)
+   391	
+   392	
+   393	def fork_run(graph, config, runtime, entry: dict, fork, snapshots: dict) -> str:
+   394	    """S5: exactly one new checkpoint, as if `handoff` had written the repaired snapshots, forked from the freeze boundary.
+   395	
+   396	    `fork.config` carries its checkpoint_id, and pending writes are not carried into a fork: the failed step's trigger
+   397	    and the old packets stay on the failed branch. The bare thread config would update the failed head instead, which
+   398	    runs the candidate beside the verifies with the new snapshots and the old packets. Neither the handoff's interrupt,
+   399	    nor freeze, nor the worker stop runs; only its edges fire.
+   400	    """
+   401	    head = graph.get_state(config)
+   402	    if head.config["configurable"]["checkpoint_id"] == entry["head_before"]:
+   403	        graph.update_state(fork.config, {"snapshots": snapshots}, as_node="handoff")
+   404	        head = graph.get_state(config)
+   405	    elif not (head.parent_config and head.parent_config["configurable"]["checkpoint_id"] == entry["fork_from"] and head.metadata.get("source") == "update"):
+   406	        raise RuntimeError(f"Checkpoint moved since repair {entry['n']} was recorded (head {head.config['configurable']['checkpoint_id']}); inspect")
+   407	    if set(head.next) != {f"verify_{node}" for node in runtime.workers} or any(task.error for task in head.tasks) or head.values.get("snapshots") != snapshots:
+   408	        raise RuntimeError(f"Contradictory run state after the fork of repair {entry['n']}: the next step is not the verify fan-out; inspect")
+   409	    return head.config["configurable"]["checkpoint_id"]
+   410	
+   411	
+   412	def finish_repair(runtime, graph, config, entry: dict, head_after: str) -> None:
+   413	    """S6: the timeline, the entry `applied`, then the report and run-state.json. Events a crash duplicated are harmless."""
+   414	    directory, n = runtime.directory, entry["n"]
+   415	    answers = " ".join(f"Answers {packet['phase']}/{packet['node_id']} attempt {packet['attempt']}: {'; '.join(packet['reasons'])}."
+   416	                       for packet in entry["blocked"]["packets"])
+   417	    for lane, item in entry["lanes"].items():
+   418	        runtime.event(f"verify_{lane}", "paused", f"Repair {n} by the operator: snapshot {item['commit'][:8]} = {item['previous_commit'][:8]} + "
+   419	                                                  f"{entry['source_commit'][:8]} on {entry['base_kind']} {entry['base_commit'][:8]} "
+   420	                                                  f"({', '.join(item['fix_files'])}). Reason: {entry['reason']}. {answers} "
+   421	                                                  f"Continue with {continuation(runtime, 'python')}")
+   422	    superseded = candidate_paths(directory, n - 1)[0]
+   423	    if superseded.exists():
+   424	        runtime.event("candidate", "paused", f"Repair {n} supersedes combined revision {read_json(superseded)['commit'][:8]}; "
+   425	                                             f"candidate-{n} is built after the lanes re-verify")
+   426	    runtime.event("controller", "running", f"Repair {n} applied: checkpoint forked from {entry['fork_from'][:8]} (after handoff); attempts "
+   427	                                           + ", ".join(f"{key} {value}" for key, value in entry["attempt_targets"].items()))
+   428	    entry.update(status="applied", applied_at=now(), head_after=head_after)
+   429	    save_entry(directory, entry)
+   430	    report(runtime, graph.get_state(config))
+   431	
+   432	
+   433	def apply_repair(runtime, graph, config, lanes: list[str], commit: str, reason: str, dry_run: bool) -> None:
+   434	    directory, repo = runtime.directory, Path(runtime.plan["repository"])
+   435	    source = resolve_commit(repo, commit)
+   436	    entries = load_repairs(directory)
+   437	    applied = [entry for entry in entries if entry["status"] == "applied"]
+   438	    recorded = next((entry for entry in entries if entry["status"] == "recorded"), None)
+   439	    if recorded is None:
+   440	        state, blocked, fork, previous = blocked_run(runtime, graph, config, applied)
+   441	    elif list(recorded["lanes"]) != lanes or recorded["source_commit"] != source or recorded["reason"] != reason:
+   442	        raise RuntimeError(f"Repair {recorded['n']} is recorded but not applied; only the identical command completes it: "
+   443	                           f"{repair_command(directory, recorded)}")
+   444	    else:
+   445	        # Completing a crashed repair: the head may already be its fork, so the recorded step and fork point stand.
+   446	        check_before_review(runtime, graph.get_state(config))
+   447	        check_source(runtime)
+   448	        blocked, previous = recorded["blocked"], effective_snapshots(directory, applied)
+   449	        fork = fork_point(graph, config, runtime, previous, recorded["fork_from"])
+   450	    derived = derive(runtime, lanes, source, blocked["packets"][0]["phase"], previous)
+   451	    if recorded is None:
+   452	        targets = attempt_targets(directory, lanes, runtime.workers)
+   453	        entry = {"n": len(entries) + 1, "status": "recorded", "mode": "commit", "reason": reason, "recorded_at": now(), "blocked": blocked,
+   454	                 "source_commit": source, "base_kind": derived["base_kind"], "base_commit": derived["base_commit"],
+   455	                 "expected_candidate_tree": derived["expected_candidate_tree"],
+   456	                 "lanes": {lane: {"previous_commit": item["previous_commit"], "fix_files": item["fix_files"]} for lane, item in derived["lanes"].items()},
+   457	                 "attempt_targets": targets, "attempt_floors": dict(targets),
+   458	                 "fork_from": fork.config["configurable"]["checkpoint_id"], "head_before": state.config["configurable"]["checkpoint_id"]}
+   459	    else:
+   460	        entry = recorded
+   461	        if any(entry[key] != derived[key] for key in ("base_kind", "base_commit", "expected_candidate_tree")) or \
+   462	                any(entry["lanes"][lane]["fix_files"] != item["fix_files"] for lane, item in derived["lanes"].items()):
+   463	            raise RuntimeError(f"Contradictory run state: repair {entry['n']} no longer derives the snapshots it recorded; inspect")
+   464	    if dry_run:
+   465	        print(f"Dry run of repair {entry['n']} (nothing written): {reason}\n{describe(entry, derived, dry_run)}\n"
+   466	              f"  fork from checkpoint {entry['fork_from']} (after handoff)\nApply: the same command without --dry-run. Then continue with: {continuation(runtime)}")
+   467	        return
+   468	    if recorded is None:
+   469	        record_repair(directory, entry)                                                   # S1
+   470	    commit_snapshots(runtime, entry, derived)                                             # S2
+   471	    save_lanes(runtime, entry, derived)                                                   # S3
+   472	    raise_attempts(directory, entry)                                                      # S4
+   473	    snapshots = effective_snapshots(directory, applied + [entry])
+   474	    finish_repair(runtime, graph, config, entry, fork_run(graph, config, runtime, entry, fork, snapshots))  # S5, S6
+   475	    print(f"Repair {entry['n']} applied: {reason}\n{describe(entry, derived, dry_run)}\n  checkpoint forked from {entry['fork_from']} "
+   476	          f"(after handoff); nothing launched, no check run\nContinue with: {continuation(runtime)}")
+   477	
+   478	
+   479	def describe(entry: dict, derived: dict, dry_run: bool) -> str:
+   480	    lines = [f"  base: {entry['base_kind']} {entry['base_commit']}"]
+   481	    for lane, item in derived["lanes"].items():
+   482	        new = f"a commit of tree {item['tree']} on the base" if dry_run else item["commit"]
+   483	        lines.append(f"  {lane}: {item['previous_commit']} -> {new}; fix files: {', '.join(item['fix_files'])}; "
+   484	                     f"changed files: {', '.join(item['changed_files'])}")
+   485	    lines.append("  attempts (each also the floor of its limit): " + ", ".join(f"{key} {value}" for key, value in entry["attempt_targets"].items()))
+   486	    return "\n".join(lines)
+   487	
+   488	
+   489	# ---- --workspace ----------------------------------------------------------------------------------------------------
+   490	
+   491	BROWSER_RULES = ("Every required scenario id appears in exactly one test title as `[scenario:<id>]`, and that test, when it passes, "
+   492	                 "attaches exactly one `image/png` named `screenshot:<id>` (other attachments never count). RUNBOOK: Playwright evidence convention.")
+   493	
+   494	
+   495	def make_workspace(runtime, graph, config, lanes: list[str], reason: str | None) -> None:
+   496	    """A detached worktree at the base the fix belongs on, with a brief of what blocked the run. No journal, no graph state."""
+   497	    directory, repo = runtime.directory, Path(runtime.plan["repository"])
+   498	    refuse_recorded(directory)
+   499	    applied = applied_repairs(directory)
+   500	    _, blocked, _, previous = blocked_run(runtime, graph, config, applied)
+   501	    if blocked["packets"][0]["phase"] == "candidate":
+   502	        base = read_json(candidate_paths(directory, len(applied))[0])["commit"]
+   503	        what = "the combined candidate that failed"
+   504	    elif len(lanes) == 1:
+   505	        base, what = previous[lanes[0]]["commit"], f"the {lanes[0]} snapshot"
+   506	    else:
+   507	        raise ValueError("A worker-phase block has no combined candidate: a fix on a lane snapshot repairs one lane only; name one lane")
+   508	    number = 1
+   509	    while (directory / f"repair-workspace-{number}").exists() or (directory / f"repair-workspace-{number}.brief.md").exists():
+   510	        number += 1
+   511	    path = directory / f"repair-workspace-{number}"
+   512	    git_worktree(repo, "add", "--detach", str(path), base)
+   513	    command = (f"{sys.executable} -m workflow repair {shlex.quote(str(directory))} {','.join(lanes)} --commit $(git -C {shlex.quote(str(path))} rev-parse HEAD) "
+   514	               f"--reason {shlex.quote(reason or '<why the fix is needed>')}")
+   515	    brief = [f"# Repair workspace {number} of run {runtime.plan['run_id']}", "",
+   516	             f"Detached at {base}, {what}. Commit the fix here, never on the source branch {runtime.plan['source_branch']}: "
+   517	             f"integration needs it at the run's base {runtime.plan['base_commit']}.", "", f"## Blocked: {blocked['step']}"]
+   518	    for packet in blocked["packets"]:
+   519	        folder = (directory / packet["path"]).parent
+   520	        evidence = sorted(folder.glob("setup-*.log")) + sorted(folder.glob("check-*.log")) + sorted(folder.glob("browser-report-*.json"))
+   521	        brief += ["", f"{packet['phase']}/{packet['node_id']} attempt {packet['attempt']} at {packet['output_commit']}, gate reasons verbatim:",
+   522	                  *(f"- {item}" for item in packet["reasons"]), "", "Evidence:", f"- {directory / packet['path']}", *(f"- {item}" for item in evidence)]
+   523	    brief += ["", "## Lanes to repair"]
+   524	    for lane in lanes:
+   525	        worker = runtime.worker_policy(lane)
+   526	        brief += ["", f"{lane} owns: {', '.join(worker['owned_paths'])}. The fix may change only paths the named lanes own.", "Checks:",
+   527	                  *(f"- {check['id']} ({check['kind']}): {shlex.join(check['argv'])}" for check in worker["checks"])]
+   528	    if any(check["kind"] == "browser" for lane in lanes for check in runtime.worker_policy(lane)["checks"]):
+   529	        brief += ["", "## Browser evidence", "", BROWSER_RULES]
+   530	    brief += ["", "## Then", "", f"git -C {shlex.quote(str(path))} commit -am '<what the fix does>'", command, ""]
+   531	    (directory / f"repair-workspace-{number}.brief.md").write_text("\n".join(brief))
+   532	    print(f"Repair workspace {number}: {path}, detached at {base} ({what}).\nBrief: {directory / f'repair-workspace-{number}.brief.md'}\n"
+   533	          f"Commit the fix there, never on the source branch, then:\n  {command}")
+   534	
+   535	
+   536	def repair_main(argv=None):
+   537	    parser = argparse.ArgumentParser(prog="python -m workflow repair", description="Turn an operator's fix commit into new snapshots of "
+   538	                                     "frozen lanes blocked at their checks or at the combined candidate, before review. Launches nothing and "
+   539	                                     "runs no check; automatic --live (or retry for a manual run) re-verifies.")
+   540	    parser.add_argument("directory", type=Path)
+   541	    parser.add_argument("lanes", help="The lane the fix belongs to, or comma-separated lanes for a fix on the combined candidate")
+   542	    parser.add_argument("--commit", metavar="SHA", help="The fix commit, on the failing candidate or on the lane's snapshot")
+   543	    parser.add_argument("--reason", help="Why: recorded in the journal, the timeline, the snapshot summary and the reviewer prompt")
+   544	    parser.add_argument("--workspace", action="store_true", help="Create a detached worktree at the right base, with a brief, to commit the fix in")
+   545	    parser.add_argument("--dry-run", action="store_true", help="Validate and print what --commit would do; write nothing")
+   546	    args = parser.parse_args(argv)
+   547	    directory = args.directory.resolve()
+   548	    try:
+   549	        if bool(args.commit) == args.workspace:
+   550	            raise ValueError("Give exactly one of --commit <sha> (apply a fix) and --workspace (make a worktree to commit one in)")
+   551	        if args.commit and not (args.reason or "").strip():
+   552	            raise ValueError("--reason is required with --commit and must not be empty")
+   553	        if args.dry_run and args.workspace:
+   554	            raise ValueError("--dry-run applies to --commit")
+   555	        with run_lock(directory, "automatic-supervisor.lock"), run_lock(directory):
+   556	            runtime = Pipeline(directory)
+   557	            if "workers" not in runtime.plan:
+   558	                raise ValueError("A plan pinned before configured lanes cannot be repaired; start a revised run")
+   559	            lanes = parse_lanes(args.lanes, runtime.workers)
+   560	            if not (directory / "pipeline.sqlite").exists():
+   561	                raise ValueError("The run was never started; there is no frozen lane to repair")
+   562	            with SqliteSaver.from_conn_string(str(directory / "pipeline.sqlite")) as saver:
+   563	                graph, config = build_pipeline(saver, runtime), graph_config(runtime)
+   564	                if args.workspace:
+   565	                    make_workspace(runtime, graph, config, lanes, args.reason)
+   566	                else:
+   567	                    apply_repair(runtime, graph, config, lanes, args.commit, args.reason.strip(), args.dry_run)
+   568	    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+   569	        parser.exit(1, f"Blocked: {error}\nAll work/evidence retained at {directory}. Nothing launched.\n")

@@ -1,0 +1,733 @@
+     1	"""The guardrails of feature.json 2.2.0 (docs/PRD_PORTABLE_WORKFLOW.md sections 2 and 4.3 to 4.6).
+     2	
+     3	- Outcome briefs: every lane task has non-empty `## Goal`, `## Acceptance` and `## Stop` sections.
+     4	- Decisions: the feature directory holds a non-empty `decisions.md` (written by the `workflow-grill` skill); it is
+     5	  pinned into the plan and every worker and reviewer prompt includes it after the task.
+     6	- Design challenge: one read-only `claude --print` job reads the pinned PRD, tasks and decisions before any worker
+     7	  starts and writes `challenge.json`. It runs inside `start` and `resume`, outside the LangGraph graph (it must decide
+     8	  before any worker session exists, and it pauses and resumes on its own); the export shows it as the first node.
+     9	  A P0 or P1 concern pauses the run; `resume` commits the edited feature files on the run's branch, moves the run to
+    10	  that commit, re-pins them and reruns it, `resume --accept-challenge <reason>` records an override.
+    11	- Completion 1.1.0 and questions: a worker may end its turn with status `question`; its deadline pauses (persisted
+    12	  in `<node>.deadline.json`) until `answer` records the reply and types it into the worker's pane.
+    13	
+    14	2.0.0 and 2.1.0 features, and every run prepared before this slice, carry none of the plan keys read here and
+    15	behave exactly as before.
+    16	"""
+    17	from __future__ import annotations
+    18	
+    19	import argparse
+    20	import copy
+    21	import fcntl
+    22	import hashlib
+    23	import json
+    24	import os
+    25	import re
+    26	import shutil
+    27	import subprocess
+    28	import sys
+    29	import time
+    30	import uuid
+    31	from contextlib import contextmanager
+    32	from datetime import datetime, timezone
+    33	from pathlib import Path
+    34	
+    35	from .checks import now
+    36	from .sessions import git, plan_workers, read_json, run_lock, save_json, terminate
+    37	from .verification import CONTRACTS, validate_schema
+    38	
+    39	GUARDED_VERSION = "2.2.0"
+    40	REQUIRED_HEADINGS = ("Goal", "Acceptance", "Stop")
+    41	DECISIONS = "decisions.md"
+    42	COMPLETION_VERSION = "1.1.0"
+    43	LEGACY_COMPLETION_VERSION = "1.0.0"
+    44	MAX_QUESTIONS = 3
+    45	CHALLENGE = "challenge"
+    46	BLOCKING = frozenset({"P0", "P1"})
+    47	DEFAULT_CHALLENGE_TIMEOUT = 1800
+    48	CHALLENGE_SCHEMA = CONTRACTS / "challenge.schema.json"
+    49	MIGRATION_NOTE = ("feature.json {version}: no guardrail is enforced (outcome-brief headings, decisions.md, design challenge, "
+    50	                  "completion evidence). To migrate, set \"version\": \"2.2.0\", give every task non-empty ## Goal, ## Acceptance "
+    51	                  "and ## Stop sections, and write decisions.md with the workflow-grill skill (workflow/README.md).")
+    52	
+    53	
+    54	# ---- Outcome briefs and decisions (launch and prepare) -------------------------------------------------------
+    55	
+    56	def sections(text: str) -> dict[str, str]:
+    57	    """The level-2 sections of a Markdown text by heading, each with its body up to the next `## ` heading.
+    58	
+    59	    Lines inside fenced code blocks are body text, never headings.
+    60	    """
+    61	    found: dict[str, list[str]] = {}
+    62	    current = None
+    63	    fence = None
+    64	    for line in text.splitlines():
+    65	        stripped = line.strip()
+    66	        marker = re.match(r"(`{3,}|~{3,})", stripped)
+    67	        if marker and (fence is None or marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence)):
+    68	            fence = None if fence else marker.group(1)
+    69	        elif fence is None and re.match(r"## \S", line):
+    70	            current = line[3:].strip().rstrip("#").strip()
+    71	            found.setdefault(current, [])
+    72	            continue
+    73	        if current is not None:
+    74	            found[current].append(line)
+    75	    return {heading: "\n".join(lines) for heading, lines in found.items()}
+    76	
+    77	
+    78	def brief_problems(text: str) -> list[str]:
+    79	    """`missing ## Stop`, `empty ## Acceptance`, ...: a required heading needs at least one non-blank line before the next `## `."""
+    80	    found = sections(text)
+    81	    problems = []
+    82	    for heading in REQUIRED_HEADINGS:
+    83	        if heading not in found:
+    84	            problems.append(f"missing ## {heading}")
+    85	        elif not found[heading].strip():
+    86	            problems.append(f"empty ## {heading}")
+    87	    return problems
+    88	
+    89	
+    90	def stop_rule(text: str) -> str | None:
+    91	    """The body of the task's `## Stop` section, which the worker prompt repeats as its bound."""
+    92	    body = sections(text).get("Stop", "").strip()
+    93	    return body or None
+    94	
+    95	
+    96	def is_guarded(manifest: dict) -> bool:
+    97	    return manifest.get("version") == GUARDED_VERSION
+    98	
+    99	
+   100	def migration_note(manifest: dict) -> str | None:
+   101	    """The note a launch of a feature before 2.2.0 prints; None for a guarded feature."""
+   102	    return None if is_guarded(manifest) else MIGRATION_NOTE.format(version=manifest.get("version"))
+   103	
+   104	
+   105	def prd_path(target: Path, value: str) -> Path:
+   106	    """The feature's `prd` inside the target; refused when it escapes the target or does not exist."""
+   107	    path = (target / value).resolve()
+   108	    if not path.is_relative_to(target.resolve()) or not path.is_file():
+   109	        raise ValueError(f"prd {value!r} does not exist in the target {target}")
+   110	    return path
+   111	
+   112	
+   113	def refusals(target: Path, folder: Path, manifest: dict, tasks: dict[str, Path]) -> list[str]:
+   114	    """Every reason a 2.2.0 feature may not launch; empty for a feature before 2.2.0."""
+   115	    if not is_guarded(manifest):
+   116	        return []
+   117	    found = []
+   118	    for path in tasks.values():
+   119	        problems = brief_problems(path.read_text())
+   120	        if problems:
+   121	            found.append(f"{os.path.relpath(path, folder)}: {', '.join(problems)} (an outcome brief needs non-empty ## Goal, ## Acceptance and ## Stop)")
+   122	    decisions = folder / DECISIONS
+   123	    if decisions.is_symlink() or not decisions.is_file() or not decisions.read_text().strip():
+   124	        found.append(f"{DECISIONS} is missing or empty: interview the operator with the workflow-grill skill, which writes it")
+   125	    if "prd" in manifest:
+   126	        try:
+   127	            prd_path(target, manifest["prd"])
+   128	        except ValueError as error:
+   129	            found.append(str(error))
+   130	    return found
+   131	
+   132	
+   133	def pinned_task(text: str, worker: dict) -> str:
+   134	    """A lane's task as the plan pins it: the authored text plus the approved ownership and checks."""
+   135	    return text + "\nApproved ownership and checks:\n" + json.dumps(worker)
+   136	
+   137	
+   138	def pin_guardrails(plan: dict, directory: Path, task_files: dict[str, Path], decisions: Path, prd: Path | None, challenge: bool) -> None:
+   139	    """The plan keys of a 2.2.0 run: the completion version, the challenge flag, decisions.md, the PRD copy and the task paths."""
+   140	    text = decisions.read_text()
+   141	    if not text.strip():
+   142	        raise ValueError(f"{decisions} is empty")
+   143	    plan.update(feature_version=GUARDED_VERSION, completion_version=COMPLETION_VERSION, challenge=challenge,
+   144	                decisions={"path": str(decisions.resolve()), "text": text},
+   145	                prd=pin_prd(directory, prd) if prd else None,
+   146	                task_files={node: str(path.resolve()) for node, path in task_files.items()})
+   147	
+   148	
+   149	def pin_prd(directory: Path, source: Path) -> dict:
+   150	    """Copy the PRD (any format the challenge can Read, PDFs included) into the run's challenge inputs; the plan keeps its hash."""
+   151	    if not source.is_file():
+   152	        raise ValueError(f"PRD {source} does not exist")
+   153	    inputs = directory / "challenge-inputs"
+   154	    inputs.mkdir(mode=0o700, exist_ok=True)
+   155	    copy_path = inputs / ("prd" + "".join(source.suffixes[-1:]))
+   156	    temporary = copy_path.with_name(f".{copy_path.name}.{uuid.uuid4()}.tmp")
+   157	    shutil.copyfile(source, temporary)
+   158	    os.chmod(temporary, 0o600)
+   159	    os.replace(temporary, copy_path)
+   160	    return {"path": str(source.resolve()), "copy": str(copy_path.relative_to(directory)), "sha256": digest_bytes(copy_path.read_bytes())}
+   161	
+   162	
+   163	def completion_version(plan: dict) -> str:
+   164	    """1.1.0 for runs prepared from a 2.2.0 feature; every other run (all runs before slice 2 included) reads 1.0.0."""
+   165	    return plan.get("completion_version", LEGACY_COMPLETION_VERSION)
+   166	
+   167	
+   168	def decisions_text(plan: dict) -> str | None:
+   169	    decisions = plan.get("decisions")
+   170	    return decisions.get("text") if isinstance(decisions, dict) and isinstance(decisions.get("text"), str) else None
+   171	
+   172	
+   173	def decisions_block(plan: dict) -> str:
+   174	    """What every worker and reviewer prompt appends after the task; empty for runs without decisions."""
+   175	    text = decisions_text(plan)
+   176	    return "" if text is None else "\n\nDecisions recorded before launch (decisions.md; they bind this run):\n" + text.rstrip() + "\n"
+   177	
+   178	
+   179	def has_challenge(plan: dict) -> bool:
+   180	    """The run's graph starts with the challenge node: a 2.2.0 run whose feature did not set `challenge: false`."""
+   181	    return plan.get("challenge") is True
+   182	
+   183	
+   184	# ---- Design challenge ----------------------------------------------------------------------------------------
+   185	
+   186	def digest_bytes(value: bytes) -> str:
+   187	    return hashlib.sha256(value).hexdigest()
+   188	
+   189	
+   190	def pinned_digests(directory: Path, plan: dict) -> dict:
+   191	    tasks = {node: plan["nodes"][node]["task"] for node in plan_workers(plan)}
+   192	    prd = plan.get("prd")
+   193	    return {"tasks_sha256": digest_bytes(json.dumps(tasks, sort_keys=True, ensure_ascii=False).encode()),
+   194	            "decisions_sha256": digest_bytes((decisions_text(plan) or "").encode()),
+   195	            "prd_sha256": digest_bytes((directory / prd["copy"]).read_bytes()) if prd else None}
+   196	
+   197	
+   198	def challenge_schema() -> dict:
+   199	    return json.loads(CHALLENGE_SCHEMA.read_text())
+   200	
+   201	
+   202	def output_schema() -> dict:
+   203	    """The job's `--json-schema`: the schema's `output` with the concern inlined (the CLI takes one self-contained schema)."""
+   204	    defs = challenge_schema()["$defs"]
+   205	    output = copy.deepcopy(defs["output"])
+   206	    output.pop("description", None)
+   207	    output["properties"]["concerns"]["items"] = copy.deepcopy(defs["concern"])
+   208	    return output
+   209	
+   210	
+   211	def validate_output(value) -> None:
+   212	    from jsonschema import Draft202012Validator
+   213	    Draft202012Validator({"$defs": challenge_schema()["$defs"], "$ref": "#/$defs/output"}).validate(value)
+   214	
+   215	
+   216	def challenge_prompt(directory: Path, plan: dict) -> str:
+   217	    prd = plan.get("prd")
+   218	    parts = ["You are the design challenge of a workflow run: a skeptical senior engineer who reads the plan before any worker "
+   219	             "starts. You only read; you change nothing and launch nothing. Your working directory is the repository at the "
+   220	             "run's base commit; read its code when a concern depends on it.\n\n"
+   221	             "Find the fragile assumptions, the strongest simpler alternative, the likely failure modes and one cheap experiment "
+   222	             "that could change the choice. Tie every concern to a concrete consequence and give it a severity: P0 when the plan "
+   223	             "cannot work as written, P1 when it is likely to produce the wrong result or major rework and must be settled before "
+   224	             "any worker starts, P2 when it is worth recording and the run can continue. A P0 or P1 pauses the run for the "
+   225	             "operator, so raise one only for a consequence you can name; do not reopen what decisions.md settles unless you "
+   226	             "show it cannot hold. kind is assumption, failure_mode, complexity or other. Return the requested JSON schema: "
+   227	             "concerns (possibly empty), simpler_alternative and cheap_experiment."]
+   228	    if prd:
+   229	        parts.append(f"\n\nThe PRD this feature implements: {directory / prd['copy']} (read it).")
+   230	    else:
+   231	        parts.append("\n\nThe feature names no PRD; challenge the tasks and decisions below.")
+   232	    for node in plan_workers(plan):
+   233	        parts.append(f"\n\n=== Task of lane {node} ===\n{plan['nodes'][node]['task']}")
+   234	    parts.append(f"\n\n=== decisions.md ===\n{decisions_text(plan) or ''}")
+   235	    return "".join(parts)
+   236	
+   237	
+   238	def challenge_path(directory: Path) -> Path:
+   239	    return directory / "challenge.json"
+   240	
+   241	
+   242	def load_challenge(directory: Path) -> dict | None:
+   243	    path = challenge_path(directory)
+   244	    return read_json(path) if path.exists() else None
+   245	
+   246	
+   247	def save_challenge(directory: Path, record: dict) -> None:
+   248	    """Validate, keep the record it replaces as `challenge-<attempt>.json`, then write the new one."""
+   249	    validate_schema("challenge", record)
+   250	    previous = load_challenge(directory)
+   251	    if previous is not None and previous.get("attempt"):
+   252	        archive = directory / f"challenge-{previous['attempt']}.json"
+   253	        if not archive.exists():  # The attempt as it was first decided (an accepted override keeps the paused record).
+   254	            save_json(archive, previous)
+   255	    save_json(challenge_path(directory), record)
+   256	
+   257	
+   258	def challenge_timeout(plan: dict) -> int:
+   259	    automatic = plan.get("automatic")
+   260	    return automatic["review_timeout_seconds"] if isinstance(automatic, dict) else DEFAULT_CHALLENGE_TIMEOUT
+   261	
+   262	
+   263	def challenge_worktree(runtime) -> Path:
+   264	    """A detached checkout at the base commit; the job gets only Read, Glob and Grep, and a change to it refuses the result."""
+   265	    cwd = runtime.directory / "challenge-worktree"
+   266	    base = runtime.plan["base_commit"]
+   267	    if not cwd.exists():
+   268	        subprocess.run(["git", "-C", runtime.plan["repository"], "worktree", "add", "--detach", str(cwd), base], check=True, capture_output=True)
+   269	    if git(cwd, "rev-parse", "HEAD") != base or git(cwd, "status", "--porcelain"):
+   270	        raise RuntimeError("Challenge worktree is not the clean base commit; reconcile before rerunning the challenge")
+   271	    return cwd
+   272	
+   273	
+   274	def run_challenge(runtime, attempt: int) -> dict:
+   275	    """One print job, validated and decided: `passed` without a P0/P1 concern, `paused` with one. No worker is launched here."""
+   276	    from .automatic import print_command
+   277	    directory, plan = runtime.directory, runtime.plan
+   278	    cwd = challenge_worktree(runtime)
+   279	    session_id = str(uuid.uuid4())
+   280	    running = directory / "challenge.running.json"
+   281	    save_json(running, {"attempt": attempt, "session_id": session_id, "started_at": now()})
+   282	    prompt_path = directory / f"challenge-{attempt}.prompt.txt"
+   283	    prompt_path.write_text(challenge_prompt(directory, plan))
+   284	    os.chmod(prompt_path, 0o600)
+   285	    add_dirs = [str(directory / "challenge-inputs")] if plan.get("prd") else []
+   286	    command = print_command(runtime.sessions.executable, session_id, output_schema(), add_dirs)
+   287	    runtime.event(CHALLENGE, "running", f"Design challenge attempt {attempt}: one print job, session {session_id}")
+   288	    env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+   289	    stdout = directory / f"challenge-{attempt}.stdout.json"
+   290	    try:
+   291	        with prompt_path.open() as stdin, stdout.open("w") as output, (directory / f"challenge-{attempt}.stderr.log").open("w") as errors:
+   292	            process = subprocess.Popen(command, cwd=cwd, env=env, stdin=stdin, stdout=output, stderr=errors, text=True, start_new_session=True)
+   293	        try:
+   294	            process.wait(timeout=challenge_timeout(plan))
+   295	        except subprocess.TimeoutExpired:
+   296	            terminate(process)
+   297	            raise RuntimeError(f"Design challenge attempt {attempt} deadline exhausted; no worker was launched") from None
+   298	        except BaseException:
+   299	            terminate(process)
+   300	            raise
+   301	        try:
+   302	            result = read_json(stdout)
+   303	        except ValueError:
+   304	            result = {}
+   305	        if process.returncode != 0 or result.get("session_id") != session_id or result.get("is_error") is not False or result.get("subtype") != "success":
+   306	            raise RuntimeError(f"Design challenge attempt {attempt} did not succeed; inspect {stdout}. No worker was launched.")
+   307	        output = result.get("structured_output")
+   308	        try:
+   309	            validate_output(output)
+   310	        except Exception as error:
+   311	            raise RuntimeError(f"Design challenge attempt {attempt} output violates {CHALLENGE_SCHEMA.name}: {getattr(error, 'message', error)}") from None
+   312	        if git(cwd, "rev-parse", "HEAD") != plan["base_commit"] or git(cwd, "status", "--porcelain"):
+   313	            raise RuntimeError("Challenge worktree changed during the job; refusing its result")
+   314	    except BaseException as error:
+   315	        runtime.event(CHALLENGE, "blocked", str(error) or type(error).__name__)
+   316	        raise
+   317	    blocking = [concern for concern in output["concerns"] if concern["severity"] in BLOCKING]
+   318	    record = {"version": "1.0.0", "run_id": plan["run_id"], "status": "paused" if blocking else "passed", "attempt": attempt,
+   319	              "session_id": session_id, "pinned": pinned_digests(directory, plan), "concerns": output["concerns"],
+   320	              "simpler_alternative": output["simpler_alternative"], "cheap_experiment": output["cheap_experiment"],
+   321	              "accepted_reason": None, "decided_at": now()}
+   322	    save_challenge(directory, record)
+   323	    running.unlink()
+   324	    if blocking:
+   325	        runtime.event(CHALLENGE, "paused", f"Design challenge attempt {attempt} paused the run before any worker launch: "
+   326	                                           f"{len(blocking)} P0/P1 concern(s)")
+   327	    else:
+   328	        runtime.event(CHALLENGE, "succeeded", f"Design challenge attempt {attempt} passed ({len(output['concerns'])} P2 concern(s)); launching workers")
+   329	    return record
+   330	
+   331	
+   332	def disabled_record(directory: Path, plan: dict) -> dict:
+   333	    return {"version": "1.0.0", "run_id": plan["run_id"], "status": "disabled", "attempt": 0, "session_id": None,
+   334	            "pinned": pinned_digests(directory, plan), "concerns": [], "simpler_alternative": None, "cheap_experiment": None,
+   335	            "accepted_reason": None, "decided_at": now()}
+   336	
+   337	
+   338	def challenge_gate(runtime) -> bool:
+   339	    """Called by `start` before any worker launch. True: launch the workers. False: the challenge paused the run.
+   340	
+   341	    Runs without the plan's `challenge` key (every feature before 2.2.0 and every earlier run) pass untouched.
+   342	    """
+   343	    plan, directory = runtime.plan, runtime.directory
+   344	    if "challenge" not in plan:
+   345	        return True
+   346	    current = load_challenge(directory)
+   347	    if plan["challenge"] is False:
+   348	        if current is None:
+   349	            save_challenge(directory, disabled_record(directory, plan))
+   350	            runtime.event("controller", "running", "Design challenge disabled by the feature (challenge: false)")
+   351	        return True
+   352	    if current is not None:
+   353	        if current["status"] in {"passed", "accepted"}:
+   354	            return True
+   355	        raise RuntimeError(f"The design challenge paused this run; edit the feature files, then: {resume_command(directory)}")
+   356	    if (directory / "challenge.running.json").exists():
+   357	        raise RuntimeError(f"A design challenge job was started and never decided; rerun it with: {resume_command(directory)}")
+   358	    return run_challenge(runtime, 1)["status"] == "passed"
+   359	
+   360	
+   361	def resume_command(directory: Path, herdr: bool = False, accept: bool = False) -> str:
+   362	    command = f"{sys.executable} -m workflow resume {directory}"
+   363	    if accept:
+   364	        command += ' --accept-challenge "<reason>"'
+   365	    return command + (" --herdr" if herdr else "")
+   366	
+   367	
+   368	def paused_message(directory: Path, herdr: bool = False) -> str:
+   369	    record = load_challenge(directory) or {}
+   370	    lines = [f"Design challenge attempt {record.get('attempt')} paused the run before any worker launch. Concerns:"]
+   371	    for severity in ("P0", "P1", "P2"):
+   372	        for concern in record.get("concerns", []):
+   373	            if concern["severity"] == severity:
+   374	                lines.append(f"  {severity} [{concern['kind']}] {concern['message']}\n      Consequence: {concern['consequence']}")
+   375	    lines.append(f"Simpler alternative: {record.get('simpler_alternative')}")
+   376	    lines.append(f"Cheap experiment: {record.get('cheap_experiment')}")
+   377	    lines.append("Edit the task files, decisions.md or the PRD, then rerun the challenge:\n  " + resume_command(directory, herdr))
+   378	    lines.append("Or record an override and launch the workers:\n  " + resume_command(directory, herdr, accept=True))
+   379	    return "\n".join(lines)
+   380	
+   381	
+   382	def read_pinned(plan: dict) -> tuple[dict[str, str], str]:
+   383	    """The lanes' tasks and decisions.md as the paths pinned at prepare hold them now; refused as prepare refuses them."""
+   384	    tasks = {}
+   385	    for node in plan_workers(plan):
+   386	        path = Path(plan["task_files"][node])
+   387	        text = path.read_text()
+   388	        problems = brief_problems(text)
+   389	        if problems:
+   390	            raise ValueError(f"{path}: {', '.join(problems)}")
+   391	        tasks[node] = text
+   392	    decisions = Path(plan["decisions"]["path"])
+   393	    text = decisions.read_text()
+   394	    if not text.strip():
+   395	        raise ValueError(f"{decisions} is empty")
+   396	    if plan.get("prd") and not Path(plan["prd"]["path"]).is_file():
+   397	        raise ValueError(f"PRD {plan['prd']['path']} does not exist")
+   398	    return tasks, text
+   399	
+   400	
+   401	def repin(directory: Path, plan: dict, policy: dict) -> dict:
+   402	    """Re-read the task files, decisions.md and the PRD from the paths pinned at prepare; the policy is never re-pinned."""
+   403	    workers = {worker["node_id"]: worker for worker in policy["workers"]}
+   404	    tasks, decisions = read_pinned(plan)
+   405	    for node, text in tasks.items():
+   406	        plan["nodes"][node]["task"] = pinned_task(text, workers[node])
+   407	    plan["decisions"]["text"] = decisions
+   408	    if plan.get("prd"):
+   409	        plan["prd"] = pin_prd(directory, Path(plan["prd"]["path"]))
+   410	    save_json(directory / "plan.json", plan)
+   411	    return plan
+   412	
+   413	
+   414	# ---- Revised feature files: `resume` commits them and moves the run to that commit ------------------------------
+   415	
+   416	def pinned_paths(plan: dict) -> set[str]:
+   417	    """The paths `repin` reads (the lanes' task files, decisions.md, the PRD) that lie in the source checkout, repository-relative."""
+   418	    repo = Path(plan["repository"])
+   419	    files = [*plan["task_files"].values(), plan["decisions"]["path"], *([plan["prd"]["path"]] if plan.get("prd") else [])]
+   420	    return {Path(path).relative_to(repo).as_posix() for path in files if Path(path).is_relative_to(repo)}
+   421	
+   422	
+   423	def dirty_paths(repo: Path) -> list[str]:
+   424	    """Every path `git status` reports: staged or unstaged changes (a rename as both of its paths) and untracked files."""
+   425	    output = subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all"], text=True)
+   426	    return sorted({entry[3:] for entry in output.split("\0") if entry})
+   427	
+   428	
+   429	def commits_after(repo: Path, base: str) -> list[str] | None:
+   430	    """The commits of the checked-out branch after `base`, oldest first; None when the branch no longer contains `base`."""
+   431	    if subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", base, "HEAD"], capture_output=True).returncode != 0:
+   432	        return None
+   433	    return git(repo, "rev-list", "--reverse", f"{base}..HEAD").split()
+   434	
+   435	
+   436	def revision_subject(run_id: str) -> str:
+   437	    return f"Workflow {run_id}: feature files revised"
+   438	
+   439	
+   440	def is_revision(repo: Path, commit: str, plan: dict) -> bool:
+   441	    """A commit `resume` made for this run: one parent, the pipeline's identity and subject, only the pinned feature files."""
+   442	    from .pipeline import commit_env
+   443	    parents = git(repo, "rev-list", "--parents", "-n", "1", commit).split()[1:]
+   444	    author, _, subject = git(repo, "log", "-1", "--format=%an%n%s", commit).partition("\n")
+   445	    paths = subprocess.check_output(["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", commit], text=True)
+   446	    return (len(parents) == 1 and author == commit_env()["GIT_AUTHOR_NAME"] and subject.startswith(revision_subject(plan["run_id"]))
+   447	            and set(filter(None, paths.split("\0"))) <= pinned_paths(plan))
+   448	
+   449	
+   450	def commit_revision(runtime, answered: int) -> None:
+   451	    """`resume` after an edit: commit the edited feature files on the run's branch, then move the run to that commit.
+   452	
+   453	    Only the paths `repin` reads may be changed. The branch may already carry the revisions of a `resume` interrupted
+   454	    after its commit; the run moves to them without a second commit. No worker launches meanwhile: the challenge stays
+   455	    paused until the rerun decides it, and an override refuses such a branch.
+   456	    """
+   457	    from .pipeline import commit_env
+   458	    plan = runtime.plan
+   459	    repo, base, branch = Path(plan["repository"]), plan["base_commit"], plan["source_branch"]
+   460	    if git(repo, "symbolic-ref", "--short", "HEAD") != branch:
+   461	        raise ValueError(f"The source checkout is not on the run's branch {branch}; switch back before resume")
+   462	    dirty = dirty_paths(repo)
+   463	    others = [path for path in dirty if path not in pinned_paths(plan)]
+   464	    if others:
+   465	        raise ValueError(f"The source checkout has changes resume does not re-pin: {', '.join(others)}. Only the task files, "
+   466	                         "decisions.md and the PRD pinned at prepare may change before resume; stash or revert the rest")
+   467	    earlier = commits_after(repo, base)
+   468	    if earlier is None or not all(is_revision(repo, commit, plan) for commit in earlier):
+   469	        raise ValueError(f"The branch {branch} moved past the run's base {base} with commits resume did not make; resume commits the "
+   470	                         f"revised feature files itself. Reset the branch to the base (git reset --soft {base}) and rerun resume")
+   471	    if dirty:
+   472	        parent = git(repo, "rev-parse", "HEAD")
+   473	        subject = revision_subject(plan["run_id"]) + (f" after design challenge attempt {answered}" if answered else " before the design challenge")
+   474	        command = ["git", "-C", str(repo), "--literal-pathspecs", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+   475	        subprocess.run([*command, "add", "-A", "--", *dirty], env=commit_env(), check=True, capture_output=True)
+   476	        subprocess.run([*command, "commit", "-q", "-m", subject, "--", *dirty], env=commit_env(), check=True, capture_output=True)
+   477	        commit = git(repo, "rev-parse", "HEAD")
+   478	        if git(repo, "rev-parse", f"{commit}^") != parent or not is_revision(repo, commit, plan) or git(repo, "status", "--porcelain"):
+   479	            raise RuntimeError(f"Revision commit {commit} is not exactly the edited feature files; reconcile the source checkout before resume")
+   480	        runtime.event(CHALLENGE, "running", f"Revised feature files committed on {branch} as {commit}: {', '.join(dirty)}")
+   481	    target = git(repo, "rev-parse", "HEAD")
+   482	    if target != base:
+   483	        move_base(runtime, target)
+   484	
+   485	
+   486	def run_worktrees(repo: Path, directory: Path) -> list[Path]:
+   487	    """The repository's worktrees inside the run directory: before any launch, the lane worktrees and the challenge worktree."""
+   488	    listing = subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain", "-z"], text=True)
+   489	    paths = [Path(field[len("worktree "):]) for field in listing.split("\0") if field.startswith("worktree ")]
+   490	    return sorted(path for path in paths if path.resolve().is_relative_to(directory))
+   491	
+   492	
+   493	def move_base(runtime, target: str) -> None:
+   494	    """Check out `target` in every worktree of the run, then pin it as the base and each lane's start commit, as prepare does.
+   495	
+   496	    Every worktree must be a clean checkout of the base, or of `target` when an interrupted move already reached it.
+   497	    """
+   498	    directory, plan = runtime.directory, runtime.plan
+   499	    repo, base = Path(plan["repository"]), plan["base_commit"]
+   500	    worktrees = run_worktrees(repo, directory)
+   501	    lanes = [Path(plan["nodes"][node]["worktree"]).resolve() for node in plan_workers(plan)]
+   502	    missing = [str(path) for path in lanes if path not in [item.resolve() for item in worktrees]]
+   503	    if missing:
+   504	        raise RuntimeError(f"Lane worktrees are not registered in {repo}: {', '.join(missing)}; reconcile before resume")
+   505	    heads = {}
+   506	    for path in worktrees:
+   507	        if not path.is_dir():
+   508	            raise RuntimeError(f"Run worktree {path} is registered but missing; reconcile before resume")
+   509	        heads[path] = git(path, "rev-parse", "HEAD")
+   510	        if heads[path] not in {base, target} or git(path, "status", "--porcelain"):
+   511	            raise RuntimeError(f"Run worktree {path} is not a clean checkout of the base {base}; reconcile before resume")
+   512	    for path, head in heads.items():
+   513	        if head != target:
+   514	            subprocess.run(["git", "-C", str(path), "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", target], check=True, capture_output=True)
+   515	        if git(path, "rev-parse", "HEAD") != target or git(path, "status", "--porcelain"):
+   516	            raise RuntimeError(f"Run worktree {path} did not move cleanly to {target}")
+   517	    plan["base_commit"] = target
+   518	    for node in plan_workers(plan):
+   519	        plan["nodes"][node]["observed_start_commit"] = git(Path(plan["nodes"][node]["worktree"]), "rev-parse", "HEAD")
+   520	    save_json(directory / "plan.json", plan)
+   521	    runtime.event(CHALLENGE, "running", f"Run moved from base {base} to {target}: {len(heads)} worktree(s) and plan.json; no worker exists yet")
+   522	
+   523	
+   524	def refuse_unused_edits(plan: dict) -> None:
+   525	    """An override launches the workers on the pinned files as they are: edited or committed-but-unused revisions refuse it."""
+   526	    repo = Path(plan["repository"])
+   527	    edited = [path for path in dirty_paths(repo) if path in pinned_paths(plan)]
+   528	    if edited:
+   529	        raise ValueError(f"Feature files changed since they were pinned ({', '.join(edited)}); the override would launch the workers without "
+   530	                         "them. Rerun resume without --accept-challenge to commit them and rerun the challenge, or revert them")
+   531	    pending = [commit for commit in commits_after(repo, plan["base_commit"]) or [] if is_revision(repo, commit, plan)]
+   532	    if pending:
+   533	        raise ValueError(f"An interrupted resume committed revised feature files ({', '.join(pending)}) that this run does not use yet; "
+   534	                         "rerun resume without --accept-challenge to finish moving the run to them")
+   535	
+   536	
+   537	def launched_workers(directory: Path, plan: dict) -> list[str]:
+   538	    return [node for node in plan_workers(plan) if (directory / f"{node}.interactive.json").exists() or (directory / f"{node}.json").exists()]
+   539	
+   540	
+   541	def resume_challenge(runtime, accept_reason: str | None = None) -> dict:
+   542	    """`resume`: rerun the challenge on the re-pinned feature files as the next attempt, or record `accepted` with a reason.
+   543	
+   544	    Only before any worker launch. Edited feature files are committed on the run's branch first and the run moves to
+   545	    that commit, so the source checkout stays clean for integration. A challenge that already passed or was accepted
+   546	    is returned as it is.
+   547	    """
+   548	    directory, plan = runtime.directory, runtime.plan
+   549	    if not has_challenge(plan):
+   550	        raise ValueError("This run has no design challenge to resume (feature.json before 2.2.0, or challenge: false)")
+   551	    launched = launched_workers(directory, plan)
+   552	    if launched:
+   553	        raise ValueError(f"Workers already launched ({', '.join(launched)}); resume applies only before any worker starts")
+   554	    current = load_challenge(directory)
+   555	    if current is not None and current["status"] in {"passed", "accepted"}:
+   556	        return current
+   557	    if accept_reason is not None:
+   558	        if not accept_reason.strip():
+   559	            raise ValueError("--accept-challenge needs a non-empty reason")
+   560	        if current is None or current["status"] != "paused":
+   561	            raise ValueError("Only a paused design challenge can be accepted")
+   562	        refuse_unused_edits(plan)
+   563	        record = {**current, "status": "accepted", "accepted_reason": accept_reason.strip(), "decided_at": now()}
+   564	        save_challenge(directory, record)
+   565	        runtime.event(CHALLENGE, "succeeded", f"Design challenge attempt {record['attempt']} accepted by the operator: {record['accepted_reason']}")
+   566	        return record
+   567	    running = directory / "challenge.running.json"
+   568	    attempt = max(current["attempt"] if current else 0, read_json(running)["attempt"] if running.exists() else 0) + 1
+   569	    read_pinned(plan)  # A brief that lost a required section is refused before anything is committed.
+   570	    commit_revision(runtime, attempt - 1)
+   571	    repin(directory, plan, runtime.policy)
+   572	    runtime.event(CHALLENGE, "running", f"Feature files re-pinned for design challenge attempt {attempt}")
+   573	    return run_challenge(runtime, attempt)
+   574	
+   575	
+   576	# ---- Worker questions and the persisted deadline pause ---------------------------------------------------------
+   577	
+   578	def iso(timestamp: float) -> str:
+   579	    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+   580	
+   581	
+   582	def epoch(value: str) -> float:
+   583	    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+   584	
+   585	
+   586	@contextmanager
+   587	def question_lock(directory: Path):
+   588	    """Serialises the controller and `answer` over `<node>.questions.json` and `<node>.deadline.json`."""
+   589	    with (directory / "questions.lock").open("a") as handle:
+   590	        fcntl.flock(handle, fcntl.LOCK_EX)
+   591	        try:
+   592	            yield
+   593	        finally:
+   594	            fcntl.flock(handle, fcntl.LOCK_UN)
+   595	
+   596	
+   597	def load_questions(directory: Path, node: str) -> list[dict]:
+   598	    path = directory / f"{node}.questions.json"
+   599	    return read_json(path)["questions"] if path.exists() else []
+   600	
+   601	
+   602	def save_questions(directory: Path, node: str, questions: list[dict]) -> None:
+   603	    save_json(directory / f"{node}.questions.json", {"node_id": node, "questions": questions})
+   604	
+   605	
+   606	def waiting_question(directory: Path, node: str) -> dict | None:
+   607	    questions = load_questions(directory, node)
+   608	    return questions[-1] if questions and questions[-1]["answer"] is None else None
+   609	
+   610	
+   611	def load_deadline(directory: Path, node: str) -> dict:
+   612	    path = directory / f"{node}.deadline.json"
+   613	    return read_json(path) if path.exists() else {"node_id": node, "paused_seconds": 0.0, "paused_at": None}
+   614	
+   615	
+   616	def deadline_extension(directory: Path, node: str) -> float | None:
+   617	    """Seconds the worker's deadline moved by answered questions; None while a question waits (no deadline runs)."""
+   618	    deadline = load_deadline(directory, node)
+   619	    return None if deadline["paused_at"] else float(deadline["paused_seconds"])
+   620	
+   621	
+   622	def resume_deadline(directory: Path, node: str, at: float) -> None:
+   623	    deadline = load_deadline(directory, node)
+   624	    if deadline["paused_at"]:
+   625	        deadline["paused_seconds"] = float(deadline["paused_seconds"]) + max(0.0, at - epoch(deadline["paused_at"]))
+   626	        deadline["paused_at"] = None
+   627	        save_json(directory / f"{node}.deadline.json", deadline)
+   628	
+   629	
+   630	def record_question(runtime, node: str, item: dict, clock=None) -> dict:
+   631	    """A `question` completion: kept as `<node>.question-<n>.json`, listed, and the lane's deadline paused. A fourth blocks."""
+   632	    directory = runtime.directory
+   633	    with question_lock(directory):
+   634	        questions = load_questions(directory, node)
+   635	        number = len(questions) + 1
+   636	        if number > MAX_QUESTIONS:
+   637	            raise RuntimeError(f"Worker {node} asked question {number}; at most {MAX_QUESTIONS} are answered, so it is treated as blocked")
+   638	        at = (clock or time.time)()
+   639	        os.replace(directory / f"{node}.completion.json", directory / f"{node}.question-{number}.json")
+   640	        entry = {"n": number, "question": item["question"], "asked_at": iso(at), "answer": None, "answered_at": None}
+   641	        save_questions(directory, node, [*questions, entry])
+   642	        deadline = load_deadline(directory, node)
+   643	        deadline["paused_at"] = iso(at)
+   644	        save_json(directory / f"{node}.deadline.json", deadline)
+   645	    runtime.event(node, "interactive", f"Worker {node} asked question {number} of {MAX_QUESTIONS}; its deadline is paused until "
+   646	                                       f"`python -m workflow answer {directory} {node} \"<text>\"`: {item['question']}")
+   647	    return entry
+   648	
+   649	
+   650	def record_answer(directory: Path, node: str, text: str, clock=None) -> dict:
+   651	    """The latest question's answer; the deadline restarts now. Refused when no question waits."""
+   652	    if not text.strip():
+   653	        raise ValueError("The answer is empty")
+   654	    with question_lock(directory):
+   655	        questions = load_questions(directory, node)
+   656	        if not questions or questions[-1]["answer"] is not None:
+   657	            raise ValueError(f"Worker {node} has no unanswered question")
+   658	        at = (clock or time.time)()
+   659	        questions[-1].update(answer=text, answered_at=iso(at))
+   660	        save_questions(directory, node, questions)
+   661	        resume_deadline(directory, node, at)
+   662	    return questions[-1]
+   663	
+   664	
+   665	PANE_ANSWER = "(answered by typing in the worker's pane)"
+   666	
+   667	
+   668	def deliver_answer(directory: Path, node: str, text: str, use_herdr: bool = True) -> str:
+   669	    """Type the answer into the worker's Herdr pane (send-text, then Enter), or say how to type it after `claude attach`."""
+   670	    receipt = read_json(directory / f"{node}.interactive.json")
+   671	    if not use_herdr:
+   672	        return f"Type the answer in the worker's session: claude attach {receipt.get('background_id')}"
+   673	    from .herdr import herdr
+   674	    mapping = read_json(directory / "terminals.json")
+   675	    if node not in mapping:
+   676	        raise RuntimeError(f"No Herdr pane is recorded for {node}; rerun with --no-herdr")
+   677	    pane = mapping[node]["pane_id"]
+   678	    herdr("pane", "send-text", pane, text)
+   679	    herdr("pane", "send-keys", pane, "Enter")
+   680	    return f"Answer typed into pane {pane} ({node})"
+   681	
+   682	
+   683	# ---- CLI: python -m workflow resume | answer -------------------------------------------------------------------
+   684	
+   685	def resume_main(argv=None):
+   686	    parser = argparse.ArgumentParser(prog="python -m workflow resume", description="Rerun a paused design challenge on the edited feature "
+   687	                                     "files, or accept it with a reason; then launch the workers (and supervise an automatic run).")
+   688	    parser.add_argument("directory", type=Path)
+   689	    parser.add_argument("--accept-challenge", metavar="REASON", help="Record the override with this reason and continue without rerunning")
+   690	    parser.add_argument("--herdr", action="store_true", help="Attach the worker panes after the launch")
+   691	    args = parser.parse_args(argv)
+   692	    directory = args.directory.resolve()
+   693	    from langgraph.checkpoint.sqlite import SqliteSaver
+   694	    from .pipeline import Pipeline, build_pipeline, graph_config, report, start_workers
+   695	    try:
+   696	        with run_lock(directory):
+   697	            runtime = Pipeline(directory)
+   698	            record = resume_challenge(runtime, args.accept_challenge)
+   699	            runtime = Pipeline(directory)  # The re-pinned plan on its current base: session receipts bind to its digest.
+   700	            if record["status"] == "paused":
+   701	                print(paused_message(directory, args.herdr))
+   702	                with SqliteSaver.from_conn_string(str(directory / "pipeline.sqlite")) as saver:
+   703	                    state = build_pipeline(saver, runtime).get_state(graph_config(runtime))
+   704	                print(f"Report: {report(runtime, state)}")  # As `start` does: run-state.json shows the new attempt and base.
+   705	                return
+   706	            start_workers(runtime, attach=args.herdr)
+   707	        print(f"Design challenge {record['status']} (attempt {record['attempt']}); workers launched: {', '.join(runtime.workers)}")
+   708	        if runtime.plan.get("automatic"):
+   709	            from .automatic import supervise
+   710	            supervise(directory)
+   711	            print(f"Automatic run reached a verified feature branch. Evidence: {directory / 'report.html'}. No main merge or push.")
+   712	    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+   713	        parser.exit(1, f"Blocked: {error}\nAll work/evidence retained at {directory}. No automatic fallback or push.\n")
+   714	
+   715	
+   716	def answer_main(argv=None):
+   717	    parser = argparse.ArgumentParser(prog="python -m workflow answer", description="Answer a worker's question: record it, restart the "
+   718	                                     "worker's deadline and type it into the worker's pane.")
+   719	    parser.add_argument("directory", type=Path)
+   720	    parser.add_argument("node", help="The lane whose latest question this answers")
+   721	    parser.add_argument("text")
+   722	    parser.add_argument("--no-herdr", action="store_true", help="Print the claude attach command instead of typing into the pane")
+   723	    args = parser.parse_args(argv)
+   724	    directory = args.directory.resolve()
+   725	    try:
+   726	        plan = read_json(directory / "plan.json")
+   727	        if args.node not in plan_workers(plan):
+   728	            raise ValueError(f"{args.node} is not a lane of this run ({', '.join(plan_workers(plan))})")
+   729	        entry = record_answer(directory, args.node, args.text)
+   730	        print(f"Recorded the answer to question {entry['n']} of {args.node}; its deadline runs again.")
+   731	        print(deliver_answer(directory, args.node, args.text, not args.no_herdr))
+   732	    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+   733	        parser.exit(1, f"Blocked: {error}\n")

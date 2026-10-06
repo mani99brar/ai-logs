@@ -1,0 +1,121 @@
+You are the design challenge of a workflow run: a skeptical senior engineer who reads the plan before any worker starts. You only read; you change nothing and launch nothing. Your working directory is the repository at the run's base commit; read its code when a concern depends on it.
+
+Find the fragile assumptions, the strongest simpler alternative, the likely failure modes and one cheap experiment that could change the choice. Tie every concern to a concrete consequence and give it a severity: P0 when the plan cannot work as written, P1 when it is likely to produce the wrong result or major rework and must be settled before any worker starts, P2 when it is worth recording and the run can continue. A P0 or P1 pauses the run for the operator, so raise one only for a consequence you can name; do not reopen what decisions.md settles unless you show it cannot hold. kind is assumption, failure_mode, complexity or other. Return the requested JSON schema: concerns (possibly empty), simpler_alternative and cheap_experiment.
+
+The PRD this feature implements: /home/agentops/.local/state/agent-workflows/project-B/economy-online/economy-online-001/challenge-inputs/prd.md (read it).
+
+=== Task of lane game ===
+# Task: game
+
+## Goal
+
+Complete the slice's small economy (§11), so gold creates route choices. Floating **supply crates** at sea pay 25 gold to the first ship that reaches each one. A **dockside shop** at every island sells a **sail tonic** (30 gold) and the targeted rumor that `intel-online` already sells. A tonic, drunk at sea, gives +10% sailing speed for 12 s. You can carry at most two tonics and only one works at a time; you can't drink one while grappled or in a duel, and a lost duel doesn't take your tonics. With this feature the §18 stage-2 slice is complete. The pure rules are on `main` (`packages/simulation/src/objectives`: `grantGold`, `purchase`, `useTonic` and the tonic state; `docs/objectives.md` "Economy"). This feature wires them in.
+
+## Context
+
+- Read `docs/spec.md` §11 (all of it), §3 (loot) and §16 (idempotent purchases).
+- Read `docs/objectives.md` (Economy: grants with keys, `purchase` with per-player request ids and kept refusals, tonics and their limits, the gold identity `checkLedger`), `docs/architecture.md` (the room, test hooks and timings, and the intel purchase flow that `intel-online` added), the sailing step (`packages/simulation/src/step.ts`, `sailing.ts` in content) and how the web client draws the sea and HUD.
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration`, `npm run build` and `npx --no-install playwright test --config=tests/e2e/playwright.config.ts`.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Constraints
+
+- Owned paths as in `policy.json`. The pure ledger module and its content aren't owned: use them through their exports, and report `blocked` naming the gap if a change is truly needed. The sailing step is owned (`packages/simulation/src/step.ts`, `state.ts`, `config.ts`), and the tonic's speed change goes there, kept pure and integer (for example 110/100 of the speed, rounded down, in sub-units).
+- Server authoritative, zod-validated messages, protocol version bump. Tests drive input like players do.
+- Determinism: the tonic multiplier is part of the simulation state and the replay hash, so client prediction and the server agree.
+
+## Design (settled)
+
+- **Supply crates:** 4 crates at fixed navigable sea points, chosen by a pure function `supplySites(map)` in `apps/server/src`: points along the routes between islands, away from docks, spawns and each other, and unit-tested for navigability and spacing. Each crate is a ledger supply cache id. A ship whose hull touches a crate claims it (`grantGold`, reason `supply-cache`, key the crate id): 25 gold once, for the first ship. The room sorts the touching ships by player id before calling `grantGold` (`MatchState.ships` is in join order), so two ships on the same tick resolve to the lower id. The tie test places both ships with the pause and step test hooks. A claimed crate disappears for everyone in sight. Crates are visible to ships in sight, like other markers.
+- **Shop:** moored at any dock, **B** opens the shop panel. It lists the sail tonic (30 gold, "you carry N of 2") and the targeted rumor per missing type, the same purchase the journal offers, through the same room flow. **Request-id namespaces:** tonic and rumor purchases share the ledger's per-player request-id space. So the room passes the ledger `tonic:<clientId>` for tonics and `rumor:<clientId>` for rumors (update intel's `chargeRumor` accordingly). A client id reused across the two items can then never collide, and a ledger refusal can never reach `chargeRumor`'s throw. Retries of the same item and id never pay twice. Refusals (`insufficient-gold`, `tonic-limit`, in a duel, disconnected, not at a dock) are shown and cost nothing. The server checks "moored at a dock" on the tick it processes the purchase. The shop is a brief interaction, not a safe zone: grappling a moored ship still works, and it closes the panel.
+- **Tonic:** **T** sends a one-shot `use-tonic` message with a request id; it isn't a held input button. The client sends one per key press and ignores key repeat. The server answers each id once, and a retried id is replayed. At sea, a tonic gives +10% sailing speed for 12 s, and the HUD shows a timer. It's refused while moored, grappled (reserved), in a duel, or while a tonic is active. Tonics are kept through a lost duel. **Timing:** the room calls `useTonic` at tick t, after that tick's simulation step. The speed multiplier, part of the simulation state and its hash, applies to the simulation steps of ticks t+1 through t+240 (240 ticks, 12 s). Document this. The sea has no client prediction (`docs/architecture.md`), so the check is server-side determinism: replaying the room's inputs and tonic activations gives the same `hashState`.
+- **HUD:** gold, tonic count and the active tonic timer. The shop and journal share the panel key rules (no key events from text fields; Esc closes).
+
+## Acceptance
+
+Each item names the test that proves it. Integration tests use headless clients through the real room.
+
+0. **Holds survive short network gaps (operator playtest bug, first priority).** Over a real connection, holds (E collect or cache claim, F eat, E treasure claim) sometimes cancel while the key is still held. The client resends a held input every 100 ms (`inputSender.ts`). The server's `InputGate` lapses it after `INPUT_HOLD_FRAMES` (15 frames, 250 ms). The room then cancels the channel, and the ledger's `progressChannel` counts only consecutive ticks. So one gap of about 150 ms of jitter resets a 6–10 s hold. The fix:
+   - **Grace window:** a held **world hold button** (interact, fruit, claim) survives gaps between received messages of up to **750 ms** (`WORLD_HOLD_GRACE_FRAMES` = 45, in the protocol). That covers a stall of S ms plus up to 200 ms of resend spacing and tick alignment, for stalls up to about 500 ms. An explicit release (an accepted message without the button) ends the hold at once.
+   - **Only the room's hold reads use the grace.** The grace applies only where the room decides whether interact, fruit or claim is held (the channel progress checks). It must **not** change what `InputGate` gives `step()`: movement and duel input keep the 250 ms lapse, and a lapsed gate still gives `step()` no entry. So a moored ship keeps its `mooredThrottle`, and keys still held after a stall don't cast off (the documented rule in `step.ts`). A test proves that a moored ship holding W+E through a 400 ms stall is neither cast off nor has its collect reset.
+   - **Diagnostics:** per-player room counters (gaps bridged, holds lapsed) appear in the room's diagnostics, and a lapse after the grace window is logged.
+   - **Player-realistic tests** (holding keys like a player does):
+     - an integration test holds E through a full 6 s collect while the headless client's transport withholds input messages for 300–450 ms twice mid-hold; the collect completes;
+     - a **1,200 ms** stall cancels it. There's no reason string for collects, so assert that the channel is gone and progress starts again from 0;
+     - an explicit key-up mid-hold cancels at once;
+     - a browser test holds E and pauses the page's sends for 400 ms mid-collect, and the collect completes.
+   - Document the rule in `docs/architecture.md`.
+1. **Crates:** `supplySites` gives 4 navigable, well-spaced points on the slice sea (unit). A ship touching a crate gets 25 gold once and the crate vanishes for everyone; a second ship gets nothing; two ships on one tick resolve by id; `checkLedger` holds (integration).
+2. **Shop purchases** (integration):
+   - buying a tonic deducts 30 and adds one;
+   - a third tonic is refused (`tonic-limit`) at no cost;
+   - a retry with the same id is replayed without charging again;
+   - a purchase after casting off is refused `not-at-dock`;
+   - a purchase in a duel or with too little gold is refused at no cost;
+   - the shop's rumor purchase is the same flow as the journal's.
+3. **Tonic** (unit and integration): drinking at tick t gives exactly 110/100 speed for the steps of ticks t+1 through t+240, measured on the server (distance per tick). Replaying the room's inputs and activations gives the same `hashState`. It's refused moored, reserved, in a duel, or while one is active. A held or repeated T drinks only one. Tonics are kept through a lost duel. A tonic bought with id "x" followed by a rumor request with id "x" is two independent purchases, and the match continues (no fault).
+4. **Hidden information** (integration): a player's gold, tonics and purchases go only to that player; crates are shown only in sight.
+5. **UI** (web unit): the shop model (items, prices, owned count, button states and refusal texts), the tonic HUD timer, and crate markers.
+6. **Browser scenario `shop-and-tonic`** (the policy's description says the ship "covers more distance over two seconds". Read it as the server-reported speed below; the scenario id is unchanged):
+   - one browser sails over a supply crate and sees its gold rise by 25;
+   - it moors at a dock, opens the shop with B and buys a tonic (gold −30, "1 of 2");
+   - it casts off and drinks it with T, and the HUD shows the tonic timer and "+10% speed";
+   - the page shows the server-reported sailing speed (a `data-max-speed` attribute on the HUD, from the synced state), and its value is 110% of the untoniced value. The exact distance measurement is the integration test's job.
+7. **The existing scenarios still pass.**
+8. **Carried from `intel-online`'s approving reviews:**
+   - targeted rumor requests still pending when the match ends are answered with a refusal (`match-ended`), so no client waits on its 5 s timeout (integration test);
+   - a retried request id that names a different type than the decided one is refused `duplicate`, matching the ledger's contract, rather than replaying the earlier type's lead (unit and integration);
+   - the privacy test in `tests/integration/intel.test.ts` checks each client's **decoded** state and messages structurally: no source or cache objects at all, other players' ships only while in sight, and no intel message carrying coordinates other than the holder's `final-route`. No raw byte search for coordinates: sources sit at dock centres, where a moored player's own ship legitimately is.
+9. **The branch table:** `docs/economy-online-coverage.md` has one row for each room-level and UI branch this feature adds or changes: the file and function, the branch, and the test that fails when the branch is deleted.
+   - Build it by deleting each branch on a scratch copy, running the deletions in parallel batches. Don't commit those edits.
+   - A branch with no failing test gets a new test. A branch that can't change the outcome is marked `equivalent`, with a one-line reason. Dead code is removed.
+   - There are no `unreachable` or `untested` rows, and the completion report's `untested` list is empty.
+10. `docs/architecture.md` gains an "Economy in the room" section of at most half a page.
+11. `npm ci` then each of the five policy checks passes from a clean checkout, with all browser scenarios. The integration suite took 192–202 s of its 300 s budget after intel-online. Keep it at or below 230 s: use the existing test hooks and short timings rather than real-time waits, run new files concurrently where they don't share a server, and report the duration.
+
+Browser checks: each scenario id appears in exactly one test title as `[scenario:<id>]`. That test, when it passes, attaches exactly one image/png named `screenshot:<id>` (other attachments are fine). The verifier refuses anything else. Before completing, run the spec files you changed with a JSON report:
+
+```bash
+WORKFLOW_VERIFICATION_PHASE=worker PLAYWRIGHT_JSON_OUTPUT_FILE=<tmp>/report.json \
+  npx --no-install playwright test --config=tests/e2e/playwright.config.ts --reporter=json <spec files>
+```
+
+Then check the report with the verifier's own rules: run the exact `check-report` command the controller appends to this task when it pins it.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A pure module or content change outside the owned paths is truly required. Name the missing operation.
+- A check can pass only by changing a path outside the owned paths.
+- After two hours of work, any required check still fails and you cannot name the next fix. The worker deadline is three hours; leave time for the branch table and the final checks.
+
+Report `question` only for a choice that would change this acceptance.
+
+Approved ownership and checks:
+{"node_id": "game", "role": "fullstack", "required_check_kinds": ["typecheck", "unit", "integration", "build", "browser"], "owned_paths": ["package.json", "package-lock.json", "README.md", "docs/architecture.md", "docs/duel.md", "docs/encounters.md", "packages/simulation/package.json", "packages/simulation/src/netcode", "packages/simulation/src/encounters", "packages/simulation/src/step.ts", "packages/simulation/src/state.ts", "packages/simulation/src/config.ts", "packages/simulation/src/index.ts", "packages/simulation/src/input.ts", "packages/simulation/src/visibility.ts", "packages/simulation/src/simulation.test.ts", "packages/content/package.json", "packages/content/src/encounters", "packages/content/src/sailing.ts", "packages/content/src/index.ts", "packages/protocol", "packages/test-tools", "apps", "tests/integration", "tests/e2e", "scripts", "vitest.config.ts", "docs/objectives.md", "docs/match-online-coverage.md", "docs/ruins-online-coverage.md", "docs/fruit-kits-online-coverage.md", "docs/intel-online-coverage.md", "docs/economy-online-coverage.md"], "checks": [{"id": "typecheck", "kind": "typecheck", "argv": ["npm", "run", "typecheck"], "timeout_seconds": 300, "scenarios": []}, {"id": "unit", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 300, "scenarios": []}, {"id": "integration", "kind": "integration", "argv": ["npm", "run", "test:integration"], "timeout_seconds": 300, "scenarios": []}, {"id": "build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 600, "scenarios": []}, {"id": "browser", "kind": "browser", "argv": ["npx", "--no-install", "playwright", "test", "--config=tests/e2e/playwright.config.ts"], "timeout_seconds": 1800, "scenarios": [{"id": "join-private-match", "description": "One browser creates a private match from the landing page; the HUD shows the code, the protocol version, one player and a connected status."}, {"id": "two-ships-sync", "description": "Two browsers join the same private match with their ships in sight of each other; one sails with the keyboard and the other browser's view shows that ship at the new server-authoritative position."}, {"id": "sail-and-dock", "description": "A browser sails its ship around a shoal to an island dock with the keyboard and docks there; the HUD shows the dock and the ship stops at it."}, {"id": "out-of-sight", "description": "Two browsers in one match with their ships out of sight of each other: neither view lists or draws the other ship until one sails within the sight radius, and it disappears again when it sails away."}, {"id": "duel-practice", "description": "One browser opens a practice duel against the dummy, lands a jab and then a keyboard throw (J then K a frame apart); the dummy's health bar and the HUD drop by the move data's damage, and hitboxes can be shown."}, {"id": "duel-online", "description": "Two browsers: one creates a duel, the other joins by its code; after the countdown the first lands a strike on the second, and both views show the same authoritative health, round clock and result, with the connection line showing input delay and corrections."}, {"id": "sea-duel", "description": "Two browsers in one match are placed within grapple range; the host sails at the guest and presses J; both see the grapple telegraph, then a three-second countdown and the arena; the duel is decided; the winner returns to the sea with protection shown, and the loser sees a respawn countdown and then their ship at a dock."}, {"id": "theft-loop", "description": "Two browsers moored at different islands each hold E and collect a different rubbing type; the host grapples the guest at sea, wins the duel by tapping attack keys, and picks the guest's type within five seconds; the host's HUD shows both types and more gold, the guest's shows the loss."}, {"id": "full-match", "description": "Two browsers: the host starts a private match from the lobby, both see the ready countdown and the match timer; the host collects both rubbing types, sees the full-set reveal and the route, sails to the final island's claim tile and holds E for ten seconds; both browsers show the results with the host as the winner."}, {"id": "match-deadline", "description": "Two browsers start a private match from the lobby with test-only short timings; nobody claims; the timer runs out; both browsers show the results with the no-winner deadline headline, and the route compass is shown inactive while no route is known."}, {"id": "ruin-solve", "description": "One browser moored at an island opens its ruin with R and reads the clue from the page; the test derives the answer from the displayed clue only, submits it, sees '+40 gold' and the island unlocked, then holds E to collect the rubbing."}, {"id": "fruit-duel", "description": "One browser moors at a pedestal's dock, presses F, reads the kit name from the panel, holds F for three seconds and sees its HUD show Ember; it grapples the second browser at sea, casts the flame bolt (U) in the arena, both browsers see the bolt drawn, and the second browser's health bar drops by the bolt's damage."}, {"id": "rumor-journal", "description": "Two browsers start a private match; the host opens the journal with Tab and reads its start rumor (a type and an island or sector name) from the page, sails to a dock, moors, buys a targeted rumor and sees its gold drop by 25 and a new journal entry marked targeted; the guest's page never shows the host's rumors."}, {"id": "shop-and-tonic", "description": "One browser sails over a supply crate and sees its gold rise by 25; it moors at a dock, opens the shop with B and buys a tonic (gold down 30, one of two carried); it casts off, drinks it with T, the HUD shows the tonic timer, and the ship covers more distance over two seconds than without the tonic."}]}]}
+Browser scenarios: each scenario id of your browser checks appears in exactly one test title as `[scenario:<id>]`, and that test, when it passes, attaches exactly one image/png named `screenshot:<id>` (other attachments are fine); before completing, run the spec files you changed with `WORKFLOW_VERIFICATION_PHASE=<worker|candidate> PLAYWRIGHT_JSON_OUTPUT_FILE=<tmp>/report.json npx --no-install playwright test --config=<config> --reporter=json <spec files>` and check the report with the verifier's own rules against the run's pinned policy (it only reads it), from anywhere in your worktree: `PYTHONSAFEPATH=1 PYTHONPATH=/home/agentops/dev/md-manager /home/agentops/dev/md-manager/.venv/bin/python -m workflow check-report "$(git rev-parse --show-toplevel)/../policy.json" game <tmp>/report.json`.
+
+=== decisions.md ===
+# Decisions: economy-online
+
+From the operator session of 2026-09-26. The assistant settled these choices under the operator's standing instruction, and recorded them in `operator-logs/decisions-overnight.md` (#57, #58).
+
+## Decisions
+
+- **Acceptance item 0 comes first:** the operator's playtest bug. Holds cancelled while the key was still held because of short network gaps (a 100 ms resend against a 250 ms lapse, and no gap tolerance in holds). World hold buttons bridge gaps up to 750 ms (45 frames), applied only to the room's hold reads, never to what `step()` receives. An explicit release still cancels at once. Movement and duels keep the 250 ms lapse. The tests hold keys like players do and inject stalls.
+- **Supply crates:** 4 crates at sea along the routes between islands (`supplySites`). The first ship to touch one gets 25 gold, as a ledger grant keyed by the crate.
+- **Shop:** B opens a dockside shop at every dock. Ledger request ids are namespaced per item (`tonic:` or `rumor:`), so a reused client id can never collide or fault the match (the challenge's P1). It sells the sail tonic (30 gold, carry 2) and the targeted rumor through intel-online's purchase flow. The server checks "moored at a dock" on the processing tick. The shop isn't a safe zone.
+- **Tonic:** T sends a one-shot `use-tonic` message (not a held button) and drinks one at sea for +10% speed over 12 s. It's integer, inside the simulation state and hash, and refused when moored, grappled, in a duel or while one is active. Tonics are kept through a lost duel.
+- The new browser scenario is `shop-and-tonic`.
+- The three P2 notes from intel-online's approving reviews are folded in (acceptance item 8).
+- The branch → test table (`docs/economy-online-coverage.md`) is required, and the integration suite stays at or under 230 s.
+
+## Assumptions
+
+- Everything in the earlier online features and their fixes stands.
+
+## Deferred
+
+- The polish phase (P0–P6: assets, the fighter rig, sound, HUD, game feel, cutscenes). The operator is asked about pacing first, because of the weekly usage limit.

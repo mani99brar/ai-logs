@@ -1,0 +1,487 @@
+diff --git a/workflow/automatic.py b/workflow/automatic.py
+index 518b3a9..7d12f37 100644
+--- a/workflow/automatic.py
++++ b/workflow/automatic.py
+@@ -20,6 +20,7 @@ from langgraph.types import Command
+ 
+ from .checks import now
+ from .guardrails import decisions_block
++from .interactive import SessionGap, UpdateGaps
+ from .sessions import (DEFAULT_REVIEWER, TransientInfraError, git, plan_reviewers, plan_workers, popen_claude, read_json, review_node, reviewer_ids,
+                        run_lock, save_json, terminate)
+ from .verification import CONTRACTS
+@@ -156,15 +157,46 @@ def lanes(runtime) -> list[str]:
+     return list(getattr(runtime, "workers", None) or plan_workers(runtime.plan))
+ 
+ 
++def lane_deadline(runtime, node: str) -> float | None:
++    """The lane's own deadline: its launch plus worker_timeout_seconds plus its answered questions' pauses; None while a question waits."""
++    from .guardrails import deadline_extension
++    extension = deadline_extension(runtime.directory, node)
++    if extension is None:
++        return None
++    receipt = read_json(runtime.directory / f"{node}.interactive.json")
++    return datetime.fromisoformat(receipt["launch_requested_at"]).timestamp() + runtime.plan["automatic"]["worker_timeout_seconds"] + extension
++
++
++def latest_deadline(runtime, workers: list[str]) -> float | None:
++    """The latest of the lanes' own deadlines; None while any lane's question waits (the run waits on its answer anyway)."""
++    deadlines = [lane_deadline(runtime, node) for node in workers]
++    return None if None in deadlines else max(deadlines)
++
++
++def question_asked_at(runtime, node: str, now: float) -> float:
++    """When the worker wrote its question: the completion file carries no time of its own, so its modification time.
++
++    Never later than now, nor before the lane's deadline last ran again (its launch, or its previous question's answer),
++    so a question first read late (the controller away across the deadline, a slow poll) pauses the deadline from when
++    it was asked, and no paused time counts twice.
++    """
++    from .guardrails import epoch, load_questions
++    receipt = read_json(runtime.directory / f"{node}.interactive.json")
++    ran = [epoch(entry["answered_at"]) for entry in load_questions(runtime.directory, node) if entry["answered_at"]]
++    ran.append(datetime.fromisoformat(receipt["launch_requested_at"]).timestamp())
++    return max(min(now, (runtime.directory / f"{node}.completion.json").stat().st_mtime), *ran)
++
++
+ def wait_handoffs(runtime, *, clock=time.time, sleep=time.sleep) -> None:
+     """Idle alone never means completion. Deadlines survive controller restart.
+ 
+     A lane's deadline runs from its launch to its completion signal: a lane that finished is not held to it while
+-    others work. A 1.1.0 `question` completion pauses only that lane's deadline (persisted in `<node>.deadline.json`)
+-    until the operator answers, with `workflow answer` or by typing in the pane; the other lanes keep running.
++    others work; once every lane's signal was accepted, one whose session works again is held to the latest lane deadline.
++    A 1.1.0 `question` completion pauses only that lane's deadline (persisted in `<node>.deadline.json`) from when it was
++    written until the operator answers, with `workflow answer` or by typing in the pane; the other lanes keep running.
+     """
+-    from .guardrails import (PANE_ANSWER, deadline_extension, deadline_met, load_questions, mark_deadline_met, record_pane_answer,
+-                             record_question, waiting_question)
++    from .guardrails import (PANE_ANSWER, deadline_met, iso, load_questions, mark_deadline_met, record_pane_answer, record_question,
++                             waiting_question)
+     validate_automatic(runtime.plan)
+     workers = lanes(runtime)
+     if any((runtime.directory / f"{node}.stop.json").exists() for node in workers):
+@@ -174,16 +206,22 @@ def wait_handoffs(runtime, *, clock=time.time, sleep=time.sleep) -> None:
+                 raise RuntimeError("Handoff changed after stop intent")
+         return
+     attention: set[str] = set()
+-    # Lanes whose completion signal was accepted once their turn ended: their deadline is met, whatever their session
+-    # does afterwards (an operator prompt in its pane, a command of its own). Kept across controller restarts.
++    # Lanes whose completion signal was accepted once their turn ended: their deadline is met while another lane still
++    # needs the run, whatever their session does afterwards (an operator prompt in its pane, a command of its own). Kept
++    # across controller restarts.
+     met = {node for node in workers if deadline_met(runtime.directory, node)}
++    bounds: dict[str, float] = {}  # The latest lane deadline last announced for a met lane that is out again.
+     # Answers recorded before this controller started need no second event.
+     answered = {(node, entry["n"]) for node in workers for entry in load_questions(runtime.directory, node) if entry["answer"] is not None}
++    gaps = UpdateGaps(runtime.sessions, runtime.directory, clock)
+     while True:
+         rows = runtime.sessions.inventory()
+         handoffs = {}
+         for node in workers:
+-            row = runtime.sessions.locate(node, rows)
++            try:
++                row = gaps.row(node, rows)
++            except SessionGap:
++                continue  # An update is respawning this lane's session (an idle one: finished, or paused on a question); no verdict.
+             if row is None:
+                 raise RuntimeError("Native worker missing; reconciliation required")
+             path = runtime.directory / f"{node}.completion.json"
+@@ -215,23 +253,34 @@ def wait_handoffs(runtime, *, clock=time.time, sleep=time.sleep) -> None:
+             if item and item["status"] != "question" and row["state"] != "blocked":
+                 handoffs[node] = read_completion(runtime, node)
+                 continue  # Its completion signal met the deadline.
+-            receipt = read_json(runtime.directory / f"{node}.interactive.json")
+-            started = datetime.fromisoformat(receipt["launch_requested_at"]).timestamp()
+-            extension = deadline_extension(runtime.directory, node)  # None while a question waits: that lane has no running deadline.
+-            if node not in met and extension is not None and clock() >= started + runtime.plan["automatic"]["worker_timeout_seconds"] + extension:
+-                raise RuntimeError(f"Worker {node} deadline exhausted; no automatic relaunch")
++            deadline = lane_deadline(runtime, node)  # None while a question waits: that lane has no running deadline.
++            if node in met:
++                # Its signal met its deadline: it never ends the run while another lane works or waits on a question. Once
++                # every lane's signal was accepted that protects no lane, so the latest lane deadline bounds its session
++                # working or blocked again: it never makes the run wait longer than the lanes' own deadlines would have.
++                deadline = latest_deadline(runtime, workers) if deadline is not None and met == set(workers) else None
+             if item and item["status"] == "question":
+-                record_question(runtime, node, item, clock)
+-                continue
++                # Written before the deadline, it pauses it from then, though first read after it (the controller away).
++                asked = question_asked_at(runtime, node, clock())
++                if deadline is None or asked < deadline:
++                    record_question(runtime, node, item, lambda: asked)
++                    continue
++            if node in met and deadline is not None and bounds.get(node) != deadline:
++                bounds[node] = deadline
++                runtime.event(node, "interactive", f"Worker {node} is {row['state']} again after its completion signal was accepted, and so was "
++                                                   f"every other lane's: the run waits for its turn to end until {iso(deadline)}, the latest lane deadline")
++            if deadline is not None and clock() >= deadline:
++                raise RuntimeError(f"Worker {node} deadline exhausted; no automatic relaunch")
+             if row["state"] == "blocked" and not waiting and node not in attention:
+                 # A native session reports `blocked` when its turn ended needing a human: a question,
+                 # a permission prompt or a refusal the harness could not continue past. That is not a
+                 # failure of the lane, and the other lanes keep working. The operator may answer in the
+-                # pane; the worker deadline bounds the wait. No billing/provider fallback. A recorded
+-                # question already said what it waits for, and its deadline is paused.
++                # pane; the worker deadline bounds the wait (a met lane's, as above). No billing/provider
++                # fallback. A recorded question already said what it waits for, and its deadline is paused.
+                 attention.add(node)
+-                runtime.event(node, "interactive", f"Worker {node} needs attention in its pane (native state blocked); "
+-                                                   "waiting until its deadline")
++                runtime.event(node, "interactive", f"Worker {node} needs attention in its pane (native state blocked); " + (
++                    "its completion signal met its deadline, so the run waits for it while another lane works or waits on a question, "
++                    "then until the latest lane deadline" if node in met else "waiting until its deadline"))
+             elif row["state"] != "blocked":
+                 attention.discard(node)
+         if set(handoffs) == set(workers):
+@@ -435,7 +484,7 @@ def wait_reviews(runtime, state: ReviewStatus | None = None, *, clock=None, slee
+ 
+     Returns the accepted decisions by reviewer id (also kept in `state.decisions`) as soon as every reviewer approved,
+     or as soon as one accepted file blocks (the others are not waited for). A rejected file, an expired deadline or
+-    a missing session raises.
++    a missing session raises. A verdict accepted before a controller restart is read again and stays accepted.
+     """
+     clock = clock or time.time
+     sleep = sleep or time.sleep
+@@ -448,6 +497,29 @@ def wait_reviews(runtime, state: ReviewStatus | None = None, *, clock=None, slee
+         started[reviewer_id] = datetime.fromisoformat(receipt["launch_requested_at"]).timestamp()
+     decisions = state.decisions
+     attention = set()
++    gaps = UpdateGaps(runtime.sessions, runtime.directory, clock)
++
++    def accept(reviewer_id: str, accepted: str | None) -> dict:
++        status = state.statuses[reviewer_id]
++        try:
++            decision = read_review_completion(runtime, reviewer_id)
++        except RuntimeError as error:
++            status.update(status="blocked", error=str(error))
++            state.save()
++            raise
++        decisions[reviewer_id] = decision
++        status.update(status="accepted", accepted_at=accepted or now())
++        state.save()
++        return decision
++
++    # Accepted before this controller started (resumed after exit 75 or Ctrl-C), a verdict was final: it is read again
++    # first, whatever its session does now (a follow-up typed in its pane) and in whatever order the reviewers were
++    # declared, so another reviewer's expired deadline cannot drop it from the combined result. Only `accepted_at`
++    # says so: saved, the combined status overwrites the default reviewer's `status`.
++    for reviewer_id in state.ids:
++        accepted = state.statuses[reviewer_id].get("accepted_at")
++        if accepted and reviewer_id not in decisions and decision_blocks(accept(reviewer_id, accepted)):
++            return decisions  # The first block decides; nobody waits for the other reviewers.
+     while True:
+         rows = runtime.sessions.inventory()
+         for reviewer_id in state.ids:
+@@ -455,11 +527,10 @@ def wait_reviews(runtime, state: ReviewStatus | None = None, *, clock=None, slee
+                 continue
+             node = review_node(reviewer_id)
+             status = state.statuses[reviewer_id]
+-            if clock() >= started[reviewer_id] + timeout:
+-                status.update(status="blocked", error="Reviewer deadline exhausted; no second reviewer is launched")
+-                state.save()
+-                raise RuntimeError(f"Reviewer {reviewer_id} deadline exhausted; no second reviewer is launched")
+-            row = runtime.sessions.locate(node, rows)
++            try:
++                row = gaps.row(node, rows)
++            except SessionGap:
++                continue  # An update is respawning this reviewer's session; no verdict.
+             if row is None:
+                 raise RuntimeError(f"Native reviewer {reviewer_id} missing; reconciliation required")
+             if row["state"] == "blocked" and reviewer_id not in attention:
+@@ -468,17 +539,13 @@ def wait_reviews(runtime, state: ReviewStatus | None = None, *, clock=None, slee
+                 attention.add(reviewer_id)
+                 runtime.event("review", "interactive", f"Reviewer {reviewer_id} needs attention in its pane (native state blocked); waiting until the deadline")
+             if row["state"] in {"idle", "done"} and (runtime.directory / f"{node}.completion.json").exists():
+-                try:
+-                    decision = read_review_completion(runtime, reviewer_id)
+-                except RuntimeError as error:
+-                    status.update(status="blocked", error=str(error))
+-                    state.save()
+-                    raise
+-                decisions[reviewer_id] = decision
+-                status.update(status="accepted", accepted_at=now())
+-                state.save()
+-                if decision_blocks(decision):
++                if decision_blocks(accept(reviewer_id, None)):
+                     return decisions  # The first block decides; nobody waits for the other reviewers.
++                continue  # Its file met the deadline, also when first read after it (a controller resumed late).
++            if clock() >= started[reviewer_id] + timeout:
++                status.update(status="blocked", error="Reviewer deadline exhausted; no second reviewer is launched")
++                state.save()
++                raise RuntimeError(f"Reviewer {reviewer_id} deadline exhausted; no second reviewer is launched")
+         if set(decisions) == set(state.ids):
+             return decisions
+         sleep(2)
+@@ -660,16 +727,37 @@ def _review_native(runtime, bundle: dict, digest: str, patch: Path) -> dict:
+     return _accept_native(runtime, bundle, digest, state)
+ 
+ 
+-def check_independence(runtime, bundle: dict, state: ReviewStatus, rows: list) -> None:
+-    """Every reviewer is the session its launch bound, and its UUID differs from every worker's and every other reviewer's."""
++def check_independence(runtime, bundle: dict, state: ReviewStatus, *, clock=None, sleep=None) -> None:
++    """Every reviewer is the session its launch bound, and its UUID differs from every worker's and every other reviewer's.
++
++    A reviewer that wrote its file is idle, which is what an update respawns under a new PID: while the listing shows a
++    bound one in that gap (UpdateGaps) it is listed again every 2 seconds, and a gap that outlasts the grace raises
++    TransientInfraError. A changed or shared UUID and every identity refusal fail at once.
++    """
++    clock = clock or time.time
++    sleep = sleep or time.sleep
+     worker_ids = {item["session_id"] for item in bundle["snapshots"].values()}
+     seen = set()
+     for reviewer_id in state.ids:
+-        row = runtime.sessions.locate(review_node(reviewer_id), rows)
+         session_id = state.statuses[reviewer_id].get("session_id")
+-        if row is None or not session_id or row.get("sessionId") != session_id or session_id in worker_ids or session_id in seen:
++        if not session_id or session_id in worker_ids or session_id in seen:
+             raise RuntimeError(f"Reviewer identity changed or is not independent ({reviewer_id}); refusing the verdict")
+         seen.add(session_id)
++    gaps = UpdateGaps(runtime.sessions, runtime.directory, clock)
++    pending = list(state.ids)
++    while True:
++        rows = runtime.sessions.inventory()
++        for reviewer_id in list(pending):
++            try:
++                row = gaps.row(review_node(reviewer_id), rows)
++            except SessionGap:
++                continue  # An update is respawning this reviewer's session; no verdict.
++            if row is None or row.get("sessionId") != state.statuses[reviewer_id]["session_id"]:
++                raise RuntimeError(f"Reviewer identity changed or is not independent ({reviewer_id}); refusing the verdict")
++            pending.remove(reviewer_id)
++        if not pending:
++            return
++        sleep(2)
+ 
+ 
+ def _accept_native(runtime, bundle: dict, digest: str, state: ReviewStatus) -> dict:
+@@ -681,7 +769,7 @@ def _accept_native(runtime, bundle: dict, digest: str, state: ReviewStatus) -> d
+     try:
+         decisions = wait_reviews(runtime, state)
+         waited = True  # From here a failure refuses the whole review: nothing accepted so far is trusted.
+-        check_independence(runtime, bundle, state, runtime.sessions.inventory())
++        check_independence(runtime, bundle, state)
+         if git(cwd, "rev-parse", "HEAD") != bundle["candidate_commit"] or git(cwd, "status", "--porcelain"):
+             raise RuntimeError("Reviewer worktree changed")
+         if runtime.validate_bundle()[1] != digest or digest_file(patch) != combined["patch_sha256"]:
+@@ -826,8 +914,23 @@ def gate_reasons(packet: Path) -> list[str]:
+     return [reason.replace(str(packet.parent), "<attempt>") for reason in read_json(packet)["gate"]["reasons"]]
+ 
+ 
++RETRY_REQUESTS = "retry-requests.json"
++
++
++def request_retry(runtime, phase: str, node: str, attempt: int) -> None:
++    """`retry --phase/--node` on an automatic plan raised this check's attempt and leaves the rerun to the controller.
++
++    It is the operator's call after a check that left no verdict (an interrupted check, a worktree Git could not
++    create): advance_failed_checks runs the raised attempt once, and only while it has not started.
++    """
++    path = runtime.directory / RETRY_REQUESTS
++    requests = read_json(path) if path.exists() else {}
++    requests[f"{phase}:{node}"] = attempt
++    save_json(path, requests)
++
++
+ def advance_failed_checks(runtime, state) -> bool:
+-    """Retry only recorded failing verification packets, never launches or review."""
++    """Retry only recorded failing verification packets, and attempts `retry` raised, never launches or review."""
+     from .repair import attempt_floor
+     # A checkpoint can carry an error from an earlier attempt of a task that has since
+     # succeeded (its writes are applied and it is no longer pending). Only pending
+@@ -837,14 +940,19 @@ def advance_failed_checks(runtime, state) -> bool:
+     failures = [task.name for task in state.tasks if task.error and task.name in state.next]
+     if not failures or any(name not in retryable for name in failures):
+         return False
+-    targets = []
++    requests_path = runtime.directory / RETRY_REQUESTS
++    requests = read_json(requests_path) if requests_path.exists() else {}
++    targets, requested = [], []
+     for name in failures:
+         phase = "candidate" if name == "candidate" else "worker"
+-        stage_targets = []
++        stage_targets, stage_requested = [], []
+         for node in workers if phase == "candidate" else (name.removeprefix("verify_"),):
+             attempt = runtime.attempt(phase, node)
+-            path = runtime.directory / "verification" / phase / node / str(attempt) / "packet.json"
+-            if path.exists() and read_json(path)["gate"]["status"] != "passed":
++            folder = runtime.directory / "verification" / phase / node / str(attempt)
++            path = folder / "packet.json"
++            if requests.get(f"{phase}:{node}") == attempt and not folder.exists():
++                stage_requested.append(f"{phase}:{node}")
++            elif path.exists() and read_json(path)["gate"]["status"] != "passed":
+                 previous = runtime.directory / "verification" / phase / node / str(attempt - 1) / "packet.json"
+                 if attempt > 1 and previous.exists() and same_revision(previous, path) and gate_reasons(previous) == gate_reasons(path):
+                     # Retries rerun immutable code; two identical failures mean the cause is
+@@ -852,16 +960,23 @@ def advance_failed_checks(runtime, state) -> bool:
+                     raise RuntimeError(f"{phase}/{node} failed identically on attempts {attempt - 1} and {attempt}; "
+                                        f"not transient, inspect {path}. Before review a code fix is a lane repair (RUNBOOK)")
+                 stage_targets.append((phase, node))
+-        if not stage_targets:
++        if not stage_targets and not stage_requested:
+             return False
+         targets.extend(stage_targets)
+-    if not targets:
+-        return False
++        requested.extend(stage_requested)
+     # Check all bounds before changing any counters. The limit counts from the floor of the lane's revision.
+     if any(runtime.attempt(p, n) >= attempt_floor(runtime.directory, p, n) + runtime.policy.get("max_verification_attempts", 3) - 1 for p, n in targets):
+         raise RuntimeError("Verification retry limit exhausted; work and evidence retained")
+     for phase, node in targets:
+         runtime.retry_check(phase, node)
++    if requested:
++        # Consumed before the rerun: one that fails before its check starts is classified as that failure, never rerun again.
++        remaining = {key: value for key, value in requests.items() if key not in requested}
++        if remaining:
++            save_json(requests_path, remaining)
++        else:
++            requests_path.unlink()
++        runtime.event("controller", "running", f"Rerunning {', '.join(requested)} at the attempt retry raised")
+     return True
+ 
+ 
+@@ -1012,19 +1127,76 @@ def review_interrupted(runtime, state) -> bool:
+ 
+ 
+ def resume_interrupted_review(runtime, state) -> bool:
+-    """Re-enter an interrupted review node once: review_candidate rebinds the running reviewers and launches nothing.
++    """Re-enter an interrupted review node: review_candidate rebinds the running reviewers and launches nothing.
+ 
+-    The marker is consumed first, so a re-entry that fails for another reason is classified as that failure.
++    The marker stays until the re-entry's outcome is known (settle_interruption): a re-entry cut short (Ctrl-C, a
++    closed terminal, a kill) is re-entered by the next controller, one that fails for another reason is classified as that failure.
+     """
+     if not review_interrupted(runtime, state):
+         return False
+-    combined = read_json(combined_status_path(runtime))
+-    cause = combined.pop("interrupted")
+-    save_json(combined_status_path(runtime), combined)
++    cause = read_json(combined_status_path(runtime))["interrupted"]
+     runtime.event("review", "running", f"Resuming the review interrupted by: {cause}; the reviewers are rebound, not relaunched")
+     return True
+ 
+ 
++def restart_review(runtime, state) -> bool:
++    """The review node failed before it launched any reviewer: no reviewer status and no review worktree exist.
++
++    Re-entering it launches each reviewer at most once (each status is saved before its launch), so the supervisor
++    does it once per controller; a partial review worktree still needs the operator (review_candidate refuses it).
++    """
++    if [task.name for task in state.tasks if task.error and task.name in state.next] != ["review"]:
++        return False
++    if combined_status_path(runtime).exists() or (runtime.directory / "review-worktree").exists():
++        return False
++    error = next(str(task.error) for task in state.tasks if task.error and task.name == "review")
++    runtime.event("review", "running", f"Re-entering the review, which failed before any reviewer was launched: {error}")
++    return True
++
++
++FREEZE_INTERRUPTED = "freeze-interrupted.json"
++FREEZE_RESUME_NOTE = ("The freeze was stopping the workers: resume completes the stops it recorded (<lane>.stop.json) and relaunches "
++                      "nothing. Once `claude` works, resume with: python -m workflow automatic {directory} --live")
++
++
++def freeze_failure(state) -> str | None:
++    """The error of a freeze that failed after its worker_handoff interrupt was resumed, else None.
++
++    LangGraph then lists no next step: the handoff task keeps the error and its interrupt, and only
++    resuming that interrupt again re-enters the freeze.
++    """
++    if state.next:
++        return None
++    return next((str(task.error) for task in state.tasks if task.name == "handoff" and task.error and task.interrupts), None)
++
++
++def resume_interrupted_freeze(runtime) -> None:
++    """Re-enter a freeze that Claude Code's unavailability interrupted.
++
++    freeze completes the stops recorded in `<lane>.stop.json` (stop_session confirms a stop it issued before issuing
++    another) and launches nothing. The marker stays until the re-entry's outcome is known (settle_interruption), as for a review.
++    """
++    cause = read_json(runtime.directory / FREEZE_INTERRUPTED)["error"]
++    runtime.event("freeze", "running", f"Resuming the freeze interrupted by: {cause}; its recorded stops are completed, nothing is relaunched")
++
++
++def settle_interruption(runtime, failed=None) -> None:
++    """Consume the marker of a re-entered freeze or review once LangGraph recorded the re-entry's outcome.
++
++    It ended, or failed for another reason (the next loop classifies that failure): no marker stays. `failed` is the
++    graph state after another TransientInfraError: the freeze or review it interrupted again keeps its marker, now
++    naming the new cause. A re-entry cut short records nothing, and its marker stays for the next controller.
++    """
++    marker = runtime.directory / FREEZE_INTERRUPTED
++    if marker.exists() and not (failed is not None and freeze_failure(failed)):
++        marker.unlink()
++    path = combined_status_path(runtime)
++    if path.exists() and not (failed is not None and review_interrupted(runtime, failed)):
++        combined = read_json(path)
++        if combined.pop("interrupted", None) is not None:
++            save_json(path, combined)
++
++
+ def drive(runtime, *, single_step=False) -> str | None:
+     """Advance persisted graph state; CLI supervision restarts this process at joins."""
+     from .pipeline import build_pipeline, graph_config, report
+@@ -1035,13 +1207,18 @@ def drive(runtime, *, single_step=False) -> str | None:
+         raise RuntimeError("Source feature branch changed; no automatic continuation")
+     runtime.event("controller", "running", f"Automatic checkpoint controller PID {os.getpid()}")
+     config = graph_config(runtime)
++    review_restarted = False
+     while True:
+         with SqliteSaver.from_conn_string(str(runtime.directory / "pipeline.sqlite")) as saver:
+             graph = build_pipeline(saver, runtime)
+             state = graph.get_state(config)
+             if not state.values or any(name.startswith("launch_") for name in state.next):
+                 raise RuntimeError("Automatic supervision requires a completed start; reconcile uncertain launches explicitly")
+-            if not state.next:
++            frozen = freeze_failure(state)
++            if frozen and not (runtime.directory / FREEZE_INTERRUPTED).exists():
++                # A stop that failed, an ownership violation, a moved HEAD: never re-entered, or the supervisor would loop.
++                raise RuntimeError(f"Freeze failed: {frozen}; non-retryable graph failure, inspect retained evidence")
++            if not state.next and not frozen:
+                 commit = state.values.get("integrated_commit")
+                 if (not commit or git(Path(runtime.plan["repository"]), "rev-parse", "HEAD") != commit
+                         or git(Path(runtime.plan["repository"]), "status", "--porcelain")):
+@@ -1076,25 +1253,40 @@ def drive(runtime, *, single_step=False) -> str | None:
+                         runtime.event("freeze", "blocked", f"Could not confirm worker stop: {cleanup_error}")
+                     report(runtime, state)
+                     raise
++                if frozen:
++                    resume_interrupted_freeze(runtime)
+                 value = Command(resume={"freeze": True})
+             elif pending:
+                 raise RuntimeError("Unexpected manual gate in automatic run; inspect state")
+             elif any(task.error for task in state.tasks) and not (advance_or_block(runtime, state) or reviewer_stop_pending(runtime, state)
+                                                                   or resume_interrupted_review(runtime, state)):
+-                raise RuntimeError("Non-retryable graph failure; inspect retained evidence")
++                if review_restarted or not restart_review(runtime, state):
++                    raise RuntimeError("Non-retryable graph failure; inspect retained evidence")
++                review_restarted = True  # Once per controller: the same failure again stops it.
+             try:
+                 graph.invoke(value, config)
+             except Exception as error:
+                 failed = graph.get_state(config)
+                 if not any(task.error for task in failed.tasks):
+                     raise
++                if isinstance(error, TransientInfraError):
++                    # Claude Code itself was unavailable, whichever node called it: no verdict on any session. Raised, so
++                    # the step exits 69 (75 would claim a persisted checkpoint to continue from) and `automatic` exits 75.
++                    if freeze_failure(failed):
++                        save_json(runtime.directory / FREEZE_INTERRUPTED, {"error": str(error)})
++                        runtime.event("freeze", "interrupted", f"{error}. {FREEZE_RESUME_NOTE.format(directory=runtime.directory)}")
++                    elif not review_interrupted(runtime, failed):  # The review node recorded its own interruption.
++                        runtime.event("controller", "interrupted", f"{error}. {UNAVAILABLE_NOTE.format(directory=runtime.directory)}")
++                    settle_interruption(runtime, failed)
++                    raise
++                settle_interruption(runtime)
+                 if reviewer_stop_pending(runtime, failed):
+                     # Not retried in this loop: the operator inspects the session first; a resumed
+                     # controller retries the stop once before continuing.
+                     raise RuntimeError(REVIEW_STOP_NOTE.format(error=error, directory=runtime.directory)) from error
+-                if isinstance(error, TransientInfraError) and review_interrupted(runtime, failed):
+-                    raise  # The review node recorded the interruption; a new controller re-enters it.
+                 # Next loop reopens the checkpointer and classifies the exact failure.
++            else:
++                settle_interruption(runtime)
+             finally:
+                 report(runtime, graph.get_state(config))
+             if single_step:

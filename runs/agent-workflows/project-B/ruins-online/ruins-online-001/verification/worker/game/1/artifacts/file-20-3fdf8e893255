@@ -1,0 +1,259 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Buttons, MessageType, PROTOCOL_VERSION, type InputMessage } from "@pirate-sea-race/protocol";
+import { SIGHT_RADIUS_TILES, SUB_UNITS_PER_TILE, WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import { defaultSimulationConfig, NOT_DOCKED, quantizeAxis, sail, tileCentre, type ShipState } from "@pirate-sea-race/simulation";
+import { followScroll, TILE_PIXELS, VIEW_HEIGHT, VIEW_WIDTH } from "./camera.js";
+import { FogOfWar } from "./fog.js";
+import { dockHint, dockText } from "./hud.js";
+import { INTERPOLATION_DELAY_MS, SnapshotBuffer } from "./interpolation.js";
+import { axis, KeyboardHelm } from "./keyboard.js";
+import { estimateServerFrame, InputSender } from "./inputSender.js";
+import { MatchView } from "./matchView.js";
+
+describe("SnapshotBuffer", () => {
+  it("interpolates between the snapshots around the render time", () => {
+    const buffer = new SnapshotBuffer();
+    buffer.push(0, 0, 100);
+    buffer.push(50, 100, 100);
+    buffer.push(100, 100, 200);
+    expect(buffer.sample(25)).toEqual({ x: 50, y: 100 });
+    expect(buffer.sample(75)).toEqual({ x: 100, y: 150 });
+  });
+
+  it("holds the ends instead of extrapolating", () => {
+    const buffer = new SnapshotBuffer();
+    expect(buffer.sample(10)).toBeUndefined();
+    buffer.push(10, 5, 5);
+    buffer.push(20, 15, 5);
+    expect(buffer.sample(0)).toEqual({ x: 5, y: 5 });
+    expect(buffer.sample(500)).toEqual({ x: 15, y: 5 });
+  });
+
+  it("keeps a bounded history and ignores out-of-order snapshots", () => {
+    const buffer = new SnapshotBuffer(3);
+    for (let time = 0; time < 10; time++) buffer.push(time * 10, time, 0);
+    buffer.push(5, 999, 999);
+    expect(buffer.latest).toEqual({ time: 90, x: 9, y: 0 });
+    expect(buffer.sample(0)).toEqual({ x: 7, y: 0 });
+  });
+});
+
+describe("MatchView", () => {
+  const ship = (x: number, y: number) => ({ id: "a", slot: 0, x, y, heading: 0, speed: 0, dock: -1 });
+
+  it("draws ships between two snapshots INTERPOLATION_DELAY_MS behind now, not at the latest one", () => {
+    const view = new MatchView("a");
+    view.ingest([ship(0, 500)], 1000);
+    view.ingest([ship(100, 500)], 1050);
+    view.ingest([ship(200, 600)], 1100);
+    expect(INTERPOLATION_DELAY_MS).toBe(100);
+    // At 1175 the scene draws the ship as it was at 1075, halfway between the patches of 1050 and 1100.
+    const drawn = view.renderPosition("a", 1175)!;
+    expect(drawn).toEqual({ x: 150, y: 550 });
+    expect(drawn.x).toBeGreaterThan(100);
+    expect(drawn.x).toBeLessThan(200);
+    // The HUD's readout is the latest decoded server position.
+    expect(view.ships()).toEqual([ship(200, 600)]);
+    // Once now is INTERPOLATION_DELAY_MS past the last patch, the drawing catches up with it.
+    expect(view.renderPosition("a", 1100 + INTERPOLATION_DELAY_MS)).toEqual({ x: 200, y: 600 });
+  });
+
+  it("forgets a ship that leaves the decoded state, as one that sails out of sight does", () => {
+    const view = new MatchView("a");
+    view.ingest([ship(0, 0)], 0);
+    view.ingest([], 50);
+    expect(view.renderPosition("a", 200)).toBeUndefined();
+    expect(view.ships()).toEqual([]);
+  });
+});
+
+describe("keyboard axes", () => {
+  it("makes opposing keys neutral", () => {
+    expect(axis(true, true)).toBe(0);
+    expect(axis(true, false)).toBe(-1);
+    expect(axis(false, true)).toBe(1);
+    expect(axis(false, false)).toBe(0);
+  });
+});
+
+describe("sea keyboard", () => {
+  /** A key event as the browser dispatches it on the window: Node has no KeyboardEvent, so an Event with a code. */
+  const key = (target: EventTarget, type: "keydown" | "keyup", code: string): Event => {
+    const event = Object.assign(new Event(type, { cancelable: true }), { code });
+    target.dispatchEvent(event);
+    return event;
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps a tap of E that goes down and up between two reads, reports it once, and that tap docks", () => {
+    const page = new EventTarget();
+    const keyboard = new KeyboardHelm(page as unknown as Window);
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
+    // Down and up before the page's next read (every 16.7 ms), as real key events: the page keeps them from scrolling.
+    expect(key(page, "keydown", "KeyE").defaultPrevented).toBe(true);
+    key(page, "keyup", "KeyE");
+    const tapped = keyboard.helm();
+    expect(tapped).toEqual({ moveX: 0, moveY: 0, buttons: Buttons.Interact });
+    expect(keyboard.helm().buttons).toBe(0);
+    // A held E stays in on every read until it is released; arrows are only what is held.
+    key(page, "keydown", "KeyE");
+    key(page, "keydown", "ArrowUp");
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: -1, buttons: Buttons.Interact });
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: -1, buttons: Buttons.Interact });
+    key(page, "keyup", "KeyE");
+    key(page, "keyup", "ArrowUp");
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
+    // Keys that are not the helm's pass through to the page untouched.
+    expect(key(page, "keydown", "KeyQ").defaultPrevented).toBe(false);
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
+
+    // The tap goes out as one input message, and the server's step moors a slow ship beside a dock with it.
+    const sent: InputMessage[] = [];
+    const sender = new InputSender({ send: (type, message) => type === MessageType.Input && sent.push(message) });
+    sender.update(tapped, 0);
+    sender.update(keyboard.helm(), 17);
+    expect(sent.map((message) => message.buttons)).toEqual([Buttons.Interact, 0]);
+    const config = defaultSimulationConfig;
+    const dock = config.map.docks[0]!;
+    const berth = tileCentre(config, dock.tileX, dock.tileY);
+    const ship: ShipState = { id: "a", slot: 0, x: berth.x + 1, y: berth.y, heading: 0, speed: 0, dock: NOT_DOCKED, mooredThrottle: 0 };
+    const [message] = sent;
+    const moored = sail(config, ship, { buttons: message!.buttons, moveX: quantizeAxis(message!.moveX), moveY: quantizeAxis(message!.moveY) });
+    expect(moored).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+  });
+
+  it("forgets held keys and a tap of E when the window loses focus", () => {
+    const page = new EventTarget();
+    const keyboard = new KeyboardHelm(page as unknown as Window);
+    key(page, "keydown", "ArrowUp");
+    key(page, "keydown", "KeyE");
+    key(page, "keyup", "KeyE");
+    page.dispatchEvent(new Event("blur"));
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
+  });
+
+  it("ignores keys typed into a text field", () => {
+    // The page's text fields, as the browser would type them; the keys go to the field and bubble up unhandled.
+    class TextField extends EventTarget {}
+    vi.stubGlobal("HTMLInputElement", TextField);
+    vi.stubGlobal("HTMLTextAreaElement", class extends EventTarget {});
+    const field = new TextField();
+    const keyboard = new KeyboardHelm(field as unknown as Window);
+    const typed = key(field, "keydown", "KeyE");
+    key(field, "keyup", "KeyE");
+    expect(typed.defaultPrevented).toBe(false);
+    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
+  });
+});
+
+describe("frame estimate", () => {
+  it("advances the last patched frame by elapsed match time, within the lead limit", () => {
+    expect(estimateServerFrame(300, 1000, 1000)).toBe(300);
+    expect(estimateServerFrame(300, 1000, 1050)).toBe(303);
+    expect(estimateServerFrame(300, 1000, 60_000)).toBe(315);
+  });
+});
+
+describe("input sender", () => {
+  function recorder() {
+    const sent: InputMessage[] = [];
+    return { sent, sender: new InputSender({ send: (type, message) => type === MessageType.Input && sent.push(message) }) };
+  }
+
+  it("sends the interact button and resends held input, but stays quiet at rest", () => {
+    const { sent, sender } = recorder();
+    sender.update({ moveX: 0, moveY: 0, buttons: 0 }, 0);
+    expect(sent).toHaveLength(0);
+    sender.update({ moveX: 0, moveY: -1, buttons: 0 }, 10);
+    sender.update({ moveX: 0, moveY: -1, buttons: 0 }, 50);
+    sender.update({ moveX: 0, moveY: -1, buttons: 0 }, 120);
+    sender.update({ moveX: 0, moveY: 0, buttons: Buttons.Interact }, 130);
+    sender.update({ moveX: 0, moveY: 0, buttons: Buttons.Interact }, 240);
+    sender.update({ moveX: 0, moveY: 0, buttons: 0 }, 250);
+    sender.update({ moveX: 0, moveY: 0, buttons: 0 }, 500);
+    expect(sent.map(({ moveY, buttons }) => [moveY, buttons])).toEqual([[-1, 0], [-1, 0], [0, 1], [0, 1], [0, 0]]);
+    expect(sent.map((message) => message.seq)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("speaks protocol v8: the sea input (the throttle, interact and the grapple), the duel messages, the theft choice, the lobby's start, the reveals and the ruins", () => {
+    expect(PROTOCOL_VERSION).toBe(8);
+  });
+});
+
+describe("minimap fog", () => {
+  it("reveals the disc around the ship once, and keeps it revealed", () => {
+    const fog = new FogOfWar(40, 30, 3);
+    const fresh = fog.revealAround(10, 10);
+    expect(fresh).toContainEqual([13, 10]);
+    expect(fresh).not.toContainEqual([13, 13]);
+    expect(fog.revealedCount).toBe(fresh.length);
+    expect(fog.revealAround(10, 10)).toEqual([]);
+    // Sailing one tile east reveals only the new edge; the old disc stays clear.
+    const next = fog.revealAround(11, 10);
+    expect(next.length).toBeGreaterThan(0);
+    expect(next.every(([x]) => x >= 11)).toBe(true);
+    expect(fog.isRevealed(7, 10)).toBe(true);
+    expect(fog.isRevealed(20, 20)).toBe(false);
+  });
+
+  it("clips at the map edge", () => {
+    const fog = new FogOfWar(5, 5, 3);
+    expect(fog.revealAround(0, 0).every(([x, y]) => x >= 0 && y >= 0)).toBe(true);
+  });
+});
+
+describe("HUD dock state", () => {
+  it("names the dock a ship is moored at", () => {
+    expect(dockText(-1)).toBe("at sea");
+    expect(dockText(0)).toMatch(/^[A-Z][a-z]+ [A-Z][a-z]+, (north|east|south|west) dock$/);
+  });
+
+  it("tells the player to press E within reach of a dock, at any speed", () => {
+    const { map, ship } = defaultSimulationConfig;
+    const berth = tileCentre(defaultSimulationConfig, map.docks[0]!.tileX, map.docks[0]!.tileY);
+    const label = dockText(0);
+    // The HUD's own ship snapshots carry a speed; it no longer changes the hint.
+    const near = (speed: number) => ({ ...berth, speed, dock: NOT_DOCKED });
+    for (const speed of [0, ship.dockMaxSpeed, ship.dockMaxSpeed + 1, ship.maxSpeed, -ship.maxReverseSpeed]) {
+      expect(dockHint(near(speed))).toBe(`Press E to dock at ${label}`);
+    }
+    // Moored already, or far from every dock: nothing to say.
+    expect(dockHint({ ...berth, dock: 0 })).toBe("");
+    const spawn = tileCentre(defaultSimulationConfig, map.spawnSlots[0]!.tileX, map.spawnSlots[0]!.tileY);
+    expect(dockHint({ ...spawn, dock: NOT_DOCKED })).toBe("");
+  });
+});
+
+describe("camera", () => {
+  const { map, ship } = defaultSimulationConfig;
+
+  it("centres the player's ship, and stops at the map's edges", () => {
+    // The hub, in the middle of the map, is far enough from every edge for the camera to centre it.
+    const hub = { x: (map.hub.tileX + 0.5) * TILE_PIXELS, y: (map.hub.tileY + 0.5) * TILE_PIXELS };
+    expect(followScroll(hub.x, hub.y)).toEqual({ x: Math.round(hub.x - VIEW_WIDTH / 2), y: Math.round(hub.y - VIEW_HEIGHT / 2) });
+    expect(followScroll(10, 10)).toEqual({ x: 0, y: 0 });
+    const far = followScroll(1e6, 1e6);
+    expect(far.x + VIEW_WIDTH).toBe(map.widthTiles * TILE_PIXELS);
+    expect(far.y + VIEW_HEIGHT).toBe(map.heightTiles * TILE_PIXELS);
+  });
+
+  it("draws tiles large enough that the whole sight circle fits on the view", () => {
+    expect(TILE_PIXELS).toBe(24);
+    expect(2 * SIGHT_RADIUS_TILES * TILE_PIXELS).toBeLessThanOrEqual(VIEW_HEIGHT);
+    expect(2 * SIGHT_RADIUS_TILES * TILE_PIXELS).toBeLessThanOrEqual(VIEW_WIDTH);
+    // A ship centred by the camera sees the circle's full width and height on screen.
+    const scroll = followScroll(map.widthTiles * TILE_PIXELS / 2, map.heightTiles * TILE_PIXELS / 2);
+    const centre = { x: map.widthTiles * TILE_PIXELS / 2 - scroll.x, y: map.heightTiles * TILE_PIXELS / 2 - scroll.y };
+    expect(centre.y - SIGHT_RADIUS_TILES * TILE_PIXELS).toBeGreaterThanOrEqual(0);
+    expect(centre.y + SIGHT_RADIUS_TILES * TILE_PIXELS).toBeLessThanOrEqual(VIEW_HEIGHT);
+  });
+
+  it("shows a ship at full speed moving about as fast on screen as before the sea was made compact (80 px/s)", () => {
+    const pixelsPerSecond = (ship.maxSpeed * WORLD_STEPS_PER_SECOND * TILE_PIXELS) / SUB_UNITS_PER_TILE;
+    expect(pixelsPerSecond).toBeGreaterThanOrEqual(72);
+    expect(pixelsPerSecond).toBeLessThanOrEqual(80);
+  });
+});

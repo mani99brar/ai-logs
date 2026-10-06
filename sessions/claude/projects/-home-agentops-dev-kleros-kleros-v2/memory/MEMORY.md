@@ -1,0 +1,3 @@
+- [No push; workflow files local-only](no-push-workflow-local-only.md) — kleros-v2: never push; CLAUDE.md/features/ stay on local workflow/base forever
+- [kleros-v2 workflow setup](kleros-v2-workflow-setup.md) — md-manager workflow wiring, setup script, Node 24/husky gotchas, monitor log path
+- [#2565 fix pending, unpushed](shutter-reveal-fix-pending.md) — local fix/shutter-reveal-justification ready; TODO-tracking gap (Closes #2565 vs deferred editor) left open, raise before any PR

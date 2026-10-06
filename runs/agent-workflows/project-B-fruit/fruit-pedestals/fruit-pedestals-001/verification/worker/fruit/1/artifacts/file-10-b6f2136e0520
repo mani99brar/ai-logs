@@ -1,0 +1,158 @@
+import { validateRulesPreset, type RulesPreset } from "@pirate-sea-race/content";
+import {
+  FRUIT_KIT_IDS,
+  fruitRules as defaultFruitRules,
+  kitDescriptions,
+  validateFruitRules,
+  type FruitKitId,
+  type FruitRules,
+  type KitDescription,
+} from "@pirate-sea-race/content/fruits";
+import type { KitId } from "@pirate-sea-race/content/moves";
+import { nextInt } from "../random.js";
+
+/** Static fruit data for one match; the step reads it and it never changes. */
+export interface FruitConfig {
+  /** World ticks of held interact that eat a fruit; the last of them eats it. */
+  readonly eatTicks: number;
+}
+
+/** Builds a match's fruit config from the content rules, refusing invalid rules. */
+export function createFruitConfig(rules: FruitRules = defaultFruitRules): FruitConfig {
+  const checked = validateFruitRules(rules);
+  if (!checked.ok) throw new RangeError(`invalid fruit rules: ${checked.issues.join("; ")}`);
+  return { eatTicks: checked.value.eatTicks };
+}
+
+/** Where the room places a pedestal. The rules never read positions: the caller decides who stands at a pedestal. */
+export interface FruitSite {
+  /** The pedestal's stable id, as the caller names it in each tick's facts. */
+  readonly id: string;
+  /** Position in sub-units, for the caller's own use. */
+  readonly x: number;
+  readonly y: number;
+}
+
+export interface FruitPedestal {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  /** The fruit dealt here; it stays recorded after the fruit is eaten. */
+  readonly kit: FruitKitId;
+  /** The player who ate it, or null while the fruit is still there. Nothing respawns. */
+  readonly eatenBy: string | null;
+}
+
+/** A player holding interact at a pedestal. */
+export interface FruitChannel {
+  readonly playerId: string;
+  readonly pedestalId: string;
+  readonly startTick: number;
+  /** The last tick it was held on; the channel continues only on the very next tick. */
+  readonly lastTick: number;
+  /** Held ticks so far, the start tick included; the fruit is eaten when this reaches `eatTicks`. */
+  readonly held: number;
+}
+
+/** A fruit eaten: the player's kit for the rest of the match. */
+export interface FruitMeal {
+  readonly playerId: string;
+  readonly pedestalId: string;
+  readonly kit: FruitKitId;
+  readonly tick: number;
+}
+
+/** The fruit state: plain integer data that `hashState` covers entirely. */
+export interface FruitState {
+  /** The last world tick processed. */
+  readonly tick: number;
+  /** In site order. */
+  readonly pedestals: readonly FruitPedestal[];
+  /** Sorted by player id. */
+  readonly channels: readonly FruitChannel[];
+  /** Sorted by player id; a player appears at most once and is never removed. */
+  readonly meals: readonly FruitMeal[];
+}
+
+function requireInteger(value: unknown, name: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
+}
+
+/**
+ * The fruit kits a match deals: `KIT_IDS` without the Duelist. A preset asking for another number of fruit kits is
+ * refused until its kits exist (the alpha asks for six; two exist).
+ */
+export function fruitDeck(preset: RulesPreset, pedestalsPerKit: number): FruitKitId[] {
+  if (preset.fruitKits !== FRUIT_KIT_IDS.length) {
+    throw new RangeError(
+      `the ${preset.id} preset deals ${preset.fruitKits} fruit kits, but only ${FRUIT_KIT_IDS.length} exist (${FRUIT_KIT_IDS.join(", ")})`,
+    );
+  }
+  return FRUIT_KIT_IDS.flatMap((kit) => Array.from({ length: pedestalsPerKit }, () => kit));
+}
+
+export interface CreateFruitStateOptions {
+  /** The world tick before the first step (default 0). */
+  readonly tick?: number;
+  readonly rules?: FruitRules;
+}
+
+/**
+ * Deals the preset's fruit onto the caller's sites with the seeded generator (a Fisher–Yates shuffle of two of each
+ * fruit kit), so the same seed and sites always give the same deal. Pass the room's private seed, never the public
+ * match code (§3, §16): the deal is hidden information. Refuses a preset whose fruit count differs from the kits that
+ * exist, and a site list whose length differs from the deck.
+ */
+export function createFruitState(sites: readonly FruitSite[], seed: number, preset: RulesPreset, options: CreateFruitStateOptions = {}): FruitState {
+  requireInteger(seed, "seed");
+  const tick = options.tick ?? 0;
+  requireInteger(tick, "tick");
+  const checkedPreset = validateRulesPreset(preset);
+  if (!checkedPreset.ok) throw new RangeError(`invalid rules preset: ${checkedPreset.issues.join("; ")}`);
+  const rules = validateFruitRules(options.rules ?? defaultFruitRules);
+  if (!rules.ok) throw new RangeError(`invalid fruit rules: ${rules.issues.join("; ")}`);
+  const deck = fruitDeck(checkedPreset.value, rules.value.pedestalsPerKit);
+  if (sites.length !== deck.length) {
+    throw new RangeError(`the ${preset.id} preset needs ${deck.length} pedestal sites (${rules.value.pedestalsPerKit} per fruit kit), got ${sites.length}`);
+  }
+  const ids = new Set<string>();
+  for (const site of sites) {
+    if (typeof site.id !== "string" || site.id.length === 0) throw new RangeError("pedestal ids must be non-empty strings");
+    if (ids.has(site.id)) throw new RangeError(`pedestal ${site.id} appears twice`);
+    ids.add(site.id);
+    requireInteger(site.x, `${site.id}.x`);
+    requireInteger(site.y, `${site.id}.y`);
+  }
+  let rng = seed >>> 0;
+  for (let index = deck.length - 1; index > 0; index--) {
+    const drawn = nextInt(rng, index + 1);
+    rng = drawn.state;
+    [deck[index], deck[drawn.value]] = [deck[drawn.value]!, deck[index]!];
+  }
+  const pedestals = sites.map((site, index) => ({ id: site.id, x: site.x, y: site.y, kit: deck[index]!, eatenBy: null }));
+  return { tick, pedestals, channels: [], meals: [] };
+}
+
+/**
+ * A player's kit (§9): the fruit they ate, or the Duelist for a player who has not eaten, and for an id the state has
+ * never seen. Nothing in this module clears a meal, so a defeat or leaving keeps it.
+ */
+export function kitOf(state: FruitState, playerId: string): KitId {
+  return state.meals.find((meal) => meal.playerId === playerId)?.kit ?? "duelist";
+}
+
+/** What a pedestal shows: its fruit's kit and description, or that it is empty. */
+export type PedestalInspection =
+  | { readonly pedestalId: string; readonly full: true; readonly kit: FruitKitId; readonly description: KitDescription }
+  | { readonly pedestalId: string; readonly full: false };
+
+/**
+ * The kit description a player may read before committing (§9), or null for an unknown pedestal. The deal is hidden
+ * information: the caller shows a pedestal's kit only to players at that pedestal.
+ */
+export function inspectPedestal(state: FruitState, pedestalId: string): PedestalInspection | null {
+  const pedestal = state.pedestals.find((candidate) => candidate.id === pedestalId);
+  if (pedestal === undefined) return null;
+  if (pedestal.eatenBy !== null) return { pedestalId, full: false };
+  return { pedestalId, full: true, kit: pedestal.kit, description: kitDescriptions[pedestal.kit] };
+}

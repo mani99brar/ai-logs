@@ -1,0 +1,62 @@
+import { useQuery } from "@tanstack/react-query";
+
+import { useGraphqlBatcher } from "context/GraphqlBatcher";
+
+import { STALE_TIME } from "src/consts";
+import { graphql } from "src/graphql";
+import { CourtTreeQuery } from "src/graphql/graphql";
+export type { CourtTreeQuery };
+
+const courtTreeQuery = graphql(`
+  query CourtTree {
+    court(id: "1") {
+      name
+      id
+      children(orderBy: name) {
+        name
+        id
+        children {
+          name
+          id
+          children {
+            name
+            id
+            children {
+              name
+              id
+              children {
+                name
+                id
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`);
+
+export const useCourtTree = () => {
+  const { graphqlBatcher } = useGraphqlBatcher();
+  return useQuery<CourtTreeQuery>({
+    queryKey: ["courtTreeQuery"],
+    staleTime: STALE_TIME,
+    queryFn: async () =>
+      await graphqlBatcher.fetch({ id: crypto.randomUUID(), document: courtTreeQuery, variables: {} }),
+  });
+};
+
+interface IItem {
+  label: string;
+  value: string;
+  children?: IItem[];
+}
+
+type Court = NonNullable<CourtTreeQuery["court"]>;
+
+export const rootCourtToItems = (court: Court, value: "id" | "path" = "path"): IItem => ({
+  label: court.name ? court.name : "Unnamed Court",
+  value: value === "id" ? court.id : `/courts/${court.id}`,
+  children:
+    court.children.length > 0 ? court.children.map((child) => rootCourtToItems(child as Court, value)) : undefined,
+});

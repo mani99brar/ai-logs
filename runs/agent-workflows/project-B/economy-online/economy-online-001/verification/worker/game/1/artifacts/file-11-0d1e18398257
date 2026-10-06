@@ -1,0 +1,109 @@
+import { isNavigable, keepClearZones, seaPathCosts, type SeaMapDefinition } from "@pirate-sea-race/content";
+
+/**
+ * §3 and §11's supply crates: floating crates at sea, each paying the first ship that reaches it (25 gold, the ledger's
+ * `grantGold` with reason `supply-cache` and the crate's id as the key). Pure and deterministic: the sites follow from
+ * the map alone, the same in every match, and the room decides who touches one.
+ */
+
+/** Crates on the slice sea: one on the route out of each island. */
+export const SUPPLY_CRATE_COUNT = 4;
+/** A crate floats as a square of this half-size (sub-units) around its tile's centre; a hull overlapping it touches it. */
+export const CRATE_HALF_SIZE = 64;
+/** A tile is on an island's route when a path through it is at most this much longer than the island's shortest route. */
+const ROUTE_SLACK = 1.15;
+/** Tiles (Euclidean, between centres) a crate keeps from every dock, spawn slot and what the tests sail on. */
+export const CRATE_KEEP_CLEAR_TILES = 5;
+/** Tiles (Euclidean) between any two crates. */
+export const CRATE_SPACING_TILES = 20;
+
+export interface SupplySite {
+  /** The ledger's supply-cache id, and the crate's key in the synced state. */
+  readonly id: string;
+  /** The island whose route it lies on. */
+  readonly island: number;
+  readonly tileX: number;
+  readonly tileY: number;
+  /** Its tile's centre, in sub-units. */
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * The crates' sites: for each island in order, the navigable tile closest to halfway along its route to the hub (every
+ * crossing between islands runs through the hub), among the tiles on a near-shortest path (within `ROUTE_SLACK`) that
+ * keep `CRATE_KEEP_CLEAR_TILES` from the docks, spawn slots and test lanes (`keepClearZones`) and
+ * `spacing` tiles (`CRATE_SPACING_TILES`) from the crates before them. Ties go to the northernmost, then westernmost tile. Throws when
+ * an island has no such tile, so a map change that leaves no room fails its unit test.
+ */
+export function supplySites(map: SeaMapDefinition, count = SUPPLY_CRATE_COUNT, spacing = CRATE_SPACING_TILES): SupplySite[] {
+  const key = `${count}:${spacing}`;
+  const cached = siteCache.get(map)?.get(key);
+  if (cached !== undefined) return [...cached];
+  const sites = findSupplySites(map, count, spacing);
+  const byKey = siteCache.get(map) ?? new Map<string, readonly SupplySite[]>();
+  byKey.set(key, sites);
+  siteCache.set(map, byKey);
+  return [...sites];
+}
+
+/** The sites found per map, count and spacing: the search reads every tile's paths, so each room reuses the first result. */
+const siteCache = new WeakMap<SeaMapDefinition, Map<string, readonly SupplySite[]>>();
+
+function findSupplySites(map: SeaMapDefinition, count: number, spacing: number): SupplySite[] {
+  const width = map.widthTiles;
+  const hubCosts = seaPathCosts(map, map.hub.tileX, map.hub.tileY);
+  const zones = keepClearZones(map).flatMap((zone) => zone.tiles);
+  const far = (tileX: number, tileY: number, points: readonly { tileX: number; tileY: number }[], tiles: number) =>
+    points.every((point) => (point.tileX - tileX) ** 2 + (point.tileY - tileY) ** 2 >= tiles * tiles);
+  const sites: SupplySite[] = [];
+  const size = map.subUnitsPerTile;
+  for (let island = 0; sites.length < count; island++) {
+    const docks = map.docks.filter((dock) => dock.island === island);
+    if (docks.length === 0) throw new Error(`${map.name}: no island ${island} for supply crate ${sites.length}`);
+    const dockCosts = docks.map((dock) => seaPathCosts(map, dock.tileX, dock.tileY));
+    const route = Math.min(...docks.map((dock) => hubCosts[dock.tileY * width + dock.tileX]!));
+    let best: { tileX: number; tileY: number; score: number } | undefined;
+    for (let tileY = 0; tileY < map.heightTiles; tileY++) {
+      for (let tileX = 0; tileX < width; tileX++) {
+        if (!isNavigable(map, tileX, tileY)) continue;
+        const index = tileY * width + tileX;
+        const fromDock = Math.min(...dockCosts.map((costs) => costs[index]!));
+        const toHub = hubCosts[index]!;
+        if (fromDock + toHub > route * ROUTE_SLACK) continue;
+        if (!far(tileX, tileY, zones, CRATE_KEEP_CLEAR_TILES) || !far(tileX, tileY, sites, spacing)) continue;
+        const score = Math.abs(fromDock - toHub);
+        if (best === undefined || score < best.score) best = { tileX, tileY, score };
+      }
+    }
+    if (best === undefined) throw new Error(`${map.name}: no room for a supply crate on island ${island}'s route`);
+    const half = Math.floor(size / 2);
+    sites.push({ id: `crate-${sites.length}`, island, tileX: best.tileX, tileY: best.tileY, x: best.tileX * size + half, y: best.tileY * size + half });
+  }
+  return sites;
+}
+
+/** Whether a ship's hull (a square of `hullHalfSize` around it) overlaps a crate. */
+export function touchesCrate(site: Pick<SupplySite, "x" | "y">, ship: { readonly x: number; readonly y: number }, hullHalfSize: number): boolean {
+  const reach = hullHalfSize + CRATE_HALF_SIZE;
+  return Math.abs(ship.x - site.x) <= reach && Math.abs(ship.y - site.y) <= reach;
+}
+
+/**
+ * The crates claimed on one tick: for each unclaimed crate, the ship that gets it among those touching it, the lowest
+ * player id first (ships are kept in join order, which must not decide), so two ships reaching one crate on the same
+ * tick always resolve the same way. A ship may claim several crates on one tick.
+ */
+export function crateClaims(
+  sites: readonly SupplySite[],
+  claimed: ReadonlySet<string>,
+  ships: readonly { readonly id: string; readonly x: number; readonly y: number }[],
+  hullHalfSize: number,
+): { readonly crateId: string; readonly playerId: string }[] {
+  const byId = [...ships].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return sites.flatMap((site) => {
+    if (claimed.has(site.id)) return [];
+    const first = byId.find((ship) => touchesCrate(site, ship, hullHalfSize));
+    return first === undefined ? [] : [{ crateId: site.id, playerId: first.id }];
+  });
+}

@@ -1,0 +1,531 @@
+     1	"""Offline automatic-controller tests: synthetic Claude, real Git/checkpoints/checks."""
+     2	import json
+     3	import subprocess
+     4	import sys
+     5	import tempfile
+     6	import unittest
+     7	from pathlib import Path
+     8	from types import SimpleNamespace
+     9	from unittest.mock import patch
+    10	
+    11	from langgraph.checkpoint.sqlite import SqliteSaver
+    12	
+    13	from .automatic import (DEFAULTS, automatic_settings, drive, read_completion, read_review_completion,
+    14	                        transport, validate_automatic, wait_handoffs, wait_review, supervise)
+    15	from .pipeline import build_pipeline
+    16	from .sessions import git, read_json, save_json
+    17	from .verification import policy_digest
+    18	from . import test_pipeline as fixtures
+    19	
+    20	
+    21	class CompletionTests(unittest.TestCase):
+    22	    def setUp(self):
+    23	        self.temp = tempfile.TemporaryDirectory()
+    24	        self.addCleanup(self.temp.cleanup)
+    25	        self.root = Path(self.temp.name)
+    26	        self.plan = {"run_id": "test", "source_branch": "feature/test", "automatic": dict(DEFAULTS),
+    27	                     "nodes": {node: {"session_id": node + "-token"} for node in ("ui", "adapter")}}
+    28	        sessions = SimpleNamespace(inventory=lambda: [], locate=lambda node, rows: {"state": "idle"})
+    29	        self.runtime = SimpleNamespace(directory=self.root, plan=self.plan, sessions=sessions)
+    30	        for node in self.plan["nodes"]:
+    31	            save_json(self.root / f"{node}.interactive.json", {"launch_requested_at": "1970-01-01T00:00:00+00:00"})
+    32	
+    33	    def completion(self, node):
+    34	        return {"version": "1.0.0", "run_id": "test", "node_id": node, "launch_token": node + "-token",
+    35	                "status": "completed", "summary": "Synthetic work", "open_assumptions": []}
+    36	
+    37	    def test_idle_without_signal_times_out_not_completes(self):
+    38	        ticks = iter([1, 1, DEFAULTS["worker_timeout_seconds"] + 1])
+    39	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+    40	            wait_handoffs(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
+    41	        self.assertFalse((self.root / "ui.handoff.json").exists())
+    42	
+    43	    def test_both_explicit_signals_create_handoffs(self):
+    44	        for node in self.plan["nodes"]:
+    45	            save_json(self.root / f"{node}.completion.json", self.completion(node))
+    46	        wait_handoffs(self.runtime, clock=lambda: 1, sleep=lambda _: self.fail("Unexpected wait"))
+    47	        self.assertEqual(read_json(self.root / "ui.handoff.json")["summary"], "Synthetic work")
+    48	
+    49	    def test_foreign_and_blocked_signals_fail_closed(self):
+    50	        item = self.completion("ui")
+    51	        item["launch_token"] = "foreign"
+    52	        save_json(self.root / "ui.completion.json", item)
+    53	        with self.assertRaisesRegex(ValueError, "foreign"):
+    54	            read_completion(self.runtime, "ui")
+    55	        item = self.completion("ui")
+    56	        item["status"] = "blocked"
+    57	        save_json(self.root / "ui.completion.json", item)
+    58	        with self.assertRaisesRegex(RuntimeError, "explicitly blocked"):
+    59	            read_completion(self.runtime, "ui")
+    60	
+    61	    def test_completion_while_working_is_not_accepted(self):
+    62	        for node in self.plan["nodes"]:
+    63	            save_json(self.root / f"{node}.completion.json", self.completion(node))
+    64	        self.runtime.sessions.locate = lambda node, rows: {"state": "working"}
+    65	        ticks = iter([1, 1, DEFAULTS["worker_timeout_seconds"] + 1])
+    66	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+    67	            wait_handoffs(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
+    68	        self.assertFalse((self.root / "ui.handoff.json").exists())
+    69	
+    70	    def test_stop_intent_recovery_uses_existing_validated_handoffs(self):
+    71	        for node in self.plan["nodes"]:
+    72	            save_json(self.root / f"{node}.completion.json", self.completion(node))
+    73	            save_json(self.root / f"{node}.handoff.json", read_completion(self.runtime, node))
+    74	        save_json(self.root / "ui.stop.json", {"stopped": True})
+    75	        self.runtime.sessions.inventory = lambda: self.fail("Must not locate a stopped worker")
+    76	        wait_handoffs(self.runtime)
+    77	
+    78	    def test_supervisor_restarts_only_for_checkpoint_continuation(self):
+    79	        save_json(self.root / "plan.json", self.plan)
+    80	        with patch("workflow.automatic.subprocess.run", side_effect=[subprocess.CompletedProcess([], 75), subprocess.CompletedProcess([], 0)]) as run:
+    81	            supervise(self.root)
+    82	        self.assertEqual(run.call_count, 2)
+    83	        self.assertEqual(run.call_args.args[0][3:], ["automatic-step", str(self.root), "--live"])
+    84	        with patch("workflow.automatic.subprocess.run", return_value=subprocess.CompletedProcess([], 1)) as run:
+    85	            with self.assertRaisesRegex(RuntimeError, "controller blocked"):
+    86	                supervise(self.root)
+    87	        self.assertEqual(run.call_count, 1)
+    88	
+    89	    def test_supervisor_interrupt_reports_resume_without_stopping_workers(self):
+    90	        save_json(self.root / "plan.json", self.plan)
+    91	        with patch("workflow.automatic.subprocess.run", side_effect=KeyboardInterrupt) as run:
+    92	            with self.assertRaisesRegex(RuntimeError, "NOT stopped.*resume with"):
+    93	                supervise(self.root)
+    94	        self.assertEqual(run.call_count, 1)
+    95	
+    96	    def test_deadlines_are_configurable_and_bounded(self):
+    97	        self.assertEqual(automatic_settings()["worker_timeout_seconds"], 4 * 3600)
+    98	        custom = automatic_settings(7200, 600)
+    99	        self.assertEqual((custom["worker_timeout_seconds"], custom["review_timeout_seconds"]), (7200, 600))
+   100	        self.assertEqual(custom["permission_mode"], DEFAULTS["permission_mode"])
+   101	        for bad in (0, -1, 86401):
+   102	            with self.assertRaisesRegex(ValueError, "bounded"):
+   103	                automatic_settings(worker_timeout_seconds=bad)
+   104	        with self.assertRaises(ValueError):
+   105	            automatic_settings(review_timeout_seconds=90000)
+   106	        self.plan["automatic"] = automatic_settings(7200)
+   107	        validate_automatic(self.plan)
+   108	
+   109	    def test_identical_failures_are_not_retried(self):
+   110	        from .automatic import advance_failed_checks
+   111	        policy = {"max_verification_attempts": 3}
+   112	        attempts = {"worker:adapter": 2}
+   113	        bumped = []
+   114	        runtime = SimpleNamespace(directory=self.root, policy=policy,
+   115	                                  attempt=lambda phase, node: attempts.get(f"{phase}:{node}", 1),
+   116	                                  retry_check=lambda phase, node: bumped.append((phase, node)))
+   117	        state = SimpleNamespace(next=("verify_adapter",), tasks=[SimpleNamespace(name="verify_adapter", error="blocked")])
+   118	        reasons = ["backend-unit: exit 1", "backend-unit: no passing test evidence or failed tests"]
+   119	        for attempt in (1, 2):
+   120	            (self.root / "verification" / "worker" / "adapter" / str(attempt)).mkdir(parents=True)
+   121	            save_json(self.root / "verification" / "worker" / "adapter" / str(attempt) / "packet.json",
+   122	                      {"gate": {"status": "blocked", "reasons": list(reasons)}})
+   123	        with self.assertRaisesRegex(RuntimeError, "failed identically on attempts 1 and 2"):
+   124	            advance_failed_checks(runtime, state)
+   125	        self.assertEqual(bumped, [])
+   126	        # A different failure on the latest attempt is still retried within the cap.
+   127	        save_json(self.root / "verification" / "worker" / "adapter" / "2" / "packet.json",
+   128	                  {"gate": {"status": "blocked", "reasons": ["browser: Playwright reported global errors"]}})
+   129	        self.assertTrue(advance_failed_checks(runtime, state))
+   130	        self.assertEqual(bumped, [("worker", "adapter")])
+   131	
+   132	    def test_stale_error_on_a_completed_sibling_does_not_block_retry(self):
+   133	        from .automatic import advance_failed_checks
+   134	        attempts = {}
+   135	        bumped = []
+   136	        runtime = SimpleNamespace(directory=self.root, policy={"max_verification_attempts": 3},
+   137	                                  attempt=lambda phase, node: attempts.get(f"{phase}:{node}", 1),
+   138	                                  retry_check=lambda phase, node: bumped.append((phase, node)))
+   139	        for node, status, reasons in (("ui", "passed", []), ("adapter", "blocked", ["Intentional lab drill"])):
+   140	            (self.root / "verification" / "worker" / node / "1").mkdir(parents=True)
+   141	            save_json(self.root / "verification" / "worker" / node / "1" / "packet.json", {"gate": {"status": status, "reasons": reasons}})
+   142	        # verify_ui carries an error from an earlier attempt but has since succeeded: it is not pending.
+   143	        state = SimpleNamespace(next=("verify_adapter",),
+   144	                                tasks=[SimpleNamespace(name="verify_ui", error="CalledProcessError(128, git worktree add)"),
+   145	                                       SimpleNamespace(name="verify_adapter", error="blocked")])
+   146	        self.assertTrue(advance_failed_checks(runtime, state))
+   147	        self.assertEqual(bumped, [("worker", "adapter")])
+   148	
+   149	    def test_main_and_unbounded_authority_rejected(self):
+   150	        self.plan["source_branch"] = "main"
+   151	        with self.assertRaises(ValueError):
+   152	            validate_automatic(self.plan)
+   153	        self.plan["source_branch"] = "feature/test"
+   154	        self.plan["automatic"]["worker_timeout_seconds"] = 0
+   155	        with self.assertRaises(ValueError):
+   156	            validate_automatic(self.plan)
+   157	
+   158	
+   159	class ReviewCompletionTests(unittest.TestCase):
+   160	    """The reviewer's file is the verdict; schema validity alone is never acceptance."""
+   161	
+   162	    def setUp(self):
+   163	        self.temp = tempfile.TemporaryDirectory()
+   164	        self.addCleanup(self.temp.cleanup)
+   165	        self.root = Path(self.temp.name)
+   166	        self.plan = {"run_id": "test", "source_branch": "feature/test", "automatic": dict(DEFAULTS)}
+   167	        self.bundle = {"run_id": "test", "candidate_commit": "b" * 40, "snapshots": {}}
+   168	        self.digest = "e" * 64
+   169	        self.token = "a2f1c0d4-1111-4111-8111-111111111111"
+   170	        self.state = "idle"
+   171	        sessions = SimpleNamespace(receipt_path=lambda node: self.root / "review.interactive.json",
+   172	                                   inventory=lambda: [], locate=lambda node, rows: {"state": self.state})
+   173	        self.runtime = SimpleNamespace(directory=self.root, plan=self.plan, sessions=sessions)
+   174	        save_json(self.root / "review.interactive.json", {"launch_requested_at": "1970-01-01T00:00:00+00:00"})
+   175	
+   176	    def completion(self, **changes):
+   177	        item = {"contract_version": "1.0.0", "run_id": "test", "node_id": "review", "launch_token": self.token,
+   178	                "bundle_sha256": self.digest, "candidate_commit": self.bundle["candidate_commit"],
+   179	                "verdict": "approved",
+   180	                "findings": [{"severity": "P2", "message": "Non-blocking observation", "disposition": "open",
+   181	                              "worker": "ui", "requirement": "Distinguish no workflows from no runs"}]}
+   182	        item.update(changes)
+   183	        save_json(self.root / "review.completion.json", item)
+   184	        return item
+   185	
+   186	    def read(self):
+   187	        return read_review_completion(self.runtime, self.bundle, self.digest, self.token)
+   188	
+   189	    def test_bound_completion_carries_worker_and_requirement(self):
+   190	        self.completion()
+   191	        decision = self.read()
+   192	        self.assertEqual(decision["verdict"], "approved")
+   193	        self.assertEqual(decision["findings"][0]["worker"], "ui")
+   194	        self.assertEqual(decision["findings"][0]["requirement"], "Distinguish no workflows from no runs")
+   195	
+   196	    def test_foreign_run_token_bundle_or_candidate_fails_closed(self):
+   197	        for change in ({"run_id": "other"}, {"launch_token": "11111111-2222-4333-8444-555555555555"},
+   198	                       {"bundle_sha256": "f" * 64}, {"candidate_commit": "c" * 40}):
+   199	            self.completion(**change)
+   200	            with self.assertRaisesRegex(ValueError, "Stale or foreign"):
+   201	                self.read()
+   202	
+   203	    def test_schema_violations_fail_closed(self):
+   204	        from jsonschema.exceptions import ValidationError
+   205	        for change in ({"node_id": "candidate"}, {"contract_version": "1.1.0"}, {"reviewer": "someone"},
+   206	                       {"findings": [{"severity": "P2", "message": "No worker named", "disposition": "open"}]},
+   207	                       {"findings": [{"severity": "P4", "message": "Unknown severity", "disposition": "open",
+   208	                                      "worker": "ui", "requirement": None}]}):
+   209	            self.completion(**change)
+   210	            with self.assertRaises(ValidationError):
+   211	                self.read()
+   212	
+   213	    def test_a_verdict_cannot_contradict_its_own_findings(self):
+   214	        self.completion(verdict="blocked", findings=[])
+   215	        with self.assertRaisesRegex(ValueError, "blocked verdict"):
+   216	            self.read()
+   217	        open_defect = {"severity": "P1", "message": "Unredacted path in the response", "disposition": "open",
+   218	                       "worker": "adapter", "requirement": None}
+   219	        self.completion(findings=[open_defect])
+   220	        with self.assertRaisesRegex(ValueError, "unresolved P0/P1"):
+   221	            self.read()
+   222	        self.completion(verdict="blocked", findings=[open_defect])
+   223	        self.assertEqual(self.read()["verdict"], "blocked")
+   224	
+   225	    def test_symlinked_or_oversized_completion_is_never_read(self):
+   226	        self.completion()
+   227	        payload = self.root / "elsewhere.json"
+   228	        (self.root / "review.completion.json").replace(payload)
+   229	        (self.root / "review.completion.json").symlink_to(payload)
+   230	        with self.assertRaisesRegex(ValueError, "Invalid reviewer completion file"):
+   231	            self.read()
+   232	        (self.root / "review.completion.json").unlink()
+   233	        self.completion(findings=[{"severity": "P2", "message": "x" * 70000, "disposition": "open",
+   234	                                   "worker": "ui", "requirement": None}])
+   235	        with self.assertRaisesRegex(ValueError, "Invalid reviewer completion file"):
+   236	            self.read()
+   237	
+   238	    def test_idle_without_a_file_times_out_without_a_second_reviewer(self):
+   239	        ticks = iter([1, 1, DEFAULTS["review_timeout_seconds"] + 1])
+   240	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+   241	            wait_review(self.runtime, self.bundle, self.digest, self.token,
+   242	                        clock=lambda: next(ticks), sleep=lambda _: None)
+   243	
+   244	    def test_completion_written_while_working_is_not_accepted(self):
+   245	        self.completion()
+   246	        self.state = "working"
+   247	        ticks = iter([1, 1, DEFAULTS["review_timeout_seconds"] + 1])
+   248	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+   249	            wait_review(self.runtime, self.bundle, self.digest, self.token,
+   250	                        clock=lambda: next(ticks), sleep=lambda _: None)
+   251	        self.state = "idle"
+   252	        self.assertEqual(wait_review(self.runtime, self.bundle, self.digest, self.token, clock=lambda: 1)["verdict"], "approved")
+   253	
+   254	    def test_a_missing_or_blocked_reviewer_stops_rather_than_relaunching(self):
+   255	        self.completion()
+   256	        self.runtime.sessions.locate = lambda node, rows: None
+   257	        with self.assertRaisesRegex(RuntimeError, "reconciliation required"):
+   258	            wait_review(self.runtime, self.bundle, self.digest, self.token, clock=lambda: 1)
+   259	        self.runtime.sessions.locate = lambda node, rows: {"state": "blocked"}
+   260	        with self.assertRaisesRegex(RuntimeError, "Reviewer blocked"):
+   261	            wait_review(self.runtime, self.bundle, self.digest, self.token, clock=lambda: 1)
+   262	
+   263	    def test_only_an_interrupted_review_of_a_live_session_resumes(self):
+   264	        """An error recorded against the review node is not a licence to review again."""
+   265	        from .automatic import advance_failed_checks
+   266	        live = {"row": None}
+   267	        runtime = SimpleNamespace(directory=self.root, plan=self.plan, policy={},
+   268	                                  sessions=SimpleNamespace(inventory=lambda: [], locate=lambda node, rows: live["row"]))
+   269	        state = SimpleNamespace(next=("review",), tasks=[SimpleNamespace(name="review", error="interrupted")])
+   270	        self.assertFalse(advance_failed_checks(runtime, state))  # No reviewer was ever launched.
+   271	        save_json(self.root / "automatic-review.json", {"transport": "native", "status": "running"})
+   272	        self.assertFalse(advance_failed_checks(runtime, state))  # The session is gone; reconcile instead.
+   273	        live["row"] = {"state": "idle"}
+   274	        self.assertTrue(advance_failed_checks(runtime, state))
+   275	        for receipt in ({"transport": "native", "status": "blocked"}, {"transport": "native", "status": "succeeded"},
+   276	                        {"transport": "print", "status": "running"}):
+   277	            save_json(self.root / "automatic-review.json", receipt)
+   278	            self.assertFalse(advance_failed_checks(runtime, state))
+   279	        save_json(self.root / "automatic-review.json", {"transport": "native", "status": "running"})
+   280	        self.plan["automatic"]["reviewer_transport"] = "print"
+   281	        self.assertFalse(advance_failed_checks(runtime, state))
+   282	        self.plan["automatic"]["reviewer_transport"] = "native"
+   283	        # A review failure alongside a failed check is never advanced automatically.
+   284	        mixed = SimpleNamespace(next=("review", "candidate"),
+   285	                                tasks=[SimpleNamespace(name="review", error="x"), SimpleNamespace(name="candidate", error="y")])
+   286	        self.assertFalse(advance_failed_checks(runtime, mixed))
+   287	
+   288	    def test_transport_defaults_to_native_and_is_bounded(self):
+   289	        self.assertEqual(transport(self.plan), "native")
+   290	        self.assertEqual(transport({"automatic": {"reviewer_transport": "print"}}), "print")
+   291	        self.assertEqual(transport({"automatic": {}}), "native")  # Runs prepared before this slice.
+   292	        self.plan["automatic"]["reviewer_transport"] = "herdr"
+   293	        with self.assertRaisesRegex(ValueError, "transport"):
+   294	            validate_automatic(self.plan)
+   295	        with self.assertRaises(ValueError):
+   296	            automatic_settings(reviewer_transport="print-mode")
+   297	
+   298	
+   299	class AutomaticGraphTests(unittest.TestCase):
+   300	    """Default transport: a reviewer session with a pane, a completion file and a stop."""
+   301	
+   302	    transport = "native"
+   303	
+   304	    def setUp(self):
+   305	        self.fixture = fixtures.PipelineTests()
+   306	        self.fixture.setUp()
+   307	        self.addCleanup(self.fixture.doCleanups)
+   308	        f = self.fixture
+   309	        self.original_branch = f.plan["source_branch"]
+   310	        git(f.repo, "switch", "-c", "feature/automatic-test")
+   311	        f.policy.update(version="1.1.0", max_verification_attempts=3,
+   312	                        failure_drill={"node_id": "adapter", "phase": "worker", "attempt": 1})
+   313	        f.plan.update(source_branch="feature/automatic-test", policy_sha256=policy_digest(f.policy),
+   314	                      automatic=automatic_settings(reviewer_transport=self.transport))
+   315	        save_json(f.directory / "plan.json", f.plan)
+   316	        save_json(f.directory / "policy.json", f.policy)
+   317	        f.runtime = fixtures.OfflinePipeline(f.directory, f.sessions)
+   318	        self.counter = f.root / "review-count"
+   319	        self.verdict = f.root / "review-verdict"
+   320	        self.verdict.write_text("approved")
+   321	        executable = f.root / "fake-reviewer"
+   322	        executable.write_text(f'''#!/usr/bin/env python3
+   323	import json, sys
+   324	from pathlib import Path
+   325	args = sys.argv
+   326	assert args[args.index('--tools') + 1] == 'Read,Glob,Grep'
+   327	assert '--dangerously-skip-permissions' not in args
+   328	counter = Path({str(self.counter)!r})
+   329	counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')
+   330	verdict = Path({str(self.verdict)!r}).read_text()
+   331	print(json.dumps({{"session_id": args[args.index('--session-id') + 1], "is_error": False, "subtype": "success",
+   332	                  "structured_output": {{"verdict": verdict, "findings": []}}}}))
+   333	''')
+   334	        executable.chmod(0o700)
+   335	        f.sessions.executable = str(executable)
+   336	        with SqliteSaver.from_conn_string(str(f.directory / "pipeline.sqlite")) as saver:
+   337	            graph = build_pipeline(saver, f.runtime)
+   338	            first = graph.invoke({"run_id": "run"}, f.config)
+   339	            self.assertEqual(first["__interrupt__"][0].value["kind"], "worker_handoff")
+   340	
+   341	    def reviews_started(self) -> int:
+   342	        """Reviewer launches, however this transport starts one."""
+   343	        if self.transport == "native":
+   344	            return len(self.fixture.sessions.reviewer_launches)
+   345	        return int(self.counter.read_text()) if self.counter.exists() else 0
+   346	
+   347	    def block_review(self):
+   348	        self.verdict.write_text("blocked")
+   349	        self.fixture.sessions.reviewer_verdict = {"verdict": "blocked", "findings": [
+   350	            {"severity": "P1", "message": "Synthetic blocking defect", "disposition": "open",
+   351	             "worker": "adapter", "requirement": None}]}
+   352	
+   353	    def events(self) -> list[dict]:
+   354	        return [json.loads(line) for line in (self.fixture.directory / "events.jsonl").read_text().splitlines()]
+   355	
+   356	    def test_automatic_drill_review_and_feature_only_finish(self):
+   357	        f = self.fixture
+   358	        # Completion protocol has separate tests; FakeSessions already supplied handoffs.
+   359	        with patch("workflow.automatic.wait_handoffs"):
+   360	            commit = drive(f.runtime)
+   361	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   362	        self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
+   363	        self.assertEqual(git(f.repo, "symbolic-ref", "--short", "HEAD"), "feature/automatic-test")
+   364	        self.assertEqual(sorted(f.sessions.starts), ["adapter", "ui"])
+   365	        self.assertEqual(self.reviews_started(), 1)
+   366	        self.assertEqual(read_json(f.directory / "failure-report.json")["verification_attempts"], {"ui": [1], "adapter": [1, 2]})
+   367	        self.assertEqual(drive(f.runtime), commit)
+   368	        self.assertEqual(self.reviews_started(), 1)
+   369	        self.assertFalse(git(f.repo, "remote"))
+   370	
+   371	    def test_review_node_records_the_reviewer_session_and_its_findings(self):
+   372	        f = self.fixture
+   373	        with patch("workflow.automatic.wait_handoffs"):
+   374	            drive(f.runtime)
+   375	        review = read_json(f.directory / "review.json")
+   376	        self.assertEqual(review["verdict"], "approved")
+   377	        if self.transport == "print":
+   378	            self.assertEqual(review["findings"], [])
+   379	            return
+   380	        receipt = read_json(f.directory / "review.interactive.json")
+   381	        self.assertEqual(receipt["node_id"], "review")
+   382	        self.assertEqual(review["reviewer"], receipt["session_id"])
+   383	        self.assertNotIn(review["reviewer"], {f.plan["nodes"][node]["session_id"] for node in ("ui", "adapter")})
+   384	        self.assertEqual(read_json(f.directory / "automatic-review.json")["transport"], "native")
+   385	        # Findings carry the fields slice C links to tasks with.
+   386	        self.assertEqual([(item["worker"], item["requirement"]) for item in review["findings"]], [("ui", "UI")])
+   387	        session_events = [event for event in self.events() if event["node"] == "review"]
+   388	        self.assertTrue(any(receipt["session_id"] in event["message"] for event in session_events))
+   389	        self.assertEqual([event["status"] for event in session_events][-2:], ["stopped", "approved"])
+   390	        self.assertTrue((f.directory / "review.stop.json").exists())
+   391	
+   392	    def test_recovery_in_actual_new_controller_processes(self):
+   393	        f = self.fixture
+   394	        script = '''import sys
+   395	from pathlib import Path
+   396	from workflow import automatic
+   397	from workflow.sessions import read_json
+   398	from workflow.test_pipeline import OfflinePipeline, FakeSessions
+   399	directory = Path(sys.argv[1])
+   400	sessions = FakeSessions(directory, read_json(directory / 'plan.json'))
+   401	sessions.executable = sys.argv[2]
+   402	runtime = OfflinePipeline(directory, sessions)
+   403	automatic.wait_handoffs = lambda runtime: None
+   404	if Path(sys.argv[3]).exists():
+   405	    def interrupt_the_operator(*arguments, **keywords):
+   406	        raise KeyboardInterrupt
+   407	    automatic.wait_review = interrupt_the_operator
+   408	try:
+   409	    commit = automatic.drive(runtime, single_step=True)
+   410	except KeyboardInterrupt:
+   411	    assert (directory / 'review.interactive.json').exists(), 'Interrupt lost the reviewer receipt'
+   412	    sys.exit(130)
+   413	assert not sessions.starts, 'Restart launched workers again'
+   414	assert not sessions.reviewer_launches, 'Restart launched a second reviewer'
+   415	sys.exit(0 if commit else 75)
+   416	'''
+   417	        marker = f.root / "interrupt-review"
+   418	        marker.touch()
+   419	        codes, launched = [], None
+   420	        for _ in range(5):
+   421	            result = subprocess.run([sys.executable, "-c", script, str(f.directory), f.sessions.executable, str(marker)],
+   422	                                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=90)
+   423	            codes.append(result.returncode)
+   424	            self.assertIn(result.returncode, (0, 75, 130), result.stderr)
+   425	            if result.returncode == 130:
+   426	                # Interrupted mid-review: the reviewer session is left running.
+   427	                launched = read_json(f.directory / "review.interactive.json")
+   428	                self.assertEqual(read_json(f.directory / "automatic-review.json")["status"], "running")
+   429	                self.assertFalse((f.directory / "review.stop.json").exists())
+   430	                marker.unlink()
+   431	            if result.returncode == 0:
+   432	                break
+   433	        self.assertEqual(codes, [75, 130, 75, 0])  # Interrupted at the review step, then resumed.
+   434	        # The resumed process reused the same reviewer session rather than launching one.
+   435	        self.assertEqual(read_json(f.directory / "review.interactive.json")["launch_token"], launched["launch_token"])
+   436	        self.assertEqual(read_json(f.directory / "review.json")["reviewer"], launched["session_id"])
+   437	        controller = [event for event in self.events() if event["node"] == "controller"]
+   438	        self.assertGreaterEqual(len({event["message"] for event in controller}), 4)
+   439	        self.assertTrue(any(event["status"] == "interrupted" for event in controller))
+   440	        self.assertEqual(read_json(f.directory / "failure-report.json")["verification_attempts"], {"ui": [1], "adapter": [1, 2]})
+   441	        self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
+   442	
+   443	    def test_interrupt_during_worker_wait_keeps_workers_and_resumes(self):
+   444	        f = self.fixture
+   445	        with patch("workflow.automatic.wait_handoffs", side_effect=KeyboardInterrupt), patch.object(f.runtime, "stop_workers") as stop:
+   446	            with self.assertRaises(KeyboardInterrupt):
+   447	                drive(f.runtime)
+   448	        stop.assert_not_called()
+   449	        self.assertTrue(any(event["status"] == "interrupted" and "resume with" in event["message"] for event in self.events()))
+   450	        self.assertFalse((f.directory / "ui.stop.json").exists())
+   451	        # The same run resumes from the persisted checkpoint without relaunching anything.
+   452	        with patch("workflow.automatic.wait_handoffs"):
+   453	            commit = drive(f.runtime)
+   454	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   455	        self.assertEqual(sorted(f.sessions.starts), ["adapter", "ui"])
+   456	
+   457	    def test_deadline_or_blocked_worker_stops_workers(self):
+   458	        f = self.fixture
+   459	        with patch("workflow.automatic.wait_handoffs", side_effect=RuntimeError("Worker ui deadline exhausted; no automatic relaunch")), \
+   460	                patch.object(f.runtime, "stop_workers") as stop:
+   461	            with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+   462	                drive(f.runtime)
+   463	        stop.assert_called_once()
+   464	
+   465	    def test_reviewer_block_preserves_branch_and_does_not_relaunch(self):
+   466	        f = self.fixture
+   467	        self.block_review()
+   468	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   469	            drive(f.runtime)
+   470	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+   471	        self.assertEqual(read_json(f.directory / "automatic-review.json")["status"], "blocked")
+   472	        with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   473	            drive(f.runtime)
+   474	        self.assertEqual(self.reviews_started(), 1)
+   475	
+   476	    def test_a_foreign_completion_file_is_not_a_verdict(self):
+   477	        f = self.fixture
+   478	        launch = f.sessions.run_reviewer
+   479	
+   480	        def foreign(prompt, token, commit):
+   481	            receipt = launch(prompt, token, commit)
+   482	            item = read_json(f.directory / "review.completion.json")
+   483	            item["bundle_sha256"] = "f" * 64  # A verdict on some other evidence.
+   484	            save_json(f.directory / "review.completion.json", item)
+   485	            return receipt
+   486	        f.sessions.run_reviewer = foreign
+   487	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   488	            drive(f.runtime)
+   489	        receipt = read_json(f.directory / "automatic-review.json")
+   490	        self.assertEqual(receipt["status"], "blocked")
+   491	        self.assertIn("Stale or foreign", receipt["error"])
+   492	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+   493	        self.assertFalse((f.directory / "review.json").exists())
+   494	        with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   495	            drive(f.runtime)
+   496	        self.assertEqual(self.reviews_started(), 1)
+   497	
+   498	    def test_a_reviewer_that_writes_no_file_times_out_with_evidence_retained(self):
+   499	        f = self.fixture
+   500	        f.sessions.reviewer_writes_completion = False
+   501	        f.runtime.plan["automatic"]["review_timeout_seconds"] = 1
+   502	        with patch("workflow.automatic.wait_handoffs"), patch("workflow.automatic.time.sleep"), \
+   503	                self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   504	            drive(f.runtime)
+   505	        receipt = read_json(f.directory / "automatic-review.json")
+   506	        self.assertEqual(receipt["status"], "blocked")
+   507	        self.assertIn("deadline exhausted", receipt["error"])
+   508	        self.assertFalse((f.directory / "review.completion.json").exists())
+   509	        self.assertTrue((f.directory / "review.diff").exists())
+   510	        self.assertEqual(self.reviews_started(), 1)
+   511	        # No second reviewer is launched for the same blocked review.
+   512	        with patch("workflow.automatic.time.sleep"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   513	            drive(f.runtime)
+   514	        self.assertEqual(self.reviews_started(), 1)
+   515	
+   516	
+   517	class PrintReviewerTests(AutomaticGraphTests):
+   518	    """`--reviewer-transport print`: the retained fallback for hosts without Herdr."""
+   519	
+   520	    transport = "print"
+   521	    # Graph recovery, interruption and the completion protocol are exercised by the
+   522	    # native class; print mode has no session, pane or completion file of its own.
+   523	    test_recovery_in_actual_new_controller_processes = None
+   524	    test_interrupt_during_worker_wait_keeps_workers_and_resumes = None
+   525	    test_deadline_or_blocked_worker_stops_workers = None
+   526	    test_a_foreign_completion_file_is_not_a_verdict = None
+   527	    test_a_reviewer_that_writes_no_file_times_out_with_evidence_retained = None
+   528	
+   529	
+   530	if __name__ == "__main__":
+   531	    unittest.main()

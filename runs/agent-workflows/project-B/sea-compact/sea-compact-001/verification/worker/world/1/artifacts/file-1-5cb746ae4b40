@@ -1,0 +1,76 @@
+import type { AddressInfo } from "node:net";
+import { createEndpoint, createRouter, defineRoom, defineServer, matchMaker, WebSocketTransport, type Server } from "colyseus";
+import { createTestPlacementSchema, DUEL_ROOM, MATCH_ROOM, TEST_PLACEMENT_PATH } from "@pirate-sea-race/protocol";
+import { defaultSimulationConfig } from "@pirate-sea-race/simulation";
+import { DuelRoom } from "./DuelRoom.js";
+import { MatchRoom } from "./MatchRoom.js";
+
+export const DEFAULT_PORT = 2593;
+
+/** The largest WebSocket frame the transport accepts; a larger one closes that connection. */
+export const MAX_FRAME_BYTES = 4096;
+
+export interface GameServerOptions {
+  /** 0 picks a free port. */
+  readonly port: number;
+  readonly host?: string;
+  /** Install SIGINT/SIGTERM handlers that drain rooms and exit. Off for in-process tests. */
+  readonly handleSignals?: boolean;
+  /**
+   * Test-only: serve TEST_PLACEMENT_PATH, which puts a player's ship on a chosen tile. Off by default; only the dev
+   * and test entry point (`dev.ts`) and in-process tests turn it on.
+   */
+  readonly testPlacement?: boolean;
+}
+
+export interface RunningGameServer {
+  readonly port: number;
+  readonly server: Server;
+  close(): Promise<void>;
+}
+
+/** Placements on the match's own sea map. */
+const testPlacementSchema = createTestPlacementSchema(defaultSimulationConfig.map);
+
+/**
+ * POST TEST_PLACEMENT_PATH with a TestPlacement body: 200 with the ship's new position, 400 for a malformed body, a
+ * tile off the map or a tile a ship cannot sit on, 404 when no match or player matches.
+ */
+const placeShipEndpoint = createEndpoint(TEST_PLACEMENT_PATH, { method: "POST" }, async (context) => {
+  const parsed = testPlacementSchema.safeParse(context.body);
+  if (!parsed.success) return Response.json({ error: "malformed placement" }, { status: 400 });
+  const { code, sessionId, tileX, tileY, heading } = parsed.data;
+  const [listing] = await matchMaker.query({ name: MATCH_ROOM, code });
+  const room = listing === undefined ? undefined : (matchMaker.getLocalRoomById(listing.roomId) as MatchRoom | undefined);
+  if (room === undefined || room.clients.get(sessionId) === undefined) return Response.json({ error: "no such player" }, { status: 404 });
+  try {
+    room.placeShip(sessionId, { tileX, tileY, heading });
+  } catch (error) {
+    return Response.json({ error: (error as Error).message }, { status: 400 });
+  }
+  const ship = room.state.ships.get(sessionId)!;
+  return Response.json({ x: ship.x, y: ship.y, heading: ship.heading });
+});
+
+export async function startGameServer(options: GameServerOptions): Promise<RunningGameServer> {
+  const server = defineServer({
+    greet: false,
+    gracefullyShutdown: options.handleSignals ?? true,
+    transport: new WebSocketTransport({ maxPayload: MAX_FRAME_BYTES }),
+    rooms: {
+      // Private matches are found by their code. A create's one-time token is a filter field too, and no listing
+      // holds it, so a request carrying one matches no existing match: `join` fails and `joinOrCreate` creates.
+      [MATCH_ROOM]: defineRoom(MatchRoom).filterBy(["code", "createToken"]),
+      // Standalone duels (the combat spike) are admitted the same way, under their own name.
+      [DUEL_ROOM]: defineRoom(DuelRoom).filterBy(["code", "createToken"]),
+    },
+    ...(options.testPlacement === true ? { routes: createRouter({ placeShipEndpoint }) } : {}),
+  });
+  await server.listen(options.port, options.host);
+  const address = server.transport.server?.address() as AddressInfo | null | undefined;
+  return {
+    port: address?.port ?? options.port,
+    server,
+    close: () => server.gracefullyShutdown(false),
+  };
+}

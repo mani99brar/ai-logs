@@ -1,0 +1,91 @@
+import { connect, createServer, type AddressInfo, type Socket } from "node:net";
+import { afterEach, describe, expect, it } from "vitest";
+import { ImpairmentProxy, type Impairment } from "./impairmentProxy.js";
+
+/** An unmasked WebSocket binary frame carrying `index` as its one-byte payload. */
+const frame = (index: number) => Buffer.from([0x82, 0x01, index]);
+
+const cleanups: (() => Promise<void> | void)[] = [];
+
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+});
+
+/**
+ * A server that answers any upgrade with 101 and then sends `count` one-byte frames, one every `spacingMs`; a client
+ * that connects through the proxy and records when each frame arrives.
+ */
+async function stream(impairment: Impairment, seed: number, count: number, spacingMs: number): Promise<{ index: number; sentAt: number; at: number }[]> {
+  const sentAt: number[] = [];
+  const target = createServer((socket: Socket) => {
+    socket.once("data", () => {
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+      let index = 0;
+      const timer = setInterval(() => {
+        sentAt.push(performance.now());
+        socket.write(frame(index++));
+        if (index === count) clearInterval(timer);
+      }, spacingMs);
+      socket.on("close", () => clearInterval(timer));
+    });
+  });
+  await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise<void>((resolve) => target.close(() => resolve())));
+  const proxy = await ImpairmentProxy.start((target.address() as AddressInfo).port, impairment, seed);
+  cleanups.push(() => proxy.close());
+
+  const port = Number(new URL(proxy.endpoint).port);
+  const client = connect(port, "127.0.0.1");
+  cleanups.push(() => void client.destroy());
+  const arrivals: { index: number; sentAt: number; at: number }[] = [];
+  let head = true;
+  let pending = Buffer.alloc(0);
+  await new Promise<void>((resolve) => {
+    client.on("data", (chunk: Buffer) => {
+      pending = Buffer.concat([pending, chunk]);
+      if (head) {
+        const end = pending.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        pending = pending.subarray(end + 4);
+        head = false;
+      }
+      while (pending.length >= 3) {
+        const index = pending[2]!;
+        arrivals.push({ index, sentAt: sentAt[index]!, at: performance.now() });
+        pending = pending.subarray(3);
+      }
+      if (arrivals.length === count) resolve();
+    });
+    client.write("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+  });
+  return arrivals;
+}
+
+describe("ImpairmentProxy", () => {
+  it("delays with jitter but never reorders", async () => {
+    const arrivals = await stream({ rttMs: 60, jitterMs: 40, loss: 0 }, 7, 40, 2);
+    expect(arrivals.map((arrival) => arrival.index)).toEqual(Array.from({ length: 40 }, (_, index) => index));
+    // Every frame waited at least half the round trip less half the jitter.
+    for (const arrival of arrivals) expect(arrival.at - arrival.sentAt).toBeGreaterThanOrEqual(30 - 20 - 2);
+  });
+
+  it("turns a lost frame into a stall of one retransmission timeout for everything behind it", async () => {
+    const arrivals = await stream({ rttMs: 20, jitterMs: 0, loss: 0.2, rtoMs: 200 }, 3, 30, 5);
+    expect(arrivals.map((arrival) => arrival.index)).toEqual(Array.from({ length: 30 }, (_, index) => index));
+    const held = arrivals.map((arrival) => arrival.at - arrival.sentAt);
+    // The first lost frame waited out the timeout; the frame sent 5 ms after it could not overtake it.
+    const lost = held.findIndex((ms) => ms >= 200);
+    expect(lost).toBeGreaterThanOrEqual(0);
+    expect(lost).toBeLessThan(29);
+    expect(held[lost + 1]).toBeGreaterThanOrEqual(200 - 5 - 2);
+  });
+
+  it("draws the same delays and losses from the same seed", async () => {
+    const a = await ImpairmentProxy.start(1, { rttMs: 80, jitterMs: 20, loss: 0.5 }, 42);
+    const b = await ImpairmentProxy.start(1, { rttMs: 80, jitterMs: 20, loss: 0.5 }, 42);
+    cleanups.push(() => a.close(), () => b.close());
+    const draws = (proxy: ImpairmentProxy) => Array.from({ length: 20 }, () => proxy.delayFor(0, true));
+    expect(draws(a)).toEqual(draws(b));
+    expect(a.stats.lost[0]).toBeGreaterThan(0);
+  });
+});

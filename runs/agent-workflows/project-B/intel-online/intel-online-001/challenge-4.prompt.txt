@@ -1,0 +1,141 @@
+You are the design challenge of a workflow run: a skeptical senior engineer who reads the plan before any worker starts. You only read; you change nothing and launch nothing. Your working directory is the repository at the run's base commit; read its code when a concern depends on it.
+
+Find the fragile assumptions, the strongest simpler alternative, the likely failure modes and one cheap experiment that could change the choice. Tie every concern to a concrete consequence and give it a severity: P0 when the plan cannot work as written, P1 when it is likely to produce the wrong result or major rework and must be settled before any worker starts, P2 when it is worth recording and the run can continue. A P0 or P1 pauses the run for the operator, so raise one only for a consequence you can name; do not reopen what decisions.md settles unless you show it cannot hold. kind is assumption, failure_mode, complexity or other. Return the requested JSON schema: concerns (possibly empty), simpler_alternative and cheap_experiment.
+
+The PRD this feature implements: /home/agentops/.local/state/agent-workflows/project-B/intel-online/intel-online-001/challenge-inputs/prd.md (read it).
+
+=== Task of lane game ===
+# Task: game
+
+## Goal
+
+Give captains something to chase besides the obvious (§3, §11). Every player starts the match with a rumor pointing at a sealed rubbing: an island, or a sector with a recovery cache. The journal keeps each lead until it goes stale, and then replaces it. Losing a rubbing in a duel gives a free fresh rumor, the comeback lead of §11. At a dock, a captain can pay 25 gold for a targeted rumor about a type they're missing. When nothing else is left, a delayed carrier sighting says roughly where another captain was seen with that type. The pure rules are on `main` (`packages/simulation/src/intel`, `docs/intel.md`). `match-online` already delivers the reveals: the final sector, the route, the minute-20 sector reveal and the minute-28 carrier reports. This feature delivers the rest (rumors, sightings, stale leads and purchases) and builds the journal.
+
+## Context
+
+- Read `docs/spec.md` §3 ("Rumors and the journal"), §11 (comeback leads, the 25-gold rumor), §13 (the journal screen: known islands, collected types, current rumors, power descriptions) and §16 (hidden information).
+- Read `docs/intel.md` (all of it: leads and their tiers, stale leads and replacements, sightings and their delay and cap, `targetedRumorAvailability`, `freeCoverage`, the messages and what they may never carry), `docs/objectives.md` (Economy: `purchase` of a `rumor`, request ids per player, and the "Rumor flow" paragraph that fixes the order: check availability, then `purchase`, then deliver), `docs/architecture.md`, and the room as `fruit-kits-online` left it: `revealOf` in `MatchRoom.ts` drops every kind but the reveals, and that's where this feature starts.
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration`, `npm run build` and `npx --no-install playwright test --config=tests/e2e/playwright.config.ts`.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Constraints
+
+- **Test timing:** the integration suite must stay under its 300 s budget. Cases that need exact tick alignment (several requests pending at once for `busy`, two requests in one tick, a stale rumor on the processing tick) use a test-only room hook that enqueues requests and steps ticks directly, gated like the existing test hooks, instead of racing the network. The 5-player sightings match and the scripted duel match use the test-only short timings.
+
+- Owned paths as in `policy.json`. The pure modules and their content aren't owned: use them through their exports, and report `blocked` naming the gap if a change is truly needed.
+- Server authoritative, zod-validated messages, protocol version bump. Tests drive input like players do.
+- Hidden information: every rumor, sighting and journal update goes only to its player. No message carries a player id, a rubbing id, or a source's, cache's or ship's position, except the `final-route` point that `match-online` already sends. The integration test reads raw frames.
+
+## Design (settled)
+
+- **Delivery:** the room delivers every intel message kind to its recipients. `revealOf` grows into a full mapping, with rumors, sightings, stale notices and `no-lead` added.
+- **Journal record (room-side):** intel's `IntelPlayerState.journal` keeps island and sector rumors with their status (active, stale, resolved), but not sightings or no-lead notices, and it doesn't link a stale rumor to what followed it. So the room keeps a per-player journal log (bounded to the last 24 entries), fed by every message the player receives. Each entry has the entry number, the kind (island or sector rumor, carrier sighting, no-lead), the type, the target name, the reason, the tick, and a status of active, stale or resolved (from `rumor-resolved` when the player gets the type). A stale entry is marked superseded by the next lead of the same type the player receives, whatever its reason: intel may give a `fresh` lead instead of a `replacement` when a loss and a stale rumor coincide, or deliver a deferred sighting later. The log is part of the player's private status, so a reconnecting player gets it back.
+- **Journal:** **M** opens and closes the journal panel (readable DOM text). It shows your current rumors: the type, the island name or the sector name, and why you got it (start, fresh, targeted, replacement, sighting). Stale rumors are greyed out with their replacement. It also shows the islands you know, your collected types, and your kit with its §9 description. "Islands you know" means the islands you've had in sight or moored at. The room tracks them per player from the same sight filter the markers use, keeps each island's unlocked state as last seen, and adds whether you solved its ruin. A short toast announces each new lead.
+- **Sectors on the sea:** faint 3 × 3 sector borders on the sea, with the sector's name shown when you enter it. The borders only show while the journal is open or a sector lead is active, so the sea stays clean.
+- **Targeted rumor (one purchase per player per tick, charge only on delivery):** moored at any dock, the journal offers "Buy a rumor (25 gold)" for each type you're missing that has an available lead (`targetedRumorAvailability`). Types with free coverage show "covered" and can't be bought. The ledger has no refunds, so no gold may ever be taken for a rumor that isn't delivered. The room resolves requests like this:
+  1. **Queue with limits:** requests arrive between ticks. A request whose (player, client id) is already pending is merged with it: it takes no slot, and both are answered by the one decision. The room keeps at most 2 pending requests per player; more are refused at once (`busy`) and nothing is kept. The button is disabled while one is pending.
+  2. **Replay first:** a request whose (player, client request id) the room has already decided is answered from the room's record, before any check: a bought id resends its delivered lead (the ledger's `replayed`), and a refused id resends the same refusal. The room keeps every bought id and the last 16 refusals per player, like the ledger.
+  3. **One per player per tick:** each world tick, the room takes **at most one** pending request per player, oldest first; the rest wait for a later tick. So the pre-check below can't be spent twice.
+  4. **Where and what:** the whole purchase (checks, `stepIntel`, `purchase`) runs in the reveal step, immediately before and around `stepIntel`, after every other ledger operation of the tick (advance, encounters, channels, settlements, grants). The checks, in order: (a) the buyer's ship is **moored at a dock on this tick** (authoritative, not just the button; a request queued at a dock and processed after casting off is refused `not-at-dock`); (b) the ledger's state (in play, not in a duel or the theft window, not disconnected, at least 25 gold), read through the ledger's own exported queries, not copied rules; (c) `targetedRumorAvailability` for that type, which must offer a lead. Any failure gives a recorded refusal with its reason, no charge, and never reaches `stepIntel`.
+  5. **`stepIntel`** with the request, under a room-namespaced intel id (`<playerId>:<clientRequestId>`, because intel's ids are global and the ledger's are per player).
+  6. **Only if the intel outcome delivers a lead** does the room call the ledger's `purchase` with the client's id. Steps 3 and 4(a) on the same synchronous tick make its success an invariant: no other gold changes for that player between the check and the purchase. The room doesn't write a fallback branch for it. A refused purchase here means a bug, so it throws, and the match faults (§12), like any broken invariant in `worldTick`. An integration test sends bursts of requests for different types, across players and ticks, with gold between 25 and 49, and checks every delivered targeted lead is charged exactly once and every undelivered one isn't (`checkLedger` after every tick). Any intel outcome that doesn't deliver a lead goes through **one shared branch**: a recorded refusal carrying intel's reason, with no charge. The room doesn't branch per outcome. After the checks above, few such outcomes are reachable (for example a stale rumor or a snapshot boundary on the processing tick). Test the shared branch with a reachable case, which a test hook may set up.
+
+  Update the "Rumor flow" paragraph in `docs/objectives.md` (owned) and document the order in `docs/architecture.md`. `economy-online`'s dockside shop will later list the same purchase.
+- **Keys:** **M** opens and closes the journal (the map and journal); Esc also closes it. M doesn't clash with E, R, F, J, U or I. Tab stays the browser's focus key: inside the open journal, Tab moves between its buttons, and Enter or Space activates one (§13 keyboard-navigable menus). The panel key rules apply: no key events are taken from text fields, and the helm stays live while the journal is open.
+
+## Acceptance
+
+Each item names the test that proves it. Integration tests use headless clients through the real room.
+
+1. **Start rumors** (integration): at control start every player gets a start rumor naming an island with a sealed source, or a sector with a cache, of a type they lack. It never names a carrier.
+2. **Fresh and replacement leads** (integration): losing a type in a settled theft gives the loser a free fresh rumor. A journal rumor whose source gets collected goes stale and is replaced. Entering a duel isn't a loss.
+3. **Targeted purchase** (integration):
+   - buying with 25 gold delivers one targeted rumor and deducts 25;
+   - a request refused by intel's step on the processing tick (the shared non-delivery branch) is charged nothing;
+   - a request processed after the ship cast off is refused `not-at-dock` and charged nothing;
+   - a retry of a still-pending id is merged and answered once;
+   - two players using the same client request id are independent (the namespaced intel id);
+   - two requests of different types in one tick from a player with 25–49 gold: one is delivered and charged, the other waits a tick and is then refused for gold, uncharged;
+   - a retried refused id gets the same refusal; a retried bought id is replayed even after the player's gold fell below 25 or while in a duel;
+   - a third pending request is refused `busy`, and a request for a type with no available lead never reaches `stepIntel`;
+   - a retry with the same request id is replayed without charging again;
+   - a covered type is refused without charge, and so is a purchase with too little gold;
+   - a purchase while in a duel is refused;
+   - the gold identity holds (`checkLedger`).
+4. **Sightings** (integration, with test-only short timings): when every copy of a missing type is carried by others, the lead is a carrier sighting delayed by the configured interval, at most one per player per snapshot. The slice has 4 copies per type and a player holds one of each type at most, so the test uses 5 headless players (4 carry the type, the 5th lacks it). Add a test-only `carrierInterval` timing, whose sighting delay equals it and whose carrier reveal is a multiple of it, so the intel validator accepts it.
+5. **Hidden information on raw messages** (integration): across a scripted match that includes a duel, no frame to a player carries another player's rumor, journal entry, rubbing id, or a source's, cache's or unseen ship's position. Every intel-derived message goes only to its recipient. Ship ids for ships in sight, the grapple's ids and the results' ids are already public by design; they're allowed, and the test states that.
+6. **Reconnect** (integration): a player who reconnects gets their journal back unchanged.
+7. **UI** (web unit): the journal model (entries of every kind, stale and replaced links, reasons, islands, types, kit), the M and Esc keys, focus traversal inside the panel, the purchase button states (available, covered, too little gold, not at a dock), the toast, and the sector-border visibility rule.
+8. **Browser scenario `rumor-journal`** (the policy's description of this scenario says "Tab"; the journal key is **M** per the design above, and the scenario id is unchanged):
+   - two browsers start a private match;
+   - the host opens the journal with M and reads its start rumor (a type and an island or sector name) from the page;
+   - it sails to a dock, moors, buys a targeted rumor and sees its gold drop by 25 and a new journal entry marked "targeted";
+   - the guest's page never shows the host's rumors.
+9. **The existing scenarios still pass**, including the full match and the ruin, fruit and theft loops.
+10. **Carried from `fruit-kits-online`'s approving reviews:**
+    - the fruit panel stays open long enough to show the `reserved` and cast-off interruption reasons, which it closes too early to show today (a web unit test plus a room-level status test);
+    - an auto-repeated F keydown (`event.repeat`) from the press that opened the panel never starts eating; only a fresh press does (web unit test);
+    - `receiveOpenRuin` checks `island === null` before calling `openRuin`, matching its `island: number` type, instead of relying on the pure module's runtime check;
+    - the fruit hidden-information test takes its marks before the players join, so it also covers the first syncs;
+    - an integration test shows that a duel fought after a lost duel starts with the eater's kit (duel diagnostics or the lobby `kits`).
+11. **The branch table:** `docs/intel-online-coverage.md` has one row for each room-level and UI branch this feature adds or changes: the file and function, the branch, and the test that fails when the branch is deleted.
+    - Build it by deleting each branch on a scratch copy, running the deletions in parallel batches. Don't commit those edits.
+    - A branch with no failing test gets a new test. A branch that can't change the outcome is marked `equivalent`, with a one-line reason. Dead code is removed.
+    - There are no `unreachable` or `untested` rows, and the completion report's `untested` list is empty.
+12. `docs/architecture.md` gains an "Intel in the room" section of at most half a page.
+13. `npm ci` then each of the five policy checks passes from a clean checkout, with all browser scenarios. The integration suite stays well inside its time budget; report its duration.
+
+Browser checks: each scenario id appears in exactly one test title as `[scenario:<id>]`. That test, when it passes, attaches exactly one image/png named `screenshot:<id>` (other attachments are fine). The verifier refuses anything else. Before completing, run the spec files you changed with a JSON report:
+
+```bash
+WORKFLOW_VERIFICATION_PHASE=worker PLAYWRIGHT_JSON_OUTPUT_FILE=<tmp>/report.json \
+  npx --no-install playwright test --config=tests/e2e/playwright.config.ts --reporter=json <spec files>
+```
+
+Then check the report with the verifier's own rules: run the exact `check-report` command the controller appends to this task when it pins it.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A pure module or content change outside the owned paths is truly required. Name the missing operation.
+- A check can pass only by changing a path outside the owned paths.
+- After two hours of work, any required check still fails and you cannot name the next fix. The worker deadline is three hours; leave time for the branch table and the final checks.
+
+Report `question` only for a choice that would change this acceptance.
+
+Approved ownership and checks:
+{"node_id": "game", "role": "fullstack", "required_check_kinds": ["typecheck", "unit", "integration", "build", "browser"], "owned_paths": ["package.json", "package-lock.json", "README.md", "docs/architecture.md", "docs/duel.md", "docs/encounters.md", "packages/simulation/package.json", "packages/simulation/src/netcode", "packages/simulation/src/encounters", "packages/simulation/src/step.ts", "packages/simulation/src/state.ts", "packages/simulation/src/config.ts", "packages/simulation/src/index.ts", "packages/simulation/src/input.ts", "packages/simulation/src/visibility.ts", "packages/simulation/src/simulation.test.ts", "packages/content/package.json", "packages/content/src/encounters", "packages/content/src/sailing.ts", "packages/content/src/index.ts", "packages/protocol", "packages/test-tools", "apps", "tests/integration", "tests/e2e", "scripts", "vitest.config.ts", "docs/objectives.md", "docs/match-online-coverage.md", "docs/ruins-online-coverage.md", "docs/fruit-kits-online-coverage.md", "docs/intel-online-coverage.md"], "checks": [{"id": "typecheck", "kind": "typecheck", "argv": ["npm", "run", "typecheck"], "timeout_seconds": 300, "scenarios": []}, {"id": "unit", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 300, "scenarios": []}, {"id": "integration", "kind": "integration", "argv": ["npm", "run", "test:integration"], "timeout_seconds": 300, "scenarios": []}, {"id": "build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 600, "scenarios": []}, {"id": "browser", "kind": "browser", "argv": ["npx", "--no-install", "playwright", "test", "--config=tests/e2e/playwright.config.ts"], "timeout_seconds": 1800, "scenarios": [{"id": "join-private-match", "description": "One browser creates a private match from the landing page; the HUD shows the code, the protocol version, one player and a connected status."}, {"id": "two-ships-sync", "description": "Two browsers join the same private match with their ships in sight of each other; one sails with the keyboard and the other browser's view shows that ship at the new server-authoritative position."}, {"id": "sail-and-dock", "description": "A browser sails its ship around a shoal to an island dock with the keyboard and docks there; the HUD shows the dock and the ship stops at it."}, {"id": "out-of-sight", "description": "Two browsers in one match with their ships out of sight of each other: neither view lists or draws the other ship until one sails within the sight radius, and it disappears again when it sails away."}, {"id": "duel-practice", "description": "One browser opens a practice duel against the dummy, lands a jab and then a keyboard throw (J then K a frame apart); the dummy's health bar and the HUD drop by the move data's damage, and hitboxes can be shown."}, {"id": "duel-online", "description": "Two browsers: one creates a duel, the other joins by its code; after the countdown the first lands a strike on the second, and both views show the same authoritative health, round clock and result, with the connection line showing input delay and corrections."}, {"id": "sea-duel", "description": "Two browsers in one match are placed within grapple range; the host sails at the guest and presses J; both see the grapple telegraph, then a three-second countdown and the arena; the duel is decided; the winner returns to the sea with protection shown, and the loser sees a respawn countdown and then their ship at a dock."}, {"id": "theft-loop", "description": "Two browsers moored at different islands each hold E and collect a different rubbing type; the host grapples the guest at sea, wins the duel by tapping attack keys, and picks the guest's type within five seconds; the host's HUD shows both types and more gold, the guest's shows the loss."}, {"id": "full-match", "description": "Two browsers: the host starts a private match from the lobby, both see the ready countdown and the match timer; the host collects both rubbing types, sees the full-set reveal and the route, sails to the final island's claim tile and holds E for ten seconds; both browsers show the results with the host as the winner."}, {"id": "match-deadline", "description": "Two browsers start a private match from the lobby with test-only short timings; nobody claims; the timer runs out; both browsers show the results with the no-winner deadline headline, and the route compass is shown inactive while no route is known."}, {"id": "ruin-solve", "description": "One browser moored at an island opens its ruin with R and reads the clue from the page; the test derives the answer from the displayed clue only, submits it, sees '+40 gold' and the island unlocked, then holds E to collect the rubbing."}, {"id": "fruit-duel", "description": "One browser moors at a pedestal's dock, presses F, reads the kit name from the panel, holds F for three seconds and sees its HUD show Ember; it grapples the second browser at sea, casts the flame bolt (U) in the arena, both browsers see the bolt drawn, and the second browser's health bar drops by the bolt's damage."}, {"id": "rumor-journal", "description": "Two browsers start a private match; the host opens the journal with Tab and reads its start rumor (a type and an island or sector name) from the page, sails to a dock, moors, buys a targeted rumor and sees its gold drop by 25 and a new journal entry marked targeted; the guest's page never shows the host's rumors."}]}]}
+Browser scenarios: each scenario id of your browser checks appears in exactly one test title as `[scenario:<id>]`, and that test, when it passes, attaches exactly one image/png named `screenshot:<id>` (other attachments are fine); before completing, run the spec files you changed with `WORKFLOW_VERIFICATION_PHASE=<worker|candidate> PLAYWRIGHT_JSON_OUTPUT_FILE=<tmp>/report.json npx --no-install playwright test --config=<config> --reporter=json <spec files>` and check the report with the verifier's own rules against the run's pinned policy (it only reads it), from anywhere in your worktree: `PYTHONSAFEPATH=1 PYTHONPATH=/home/agentops/dev/md-manager /home/agentops/dev/md-manager/.venv/bin/python -m workflow check-report "$(git rev-parse --show-toplevel)/../policy.json" game <tmp>/report.json`.
+
+=== decisions.md ===
+# Decisions: intel-online
+
+From the operator session of 2026-09-25. The operator asked the assistant to keep launching the queued slices on the 10-minute loop. The assistant settled the choices below, and they're recorded in `operator-logs/decisions-overnight.md` (#54).
+
+## Decisions
+
+- The pure intel module and the ledger on `main` are used through their exports and aren't owned. The room delivers every intel message kind: `revealOf` grows into a full mapping.
+- The room keeps each player's journal log (the last 24 entries: rumors, sightings and no-lead, with active, stale or resolved status, and a stale entry linked to the next lead of its type), because intel's journal holds neither sightings nor links. It's part of the private status, so a reconnecting player gets it back.
+- **M** opens the journal (Tab stays the browser's focus key, and moves between the journal's buttons). It lists your rumors (type, island or sector, reason, stale marks with their replacement), known islands, collected types and your kit with its description. A toast announces each new lead.
+- The 3 × 3 sector borders on the sea show only while the journal is open or a sector lead is active.
+- Moored at any dock, the journal sells a targeted rumor for 25 gold (challenge attempts 1–3). The server checks the buyer is moored at a dock on the processing tick. The whole purchase runs in the reveal step after every other ledger operation. Pending retries of the same id are merged. Every non-delivering intel outcome goes through one shared refusal branch. The room queues at most 2 requests per player and replays a decided id before any check. It takes at most one request per player per tick, checks the ledger and `targetedRumorAvailability`, runs `stepIntel` under a namespaced id, and calls `purchase` only when a lead is delivered; that purchase's success is an invariant, and a violation faults the match. Undelivered rumors never cost gold. Refusals are recorded (16 per player) and replayed on retry. `economy-online`'s dockside shop will later list the same purchase.
+- The new browser scenario is `rumor-journal`.
+- The five P2 notes from `fruit-kits-online`'s approving reviews are folded in (acceptance item 10).
+- The committed branch → test table (`docs/intel-online-coverage.md`) is required from the start.
+
+## Assumptions
+
+- "Islands you know" = islands a player has had in sight or moored at, tracked per player by the room.
+- Tick-exact tests use a gated test-only hook that enqueues requests and steps ticks.
+
+- The raw-message privacy test allows the ids that are already public by design (ship ids in sight, the grapple's ids, the results).
+- The sightings test uses 5 headless players and a test-only carrier-interval timing.
+
+- Everything in `features/match-online/`, `features/ruins-online/`, `features/fruit-kits-online/` and their fixes stands.
+- The reveals that `match-online` already delivers keep their current messages and HUD.
+
+## Deferred
+
+- `economy-online` (the dockside shop with rumor and tonic, the tonic's sailing effect, supply caches), then the polish phase (P0–P6).

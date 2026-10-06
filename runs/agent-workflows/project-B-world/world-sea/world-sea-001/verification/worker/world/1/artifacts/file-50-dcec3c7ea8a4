@@ -1,0 +1,234 @@
+import { expect, type APIRequestContext, type Page, type TestInfo } from "@playwright/test";
+import { HEADING_COUNT, SUB_UNITS_PER_TILE } from "../../packages/content/src/index.js";
+import { TEST_PLACEMENT_PATH } from "../../packages/protocol/src/index.js";
+
+export const SERVER_URL = "http://localhost:2593";
+export const TILE = SUB_UNITS_PER_TILE;
+const PIXELS_PER_SUB_UNIT = 16 / SUB_UNITS_PER_TILE;
+
+export interface Readout {
+  readonly id: string;
+  readonly slot: number;
+  readonly x: number;
+  readonly y: number;
+  readonly heading: number;
+  readonly speed: number;
+  readonly dock: number;
+}
+
+export interface DrawnShip {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly color: string;
+}
+
+export async function createMatch(page: Page): Promise<string> {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Create match" }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+  const code = page.getByTestId("hud-code");
+  await expect(code).toHaveText(/^[A-Z0-9]{6}$/);
+  return (await code.textContent())!;
+}
+
+export async function joinMatch(page: Page, code: string): Promise<void> {
+  await page.goto("/");
+  await page.getByLabel("Match code").fill(code);
+  await page.getByRole("button", { name: "Join" }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+}
+
+export async function selfId(page: Page): Promise<string> {
+  return (await page.getByTestId("hud-self").textContent())!;
+}
+
+/** Every ship the page's HUD lists, with the latest decoded server state. */
+export async function listed(page: Page): Promise<Readout[]> {
+  return page.evaluate(() =>
+    [...document.querySelectorAll<HTMLElement>('[data-testid="positions"] [data-ship-id]')].map((item) => ({
+      id: item.dataset["shipId"]!,
+      slot: Number(item.dataset["slot"]),
+      x: Number(item.dataset["x"]),
+      y: Number(item.dataset["y"]),
+      heading: Number(item.dataset["heading"]),
+      speed: Number(item.dataset["speed"]),
+      dock: Number(item.dataset["dock"]),
+    })),
+  );
+}
+
+export async function listedIds(page: Page): Promise<string[]> {
+  return (await listed(page)).map((ship) => ship.id).sort();
+}
+
+/** A ship's authoritative state in a page's HUD, or undefined when the page does not list it. */
+export async function readout(page: Page, shipId: string): Promise<Readout | undefined> {
+  return (await listed(page)).find((ship) => ship.id === shipId);
+}
+
+export async function drawnShips(page: Page): Promise<DrawnShip[]> {
+  return JSON.parse((await page.getByTestId("game").getAttribute("data-drawn-ships")) ?? "[]") as DrawnShip[];
+}
+
+export async function drawnIds(page: Page): Promise<string[]> {
+  return (await drawnShips(page)).map((ship) => ship.id).sort();
+}
+
+/**
+ * Test-only placement (the server's PIRATE_SEA_RACE_TEST_PLACEMENT setting, on for these tests): puts a player's
+ * ship at rest on a tile, then waits until the page shows it there.
+ */
+export async function place(request: APIRequestContext, page: Page, code: string, tileX: number, tileY: number, heading: number): Promise<void> {
+  const sessionId = await selfId(page);
+  const response = await request.post(`${SERVER_URL}${TEST_PLACEMENT_PATH}`, { data: { code, sessionId, tileX, tileY, heading } });
+  expect(response.status(), await response.text()).toBe(200);
+  await expect
+    .poll(async () => {
+      const ship = await readout(page, sessionId);
+      return ship === undefined ? undefined : [ship.x, ship.y, ship.speed];
+    })
+    .toEqual([tileX * TILE + TILE / 2, tileY * TILE + TILE / 2, 0]);
+}
+
+/** Canvas pixels as RGBA rows, read from a real screenshot of the canvas. */
+async function canvasPixels(page: Page, points: readonly { x: number; y: number }[], radius: number): Promise<[number, number, number][][]> {
+  const png = await page.locator("#game canvas").screenshot();
+  return page.evaluate(
+    async ({ base64, points, radius }) => {
+      const blob = await (await fetch(`data:image/png;base64,${base64}`)).blob();
+      const bitmap = await createImageBitmap(blob);
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const context = canvas.getContext("2d")!;
+      context.drawImage(bitmap, 0, 0);
+      return points.map(({ x, y }) => {
+        const pixels: [number, number, number][] = [];
+        for (let dy = -radius; dy <= radius; dy++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            const px = x + dx;
+            const py = y + dy;
+            if (px < 0 || py < 0 || px >= bitmap.width || py >= bitmap.height) continue;
+            const [r, g, b] = context.getImageData(px, py, 1, 1).data;
+            pixels.push([r!, g!, b!]);
+          }
+        }
+        return pixels;
+      });
+    },
+    { base64: png.toString("base64"), points, radius },
+  );
+}
+
+function near(pixel: [number, number, number], color: string, tolerance = 24): boolean {
+  const want = Number.parseInt(color.slice(1), 16);
+  const [r, g, b] = pixel;
+  return Math.abs(r - ((want >> 16) & 0xff)) <= tolerance && Math.abs(g - ((want >> 8) & 0xff)) <= tolerance && Math.abs(b - (want & 0xff)) <= tolerance;
+}
+
+/**
+ * The ids of ships whose colour is actually on the canvas where the scene says it drew them. Reads a real
+ * screenshot of the canvas, so it checks rendered pixels rather than scene bookkeeping.
+ */
+export async function shipsOnCanvas(page: Page): Promise<string[]> {
+  const drawn = await drawnShips(page);
+  const pixels = await canvasPixels(page, drawn, 0);
+  return drawn.filter((ship, index) => near(pixels[index]![0]!, ship.color)).map((ship) => ship.id).sort();
+}
+
+/** The camera's scroll, in world pixels. */
+async function camera(page: Page): Promise<{ x: number; y: number }> {
+  const [x, y] = ((await page.getByTestId("game").getAttribute("data-camera")) ?? "0,0").split(",").map(Number);
+  return { x: x!, y: y! };
+}
+
+/**
+ * Whether a ship's colour shows anywhere within a few pixels of where a ship at world position (x, y) sub-units would
+ * be drawn on this page's canvas.
+ */
+export async function colourAt(page: Page, x: number, y: number, color: string): Promise<boolean> {
+  const scroll = await camera(page);
+  const point = { x: Math.round(x * PIXELS_PER_SUB_UNIT - scroll.x), y: Math.round(y * PIXELS_PER_SUB_UNIT - scroll.y) };
+  const [pixels] = await canvasPixels(page, [point], 4);
+  return pixels!.some((pixel) => near(pixel, color));
+}
+
+/** The colour a page draws its own ship in. */
+export async function ownColour(page: Page): Promise<string> {
+  const id = await selfId(page);
+  await expect.poll(async () => (await drawnShips(page)).some((ship) => ship.id === id)).toBe(true);
+  return (await drawnShips(page)).find((ship) => ship.id === id)!.color;
+}
+
+/** Holds the keys of a keyboard helm, sending only changes. */
+class Keys {
+  private readonly down = new Set<string>();
+
+  constructor(private readonly page: Page) {}
+
+  async set(key: string, pressed: boolean): Promise<void> {
+    if (pressed === this.down.has(key)) return;
+    if (pressed) {
+      await this.page.keyboard.down(key);
+      this.down.add(key);
+    } else {
+      await this.page.keyboard.up(key);
+      this.down.delete(key);
+    }
+  }
+
+  async releaseAll(): Promise<void> {
+    for (const key of [...this.down]) await this.set(key, false);
+  }
+}
+
+export interface SailOptions {
+  /** Stop once the ship is this close to the target, in sub-units. */
+  readonly within?: number;
+  /** Or once this holds. */
+  readonly until?: () => Promise<boolean>;
+  readonly timeoutMs?: number;
+  /** Called with every readout on the way, for checks along the route. */
+  readonly onReadout?: (ship: Readout) => void;
+}
+
+/**
+ * Sails a page's ship toward a world position with the keyboard only, steering from the HUD's authoritative readout:
+ * left or right toward the bearing, up when roughly on course and below the wanted speed, down when too fast. The
+ * wanted speed falls as the target nears, so the ship arrives slowly.
+ */
+export async function sailTo(page: Page, target: { x: number; y: number }, options: SailOptions = {}): Promise<Readout> {
+  const id = await selfId(page);
+  const keys = new Keys(page);
+  const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+  try {
+    for (;;) {
+      const ship = await readout(page, id);
+      if (ship === undefined) throw new Error("own ship missing from the HUD");
+      options.onReadout?.(ship);
+      const dx = target.x - ship.x;
+      const dy = target.y - ship.y;
+      const distance = Math.hypot(dx, dy);
+      if (options.within !== undefined && distance <= options.within) return ship;
+      if (options.until !== undefined && (await options.until())) return ship;
+      if (Date.now() > deadline) throw new Error(`did not reach ${target.x},${target.y} (at ${ship.x},${ship.y})`);
+      const bearing = Math.round((Math.atan2(dy, dx) / (2 * Math.PI)) * HEADING_COUNT);
+      const turn = ((((bearing - ship.heading) % HEADING_COUNT) + HEADING_COUNT + HEADING_COUNT / 2) % HEADING_COUNT) - HEADING_COUNT / 2;
+      await keys.set("ArrowRight", turn > 0);
+      await keys.set("ArrowLeft", turn < 0);
+      const wanted = Math.min(64, Math.max(14, (distance / TILE) * 10));
+      const onCourse = Math.abs(turn) <= 4;
+      await keys.set("ArrowUp", onCourse && ship.speed < wanted - 2);
+      await keys.set("ArrowDown", ship.speed > wanted + 8);
+      await page.waitForTimeout(30);
+    }
+  } finally {
+    await keys.releaseAll();
+  }
+}
+
+/** Attaches the one screenshot a scenario's verifier reads. */
+export async function attachScreenshot(page: Page, testInfo: TestInfo, scenario: string): Promise<void> {
+  const path = testInfo.outputPath(`${scenario}.png`);
+  await page.screenshot({ path });
+  await testInfo.attach(`screenshot:${scenario}`, { path, contentType: "image/png" });
+}

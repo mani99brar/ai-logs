@@ -1,0 +1,201 @@
+import { z } from "zod";
+import { encodedSize } from "./input.js";
+import { RUBBING_TYPE_NAMES } from "./rubbings.js";
+
+/**
+ * The journal messages (protocol v10, §3, §11, §13 and §16). The intel module's leads reach one player each: a rumor
+ * (an island or a sector), a carrier sighting, a no-lead notice, and a rumor going stale or resolved. At a dock a player
+ * buys a targeted rumor (25 gold); the server answers every request once. None of these names a player, a rubbing or
+ * the position of a source, a cache or a ship: they carry types, island and sector indexes and names, and ticks. The
+ * player's journal itself (the room's log of these, their known islands and what they could buy) is in their own
+ * private status, so a reconnecting player reads it back.
+ */
+export const JournalMessageType = {
+  /** Server → client: one lead or journal notice (`JournalMessage`), to its player only. */
+  Lead: "journal",
+  /** Client → server: buy a targeted rumor about a missing type (`BuyRumorMessage`). */
+  BuyRumor: "buy-rumor",
+  /** Server → client: the answer to one purchase request, to its sender only (`RumorResultMessage`). */
+  RumorResult: "rumor-result",
+} as const;
+
+/** Why a lead was given (the intel module's `IntelLeadReason`). */
+export const LEAD_REASON_NAMES = ["start", "fresh", "targeted", "replacement"] as const;
+export type LeadReasonName = (typeof LEAD_REASON_NAMES)[number];
+
+const tickSchema = z.int().min(0);
+const typeSchema = z.enum(RUBBING_TYPE_NAMES);
+const nameSchema = z.string().min(1).max(64);
+const reasonSchema = z.enum(LEAD_REASON_NAMES);
+
+/** A lead from the server, as the intel module words it. */
+export const journalMessageSchema = z.discriminatedUnion("kind", [
+  /** A journal rumor: a missing type at an island (a sealed source) or in a sector (a recovery cache). */
+  z.strictObject({
+    kind: z.literal("rumor"),
+    tick: tickSchema,
+    entry: z.int().min(1),
+    type: typeSchema,
+    reason: reasonSchema,
+    target: z.discriminatedUnion("kind", [
+      z.strictObject({ kind: z.literal("island"), island: z.int().min(0), name: nameSchema }),
+      z.strictObject({ kind: z.literal("sector"), sector: z.int().min(0), name: nameSchema }),
+    ]),
+  }),
+  /** One-shot: per type, the sector where another captain was seen carrying it at `seenTick`, 30–60 s ago. */
+  z.strictObject({
+    kind: z.literal("carrier-sighting"),
+    tick: tickSchema,
+    seenTick: tickSchema,
+    sightings: z
+      .array(z.strictObject({ type: typeSchema, reason: z.enum(["fresh", "targeted", "replacement"]), sector: z.int().min(0), name: nameSchema }))
+      .min(1)
+      .max(RUBBING_TYPE_NAMES.length),
+  }),
+  /** A free trigger found nothing to point at. */
+  z.strictObject({ kind: z.literal("no-lead"), tick: tickSchema, type: typeSchema, reason: reasonSchema }),
+  /** A journal rumor's target no longer holds its type. */
+  z.strictObject({ kind: z.literal("rumor-stale"), tick: tickSchema, entry: z.int().min(1), type: typeSchema }),
+  /** The player has the type a journal rumor pointed at. */
+  z.strictObject({ kind: z.literal("rumor-resolved"), tick: tickSchema, entry: z.int().min(1), type: typeSchema }),
+]);
+export type JournalMessage = z.infer<typeof journalMessageSchema>;
+export type JournalMessageKind = JournalMessage["kind"];
+
+/** Parses a lead the server sent, or undefined when it is not one. */
+export function parseJournalMessage(message: unknown): JournalMessage | undefined {
+  const parsed = journalMessageSchema.safeParse(message);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** The largest purchase request accepted, measured as its JSON encoding. A valid one is under 70 bytes. */
+export const MAX_BUY_RUMOR_BYTES = 96;
+/** Purchase requests a client may send per second before the server drops the rest. */
+export const MAX_BUY_RUMOR_PER_SECOND = 8;
+
+/**
+ * §11: buy a targeted rumor about a type. The client's request id makes it idempotent (§16): a retry of an id the
+ * server already decided gets the same answer again, never a second charge. Ids are per player.
+ */
+export const buyRumorMessageSchema = z.strictObject({
+  requestId: z.string().regex(/^[A-Za-z0-9_-]{1,32}$/),
+  type: typeSchema,
+});
+export type BuyRumorMessage = z.infer<typeof buyRumorMessageSchema>;
+
+/** Validates an untrusted purchase request: its size, then its schema. */
+export function validateBuyRumorMessage(message: unknown): BuyRumorMessage | undefined {
+  const size = encodedSize(message);
+  if (size === undefined || size > MAX_BUY_RUMOR_BYTES) return undefined;
+  const parsed = buyRumorMessageSchema.safeParse(message);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * Why a purchase was refused, charging nothing: `busy` (two requests already wait), `not-in-play`, `not-at-dock` (the
+ * ship was not moored at a dock on the tick it was processed), the ledger's `player-in-duel`, `player-disconnected`
+ * and `insufficient-gold`, and the intel module's `covered` (free coverage, or this step gives the type anyway),
+ * `capped`, `none` (nothing to sell) and `duplicate` (also a retried request id naming another type than the one it
+ * was decided or is waiting for), and `match-ended` (still waiting when the match ended, protocol v11).
+ */
+export const RUMOR_REFUSAL_NAMES = [
+  "busy",
+  "not-in-play",
+  "not-at-dock",
+  "player-in-duel",
+  "player-disconnected",
+  "insufficient-gold",
+  "covered",
+  "capped",
+  "none",
+  "duplicate",
+  "match-ended",
+] as const;
+export type RumorRefusalName = (typeof RUMOR_REFUSAL_NAMES)[number];
+
+/**
+ * The answer to one purchase request: `bought` with the gold it cost (the lead itself arrives as a `journal` message,
+ * again on a replay), or `refused` with its reason and nothing charged. `replayed` answers an id already decided.
+ */
+export const rumorResultMessageSchema = z.discriminatedUnion("outcome", [
+  z.strictObject({ requestId: z.string().min(1).max(32), type: typeSchema, outcome: z.literal("bought"), price: z.int().min(0), replayed: z.boolean() }),
+  z.strictObject({ requestId: z.string().min(1).max(32), type: typeSchema, outcome: z.literal("refused"), reason: z.enum(RUMOR_REFUSAL_NAMES), replayed: z.boolean() }),
+]);
+export type RumorResultMessage = z.infer<typeof rumorResultMessageSchema>;
+
+export function parseRumorResultMessage(message: unknown): RumorResultMessage | undefined {
+  const parsed = rumorResultMessageSchema.safeParse(message);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** A journal entry's kind: a rumor pointing at an island or a sector, a carrier sighting, or a no-lead notice. */
+export const JOURNAL_ENTRY_KINDS = ["island", "sector", "sighting", "no-lead"] as const;
+export const JOURNAL_ENTRY_STATUSES = ["active", "stale", "resolved"] as const;
+
+/**
+ * One entry of the room's journal log, in the player's own status (`journal`, a JSON array, oldest first, at most
+ * `JOURNAL_LOG_LIMIT`). `n` numbers the player's entries from 1; `replacedBy` is the `n` of the next lead of the same
+ * type after this entry went stale (0 while none). `island` and `sector` are -1 where they do not apply; `seenTick` is
+ * a sighting's, else 0.
+ */
+export const journalEntrySchema = z.strictObject({
+  n: z.int().min(1),
+  kind: z.enum(JOURNAL_ENTRY_KINDS),
+  type: typeSchema,
+  target: z.string().max(64),
+  island: z.int().min(-1),
+  sector: z.int().min(-1),
+  reason: reasonSchema,
+  tick: tickSchema,
+  seenTick: tickSchema,
+  status: z.enum(JOURNAL_ENTRY_STATUSES),
+  replacedBy: z.int().min(0),
+});
+export type JournalEntry = z.infer<typeof journalEntrySchema>;
+
+/** The room keeps each player's last 24 entries. */
+export const JOURNAL_LOG_LIMIT = 24;
+
+const journalLogSchema = z.array(journalEntrySchema).max(JOURNAL_LOG_LIMIT);
+
+/** Parses a status's journal, or an empty journal when it is empty (not JSON) or malformed. */
+export function parseJournal(text: string): JournalEntry[] {
+  try {
+    const parsed = journalLogSchema.safeParse(JSON.parse(text));
+    return parsed.success ? parsed.data : [];
+  } catch {
+    return [];
+  }
+}
+
+/** An island the player knows (§13): had in sight or moored at, its ruin unlocked as last seen, and whether they solved it. */
+export const knownIslandSchema = z.strictObject({ island: z.int().min(0), unlocked: z.boolean(), solved: z.boolean() });
+export type KnownIsland = z.infer<typeof knownIslandSchema>;
+
+/** Parses a status's known islands, or none when empty or malformed. */
+export function parseKnownIslands(text: string): KnownIsland[] {
+  try {
+    const parsed = z.array(knownIslandSchema).max(64).safeParse(JSON.parse(text));
+    return parsed.success ? parsed.data : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * What a targeted rumor about each missing type would yield now (`targetedRumorAvailability`), in the player's own
+ * status as `type:offer` pairs: `available` (a rumor or a sighting to buy), `covered` (free coverage: nothing to pay
+ * for) or `none` (no lead to sell).
+ */
+export const RUMOR_OFFER_NAMES = ["available", "covered", "none"] as const;
+export type RumorOfferName = (typeof RUMOR_OFFER_NAMES)[number];
+
+export function parseRumorOffers(text: string): { readonly type: (typeof RUBBING_TYPE_NAMES)[number]; readonly offer: RumorOfferName }[] {
+  const offers: { type: (typeof RUBBING_TYPE_NAMES)[number]; offer: RumorOfferName }[] = [];
+  for (const pair of text.split(",")) {
+    const [type, offer] = pair.split(":");
+    if (!(RUBBING_TYPE_NAMES as readonly string[]).includes(type ?? "") || !(RUMOR_OFFER_NAMES as readonly string[]).includes(offer ?? "")) return [];
+    offers.push({ type: type as (typeof RUBBING_TYPE_NAMES)[number], offer: offer as RumorOfferName });
+  }
+  return offers;
+}

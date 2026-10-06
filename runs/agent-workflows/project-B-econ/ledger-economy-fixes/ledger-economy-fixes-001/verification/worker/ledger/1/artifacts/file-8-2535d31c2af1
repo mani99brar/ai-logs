@@ -1,0 +1,421 @@
+import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+import {
+  objectiveRules,
+  presetRubbings,
+  presetRubbingTypes,
+  rubbingTypeOrder,
+  sourceId,
+  validateObjectiveRules,
+  validateSourceAssignment,
+  validateSourceSites,
+  validateSupplyCaches,
+  type GoldGrantReason,
+  type ObjectiveRules,
+  type RubbingType,
+  type ShopItem,
+  type SourceAssignment,
+  type SourceSite,
+} from "@pirate-sea-race/content/objectives";
+import { nextInt } from "../random.js";
+
+/** An integer sub-unit position supplied by the caller; the ledger does not know the map. */
+export interface Position {
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * The one place a rubbing is (§4): sealed at its source, owned by a player, held in a recovery cache, or reserved for
+ * one of the two players inside an unresolved duel.
+ */
+export type RubbingLocation =
+  | { readonly kind: "source"; readonly sourceId: string }
+  | { readonly kind: "player"; readonly playerId: string }
+  | { readonly kind: "cache"; readonly cacheId: string }
+  | { readonly kind: "duel"; readonly duelId: string; readonly playerId: string };
+
+/** §16's rubbing: its id and type never change; `revision` counts the moves it has made. */
+export interface LedgerRubbing {
+  readonly id: string;
+  readonly type: RubbingType;
+  readonly location: RubbingLocation;
+  readonly revision: number;
+}
+
+/** A source and the rubbing sealed there at the start. It is empty once that rubbing has left; nothing respawns. */
+export interface LedgerSource {
+  readonly id: string;
+  readonly island: number;
+  readonly x: number;
+  readonly y: number;
+  readonly type: RubbingType;
+  readonly rubbingId: string;
+  /** Sources start locked; the ruin that guards one unlocks it. */
+  readonly unlocked: boolean;
+}
+
+/** A held interaction: `heldTicks` counts consecutive ticks of holding since `startTick`. */
+export type LedgerChannel =
+  | {
+      readonly kind: "collect";
+      readonly sourceId: string;
+      readonly rubbingId: string;
+      readonly startTick: number;
+      readonly lastTick: number;
+      readonly heldTicks: number;
+    }
+  | {
+      readonly kind: "claim";
+      readonly cacheId: string;
+      readonly rubbingId: string;
+      readonly startTick: number;
+      readonly lastTick: number;
+      readonly heldTicks: number;
+    };
+
+export type PlayerStatus = "connected" | "disconnected" | "left";
+
+export interface LedgerPlayer {
+  readonly id: string;
+  readonly gold: number;
+  readonly status: PlayerStatus;
+  /** While disconnected: the tick at which the seat reservation expires. Reconnecting never moves it. */
+  readonly reservationDeadline: number | null;
+  /** Once left: where rubbings still reserved in an unresolved duel go when that duel settles. */
+  readonly exit: Position | null;
+  readonly channel: LedgerChannel | null;
+  /** Types this player lost and is owed a fresh rumor for (§11), in type order. The rumor system reads it. */
+  readonly freshRumors: readonly RubbingType[];
+  /** Sail tonics carried (§11): 0 up to the rules' carry limit. A lost duel keeps them; leaving drops them. */
+  readonly tonics: number;
+  /** The last tonic activated, if any; it is active from `startTick` until just before `endTick`. */
+  readonly tonicEffect: TonicEffect | null;
+}
+
+/** An activated sail tonic: active on the ticks `startTick ≤ tick < endTick`, `endTick = startTick + tonicTicks`. */
+export interface TonicEffect {
+  readonly startTick: number;
+  readonly endTick: number;
+}
+
+/**
+ * Gold the rules minted (§11). Its key makes it once only: a `ruin` grant once per (player, `sourceKey`), a
+ * `supply-cache` grant once per `sourceKey` for the whole match. The key is bounded by what the ledger knows: a ruin's
+ * key is `String(island)` for one of its sources' islands (the ruins module's key), a supply cache's is one of
+ * `supplyCaches`.
+ */
+export interface GoldGrant {
+  readonly reason: GoldGrantReason;
+  readonly sourceKey: string;
+  readonly playerId: string;
+  readonly amount: number;
+  readonly tick: number;
+}
+
+/** A completed dockside purchase, kept under (player, request id) so a retry finds it instead of paying again (§11, §16). */
+export interface PurchaseRecord {
+  readonly kind: "purchase";
+  readonly requestId: string;
+  readonly playerId: string;
+  readonly item: ShopItem;
+  readonly price: number;
+  readonly tick: number;
+  /** The buyer's gold and tonics right after the purchase. */
+  readonly goldAfter: number;
+  readonly tonicsAfter: number;
+}
+
+/** The refusals that are decisions on a well-formed request from a player in the match, and so are kept (§16). */
+export const RECORDED_REFUSALS = ["insufficient-gold", "tonic-limit", "player-in-duel", "player-disconnected"] as const;
+export type RecordedRefusal = (typeof RECORDED_REFUSALS)[number];
+
+/** At most this many refusals are kept per player; the oldest goes first, and its id is then evaluated afresh. */
+export const MAX_RECORDED_REFUSALS = 16;
+
+/** A decided refusal, kept under (player, request id) so a retry gets the same answer even if it would succeed now. */
+export interface RefusalRecord {
+  readonly kind: "refusal";
+  readonly requestId: string;
+  readonly playerId: string;
+  readonly item: ShopItem;
+  readonly tick: number;
+  readonly rejection: RecordedRefusal;
+}
+
+/** The outcome of a purchase request, kept under its (player, request id). */
+export type PurchaseOutcome = PurchaseRecord | RefusalRecord;
+
+/** A recovery cache (§12). It never despawns; it disappears once empty. Its contents are the rubbings located in it. */
+export interface LedgerCache {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly createdTick: number;
+}
+
+/** `fighting` until the result arrives; `choosing` while the winner picks a type; `settled` once committed. */
+export type DuelPhase = "fighting" | "choosing" | "settled";
+
+export interface DuelResultRecord {
+  readonly outcome: "win" | "draw" | "cancelled";
+  readonly winner: string | null;
+  readonly loser: string | null;
+  /** Decided by leaving the match (quit or reservation expiry) during the fight: the loser for a win, both players for a cancellation. */
+  readonly forfeit: boolean;
+  readonly tick: number;
+}
+
+/** What the commit did. It happens once per duel. */
+export interface DuelSettlement {
+  readonly tick: number;
+  readonly stolenRubbingId: string | null;
+  readonly stolenType: RubbingType | null;
+  /** Who picked the stolen type: the winner, the default at the deadline, or nobody (nothing moved). */
+  readonly choice: "winner" | "default" | "none";
+  readonly gold: number;
+  readonly goldSuppressed: boolean;
+}
+
+export interface LedgerDuel {
+  readonly id: string;
+  readonly players: readonly [string, string];
+  readonly startTick: number;
+  readonly phase: DuelPhase;
+  readonly result: DuelResultRecord | null;
+  /** In `choosing`: the first tick at which the winner can no longer choose and the default applies. */
+  readonly choiceDeadline: number | null;
+  readonly settlement: DuelSettlement | null;
+}
+
+/** The last win of `winner` over `loser`, for §11's repeated-victory gold suppression. */
+export interface WinRecord {
+  readonly winner: string;
+  readonly loser: string;
+  readonly tick: number;
+}
+
+/** The whole ledger: plain, integer data that `hashState` covers entirely. */
+export interface LedgerState {
+  readonly preset: RulesPresetId;
+  readonly rules: ObjectiveRules;
+  /** The preset's types, in the fixed type order. */
+  readonly types: readonly RubbingType[];
+  /** The latest world tick an applied request carried. Requests from earlier ticks are stale. */
+  readonly tick: number;
+  readonly rng: number;
+  readonly sources: readonly LedgerSource[];
+  /** Every rubbing of the preset, by id. */
+  readonly rubbings: readonly LedgerRubbing[];
+  /** In join order; a player who left stays, with status `left`. */
+  readonly players: readonly LedgerPlayer[];
+  readonly caches: readonly LedgerCache[];
+  /** In reservation order, settled ones included, so a repeated message finds its result. */
+  readonly duels: readonly LedgerDuel[];
+  readonly wins: readonly WinRecord[];
+  readonly nextCacheNumber: number;
+  /**
+   * Gold players brought in when joining (the rules' `startingGold` each) plus the gold grants minted. Settlements
+   * only move gold and purchases spend it, so the balances plus `goldSpent` always sum to this.
+   */
+  readonly goldIssued: number;
+  /** Gold spent at the shop: it leaves the balances and goes to nobody. */
+  readonly goldSpent: number;
+  /** The supply caches of this match, by id, given at creation: the only keys a `supply-cache` grant may carry. */
+  readonly supplyCaches: readonly string[];
+  /** Every grant made, in order. */
+  readonly grants: readonly GoldGrant[];
+  /**
+   * Every purchase and every kept refusal, in order; (player, request id) is unique. Purchases are never dropped;
+   * each player's refusals beyond `MAX_RECORDED_REFUSALS` are, oldest first.
+   */
+  readonly requests: readonly PurchaseOutcome[];
+}
+
+/**
+ * Deals the preset's rubbings onto the sites with the seeded generator: a Fisher–Yates shuffle, so the server alone
+ * decides, and the same seed and sites always give the same assignment. Source ids number each island's sites in the
+ * order given.
+ */
+export function assignSources(
+  presetId: RulesPresetId,
+  sites: readonly SourceSite[],
+  seed: number,
+): { assignment: SourceAssignment; rng: number } {
+  if (!Number.isInteger(seed)) throw new RangeError(`seed must be an integer, got ${seed}`);
+  const preset = rulesPresets[presetId];
+  const checked = validateSourceSites(preset, sites);
+  if (!checked.ok) throw new Error(`invalid source sites for ${presetId}: ${checked.issues.join("; ")}`);
+  const deck = presetRubbings(preset);
+  let rng = seed >>> 0;
+  for (let index = deck.length - 1; index > 0; index--) {
+    const drawn = nextInt(rng, index + 1);
+    rng = drawn.state;
+    [deck[index], deck[drawn.value]] = [deck[drawn.value]!, deck[index]!];
+  }
+  const slots = new Map<number, number>();
+  const sources = checked.value.map((site, index) => {
+    const slot = slots.get(site.island) ?? 0;
+    slots.set(site.island, slot + 1);
+    const rubbing = deck[index]!;
+    return { id: sourceId(site.island, slot), island: site.island, x: site.x, y: site.y, type: rubbing.type, rubbingId: rubbing.id };
+  });
+  const assignment = validateSourceAssignment({ preset: presetId, seed: seed >>> 0, sources });
+  if (!assignment.ok) throw new Error(`invalid source assignment: ${assignment.issues.join("; ")}`);
+  return { assignment: assignment.value, rng };
+}
+
+export interface CreateLedgerOptions {
+  readonly preset: RulesPresetId;
+  readonly seed: number;
+  readonly sites: readonly SourceSite[];
+  readonly rules?: ObjectiveRules;
+  /** The match's supply-cache ids; none means no supply-cache grants. */
+  readonly supplyCaches?: readonly string[];
+}
+
+/** A new match's ledger: every rubbing sealed at its (locked) source, no players, caches or duels. */
+export function createLedger(options: CreateLedgerOptions): LedgerState {
+  const rules = validateObjectiveRules(options.rules ?? objectiveRules);
+  if (!rules.ok) throw new Error(`invalid objective rules: ${rules.issues.join("; ")}`);
+  const { assignment, rng } = assignSources(options.preset, options.sites, options.seed);
+  return createLedgerFromAssignment(assignment, rng, rules.value, options.supplyCaches);
+}
+
+/** A ledger from an assignment made earlier (validated again here), for example one restored from a match record. */
+export function createLedgerFromAssignment(
+  candidate: SourceAssignment,
+  rng: number,
+  rules: ObjectiveRules = objectiveRules,
+  supplyCaches: readonly string[] = [],
+): LedgerState {
+  const parsed = validateSourceAssignment(candidate);
+  if (!parsed.ok) throw new Error(`invalid source assignment: ${parsed.issues.join("; ")}`);
+  const checkedRules = validateObjectiveRules(rules);
+  if (!checkedRules.ok) throw new Error(`invalid objective rules: ${checkedRules.issues.join("; ")}`);
+  const cacheIds = validateSupplyCaches(supplyCaches);
+  if (!cacheIds.ok) throw new Error(`invalid supply caches: ${cacheIds.issues.join("; ")}`);
+  const assignment = parsed.value;
+  const sources: LedgerSource[] = assignment.sources.map((source) => ({ ...source, unlocked: false }));
+  const rubbings: LedgerRubbing[] = sources
+    .map((source) => ({
+      id: source.rubbingId,
+      type: source.type,
+      location: { kind: "source", sourceId: source.id } as const,
+      revision: 0,
+    }))
+    .sort(byId);
+  return {
+    preset: assignment.preset,
+    rules: checkedRules.value,
+    types: presetRubbingTypes(rulesPresets[assignment.preset]),
+    tick: 0,
+    rng: rng >>> 0,
+    sources,
+    rubbings,
+    players: [],
+    caches: [],
+    duels: [],
+    wins: [],
+    nextCacheNumber: 1,
+    goldIssued: 0,
+    goldSpent: 0,
+    supplyCaches: cacheIds.value,
+    grants: [],
+    requests: [],
+  };
+}
+
+export function byId<T extends { readonly id: string }>(a: T, b: T): number {
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+export function byTypeOrder(a: RubbingType, b: RubbingType): number {
+  return rubbingTypeOrder(a) - rubbingTypeOrder(b);
+}
+
+export function findPlayer(state: LedgerState, id: string): LedgerPlayer | undefined {
+  return state.players.find((player) => player.id === id);
+}
+
+export function findSource(state: LedgerState, id: string): LedgerSource | undefined {
+  return state.sources.find((source) => source.id === id);
+}
+
+export function findCache(state: LedgerState, id: string): LedgerCache | undefined {
+  return state.caches.find((cache) => cache.id === id);
+}
+
+export function findDuel(state: LedgerState, id: string): LedgerDuel | undefined {
+  return state.duels.find((duel) => duel.id === id);
+}
+
+export function findRubbing(state: LedgerState, id: string): LedgerRubbing | undefined {
+  return state.rubbings.find((rubbing) => rubbing.id === id);
+}
+
+/** A player's rubbings: those they own and those reserved for them in an unresolved duel. */
+export function heldRubbings(state: LedgerState, playerId: string): LedgerRubbing[] {
+  return state.rubbings.filter(
+    (rubbing) =>
+      (rubbing.location.kind === "player" || rubbing.location.kind === "duel") && rubbing.location.playerId === playerId,
+  );
+}
+
+export function heldTypes(state: LedgerState, playerId: string): RubbingType[] {
+  return heldRubbings(state, playerId)
+    .map((rubbing) => rubbing.type)
+    .sort(byTypeOrder);
+}
+
+/** The input §5's claim rules take: the player holds every type of the preset. */
+export function holdsAllTypes(state: LedgerState, playerId: string): boolean {
+  const held = new Set(heldTypes(state, playerId));
+  return state.types.every((type) => held.has(type));
+}
+
+export function cacheRubbings(state: LedgerState, cacheId: string): LedgerRubbing[] {
+  return state.rubbings.filter((rubbing) => rubbing.location.kind === "cache" && rubbing.location.cacheId === cacheId);
+}
+
+/** Sources of a type whose rubbing is still sealed there (locked or not). */
+export function freeSourceCount(state: LedgerState, type: RubbingType): number {
+  return state.rubbings.filter((rubbing) => rubbing.type === type && rubbing.location.kind === "source").length;
+}
+
+/** The duel a player is in that has not settled yet, if any. */
+export function activeDuelOf(state: LedgerState, playerId: string): LedgerDuel | undefined {
+  return state.duels.find((duel) => duel.phase !== "settled" && duel.players.includes(playerId));
+}
+
+export function reservedIn(state: LedgerState, duelId: string, playerId: string): LedgerRubbing[] {
+  return state.rubbings.filter(
+    (rubbing) => rubbing.location.kind === "duel" && rubbing.location.duelId === duelId && rubbing.location.playerId === playerId,
+  );
+}
+
+/**
+ * The types the winner of a decided duel may steal (§4): held by the loser, lacked by the winner. None once the
+ * winner has left the match, and none for a draw.
+ */
+export function eligibleTheftTypes(state: LedgerState, duelId: string): RubbingType[] {
+  const duel = findDuel(state, duelId);
+  if (!duel || duel.phase === "settled" || duel.result?.outcome !== "win") return [];
+  const { winner, loser } = duel.result;
+  if (winner === null || loser === null || findPlayer(state, winner)?.status === "left") return [];
+  const winnerTypes = new Set(heldTypes(state, winner));
+  return heldTypes(state, loser).filter((type) => !winnerTypes.has(type));
+}
+
+/** §4's default theft: the eligible type with the fewest free sources, then the fixed type order. */
+export function defaultTheftType(state: LedgerState, eligible: readonly RubbingType[]): RubbingType | null {
+  let best: RubbingType | null = null;
+  let bestFree = 0;
+  for (const type of [...eligible].sort(byTypeOrder)) {
+    const free = freeSourceCount(state, type);
+    if (best === null || free < bestFree) {
+      best = type;
+      bestFree = free;
+    }
+  }
+  return best;
+}

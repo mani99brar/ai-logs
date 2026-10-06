@@ -1,0 +1,439 @@
+import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+import { describe, expect, it } from "vitest";
+import { nextInt } from "../random.js";
+import {
+  activeDuelOf,
+  activeTonic,
+  addPlayer,
+  advanceLedger,
+  cacheRubbings,
+  cancelChannel,
+  checkLedger,
+  chooseTheft,
+  createLedger,
+  disconnectPlayer,
+  eligibleTheftTypes,
+  expireReservation,
+  findPlayer,
+  findRubbing,
+  grantGold,
+  hashState,
+  heldTypes,
+  progressChannel,
+  purchase,
+  quitPlayer,
+  reconnectPlayer,
+  reportDuelResult,
+  reserveDuel,
+  startCacheClaim,
+  startCollect,
+  unlockSource,
+  useTonic,
+  type LedgerState,
+  type LedgerStep,
+  type Transfer,
+} from "./index.js";
+
+/** Freezes a state deeply, so any operation that writes into its input throws. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+/** The test's own seeded generator, apart from the ledger's. */
+class Dice {
+  constructor(private state: number) {}
+  int(bound: number): number {
+    const drawn = nextInt(this.state, bound);
+    this.state = drawn.state;
+    return drawn.value;
+  }
+  pick<T>(items: readonly T[]): T {
+    return items[this.int(items.length)]!;
+  }
+  percent(chance: number): boolean {
+    return this.int(1000) < chance * 10;
+  }
+}
+
+type Stats = Record<string, number>;
+
+interface Outcome {
+  readonly ok: boolean;
+  readonly rejection: string | null;
+  readonly transfers?: readonly Transfer[];
+  readonly status?: string | null;
+  readonly cacheIds?: readonly string[];
+}
+
+/**
+ * A seeded random match: players join, collect, get interrupted, duel (won, lost, drawn, cancelled), choose or let
+ * the window lapse, repeat old messages, disconnect, return, expire, quit and claim from caches, earn ruin and supply
+ * gold, buy (and retry buying) rumors and tonics and use tonics, mixed with invalid, duplicate and stale requests.
+ * After every operation the invariant holds, a rejected request returned its input state, every reported transfer
+ * matches where the rubbing now is, gold is accounted for and never negative, and each player carries 0 to 2 tonics
+ * with at most one active.
+ */
+function simulate(preset: RulesPresetId, seed: number, steps: number, check = true): { state: LedgerState; stats: Stats } {
+  const dice = new Dice(seed ^ 0x5eed);
+  const { islands, sourcesPerIsland, maxPlayers } = rulesPresets[preset];
+  const sites = Array.from({ length: islands * sourcesPerIsland }, (_, index) => ({
+    island: Math.floor(index / sourcesPerIsland),
+    x: dice.int(50_000),
+    y: dice.int(50_000),
+  }));
+  let state = deepFreeze(createLedger({ preset, seed, sites }));
+  const stats: Stats = {};
+  const count = (key: string) => (stats[key] = (stats[key] ?? 0) + 1);
+  let now = 0;
+  let joined = 0;
+  let duelNumber = 0;
+  const messages: (() => LedgerStep<Outcome>)[] = [];
+  let requestNumber = 0;
+  const bought: { requestId: string; playerId: string; item: "rumor" | "tonic" }[] = [];
+
+  const apply = <Q, R extends Outcome>(label: string, op: (s: LedgerState, q: Q) => LedgerStep<R>, request: Q): R => {
+    const before = state;
+    const { state: after, result } = op(before, request);
+    count("operations");
+    count(`${label}:${result.ok ? "ok" : result.rejection}`);
+    if (result.status) count(`status:${result.status}`);
+    if (!check) {
+      state = after;
+      return result;
+    }
+    const problems = checkLedger(after);
+    if (problems.length > 0) throw new Error(`seed ${seed}, ${label} ${JSON.stringify(request)}:\n${problems.join("\n")}`);
+    if (!result.ok && after !== before) throw new Error(`${label} was rejected (${result.rejection}) but changed the state`);
+    economyCheck(after, label);
+    const moved = new Set<string>();
+    for (const transfer of result.transfers ?? []) {
+      if (moved.has(transfer.rubbingId)) throw new Error(`${label} moved ${transfer.rubbingId} twice`);
+      moved.add(transfer.rubbingId);
+      const rubbing = findRubbing(after, transfer.rubbingId)!;
+      expect(rubbing.location).toEqual(transfer.to);
+      expect(rubbing.revision).toBe(transfer.revisionAfter);
+      expect(transfer.revisionAfter).toBe(transfer.revisionBefore + 1);
+      expect(findRubbing(before, transfer.rubbingId)!.location).toEqual(transfer.from);
+    }
+    state = deepFreeze(after);
+    return result;
+  };
+
+  /** §11's economy after every step, stated directly rather than only through `checkLedger`. */
+  const economyCheck = (after: LedgerState, label: string) => {
+    let balances = 0;
+    for (const player of after.players) {
+      balances += player.gold;
+      // One effect slot per player, so at most one tonic is active: the slot must be the one activation that fits.
+      const effect = player.tonicEffect;
+      const oneEffect = effect === null || effect.endTick - effect.startTick === after.rules.tonicTicks;
+      if (player.gold < 0 || player.tonics < 0 || player.tonics > after.rules.tonicCarryLimit || !oneEffect) {
+        throw new Error(`seed ${seed}, ${label}: player ${player.id} has ${player.gold} gold, ${player.tonics} tonics, ${JSON.stringify(effect)}`);
+      }
+    }
+    if (balances + after.goldSpent !== after.goldIssued) throw new Error(`seed ${seed}, ${label}: gold is not accounted for`);
+  };
+
+  const players = () => state.players.map((player) => player.id);
+  const present = () => state.players.filter((player) => player.status !== "left").map((player) => player.id);
+  /** Mostly a player still in the match; sometimes one who left, or an unknown id. */
+  const anyPlayer = () => {
+    const roll = dice.int(100);
+    if (roll < 88 && present().length > 0) return dice.pick(present());
+    if (roll < 97 && players().length > 0) return dice.pick(players());
+    return "ghost";
+  };
+  const idle = () => present().filter((id) => activeDuelOf(state, id) === undefined);
+  const position = () => ({ x: dice.int(50_000), y: dice.int(50_000) });
+
+  /** A run of world ticks: the clock advances and each channelling player holds on, now and then letting go a tick. */
+  const ticks = () => {
+    for (let burst = 1 + dice.int(20); burst > 0; burst--) {
+      now += 1;
+      // The room advances every tick; here only when a choice window is due, or at random, to keep the test quick.
+      const due = state.duels.some((duel) => duel.phase === "choosing" && duel.choiceDeadline! <= now);
+      if (due || dice.percent(10)) {
+        const advanced = apply("advance", advanceLedger, { tick: now });
+        for (const duel of advanced.settled) count(`default-theft:${duel.settlement!.stolenType === null ? "none" : "type"}`);
+      }
+      for (const player of state.players) {
+        if (player.channel !== null && !dice.percent(0.3)) {
+          const progress = apply("progress", progressChannel, { playerId: player.id, tick: now });
+          if (progress.status === "claimed" || progress.status === "collected") {
+            expect(findRubbing(state, progress.rubbingId!)!.location).toEqual({ kind: "player", playerId: player.id });
+          }
+        }
+      }
+    }
+  };
+
+  const actions: [number, () => void][] = [
+    [40, ticks],
+    [1, () => {
+      now += 1 + dice.int(1500);
+      apply("advance", advanceLedger, { tick: now });
+    }],
+    [3, () => {
+      const fresh = present().length < maxPlayers && dice.percent(90);
+      apply("join", addPlayer, { playerId: fresh ? `p${++joined}` : anyPlayer(), tick: now, gold: dice.percent(20) ? dice.int(400) : undefined });
+    }],
+    [4, () => {
+      const playerId = anyPlayer();
+      const held = new Set(findPlayer(state, playerId) ? heldTypes(state, playerId) : []);
+      const sealed = state.sources.filter((source) => findRubbing(state, source.rubbingId)!.location.kind === "source");
+      const useful = sealed.filter((source) => !held.has(source.type));
+      const already = sealed.filter((source) => held.has(source.type));
+      const roll = dice.int(100);
+      const source =
+        roll < 65 && useful.length > 0 ? dice.pick(useful) : roll < 80 && already.length > 0 ? dice.pick(already) : dice.pick(state.sources);
+      apply("start-collect", startCollect, { playerId, sourceId: dice.percent(97) ? source.id : "source-99-9", tick: now });
+    }],
+    [4, () => {
+      const playerId = anyPlayer();
+      if (state.caches.length === 0) return;
+      const cache = dice.pick(state.caches);
+      const held = new Set(findPlayer(state, playerId) ? heldTypes(state, playerId) : []);
+      const inside = cacheRubbings(state, cache.id);
+      const wanted = inside.filter((rubbing) => !held.has(rubbing.type));
+      const rubbing = dice.percent(80) && wanted.length > 0 ? dice.pick(wanted) : dice.pick(state.rubbings);
+      apply("start-claim", startCacheClaim, { playerId, cacheId: cache.id, rubbingId: rubbing.id, tick: now });
+    }],
+    [1, () => apply("cancel", cancelChannel, { playerId: anyPlayer(), tick: now })],
+    [2, () => {
+      // A rival starts on the same rubbing someone is already channelling: only one of them may get it.
+      const channelling = state.players.filter((player) => player.channel !== null);
+      const rivals = idle().filter((id) => findPlayer(state, id)!.status === "connected" && findPlayer(state, id)!.channel === null);
+      if (channelling.length === 0 || rivals.length === 0) return;
+      const channel = dice.pick(channelling).channel!;
+      const playerId = dice.pick(rivals);
+      if (channel.kind === "collect") apply("contest-collect", startCollect, { playerId, sourceId: channel.sourceId, tick: now });
+      else apply("contest-claim", startCacheClaim, { playerId, cacheId: channel.cacheId, rubbingId: channel.rubbingId, tick: now });
+    }],
+    [4, () => {
+      if (players().length < 2) return;
+      const reuse = dice.percent(5) && duelNumber > 0;
+      const duelId = reuse ? `d${1 + dice.int(duelNumber)}` : `d${++duelNumber}`;
+      const free = idle();
+      const pair = free.length >= 2 && dice.percent(85) ? [dice.pick(free), dice.pick(free)] : [anyPlayer(), anyPlayer()];
+      const request = { duelId, players: [pair[0]!, pair[1]!] as const, tick: now };
+      apply("reserve", reserveDuel, request);
+      messages.push(() => reserveDuel(state, { ...request, tick: now }));
+    }],
+    [4, () => {
+      const open = state.duels.filter((duel) => duel.phase === "fighting");
+      const duel = dice.percent(90) && open.length > 0 ? dice.pick(open) : state.duels.length > 0 ? dice.pick(state.duels) : undefined;
+      if (!duel) return;
+      const roll = dice.int(100);
+      const request =
+        roll < 75
+          ? { duelId: duel.id, tick: now, outcome: "win" as const, winner: dice.percent(95) ? dice.pick(duel.players) : anyPlayer() }
+          : roll < 95
+            ? { duelId: duel.id, tick: now, outcome: "draw" as const }
+            : { duelId: duel.id, tick: now, outcome: "cancelled" as const };
+      const result = apply("result", reportDuelResult, request);
+      if (result.ok && result.duel!.phase === "settled" && request.outcome === "win") count("settled-without-choice");
+      messages.push(() => reportDuelResult(state, { ...request, tick: now }));
+    }],
+    [4, () => {
+      const choosing = state.duels.filter((duel) => duel.phase === "choosing");
+      if (choosing.length === 0) return;
+      const duel = dice.pick(choosing);
+      const eligible = eligibleTheftTypes(state, duel.id);
+      const type = dice.percent(80) && eligible.length > 0 ? dice.pick(eligible) : dice.pick(state.types);
+      const playerId = dice.percent(80) ? duel.result!.winner! : dice.pick(duel.players);
+      const request = { duelId: duel.id, playerId, type, tick: now };
+      const result = apply("choose", chooseTheft, request);
+      if (result.ok) count(`chosen-theft:${result.duel!.settlement!.stolenType === null ? "none" : "type"}`);
+      messages.push(() => chooseTheft(state, { ...request, tick: now }));
+    }],
+    [3, () => {
+      if (messages.length === 0) return;
+      const replay = dice.pick(messages);
+      const before = state;
+      const { state: after, result } = replay();
+      count("operations");
+      count(`repeat:${result.ok ? "ok" : result.rejection}`);
+      if (check) {
+        expect(checkLedger(after)).toEqual([]);
+        if (!result.ok) expect(after).toBe(before);
+      }
+      state = check ? deepFreeze(after) : after;
+    }],
+    [2, () => apply("disconnect", disconnectPlayer, { playerId: anyPlayer(), tick: now })],
+    [2, () => apply("reconnect", reconnectPlayer, { playerId: anyPlayer(), tick: now })],
+    [2, () => {
+      const waiting = state.players.filter((player) => player.status === "disconnected");
+      const target = waiting.length > 0 && dice.percent(80) ? dice.pick(waiting) : undefined;
+      if (target && dice.percent(60)) now = Math.max(now, target.reservationDeadline!);
+      const result = apply("expire", expireReservation, { playerId: target?.id ?? anyPlayer(), tick: now, position: position() });
+      if (result.ok && result.duel) count("expire-in-duel");
+    }],
+    [1, () => {
+      const result = apply("quit", quitPlayer, { playerId: anyPlayer(), tick: now, position: position() });
+      if (result.ok && result.duel) count(`quit-in-duel:${result.duel.phase}`);
+    }],
+    [2, () => apply("unlock", unlockSource, { sourceId: dice.pick(state.sources).id, tick: now })],
+    [1, () => {
+      if (state.tick === 0) return;
+      const stale = state.tick - 1 - dice.int(Math.min(state.tick, 20));
+      const result = apply("stale", addPlayer, { playerId: `late${stale}`, tick: stale });
+      expect(result.rejection).toBe("stale-tick");
+    }],
+  ];
+  const total = actions.reduce((sum, [weight]) => sum + weight, 0);
+
+  /**
+   * §11's economy draws from its own dice between the steps above. Gold and tonics never steer those steps' draws,
+   * so the match around the economy is the same sequence it was before the economy existed.
+   */
+  const shop = new Dice(seed ^ 0xc01d);
+  const shopper = () => {
+    const roll = shop.int(100);
+    if (roll < 88 && present().length > 0) return shop.pick(present());
+    if (roll < 97 && players().length > 0) return shop.pick(players());
+    return "ghost";
+  };
+  const economy: [number, () => void][] = [
+    [4, () => {
+      // Ruins are keyed per player, supply caches once per match; a small pool of keys makes repeats common.
+      const reason = shop.percent(50) ? ("ruin" as const) : ("supply-cache" as const);
+      const sourceKey = reason === "ruin" ? `ruin-${shop.int(4)}` : `supply-${shop.int(4)}`;
+      apply(`grant-${reason}`, grantGold, { playerId: shopper(), reason, sourceKey, tick: now });
+    }],
+    [4, () => {
+      const roll = shop.int(100);
+      if (roll < 25 && bought.length > 0) {
+        // A retry of an earlier purchase: the original result, no charge. Now and then the id is reused wrongly.
+        const earlier = shop.pick(bought);
+        const request = shop.percent(85) ? earlier : { ...earlier, playerId: shopper(), item: shop.pick(["rumor", "tonic"] as const) };
+        const before = state;
+        const result = apply("rebuy", purchase, { ...request, tick: shop.percent(50) ? now : 0 });
+        if (result.replayed) {
+          count("purchase-replayed");
+          expect(state).toBe(before);
+          expect(result.purchase?.requestId).toBe(earlier.requestId);
+        }
+        return;
+      }
+      const item = shop.pick(["rumor", "tonic"] as const);
+      // Tonic buyers are often players who carry one already, so the carry limit is reached.
+      const carrying = state.players.filter((player) => player.tonics > 0).map((player) => player.id);
+      const playerId = item === "tonic" && carrying.length > 0 && shop.percent(50) ? shop.pick(carrying) : shopper();
+      const request = { requestId: `r${++requestNumber}`, playerId, item };
+      const result = apply(`buy-${item}`, purchase, { ...request, tick: now });
+      if (result.ok) bought.push(request);
+    }],
+    [3, () => {
+      const atSea = shop.percent(85);
+      const grappled = shop.percent(10);
+      // Often a player whose tonic is still active, who must not start a second one.
+      const sailing = state.players.filter((player) => activeTonic(state, player.id, now)).map((player) => player.id);
+      const playerId = sailing.length > 0 && shop.percent(40) ? shop.pick(sailing) : shopper();
+      const result = apply("use-tonic", useTonic, { playerId, tick: now, atSea, grappled });
+      if (result.ok && activeTonic(state, playerId, now) && !activeTonic(state, playerId, now + state.rules.tonicTicks)) count("tonic-active");
+    }],
+  ];
+  const economyTotal = economy.reduce((sum, [weight]) => sum + weight, 0);
+
+  for (let step = 0; step < steps; step++) {
+    let roll = dice.int(total);
+    const action = actions.find(([weight]) => (roll -= weight) < 0)!;
+    action[1]();
+    if (shop.percent(40)) {
+      let pick = shop.int(economyTotal);
+      economy.find(([weight]) => (pick -= weight) < 0)![1]();
+    }
+  }
+  for (const duel of state.duels) {
+    if (duel.settlement?.goldSuppressed) count("gold-suppressed");
+    if (duel.result?.forfeit) count("forfeit");
+    if (duel.settlement?.stolenRubbingId !== null && duel.settlement?.stolenRubbingId !== undefined) count("theft");
+    if (duel.result?.outcome === "win" && duel.settlement?.stolenRubbingId === null) count("win-without-theft");
+  }
+  stats.caches = state.nextCacheNumber - 1;
+  stats.rumors = state.players.filter((player) => player.freshRumors.length > 0).length;
+  return { state, stats };
+}
+
+const SEEDS = [1, 2, 3];
+const STEPS = 1200;
+
+/** Each rule the sequences exercise, by the stats that show it happened (any of them). */
+const EXERCISED: [string, string[]][] = [
+  ["collection", ["status:collected"]],
+  ["cache claim", ["status:claimed"]],
+  ["contested completion fails", ["status:failed"]],
+  ["interrupted hold resets", ["status:reset"]],
+  ["cancelled hold", ["status:cancelled"]],
+  ["held type refused", ["start-collect:type-held", "start-claim:type-held", "contest-collect:type-held", "contest-claim:type-held"]],
+  ["winner's theft choice", ["chosen-theft:type"]],
+  ["default theft at the deadline", ["default-theft:type"]],
+  ["win with no eligible type", ["settled-without-choice"]],
+  ["refused choice", ["choose:ineligible-type", "choose:not-winner", "choose:choice-window-closed"]],
+  ["draw or win recorded", ["result:ok"]],
+  ["repeated result", ["result:already-resolved", "repeat:already-resolved"]],
+  ["repeated reservation", ["repeat:duplicate", "reserve:duplicate"]],
+  ["busy player", ["reserve:player-in-duel"]],
+  ["theft", ["theft"]],
+  ["gold without theft", ["win-without-theft"]],
+  ["suppressed gold", ["gold-suppressed"]],
+  ["forfeit on leaving a fight", ["forfeit"]],
+  ["disconnect and return", ["reconnect:ok"]],
+  ["late return", ["reconnect:reservation-expired"]],
+  ["reservation expiry", ["expire:ok"]],
+  ["early expiry refused", ["expire:reservation-active"]],
+  ["quit", ["quit:ok"]],
+  ["leaving during a choice window", ["quit-in-duel:choosing", "expire-in-duel"]],
+  ["recovery caches", ["caches"]],
+  ["fresh-rumor entitlements", ["rumors"]],
+  ["stale requests", ["stale:stale-tick"]],
+  ["ruin gold", ["grant-ruin:ok"]],
+  ["repeated ruin grant", ["grant-ruin:duplicate"]],
+  ["supply cache gold", ["grant-supply-cache:ok"]],
+  ["supply cache claimed by another", ["grant-supply-cache:already-claimed"]],
+  ["repeated supply cache grant", ["grant-supply-cache:duplicate"]],
+  ["grant to a player who left", ["grant-ruin:player-left", "grant-supply-cache:player-left"]],
+  ["rumor bought", ["buy-rumor:ok"]],
+  ["tonic bought", ["buy-tonic:ok"]],
+  ["repeated request id replayed", ["purchase-replayed"]],
+  ["request id reused for another purchase", ["rebuy:duplicate"]],
+  ["short gold", ["buy-rumor:insufficient-gold", "buy-tonic:insufficient-gold"]],
+  ["third tonic", ["buy-tonic:tonic-limit"]],
+  ["purchase in a duel", ["buy-rumor:player-in-duel", "buy-tonic:player-in-duel"]],
+  ["purchase while disconnected", ["buy-rumor:player-disconnected", "buy-tonic:player-disconnected"]],
+  ["purchase after leaving", ["buy-rumor:player-left", "buy-tonic:player-left"]],
+  ["tonic used", ["use-tonic:ok"]],
+  ["tonic active for its duration", ["tonic-active"]],
+  ["second tonic while active", ["use-tonic:tonic-active"]],
+  ["no tonic carried", ["use-tonic:no-tonic"]],
+  ["tonic off the sea", ["use-tonic:not-at-sea"]],
+  ["tonic while grappled", ["use-tonic:grappled"]],
+  ["tonic in a duel", ["use-tonic:player-in-duel"]],
+  ["tonic after leaving", ["use-tonic:player-left"]],
+];
+
+describe("ledger property: no rubbing is ever lost or duplicated (§19)", () => {
+  for (const preset of ["slice", "alpha"] as const) {
+    it(`keeps the invariant after every step of ${SEEDS.length} random ${preset} matches and replays them identically`, { timeout: 120_000 }, () => {
+      const totals: Stats = {};
+      for (const seed of SEEDS) {
+        const first = simulate(preset, seed, STEPS);
+        // The replay skips the per-step checks, which draw nothing from the dice, so it is the same sequence.
+        const again = simulate(preset, seed, STEPS, false);
+        expect(hashState(again.state)).toBe(hashState(first.state));
+        expect(again.stats).toEqual(first.stats);
+        expect(first.stats.operations).toBeGreaterThan(2000);
+        for (const [key, value] of Object.entries(first.stats)) totals[key] = (totals[key] ?? 0) + value;
+      }
+      // The invariant was not checked vacuously: every rule the sequences are meant to exercise happened.
+      const missing = EXERCISED.filter(([, keys]) => keys.every((key) => (totals[key] ?? 0) === 0)).map(([rule]) => rule);
+      expect(missing).toEqual([]);
+    });
+  }
+
+  it("replays to a different state from a different seed", { timeout: 60_000 }, () => {
+    expect(hashState(simulate("alpha", 7, 1000, false).state)).not.toBe(hashState(simulate("alpha", 8, 1000, false).state));
+  });
+});

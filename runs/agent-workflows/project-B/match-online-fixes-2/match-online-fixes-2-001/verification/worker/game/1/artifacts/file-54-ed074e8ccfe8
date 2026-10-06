@@ -1,0 +1,123 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { createMatchLedger, deriveSeed, finalIslandOf, MASTER_SECRET_BYTES, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { addShip, createMatchState, defaultSimulationConfig } from "@pirate-sea-race/simulation";
+import { objectiveRules, type LedgerState } from "@pirate-sea-race/simulation/objectives";
+import { HeadlessClient } from "@pirate-sea-race/test-tools";
+import { grapple, pairInRange, quickStart, roomOf, tracker } from "./seaDuelSetup.js";
+
+/**
+ * Every system's seed is derived from the match's one private master secret (§3, §16), never from the public match
+ * code: the ledger's deal and the final island's socket each follow their own keyed derivation of it. The server's
+ * test-only seam (`MatchTuning.masterSecret`) injects the secret: here one the test sets before each match is
+ * created. The test-only source layout and final-socket secret are off, so both come from the secret.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+/** The master secret of the next match created. */
+let secret: Uint8Array = new Uint8Array(MASTER_SECRET_BYTES);
+
+beforeAll(async () => {
+  server = await startGameServer({
+    port: 0,
+    host: "127.0.0.1",
+    handleSignals: false,
+    // Matches start at once through the lobby, and tests may place ships (both test-only), for the duel's seed.
+    testPlacement: true,
+    matchTuning: quickStart({ sourceLayout: undefined, finalSocketSecret: undefined, masterSecret: () => new Uint8Array(secret) }),
+  });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+/** A deal: each source's type, in source order (8 sites over 2 types: one of 70 layouts). */
+const dealOf = (ledger: LedgerState): string => ledger.sources.map((source) => `${source.id}=${source.type}`).join(" ");
+const dealFor = (seed: number): string => dealOf(createMatchLedger({ map: seaMap, seed, rules: objectiveRules }));
+const secretOf = (fill: number) => new Uint8Array(MASTER_SECRET_BYTES).fill(fill);
+
+describe("the match's seeds (§3, §16)", () => {
+  it("derive the ledger's deal and the final island from the room's master secret, per system, and never from the match code", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // Two secrets the test first checks deal differently and pick different sockets.
+    const first = secretOf(1);
+    let fill = 2;
+    while (
+      (dealFor(deriveSeed(secretOf(fill), "ledger")) === dealFor(deriveSeed(first, "ledger")) ||
+        finalIslandOf(seaMap, deriveSeed(secretOf(fill), "final-socket")).socket === finalIslandOf(seaMap, deriveSeed(first, "final-socket")).socket) &&
+      fill < 200
+    ) {
+      fill++;
+    }
+    const second = secretOf(fill);
+
+    const open = async (next: Uint8Array) => {
+      secret = next;
+      const client = await HeadlessClient.create(endpoint);
+      track(client);
+      const room = roomOf(client);
+      expect(room.ledgerState.sources.every((source) => source.unlocked)).toBe(true);
+      return { code: client.code, deal: dealOf(room.ledgerState), socket: room.finalIslandChoice.socket, seeds: room.derivedSeeds() };
+    };
+
+    // The same secret: two matches, two different codes, the same deal and the same final island, each the keyed
+    // derivation of that secret for its own system.
+    const a = await open(first);
+    const b = await open(first);
+    expect(b.code).not.toBe(a.code);
+    expect(a.deal).toBe(dealFor(deriveSeed(first, "ledger")));
+    expect(a.socket).toBe(finalIslandOf(seaMap, deriveSeed(first, "final-socket")).socket);
+    expect(b.deal).toBe(a.deal);
+    expect(b.socket).toBe(a.socket);
+    expect(b.seeds).toEqual(a.seeds);
+    // One seed per system, all different: no raw seed feeds two systems.
+    expect(new Set(Object.values(a.seeds)).size).toBe(Object.keys(a.seeds).length);
+    // Another secret through the same room: the deal and the island change with it.
+    const c = await open(second);
+    expect(c.deal).toBe(dealFor(deriveSeed(second, "ledger")));
+    expect(c.deal).not.toBe(a.deal);
+    expect(c.socket).not.toBe(a.socket);
+  });
+
+  it("refuses the room's test hooks unless the server's tuning turns them on (off here, as in production)", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const client = await HeadlessClient.create(endpoint);
+    track(client);
+    const room = roomOf(client);
+    expect(() => room.injectFault()).toThrow("the room's test hooks are off");
+    expect(() => room.pauseAfterTick(room.matchState.worldTick + 1)).toThrow("the room's test hooks are off");
+    expect(() => room.resumeWorld()).toThrow("the room's test hooks are off");
+    const tick = room.matchState.worldTick;
+    await client.waitFor(() => client.worldTick > tick + 5);
+    expect(room.worldPaused).toBe(false);
+    expect(client.phase).toBe("lobby");
+  });
+
+  it("seeds the world (the spawn slots) with its own derivation of the master secret", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    secret = secretOf(9);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    const room = roomOf(host);
+    // The one ship took the spawn slot that the world's own seed draws, and no other system's seed would.
+    const spawned = (system: "world" | "ledger") => addShip(defaultSimulationConfig, createMatchState(deriveSeed(secretOf(9), system)), host.sessionId);
+    expect(room.matchState.rng).toBe(spawned("world").rng);
+    expect(spawned("ledger").rng).not.toBe(spawned("world").rng);
+    const ship = room.matchState.ships.find((each) => each.id === host.sessionId)!;
+    expect({ x: ship.x, y: ship.y }).toEqual({ x: spawned("world").ships[0]!.x, y: spawned("world").ships[0]!.y });
+  });
+
+  it("seeds the intel module and each duel at sea with their own derivations of the master secret, never the world's", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    secret = secretOf(7);
+    const { host, guest } = await pairInRange(endpoint, track);
+    const room = roomOf(host);
+    expect(room.intelState!.rng).toBe(deriveSeed(secretOf(7), "intel"));
+    await grapple(host, guest);
+    const seed = room.seaDuelDiagnostics(host.sessionId)!.seed;
+    expect(seed).toBe(deriveSeed(secretOf(7), "duel:1"));
+    expect(Object.values(room.derivedSeeds())).not.toContain(seed);
+  });
+});

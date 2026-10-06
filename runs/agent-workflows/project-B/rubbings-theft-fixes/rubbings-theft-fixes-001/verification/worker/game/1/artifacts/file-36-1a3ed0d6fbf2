@@ -1,0 +1,144 @@
+import { expect, test, type Page } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/index.js";
+import { encounterRules } from "../../packages/content/src/encounters/index.js";
+import { attachScreenshot, createMatch, joinMatch, place, readout, selfId, TILE } from "./helpers.js";
+
+const HUB_X = seaMap.hub.tileX;
+/** The row three tiles south of the hub, which the map keeps clear for a hull 20 tiles either side of the hub. */
+const OPEN_ROW = seaMap.hub.tileY + 3;
+const RANGE = encounterRules.grapple.rangeTiles * TILE;
+
+interface DrawnTelegraph {
+  readonly attackerId: string;
+  readonly defenderId: string;
+  readonly role: string;
+}
+
+/**
+ * Records, as a player would see them, every text a HUD line shows and every telegraph the sea scene draws from now
+ * on: a MutationObserver catches the one-second windup however briefly it shows. `seen(page)` returns them.
+ */
+async function recordTelegraph(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const seen = { lines: [] as string[], telegraphs: [] as string[] };
+    (window as unknown as { __seen: typeof seen }).__seen = seen;
+    const game = document.querySelector<HTMLElement>('[data-testid="game"]')!;
+    const lines = ["hud-grapple", "hud-incoming"].map((id) => document.querySelector<HTMLElement>(`[data-testid="${id}"]`)!);
+    new MutationObserver(() => {
+      for (const line of lines) if (line.textContent !== "" && !seen.lines.includes(line.textContent!)) seen.lines.push(line.textContent!);
+    }).observe(document.querySelector("#hud")!, { childList: true, characterData: true, subtree: true });
+    new MutationObserver(() => seen.telegraphs.push(game.dataset["telegraphs"] ?? "[]")).observe(game, { attributes: true, attributeFilter: ["data-telegraphs"] });
+  });
+}
+
+async function seen(page: Page): Promise<{ lines: string[]; telegraphs: DrawnTelegraph[] }> {
+  const raw = await page.evaluate(() => (window as unknown as { __seen: { lines: string[]; telegraphs: string[] } }).__seen);
+  return { lines: raw.lines, telegraphs: raw.telegraphs.flatMap((each) => JSON.parse(each) as DrawnTelegraph[]) };
+}
+
+const scene = (page: Page) => page.getByTestId("game").getAttribute("data-scene");
+
+/** The 95th percentile of a list of numbers (nearest rank). */
+function percentile95(values: readonly number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)] ?? Number.POSITIVE_INFINITY;
+}
+
+test("two browsers at sea: a grapple lands, they duel in the match (the host taps attack keys), the winner sails on protected and the loser respawns at a dock [scenario:sea-duel]", async ({ browser, request }, testInfo) => {
+  // A three-second countdown, a KO in about ten seconds, then the loser's fifteen-second wait.
+  test.setTimeout(180_000);
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+    const code = await createMatch(host);
+    await joinMatch(guest, code);
+    const [hostId, guestId] = [await selfId(host), await selfId(guest)];
+
+    // Eight tiles apart on open water, in sight but out of the grapple's six-tile range; the host faces the guest.
+    await place(request, host, code, HUB_X - 4, OPEN_ROW, 0);
+    await place(request, guest, code, HUB_X + 4, OPEN_ROW, 32);
+    await expect.poll(async () => (await readout(host, guestId)) !== undefined).toBe(true);
+    await expect(host.getByTestId("hud-grapple")).toHaveAttribute("data-state", "ready");
+    await recordTelegraph(host);
+    await recordTelegraph(guest);
+
+    // The host sails at the guest and, once within range, presses J (a tap), and lets the ship coast on.
+    await host.keyboard.down("ArrowUp");
+    try {
+      await expect
+        .poll(
+          async () => {
+            const [own, target] = [await readout(host, hostId), await readout(host, guestId)];
+            return own === undefined || target === undefined ? Number.POSITIVE_INFINITY : Math.hypot(target.x - own.x, target.y - own.y);
+          },
+          { intervals: [25], timeout: 10_000 },
+        )
+        .toBeLessThanOrEqual(RANGE - TILE);
+      await host.keyboard.press("j");
+    } finally {
+      await host.keyboard.up("ArrowUp");
+    }
+
+    // Both saw the telegraph: the host its own aim, the guest the warning from the west.
+    await expect.poll(async () => (await seen(host)).lines.some((line) => line.startsWith("Grappling, aimed east"))).toBe(true);
+    await expect.poll(async () => (await seen(guest)).lines.some((line) => line.startsWith("Incoming grapple from the west"))).toBe(true);
+    // The scene reports what it drew on its next animation frame, which may come just after the HUD's line.
+    await expect.poll(async () => (await seen(host)).telegraphs).toContainEqual(expect.objectContaining({ attackerId: hostId, defenderId: guestId, role: "own" }));
+    await expect.poll(async () => (await seen(guest)).telegraphs).toContainEqual(expect.objectContaining({ attackerId: hostId, defenderId: guestId, role: "incoming" }));
+
+    // It lands: both see the three-second countdown in the arena, which replaces the sea in the same game.
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "countdown", { timeout: 5000 });
+      await expect.poll(() => scene(page)).toBe("arena");
+      await expect(page.locator("canvas")).toHaveCount(1);
+    }
+    await expect(guest.getByTestId("duel-name-1")).toHaveText("Player 2 (you)");
+    for (const page of [host, guest]) await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "fighting", { timeout: 15_000 });
+
+    // The host wins: it keeps tapping its first special (U) at the guest, who stands still, until the KO.
+    const result = host.getByTestId("duel-result");
+    for (let press = 0; press < 60 && !(await result.isVisible()); press++) {
+      await host.keyboard.press("u");
+      await host.waitForTimeout(500);
+    }
+    for (const page of [host, guest]) await expect(page.getByTestId("duel-result-text")).toHaveText("Player 1 wins by KO", { timeout: 10_000 });
+
+    // The match game is one Phaser game (Phaser.AUTO) holding the sea and the arena. Headless Chromium renders WebGL
+    // in software, the GPU-less case: the duel client's 4 ms tick must stay responsive there. Its tick intervals
+    // during the fight, in both browsers: the 95th percentile is under a 60 Hz frame (16 ms).
+    for (const [name, page] of [["host", host], ["guest", guest]] as const) {
+      const intervals = await page.evaluate(() => (window as unknown as { __duel: { tickIntervals(): number[] } }).__duel.tickIntervals());
+      const p95 = percentile95(intervals);
+      testInfo.annotations.push({ type: "duel-tick-interval", description: `${name}: ${intervals.length} ticks, p95 ${p95.toFixed(1)} ms, max ${Math.max(...intervals).toFixed(1)} ms` });
+      expect(intervals.length, name).toBeGreaterThan(200);
+      expect(p95, `${name}'s duel tick p95 (ms)`).toBeLessThan(16);
+    }
+
+    // Back at sea: the winner with its protection shown, the loser waiting out of the world with its countdown.
+    for (const page of [host, guest]) await expect.poll(() => scene(page), { timeout: 10_000 }).toBe("sea");
+    await expect(host.getByTestId("hud-protection")).toHaveAttribute("data-state", "win");
+    await expect(host.getByTestId("hud-protection")).toHaveText(/^Protected for [1-8] s \(won a duel\)$/);
+    await expect(guest.getByTestId("hud-respawn")).toHaveText(/^Duel lost: respawning at a dock in \d+ s$/);
+    const wait = Number(await guest.getByTestId("hud-respawn").getAttribute("data-seconds"));
+    expect(wait).toBeGreaterThan(5);
+    expect(wait).toBeLessThanOrEqual(15);
+    expect(await readout(guest, guestId)).toBeUndefined();
+    await expect.poll(async () => (await readout(host, guestId)) === undefined).toBe(true);
+
+    // Then its ship is back, moored at a dock, with the respawn's protection.
+    await expect(guest.getByTestId("hud-dock")).not.toHaveAttribute("data-dock", "-1", { timeout: 25_000 });
+    const docked = (await readout(guest, guestId))!;
+    expect(docked.dock).toBeGreaterThanOrEqual(0);
+    const dock = seaMap.docks.find((each) => each.id === docked.dock)!;
+    expect([docked.x, docked.y]).toEqual([dock.tileX * TILE + TILE / 2, dock.tileY * TILE + TILE / 2]);
+    await expect(guest.getByTestId("hud-respawn")).toHaveText("");
+    await expect(guest.getByTestId("hud-protection")).toHaveAttribute("data-state", "respawn");
+
+    await attachScreenshot(guest, testInfo, "sea-duel");
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

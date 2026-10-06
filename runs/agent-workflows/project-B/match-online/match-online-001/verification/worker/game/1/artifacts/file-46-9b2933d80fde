@@ -1,0 +1,124 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { intelRules } from "@pirate-sea-race/content/intel";
+import { startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { createIntelConfig, sectorName, sectorOf } from "@pirate-sea-race/simulation/intel";
+import { sleep, type HeadlessClient } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, HOST_SEAT, placePair } from "./rubbingsSetup.js";
+import { collectFullSet, controlStartOf, FINAL, flowTuning } from "./matchFlowSetup.js";
+import { collectAt, containsText, dockFor, grapple, playersAt, roomOf, tracker } from "./seaDuelSetup.js";
+
+/**
+ * §2 and §5's reveals through the real room, on raw frames: the first full set sends the final island's sector to
+ * everyone and its exact claim point only to the holder; losing a type makes the holder's route inactive; the minute-20
+ * and minute-28 broadcasts arrive for everyone. Test-only timings: the sector reveal 10 s after control start and the
+ * carrier reveal 14 s after it (every 2 s from then), instead of minutes 20 and 28.
+ */
+const SECTOR_REVEAL_TICKS = 200;
+const CARRIER_INTERVAL_TICKS = 40;
+const CARRIER_REVEAL_TICKS = 280;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  const matchTuning = flowTuning({
+    intel: {
+      ...intelRules,
+      sectorRevealTicks: SECTOR_REVEAL_TICKS,
+      carrierIntervalTicks: CARRIER_INTERVAL_TICKS,
+      sightingDelayTicks: CARRIER_INTERVAL_TICKS,
+      carrierRevealTicks: CARRIER_REVEAL_TICKS,
+    },
+    claim: { ...claimRules, deadlineTicks: 2400 },
+  });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+const intel = createIntelConfig({ preset: "slice", finalIsland: FINAL.claimPoint, map: seaMap });
+const finalSector = sectorOf(intel, FINAL.claimPoint);
+
+describe.concurrent("the reveals (§2, §5, §16)", () => {
+  it("sends the final island's sector to everyone at the first full set and its exact point only to the holder, then the minute-20 and minute-28 broadcasts to all", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    const marks = { host: host.frameCount, guest: guest.frameCount };
+    // Nothing is revealed before a full set.
+    await collectAt(host, endpoint, dockFor("sun"), "sun");
+    await sleep(200);
+    expect(host.reveals).toEqual([]);
+    expect(guest.room.state.finalSector).toBe("");
+    await collectAt(host, endpoint, dockFor("moon"), "moon");
+
+    // The sector to everyone: a message and the public state, never the point.
+    const sector = { kind: "final-sector", sector: finalSector, name: sectorName(intel, finalSector) };
+    for (const client of [host, guest]) await client.waitFor(() => client.reveals.some((reveal) => reveal.kind === "final-sector"));
+    expect(guest.reveals).toEqual([expect.objectContaining(sector)]);
+    expect(guest.room.state.finalSector).toBe(sector.name);
+    expect(guest.room.state.finalSectorIndex).toBe(finalSector);
+    // The exact point only to the holder, as a message and in its own status.
+    expect(host.reveals.map((reveal) => reveal.kind).sort()).toEqual(["final-route", "final-sector"]);
+    expect(host.reveals.find((reveal) => reveal.kind === "final-route")).toMatchObject({ x: FINAL.claimPoint.x, y: FINAL.claimPoint.y, restored: false });
+    await host.waitFor(() => host.claimView()?.routeActive === true);
+    expect(host.claimView()).toMatchObject({ fullSet: true, routeKnown: true, routeX: FINAL.claimPoint.x, routeY: FINAL.claimPoint.y });
+    expect(guest.claimView()).toMatchObject({ fullSet: false, routeKnown: false, routeActive: false, routeX: 0, routeY: 0 });
+    // On the wire: the route crossed the network to the holder only; the guest's frames never carried it.
+    await sleep(300);
+    expect(host.framesSince(marks.host).some((frame) => containsText(frame, "final-route"))).toBe(true);
+    const guestFrames = guest.framesSince(marks.guest);
+    expect(guestFrames.some((frame) => containsText(frame, "final-sector"))).toBe(true);
+    expect(guestFrames.some((frame) => containsText(frame, "final-route"))).toBe(false);
+    expect([...(guest.room.state.status?.keys() ?? [])]).toEqual([guest.sessionId]);
+
+    // Minute 20 (here 10 s): the sectors still holding sealed sources, to everyone.
+    const controlStart = controlStartOf(host);
+    for (const client of [host, guest]) await client.waitFor(() => client.reveals.some((reveal) => reveal.kind === "sector-reveal"), 12_000);
+    for (const client of [host, guest]) {
+      const reveal = client.reveals.find((each) => each.kind === "sector-reveal")!;
+      expect(reveal).toMatchObject({ tick: controlStart + SECTOR_REVEAL_TICKS, caches: [] });
+      expect(reveal.kind === "sector-reveal" && reveal.sources.length).toBeGreaterThan(0);
+    }
+    // Minute 28 (here 14 s): the carriers' sectors and types, to everyone; then again every interval.
+    for (const client of [host, guest]) await client.waitFor(() => client.reveals.filter((reveal) => reveal.kind === "carrier-report").length >= 2, 8000);
+    const reports = guest.reveals.filter((reveal) => reveal.kind === "carrier-report");
+    expect(reports[0]).toMatchObject({ tick: controlStart + CARRIER_REVEAL_TICKS });
+    expect(reports[1]!.tick - reports[0]!.tick).toBe(CARRIER_INTERVAL_TICKS);
+    const carried = reports[0]!.kind === "carrier-report" ? reports[0]!.carriers.map((carrier) => carrier.type).sort() : [];
+    expect(carried).toEqual(["moon", "sun"]);
+    // Neither broadcast names a player or a position: they name sectors and types.
+    for (const reveal of guest.reveals) expect(JSON.stringify(reveal)).not.toContain(host.sessionId);
+  }, 30_000);
+
+  it("makes the holder's route inactive when a duel takes a type, and gives the thief who completes a set its own route", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The guest never readies: it forfeits the duel to the host.
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { clients: [{}, { autoReady: false }] })) as [HeadlessClient, HeadlessClient];
+    await collectAt(host, endpoint, dockFor("sun"), "sun");
+    await collectFullSet(guest, endpoint);
+    await guest.waitFor(() => guest.claimView()?.routeActive === true);
+    await host.waitFor(() => host.reveals.some((reveal) => reveal.kind === "final-sector"));
+
+    // The host grapples the guest, wins by forfeit and takes the Moon.
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => host.objectives()?.theftOptions.join(",") === "moon", 10_000);
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "sun,moon");
+
+    // The guest's route goes inactive (it still knows the point); the host, whose set is now whole, gets its own.
+    await guest.waitFor(() => guest.reveals.some((reveal) => reveal.kind === "final-route-inactive"));
+    await guest.waitFor(() => guest.claimView()?.routeActive === false);
+    expect(guest.claimView()).toMatchObject({ fullSet: false, routeKnown: true, routeX: FINAL.claimPoint.x, routeY: FINAL.claimPoint.y });
+    await host.waitFor(() => host.claimView()?.routeActive === true);
+    expect(host.reveals.filter((reveal) => reveal.kind === "final-route")).toEqual([expect.objectContaining({ x: FINAL.claimPoint.x, y: FINAL.claimPoint.y })]);
+    // The sector was announced once, at the first full set, and never again.
+    expect(guest.reveals.filter((reveal) => reveal.kind === "final-sector")).toHaveLength(1);
+    expect(host.reveals.filter((reveal) => reveal.kind === "final-sector")).toHaveLength(1);
+    expect(roomOf(host).ledgerRefusals).toEqual([]);
+  }, 30_000);
+});

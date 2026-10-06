@@ -1,0 +1,175 @@
+import { rulesPresets } from "@pirate-sea-race/content";
+import { describe, expect, it } from "vitest";
+import { nextInt } from "../random.js";
+import {
+  checkFruitState,
+  createFruitConfig,
+  createFruitState,
+  fruitRules,
+  hashState,
+  kitOf,
+  replayFruits,
+  stepFruits,
+  type FruitPlayer,
+  type FruitResult,
+  type FruitSite,
+  type FruitState,
+  type FruitTickInput,
+} from "./index.js";
+
+/** A short meal, so random scripts finish plenty of them. */
+const config = createFruitConfig({ ...fruitRules, eatTicks: 8 });
+const SITES: FruitSite[] = ["dock-a", "dock-b", "dock-c", "dock-d"].map((id, index) => ({ id, x: index * 512, y: 0 }));
+/** Ids whose code-unit order differs from numeric and case-insensitive order. */
+const IDS = ["p1", "p10", "p2", "P3", "a", "B"];
+
+type Draw = (bound: number) => number;
+
+function generator(seed: number): Draw {
+  let rng = seed;
+  return (bound) => {
+    const drawn = nextInt(rng, bound);
+    rng = drawn.state;
+    return drawn.value;
+  };
+}
+
+function shuffled<T>(items: readonly T[], draw: Draw): T[] {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index--) {
+    const other = draw(index + 1);
+    [copy[index], copy[other]] = [copy[other]!, copy[index]!];
+  }
+  return copy;
+}
+
+/**
+ * A seeded script: players crowd the pedestals, hold and release, get reserved, disconnect, leave for good and drop
+ * out of the facts; world ticks are now and then skipped or repeated. `calm` (per mille) scales how rarely anything
+ * changes, so some meals run to completion and some players finish together.
+ */
+function randomScript(seed: number, calm: number): FruitTickInput[] {
+  const draw = generator(seed);
+  const chance = (perMille: number) => draw(1000) < Math.floor((perMille * (1000 - calm)) / 1000);
+  const ids = shuffled(IDS, draw).slice(0, 2 + draw(5));
+  const pedestalOf = () => (draw(6) === 0 ? null : SITES[draw(2)]!.id); // two busy pedestals, crowded
+  const players = new Map<string, FruitPlayer>(
+    ids.map((playerId) => [playerId, { playerId, pedestalId: pedestalOf(), holding: true, reserved: false, disconnected: false, left: false }]),
+  );
+  const script: FruitTickInput[] = [];
+  let tick = 0;
+  for (let count = 0; count < 160; count++) {
+    tick += chance(15) ? 2 : 1;
+    for (const id of ids) {
+      let next = players.get(id)!;
+      if (chance(30)) next = { ...next, pedestalId: draw(3) === 0 ? SITES[draw(SITES.length)]!.id : pedestalOf() };
+      if (chance(60)) next = { ...next, holding: !next.holding };
+      if (chance(20)) next = { ...next, reserved: !next.reserved };
+      if (chance(15)) next = { ...next, disconnected: !next.disconnected };
+      if (chance(3)) next = { ...next, left: true };
+      players.set(id, next);
+    }
+    script.push({ tick, players: ids.filter(() => !chance(10)).map((id) => players.get(id)!) });
+    // A repeated or stale tick, which must change nothing.
+    if (chance(15)) script.push({ tick: tick - draw(3), players: shuffled([...players.values()], draw) });
+  }
+  return script;
+}
+
+interface Run {
+  readonly states: readonly FruitState[];
+  readonly hashes: readonly string[];
+  readonly results: readonly (readonly FruitResult[])[];
+}
+
+function run(script: readonly FruitTickInput[], seed: number): Run {
+  let state = createFruitState(SITES, seed, rulesPresets.slice);
+  const states: FruitState[] = [];
+  const results: FruitResult[][] = [];
+  for (const input of script) {
+    const stepped = stepFruits(config, state, input);
+    if (input.tick <= state.tick) expect(stepped.state).toBe(state);
+    state = stepped.state;
+    states.push(state);
+    results.push([...stepped.results]);
+  }
+  return { states, hashes: states.map(hashState), results };
+}
+
+const resultKey = (result: FruitResult) => ("reason" in result ? `${result.kind}:${result.reason}` : result.kind);
+
+/** Every result the step can give; the seeds together must produce each one. */
+const EXERCISED = [
+  "eat-started",
+  "eat-completed",
+  "tick-rejected",
+  ...["released", "moved", "gap", "taken", "left", "disconnected", "reserved"].map((reason) => `eat-interrupted:${reason}`),
+  ...["left", "disconnected", "reserved", "already-eaten", "empty"].map((reason) => `eat-refused:${reason}`),
+];
+
+const SEEDS = Array.from({ length: 80 }, (_, index) => index + 1);
+const scriptFor = (seed: number) => randomScript(seed, [0, 500, 850][seed % 3]!);
+
+describe("seeded random ticks", () => {
+  it.each(SEEDS)("seed %i keeps every invariant", (seed) => {
+    const script = scriptFor(seed);
+    const { states, results } = run(script, seed);
+    const all = results.flat();
+    const completed = all.filter((result) => result.kind === "eat-completed");
+    // Each pedestal is eaten at most once, and each player eats at most once.
+    expect(new Set(completed.map((result) => result.pedestalId)).size).toBe(completed.length);
+    expect(new Set(completed.map((result) => result.playerId)).size).toBe(completed.length);
+    const kits = new Map<string, string>();
+    for (const state of states) {
+      expect(checkFruitState(state)).toEqual([]);
+      const full = state.pedestals.filter((pedestal) => pedestal.eatenBy === null).length;
+      expect(state.meals.length + full).toBe(SITES.length);
+      // A kit, once eaten, never changes.
+      for (const id of IDS) {
+        const kit = kitOf(state, id);
+        if (kits.has(id)) expect(kit).toBe(kits.get(id));
+        else if (kit !== "duelist") kits.set(id, kit);
+      }
+    }
+    expect(states.at(-1)!.meals).toHaveLength(completed.length);
+    // A tick's results are in player id order, completions and their takings last.
+    for (const tick of results) {
+      const early = tick.filter((result) => result.kind !== "eat-completed" && !(result.kind === "eat-interrupted" && result.reason === "taken"));
+      const ids = early.map((result) => ("playerId" in result ? result.playerId : ""));
+      expect(ids).toEqual([...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)));
+    }
+  });
+
+  it("exercises every result across the seeds", () => {
+    const seen = new Set<string>();
+    let contested = 0;
+    for (const seed of SEEDS) {
+      for (const tick of run(scriptFor(seed), seed).results) {
+        for (const result of tick) seen.add(resultKey(result));
+        // Two completers on one tick: one eats and the other finds it taken with a full channel.
+        if (tick.some((result) => result.kind === "eat-interrupted" && result.reason === "taken" && result.held >= config.eatTicks)) contested++;
+      }
+    }
+    expect([...seen].sort()).toEqual([...EXERCISED].sort());
+    expect(contested).toBeGreaterThan(0);
+  });
+
+  it.each(SEEDS.slice(0, 20))("seed %i replays to the same hash, tick by tick", (seed) => {
+    const script = scriptFor(seed);
+    const first = run(script, seed);
+    const again = run(JSON.parse(JSON.stringify(script)) as FruitTickInput[], seed);
+    expect(again.hashes).toEqual(first.hashes);
+    expect(again.results).toEqual(first.results);
+    expect(replayFruits(config, createFruitState(SITES, seed, rulesPresets.slice), script).hash).toBe(first.hashes.at(-1));
+  });
+
+  it.each(SEEDS.slice(0, 20))("seed %i: the order of players in each tick never matters", (seed) => {
+    const script = scriptFor(seed);
+    const draw = generator(seed * 7919);
+    const reordered = script.map((input) => ({ ...input, players: shuffled(input.players, draw) }));
+    const first = run(script, seed);
+    const again = run(reordered, seed);
+    expect(again.hashes).toEqual(first.hashes);
+    expect(again.results).toEqual(first.results);
+  });
+});

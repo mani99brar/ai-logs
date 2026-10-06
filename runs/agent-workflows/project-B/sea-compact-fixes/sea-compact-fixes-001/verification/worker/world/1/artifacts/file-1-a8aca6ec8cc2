@@ -1,0 +1,217 @@
+import { randomInt } from "node:crypto";
+import { StateView } from "@colyseus/schema";
+import { ErrorCode, matchMaker, Room, ServerError, type AuthContext, type Client } from "colyseus";
+import { privateMatch } from "@pirate-sea-race/content";
+import {
+  createMatchOptionsSchema,
+  JoinRefusal,
+  joinMatchOptionsSchema,
+  MATCH_CODE_REQUIRED_MESSAGE,
+  MATCH_ROOM,
+  MATCH_UNAVAILABLE_MESSAGE,
+  matchFullMessage,
+  MAX_INPUT_MESSAGES_PER_SECOND,
+  MessageType,
+  NO_SUCH_MATCH_MESSAGE,
+  PROTOCOL_VERSION,
+} from "@pirate-sea-race/protocol";
+import {
+  addShip,
+  createMatchState,
+  defaultSimulationConfig,
+  isWorldStep,
+  placeShip,
+  removeShip,
+  step,
+  STEPS_PER_SECOND,
+  visibleShipIds,
+  type MatchState,
+  type Placement,
+  type PlayerInput,
+} from "@pirate-sea-race/simulation";
+import { admitSeat, authorizePrivateEntry, type AdmissionRules } from "./admission.js";
+import { InputGate } from "./inputGate.js";
+import { generateMatchCode } from "./matchCode.js";
+import { MatchStateSchema, ShipSchema } from "./schema.js";
+
+/**
+ * The room's matchmaking listing: private matches are found by `code` (Colyseus `filterBy`). It never holds the
+ * creator's `createToken`, so a request carrying a token matches no listing.
+ */
+export interface MatchMetadata {
+  code: string;
+  custom: boolean;
+  /** A `filterBy` field that is never set: no listing holds a token, so no token-carrying request matches one. */
+  createToken?: never;
+}
+
+/** World updates go out at 20 Hz, the world simulation rate (§15). */
+const PATCH_INTERVAL_MS = 1000 / 20;
+
+/** Checks a create or join request for a match before matchmaking places it (see `authorizePrivateEntry`). */
+export async function authorizeEntry(options: unknown): Promise<true> {
+  return authorizePrivateEntry(options, MATCH_ADMISSION);
+}
+
+/** A match's admission: the `match` listing, the match option schemas and the match refusal messages. */
+const MATCH_ADMISSION: AdmissionRules = {
+  roomName: MATCH_ROOM,
+  createSchema: createMatchOptionsSchema,
+  joinSchema: joinMatchOptionsSchema,
+  noSuchMessage: NO_SUCH_MATCH_MESSAGE,
+  codeRequiredMessage: MATCH_CODE_REQUIRED_MESSAGE,
+  fullMessage: matchFullMessage,
+};
+
+/**
+ * One private match (§14): the only writer of its state. It runs the shared simulation on a 60 Hz fixed step,
+ * applies validated client intent, and mirrors the simulation into the synced schema after every world step.
+ *
+ * Visibility (§16): every client has a Colyseus StateView. After each mirror the room puts into it the client's own
+ * ship and every ship inside that ship's sight radius, and takes out the rest, so a ship out of sight is never encoded
+ * into that client's patches. Terrain is static content every client already has, so it is not synced at all.
+ */
+export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMetadata }> {
+  override maxClients = privateMatch.maxPlayers;
+  /** A flood ceiling: past it Colyseus disconnects the client. Excess input is dropped well below it, in InputGate. */
+  override maxMessagesPerSecond = MAX_INPUT_MESSAGES_PER_SECOND * 4;
+  override patchRate = PATCH_INTERVAL_MS;
+  override state = new MatchStateSchema();
+
+  private readonly config = defaultSimulationConfig;
+  private simulation: MatchState = createMatchState(0);
+  private readonly gates = new Map<string, InputGate>();
+  /** The creator's one-time token; cleared once the creator's seat is taken. */
+  private createToken: string | undefined;
+
+  static override async onAuth(_token: string, options: unknown, _context: AuthContext): Promise<true> {
+    return authorizeEntry(options);
+  }
+
+  override async onCreate(options: unknown): Promise<void> {
+    // Only a token-carrying request creates a match. A join by code reaches here only when its match filled up or
+    // closed after authorizeEntry admitted it (joinOrCreate then falls back to create).
+    const parsed = createMatchOptionsSchema.safeParse(options);
+    if (!parsed.success) throw new ServerError(ErrorCode.MATCHMAKE_INVALID_CRITERIA, MATCH_UNAVAILABLE_MESSAGE);
+    this.createToken = parsed.data.createToken;
+    const code = await this.allocateCode();
+    this.simulation = createMatchState(randomInt(0, 2 ** 32));
+    this.state.code = code;
+    this.state.protocolVersion = PROTOCOL_VERSION;
+    this.state.custom = privateMatch.custom;
+    // Colyseus copied the filterBy fields of the create request, the token among them, into the listing's metadata.
+    // Replacing the metadata drops the token before the listing is first stored.
+    await this.setMatchmaking({ metadata: { code, custom: privateMatch.custom } });
+
+    this.onMessage(MessageType.Input, (client, message: unknown) => {
+      this.gates.get(client.sessionId)?.receive(message, this.simulation.frame);
+    });
+    // Unknown message types are dropped, not answered: Colyseus would otherwise disconnect the sender.
+    this.onMessage("*", () => undefined);
+    this.setFixedTimestep(() => this.advance(), STEPS_PER_SECOND);
+  }
+
+  /**
+   * The room's own admission check, which also covers `joinById` (no listing filter applies there): the one seat
+   * carrying the creator's token, then only seats carrying this match's code. Throwing refuses and frees the seat.
+   */
+  override onJoin(client: Client, options: unknown): void {
+    this.admit(options);
+    this.simulation = addShip(this.config, this.simulation, client.sessionId);
+    this.gates.set(client.sessionId, new InputGate());
+    client.view = new StateView();
+    this.mirror();
+  }
+
+  override onLeave(client: Client): void {
+    this.simulation = removeShip(this.simulation, client.sessionId);
+    this.gates.delete(client.sessionId);
+    client.view?.dispose();
+    client.view = undefined;
+    this.mirror();
+  }
+
+  /**
+   * Test-only (the server's test-placement setting, off by default): puts a player's ship at rest on a navigable tile.
+   * Visibility follows at once, as after any move.
+   */
+  placeShip(sessionId: string, placement: Placement): void {
+    this.simulation = placeShip(this.config, this.simulation, sessionId, placement);
+    this.mirror();
+  }
+
+  /** The ship ids a client's view holds, for tests and diagnostics. */
+  viewedShipIds(sessionId: string): string[] {
+    const view = this.clients.get(sessionId)?.view;
+    if (view === undefined) return [];
+    return [...this.state.ships.values()].filter((ship) => view.has(ship)).map((ship) => ship.id);
+  }
+
+  /** Inputs dropped per client and reason, for tests and diagnostics. */
+  droppedInputs(sessionId: string): InputGate["dropped"] | undefined {
+    return this.gates.get(sessionId)?.dropped;
+  }
+
+  private admit(options: unknown): void {
+    this.createToken = admitSeat(options, { code: this.state.code, createToken: this.createToken }, MATCH_ADMISSION);
+  }
+
+  private advance(): void {
+    const frame = this.simulation.frame + 1;
+    const inputs: Record<string, PlayerInput> = {};
+    // A lapsed client gets no entry: its ship sails as neutral, but keeps its mooring throttle until real input.
+    for (const [sessionId, gate] of this.gates) if (!gate.lapsedAt(frame)) inputs[sessionId] = gate.inputAt(frame);
+    this.simulation = step(this.config, this.simulation, inputs);
+    if (!isWorldStep(this.simulation.frame)) return;
+    for (const gate of this.gates.values()) gate.worldStepTaken();
+    this.mirror();
+  }
+
+  /** Copies the plain simulation state into the synced schema, then updates what each client may see. */
+  private mirror(): void {
+    this.state.frame = this.simulation.frame;
+    this.state.worldTick = this.simulation.worldTick;
+    this.state.players = this.simulation.ships.length;
+    const present = new Set<string>();
+    for (const ship of this.simulation.ships) {
+      present.add(ship.id);
+      let synced = this.state.ships.get(ship.id);
+      if (synced === undefined) {
+        synced = new ShipSchema();
+        synced.id = ship.id;
+        synced.slot = ship.slot;
+        this.state.ships.set(ship.id, synced);
+      }
+      synced.x = ship.x;
+      synced.y = ship.y;
+      synced.heading = ship.heading;
+      synced.speed = ship.speed;
+      synced.dock = ship.dock;
+    }
+    for (const id of [...this.state.ships.keys()]) if (!present.has(id)) this.state.ships.delete(id);
+    this.updateViews();
+  }
+
+  /** Each client's view: its own ship and the ships it can see (§3, §16); nothing else is encoded for it. */
+  private updateViews(): void {
+    for (const client of this.clients) {
+      const view = client.view;
+      if (view === undefined) continue;
+      const visible = visibleShipIds(this.config, this.simulation, client.sessionId);
+      for (const [id, ship] of this.state.ships) {
+        const shown = view.has(ship);
+        if (visible.has(id) && !shown) view.add(ship);
+        else if (!visible.has(id) && shown) view.remove(ship);
+      }
+    }
+  }
+
+  private async allocateCode(): Promise<string> {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const code = generateMatchCode();
+      const taken = await matchMaker.query({ name: this.roomName, code });
+      if (taken.length === 0) return code;
+    }
+    throw new ServerError(JoinRefusal.BadRequest, "Could not allocate a match code");
+  }
+}

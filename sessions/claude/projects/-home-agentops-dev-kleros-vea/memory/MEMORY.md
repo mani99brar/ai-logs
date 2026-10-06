@@ -1,0 +1,1 @@
+- [Workflow setup is local-only](workflow-setup-local-only.md) — CLAUDE.md/features/ live on local branch workflow/base; never push, cherry-pick onto dev branches

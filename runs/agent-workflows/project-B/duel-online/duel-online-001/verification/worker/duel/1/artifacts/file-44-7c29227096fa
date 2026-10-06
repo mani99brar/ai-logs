@@ -1,0 +1,231 @@
+import { expect, test, type Page } from "@playwright/test";
+import { DUEL_INPUT, duelistMoveset } from "../../packages/content/src/moves/index.js";
+import { attachScreenshot } from "./helpers.js";
+
+const { rules, arena, commands, moves } = duelistMoveset;
+const SUB = arena.subPixelsPerPixel;
+const damageOf = (id: string) => moves.find((move) => move.timing.id === id)!.damage;
+const JAB = damageOf(commands.light);
+const THROW = damageOf(commands.throw);
+const LIGHT_BIT = DUEL_INPUT.light;
+const HEAVY_BIT = DUEL_INPUT.heavy;
+
+/** The read-only diagnostics the duel page exposes as `window.__duel`. */
+interface DuelDiagnostics {
+  readonly __duel: { lastTaggedFrame(): number | undefined; taggedInputs(from: number, to: number): number[] };
+}
+
+/** The hurtbox outline the developer toggle draws (the arena's HURTBOX_COLOR). */
+const HURTBOX_COLOR = "#46e06b";
+
+interface DrawnFighter {
+  readonly x: number;
+  readonly y: number;
+  readonly action: string;
+  readonly moveId: string | null;
+  readonly health: number;
+}
+
+interface DrawnBoxes {
+  readonly shown: boolean;
+  readonly hurtboxes: number;
+  readonly hitboxes: number;
+  readonly hitboxFrames: number;
+}
+
+async function fighters(page: Page): Promise<DrawnFighter[]> {
+  return JSON.parse((await page.getByTestId("arena").getAttribute("data-fighters")) ?? "[]") as DrawnFighter[];
+}
+
+async function boxes(page: Page): Promise<DrawnBoxes> {
+  return JSON.parse((await page.getByTestId("arena").getAttribute("data-boxes")) ?? "{}") as DrawnBoxes;
+}
+
+/** The authoritative (confirmed) health a page's HUD shows for a player. */
+async function health(page: Page, player: 0 | 1): Promise<number> {
+  return Number(await page.getByTestId(`duel-health-${player}`).getAttribute("data-value"));
+}
+
+/** What a page's HUD shows once the duel is over: the same for both players when the server is the only authority. */
+async function outcome(page: Page) {
+  const result = page.getByTestId("duel-result");
+  return {
+    text: await page.getByTestId("duel-result-text").textContent(),
+    winner: await result.getAttribute("data-winner"),
+    reason: await result.getAttribute("data-reason"),
+    frame: await result.getAttribute("data-frame"),
+    health: await result.getAttribute("data-health"),
+    clock: await page.getByTestId("duel-clock").textContent(),
+    healthBars: [await health(page, 0), await health(page, 1)],
+  };
+}
+
+/** Holds a key (as a player holds a direction) until the fighters are within `pixels` of each other, then lets go. */
+async function walkUntilWithin(page: Page, key: string, pixels: number): Promise<void> {
+  await page.keyboard.down(key);
+  try {
+    await expect
+      .poll(
+        async () => {
+          const [a, b] = await fighters(page);
+          return a === undefined || b === undefined ? Number.POSITIVE_INFINITY : Math.abs(a.x - b.x) / SUB;
+        },
+        { intervals: [20], timeout: 10_000 },
+      )
+      .toBeLessThanOrEqual(pixels);
+  } finally {
+    await page.keyboard.up(key);
+  }
+}
+
+/** Waits until this page's own fighter can act again (idle). */
+async function settle(page: Page, player: 0 | 1): Promise<void> {
+  await expect.poll(async () => (await fighters(page))[player]?.action, { intervals: [20] }).toBe("idle");
+  await page.waitForTimeout(150);
+}
+
+/** Share of canvas pixels within a few levels of a colour, from a real screenshot of the arena canvas. */
+async function colourShare(page: Page, color: string): Promise<number> {
+  const png = await page.locator("#arena canvas").screenshot();
+  return page.evaluate(
+    async ({ base64, color }) => {
+      const bitmap = await createImageBitmap(await (await fetch(`data:image/png;base64,${base64}`)).blob());
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const context = canvas.getContext("2d")!;
+      context.drawImage(bitmap, 0, 0);
+      const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
+      const want = Number.parseInt(color.slice(1), 16);
+      const [r, g, b] = [(want >> 16) & 0xff, (want >> 8) & 0xff, want & 0xff];
+      let near = 0;
+      for (let index = 0; index < data.length; index += 4) {
+        if (Math.abs(data[index]! - r) <= 24 && Math.abs(data[index + 1]! - g) <= 24 && Math.abs(data[index + 2]! - b) <= 24) near++;
+      }
+      return near / (data.length / 4);
+    },
+    { base64: png.toString("base64"), color },
+  );
+}
+
+test("a practice duel: a jab, then a throw pressed J then K with rollover, drop the dummy's health [scenario:duel-practice]", async ({ page }, testInfo) => {
+  test.setTimeout(60_000);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Practice" }).click();
+  await expect(page.getByTestId("duel-code")).toHaveText(/^[A-Z0-9]{6} \(practice\)$/);
+  await expect(page.getByTestId("duel-status")).toHaveText("connected");
+  await expect(page.getByTestId("duel-name-1")).toHaveText("Player 2 (dummy)");
+  await expect(page.getByTestId("dummy-select")).toHaveValue("idle");
+
+  // The developer toggle draws the hurtboxes (green outlines on the canvas); off, there are none.
+  expect(await colourShare(page, HURTBOX_COLOR)).toBe(0);
+  await page.getByTestId("hitbox-toggle").check();
+  await expect.poll(async () => (await boxes(page)).hurtboxes).toBe(2);
+  await expect.poll(() => colourShare(page, HURTBOX_COLOR)).toBeGreaterThan(0);
+
+  await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "fighting", { timeout: 10_000 });
+  expect(await health(page, 1)).toBe(rules.maxHealth);
+
+  // Walk in holding D, then tap J: a press shorter than a frame still jabs.
+  await walkUntilWithin(page, "d", 44);
+  await settle(page, 0);
+  const hitboxFramesBefore = (await boxes(page)).hitboxFrames;
+  await page.keyboard.press("j");
+  await expect.poll(() => health(page, 1)).toBe(rules.maxHealth - JAB);
+  expect((await boxes(page)).hitboxFrames).toBeGreaterThan(hitboxFramesBefore);
+  await expect(page.getByTestId("duel-health-text-1")).toHaveText(`${rules.maxHealth - JAB} / ${rules.maxHealth}`);
+
+  // The throw from the keyboard: J then K back to back as rollover presses them (K goes down right after J, without
+  // waiting for J's event to be acknowledged), both held through the throw. The frames the client tagged them on
+  // decide, by the unchanged rules: within the 2-frame chord window it is the throw; later, a jab. A heavily loaded
+  // machine can deliver K late, so such an attempt is checked as the jab it is and pressed again.
+  let jabs = 1;
+  const gaps: number[] = [];
+  for (let attempt = 1; ; attempt++) {
+    await settle(page, 0);
+    await expect.poll(async () => (await fighters(page))[1]?.action, { intervals: [20] }).toBe("idle");
+    const from = (await page.evaluate(() => (window as unknown as DuelDiagnostics).__duel.lastTaggedFrame()))! + 1;
+    const before = await health(page, 1);
+    const j = page.keyboard.down("j");
+    const k = page.keyboard.down("k");
+    await Promise.all([j, k]);
+    await page.waitForTimeout(200);
+    await page.keyboard.up("j");
+    await page.keyboard.up("k");
+    const tagged = await page.evaluate(([start]) => (window as unknown as DuelDiagnostics).__duel.taggedInputs(start!, start! + 30), [from]);
+    const gap = tagged.findIndex((bits) => (bits & HEAVY_BIT) !== 0) - tagged.findIndex((bits) => (bits & LIGHT_BIT) !== 0);
+    gaps.push(gap);
+    if (Math.abs(gap) <= rules.throwChordFrames) {
+      await expect.poll(() => health(page, 1)).toBe(before - THROW);
+      break;
+    }
+    await expect.poll(() => health(page, 1)).toBe(before - JAB);
+    jabs++;
+    expect(attempt, `J and K arrived ${gaps.join(", ")} frames apart`).toBeLessThan(3);
+  }
+  await testInfo.attach("chord-gaps", { body: `J to K, in frames, per attempt: ${gaps.join(", ")}`, contentType: "text/plain" });
+  const afterBoth = rules.maxHealth - jabs * JAB - THROW;
+  await expect.poll(() => health(page, 1)).toBe(afterBoth);
+  await expect(page.getByTestId("duel-health-text-1")).toHaveText(`${afterBoth} / ${rules.maxHealth}`);
+  // The health bar is filled to the same share, and the predicted arena agrees with the server.
+  expect(await page.getByTestId("duel-health-1").evaluate((bar) => bar.style.getPropertyValue("--fill"))).toBe(`${(100 * afterBoth) / rules.maxHealth}%`);
+  await expect.poll(async () => (await fighters(page))[1]?.health).toBe(afterBoth);
+  expect(await health(page, 0)).toBe(rules.maxHealth);
+  await expect(page.getByTestId("duel-delay")).toHaveAttribute("data-frames", /^[3-8]$/);
+
+  await attachScreenshot(page, testInfo, "duel-practice");
+});
+
+test("two browsers duel online: a strike lands, and both show the same health, clock and result [scenario:duel-online]", async ({ browser }, testInfo) => {
+  // The rules stay as they are: the round lasts 60 seconds after a 3-second countdown.
+  test.setTimeout(180_000);
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+    await host.goto("/");
+    await host.getByRole("button", { name: "Create duel" }).click();
+    await expect(host.getByTestId("duel-code")).toHaveText(/^[A-Z0-9]{6}$/);
+    const code = (await host.getByTestId("duel-code").textContent())!;
+    await expect(host.getByTestId("duel-phase")).toHaveAttribute("data-phase", "waiting");
+
+    await guest.goto("/");
+    await guest.getByLabel("Duel code").fill(code.toLowerCase());
+    await guest.getByRole("button", { name: "Join duel" }).click();
+    await expect(guest.getByTestId("duel-code")).toHaveText(code);
+    await expect(guest.getByTestId("duel-name-1")).toHaveText("Player 2 (you)");
+    for (const page of [host, guest]) await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "countdown");
+    for (const page of [host, guest]) await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "fighting", { timeout: 10_000 });
+
+    // The connection line: the round trip, the shared input delay (the same in both), and the corrections so far.
+    const delay = await host.getByTestId("duel-delay").getAttribute("data-frames");
+    expect(Number(delay)).toBeGreaterThanOrEqual(3);
+    expect(Number(delay)).toBeLessThanOrEqual(8);
+    await expect(guest.getByTestId("duel-delay")).toHaveAttribute("data-frames", delay!);
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("duel-rtt")).toHaveText(/^\d+ ms$/);
+      await expect(page.getByTestId("duel-corrections")).toHaveAttribute("data-count", /^\d+$/);
+    }
+
+    // The host walks in and jabs; the guest stands. Both views show the authoritative damage.
+    await walkUntilWithin(host, "d", 60);
+    await settle(host, 0);
+    await host.keyboard.press("j");
+    for (const page of [host, guest]) await expect.poll(() => health(page, 1), { timeout: 5000 }).toBe(rules.maxHealth - JAB);
+    for (const page of [host, guest]) expect(await health(page, 0)).toBe(rules.maxHealth);
+
+    // The round runs out (60 s); the server's result reaches both views, with the same health and clock.
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("duel-result")).toBeVisible({ timeout: (rules.roundFrames / 60) * 1000 + 30_000 });
+      await expect(page.getByTestId("duel-result-text")).toHaveText("Player 1 wins by time");
+    }
+    await expect.poll(async () => JSON.stringify(await outcome(guest))).toBe(JSON.stringify(await outcome(host)));
+    const final = await outcome(host);
+    expect(final).toMatchObject({ winner: "0", reason: "timeout", frame: String(rules.roundFrames), clock: "0", healthBars: [rules.maxHealth, rules.maxHealth - JAB] });
+    await expect(host.getByTestId("duel-corrections")).toHaveAttribute("data-count", /^\d+$/);
+
+    await attachScreenshot(host, testInfo, "duel-online");
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

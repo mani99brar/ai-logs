@@ -1,0 +1,696 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { FileRef } from '../graph/model.ts'
+import { fetchDocument } from './api.ts'
+import { ConfirmDialog } from './ConfirmDialog.tsx'
+import { Editor } from './Editor.tsx'
+import { hasUnacknowledgedWork, isPending, type Snapshot } from './editSession.ts'
+import { analyzeText, contentHash, type TextAnalysis } from './serialize.ts'
+import { useEditSession } from './useEditSession.ts'
+
+/** What the rest of the app needs to know to guard navigation and refuse operations on the active file. */
+export type EditingState = { dirty: boolean; pending: boolean; conflicted: boolean }
+
+type Props = {
+  fileRef: FileRef
+  document: Snapshot
+  analysis: TextAnalysis
+  onAnnounce: (message: string) => void
+  onStateChange: (state: EditingState | null) => void
+  /** The last acknowledged content/hash (initial read, each successful save or revert, each reload). */
+  onAcknowledged: (acknowledged: Snapshot) => void
+  /** Runs `leave` now, or after the user confirms discarding a dirty draft; refuses while a save is pending. */
+  guardLeave: (leave: () => void) => void
+  /** Leaves editing mode; `acknowledged` is what the read-only view should now show. */
+  onExit: (acknowledged: Snapshot) => void
+}
+
+type Confirmation = 'reload' | 'revert' | null
+
+function fileName(ref: FileRef): string {
+  return ref.path.slice(ref.path.lastIndexOf('/') + 1)
+}
+
+export function EditingSession({ fileRef, document, analysis: initialAnalysis, onAnnounce, onStateChange, onAcknowledged, guardLeave, onExit }: Props) {
+  const name = fileName(fileRef)
+  const [analysis, setAnalysis] = useState(initialAnalysis)
+  const [retainedDraft, setRetainedDraft] = useState<string | null>(null)
+  const alive = useRef(true)
+  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  const { session, edit, save, revert, reload } = useEditSession(fileRef, document, {
+    onSaved: purpose => onAnnounce(purpose === 'revert' ? `Reverted ${name} to the version from when editing began.` : `Saved ${name}.`),
+    onFailed: (error, purpose) => onAnnounce(error.kind === 'conflict'
+      ? `${purpose === 'revert' ? 'Revert' : 'Save'} conflicted: ${name} changed on disk.`
+      : `${purpose === 'revert' ? 'Revert' : 'Save'} failed for ${name}.`),
+  })
+
+  const dirty = hasUnacknowledgedWork(session)
+  const pending = isPending(session)
+  const conflicted = session.conflicted
+  useEffect(() => { onStateChange({ dirty, pending, conflicted }) }, [dirty, pending, conflicted, onStateChange])
+  useEffect(() => () => onStateChange(null), [onStateChange])
+  useEffect(() => { onAcknowledged(session.acknowledged) }, [session.acknowledged, onAcknowledged])
+
+  const sessionRef = useRef(session)
+  useEffect(() => { sessionRef.current = session })
+
+  const [confirmation, setConfirmation] = useState<Confirmation>(null)
+  const [reloading, setReloading] = useState(false)
+  const [fallback, setFallback] = useState<string | null>(null)
+
+  const performReload = useCallback(async () => {
+    setReloading(true)
+    onAnnounce(`Reloading ${name} from disk.`)
+    try {
+      const fresh = await fetchDocument(fileRef)
+      const textAnalysis = analyzeText(fresh.content)
+      const matches = await contentHash(fresh.content) === fresh.hash
+      if (!alive.current) return
+      const nextAnalysis: TextAnalysis = matches ? textAnalysis : {
+        ...textAnalysis, editable: false, reason: 'it is not valid UTF-8, so its bytes cannot be reproduced',
+      }
+      // Install content, hash and serialization rules together, before the editor can accept another key.
+      // Keep the discarded draft selectable when the fresh bytes cannot safely be edited here.
+      if (!nextAnalysis.editable && analysis.editable) setRetainedDraft(sessionRef.current.draft)
+      setAnalysis(nextAnalysis)
+      reload({ content: fresh.content, hash: fresh.hash })
+      setConfirmation(null)
+      onAnnounce(nextAnalysis.editable
+        ? `Reloaded ${name} from disk. Editing starts again from this version.`
+        : `Reloaded ${name} from disk as read-only. Your previous draft is kept for copying.`)
+    } catch {
+      if (!alive.current) return
+      setConfirmation(null)
+      onAnnounce(`Reloading ${name} failed. The draft and the conflict are unchanged.`)
+    } finally { if (alive.current) setReloading(false) }
+  }, [analysis.editable, fileRef, name, onAnnounce, reload])
+
+  const copyDraft = useCallback(async () => {
+    const draft = sessionRef.current.draft
+    try {
+      await navigator.clipboard.writeText(draft)
+      setFallback(null)
+      onAnnounce('Draft copied to the clipboard.')
+    } catch {
+      setFallback(draft)
+      onAnnounce('The clipboard is unavailable. The draft is shown as selectable text.')
+    }
+  }, [onAnnounce])
+
+  const exitEditing = useCallback(() => {
+    guardLeave(() => onExit(sessionRef.current.acknowledged))
+  }, [guardLeave, onExit])
+
+  const recovery = fallback !== null ? (
+    <div className="editor-fallback">
+      <p id="draft-fallback-help">The clipboard is unavailable. Select the text below and copy it yourself.</p>
+      <textarea aria-label="Draft text" aria-describedby="draft-fallback-help" readOnly value={fallback} rows={6} onFocus={event => event.currentTarget.select()} />
+      <p className="document-actions"><button type="button" className="button" onClick={() => setFallback(null)}>Hide draft text</button></p>
+    </div>
+  ) : null
+
+  return (
+    <>
+      <Editor
+        fileRef={fileRef}
+        session={session}
+        analysis={analysis}
+        onEdit={edit}
+        onSave={save}
+        onRevert={() => setConfirmation('revert')}
+        onReload={() => setConfirmation('reload')}
+        onCopyDraft={() => { void copyDraft() }}
+        onExit={exitEditing}
+        recovery={<>
+          {retainedDraft !== null && <div className="editor-fallback">
+            <p>A reloaded version could not be edited safely. Your previous draft is kept below so you can select and copy it before leaving.</p>
+            <textarea aria-label="Draft before reload" readOnly value={retainedDraft} rows={6} onFocus={event => event.currentTarget.select()} />
+          </div>}
+          {recovery}
+        </>}
+      />
+      {confirmation === 'reload' && (
+        <ConfirmDialog title="Reload from disk?" confirmLabel="Reload" destructive pending={reloading} onConfirm={() => { void performReload() }} onCancel={() => setConfirmation(null)}>
+          <p>Reloading {name} will discard your current draft and replace it with the version now on disk. Copy the draft first if you want to keep it.</p>
+        </ConfirmDialog>
+      )}
+      {confirmation === 'revert' && (
+        <ConfirmDialog title="Revert to the version from when editing began?" confirmLabel="Revert" destructive onConfirm={() => { setConfirmation(null); revert() }} onCancel={() => setConfirmation(null)}>
+          <p>This will discard your current draft changes and save the content {name} had when you pressed Edit, replacing every save made since. It is checked against the last acknowledged version and can report a conflict.</p>
+        </ConfirmDialog>
+      )}
+    </>
+  )
+}
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, highlightSpecialChars } from '@codemirror/view'
+import { EditorState, type Extension } from '@codemirror/state'
+import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
+import { HighlightStyle, syntaxHighlighting, bracketMatching } from '@codemirror/language'
+import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
+import { tags } from '@lezer/highlight'
+import type { FileRef } from '../graph/model.ts'
+import { Markdown } from './Markdown.tsx'
+import { canRevert, canSave, hasUnacknowledgedWork, isPending, status, type Session } from './editSession.ts'
+import { serializeText, textFromContent, type TextAnalysis } from './serialize.ts'
+
+type Tab = 'edit' | 'preview'
+const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
+  { id: 'edit', label: 'Edit' },
+  { id: 'preview', label: 'Preview' },
+]
+
+const STATUS_LABEL: Record<ReturnType<typeof status>, string> = { saved: 'Saved', unsaved: 'Unsaved', saving: 'Saving', error: 'Error' }
+
+/** Theme-neutral Markdown highlighting driven by the app's CSS variables so light and dark both stay readable. */
+const markdownHighlight = HighlightStyle.define([
+  { tag: tags.heading, fontWeight: 'bold', color: 'var(--md-heading)' },
+  { tag: tags.emphasis, fontStyle: 'italic' },
+  { tag: tags.strong, fontWeight: 'bold' },
+  { tag: tags.strikethrough, textDecoration: 'line-through' },
+  { tag: tags.link, color: 'var(--md-link)' },
+  { tag: tags.url, color: 'var(--md-link)', textDecoration: 'underline' },
+  { tag: tags.monospace, color: 'var(--md-code)' },
+  { tag: tags.quote, color: 'var(--text-muted)' },
+  { tag: tags.list, color: 'var(--md-punct)' },
+  { tag: tags.processingInstruction, color: 'var(--md-punct)' },
+  { tag: tags.meta, color: 'var(--text-muted)' },
+  { tag: tags.contentSeparator, color: 'var(--md-punct)' },
+])
+
+const editorTheme = EditorView.theme({
+  '&': { backgroundColor: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.95rem' },
+  '&.cm-focused': { outline: '3px solid var(--focus)', outlineOffset: '2px' },
+  '.cm-content': { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', caretColor: 'var(--text)', padding: '8px 0' },
+  '.cm-gutters': { backgroundColor: 'var(--surface-alt)', color: 'var(--text-muted)', border: 'none' },
+  '.cm-activeLine': { backgroundColor: 'transparent' },
+  '.cm-activeLineGutter': { backgroundColor: 'transparent' },
+  '.cm-cursor': { borderLeftColor: 'var(--text)' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': { backgroundColor: 'var(--selection)' },
+  '.cm-scroller': { overflow: 'auto', maxHeight: 'calc(100vh - 320px)', minHeight: '240px', lineHeight: '1.5' },
+})
+
+type CodeMirrorProps = {
+  /** Initial draft; the parent remounts this editor on Revert/Reload with fresh serialization rules. */
+  content: string
+  analysis: TextAnalysis
+  /** Fires with the serialized document (original line ending and BOM restored) after every change. */
+  onChange: (content: string) => void
+  onSave: () => void
+  label: string
+}
+
+function CodeMirror({ content, analysis, onChange, onSave, label }: CodeMirrorProps) {
+  const host = useRef<HTMLDivElement>(null)
+  const latest = useRef({ onChange, onSave })
+  useLayoutEffect(() => { latest.current = { onChange, onSave } })
+  useEffect(() => {
+    const extensions: Extension[] = [
+      lineNumbers(), highlightSpecialChars(), history(), drawSelection(), highlightActiveLine(), bracketMatching(),
+      markdown({ base: markdownLanguage }), syntaxHighlighting(markdownHighlight), editorTheme, EditorView.lineWrapping,
+      EditorView.contentAttributes.of({ 'aria-label': label }),
+      keymap.of([{ key: 'Mod-s', run: () => { latest.current.onSave(); return true } }, ...defaultKeymap, ...historyKeymap, indentWithTab]),
+      EditorView.updateListener.of(update => {
+        if (update.docChanged) latest.current.onChange(serializeText(update.state.doc, analysis))
+      }),
+    ]
+    const view = new EditorView({ state: EditorState.create({ doc: textFromContent(content, analysis), extensions }), parent: host.current! })
+    return () => view.destroy()
+    // CodeMirror owns keystrokes until the parent remounts it with a new baseline/generation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  return <div ref={host} className="editor-host" />
+}
+
+type Props = {
+  fileRef: FileRef
+  session: Session
+  analysis: TextAnalysis
+  onEdit: (content: string) => void
+  onSave: () => void
+  onRevert: () => void
+  onReload: () => void
+  onCopyDraft: () => void
+  onExit: () => void
+  /** Optional recovery panel shown by the parent (conflict/copy state). */
+  recovery?: React.ReactNode
+}
+
+/** Editing shell: Edit/Preview tabs, Save/Revert/Done controls, accessible status and error guidance. */
+export function Editor({ fileRef, session, analysis, onEdit, onSave, onRevert, onReload, onCopyDraft, onExit, recovery }: Props) {
+  const [tab, setTab] = useState<Tab>('edit')
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const current = status(session)
+  const pending = isPending(session)
+  const saveEnabled = analysis.editable && canSave(session)
+
+  // Ctrl/Cmd+S anywhere in editing mode saves and never triggers the browser's Save Page.
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && (event.key === 's' || event.key === 'S')) {
+        event.preventDefault()
+        if (saveEnabled) onSave()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [onSave, saveEnabled])
+
+  // Warn on supported browser departures while there is unsaved or unacknowledged work.
+  const dirty = hasUnacknowledgedWork(session)
+  useEffect(() => {
+    if (!dirty) return
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [dirty])
+
+  const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    const index = TABS.findIndex(candidate => candidate.id === tab)
+    let next: number | null = null
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % TABS.length
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + TABS.length) % TABS.length
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = TABS.length - 1
+    if (next === null) return
+    event.preventDefault()
+    setTab(TABS[next].id)
+    tabRefs.current[next]?.focus()
+  }
+
+  const preview = useMemo(() => (tab === 'preview'
+    ? session.draft === '' ? <p className="document-message">This draft is empty.</p> : <Markdown content={session.draft} />
+    : null), [tab, session.draft])
+
+  const error = session.error
+  let guidance: React.ReactNode = null
+  if (error) {
+    const explanation = error.kind === 'conflict'
+      ? 'This file changed on disk since it was last read. Your draft is kept but cannot be saved over the newer version. Reload to discard the draft and edit the current file, or copy the draft first.'
+      : error.kind === 'too-large'
+        ? `${error.message} Your draft is unchanged.`
+        : error.kind === 'missing'
+          ? 'The file no longer exists on disk, so the draft cannot be saved there. Copy the draft to keep it.'
+          : `The save failed: ${error.message} Your draft, including edits made during the failed save, is unchanged. Retry with the last acknowledged version; if the earlier write did reach the disk, the retry reports a conflict instead of silently overwriting it.`
+    guidance = (
+      <div className="document-message document-error editor-error" role="alert">
+        <p>{explanation}</p>
+        <p className="document-actions">
+          {error.kind === 'conflict' && <button type="button" className="button" onClick={onReload}>Reload</button>}
+          {(error.kind === 'failed' || error.kind === 'too-large') && <button type="button" className="button" onClick={onSave}>Retry</button>}
+          <button type="button" className="button" onClick={onCopyDraft}>Copy draft</button>
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="editor" data-testid="editor" data-save-status={current}>
+      <div className="editor-toolbar">
+        <div className="tabs" role="tablist" aria-label="Editor">
+          {TABS.map((candidate, index) => (
+            <button
+              key={candidate.id}
+              ref={element => { tabRefs.current[index] = element }}
+              type="button"
+              role="tab"
+              id={`editor-tab-${candidate.id}`}
+              className="tab"
+              aria-selected={tab === candidate.id}
+              aria-controls="editor-panel"
+              tabIndex={tab === candidate.id ? 0 : -1}
+              onClick={() => setTab(candidate.id)}
+              onKeyDown={onTabKeyDown}
+            >
+              {candidate.label}
+            </button>
+          ))}
+        </div>
+        <div className="editor-actions">
+          <span className={`save-status save-status-${current}`} data-testid="save-status" aria-live="polite" aria-atomic="true">
+            {STATUS_LABEL[current]}
+          </span>
+          <button type="button" className="button" onClick={onSave} disabled={!saveEnabled} aria-keyshortcuts="Control+S Meta+S">Save</button>
+          <button type="button" className="button" onClick={onRevert} disabled={!analysis.editable || !canRevert(session)}>Revert</button>
+          <button type="button" className="button" onClick={onExit} disabled={pending} title={pending ? 'Wait for the save to finish.' : undefined}>Done</button>
+        </div>
+      </div>
+      {!analysis.editable && <p className="document-notice">This file is read-only here because {analysis.reason}. <button type="button" className="button" onClick={onReload}>Reload</button></p>}
+      {guidance}
+      {recovery}
+      <div className="editor-panel" role="tabpanel" id="editor-panel" aria-labelledby={`editor-tab-${tab}`}>
+        <div hidden={tab !== 'edit'}>
+          {analysis.editable
+            ? <CodeMirror key={session.generation} content={session.draft} analysis={analysis} onChange={onEdit} onSave={onSave} label={`Editing ${fileRef.path}`} />
+            : <pre className="document-source" tabIndex={0}>{session.draft}</pre>}
+        </div>
+        {preview}
+      </div>
+    </div>
+  )
+}
+/**
+ * Pure explicit-save state machine for one editing session of one document. No React, no network.
+ *
+ * - `baseline` is captured once when Edit begins and never changes until a Reload.
+ * - `acknowledged` is the last content/hash the server confirmed (read or successful write).
+ * - `draft` is what the editor holds now. Keystrokes only change `draft`.
+ * - At most one request is `inFlight`; explicit saves while one is pending fill a single `queued` slot.
+ * - A failure or conflict empties the queue; a conflict blocks Save and Revert until `reloaded`.
+ */
+export type Snapshot = { content: string; hash: string }
+export type SaveErrorKind = 'failed' | 'conflict' | 'too-large' | 'missing'
+export type SaveError = { kind: SaveErrorKind; message: string }
+export type Request = { token: number; content: string; expectedHash: string; purpose: 'save' | 'revert' }
+export type Session = {
+  readonly baseline: Snapshot
+  readonly acknowledged: Snapshot
+  readonly draft: string
+  readonly inFlight: Request | null
+  readonly queued: { content: string } | null
+  readonly error: SaveError | null
+  readonly conflicted: boolean
+  readonly nextToken: number
+  /** Increments whenever the draft is replaced from outside the editor (Revert success, Reload). */
+  readonly generation: number
+}
+export type SaveStatus = 'saved' | 'unsaved' | 'saving' | 'error'
+
+export function startSession(document: Snapshot): Session {
+  const snapshot = { content: document.content, hash: document.hash }
+  return { baseline: snapshot, acknowledged: snapshot, draft: document.content, inFlight: null, queued: null, error: null, conflicted: false, nextToken: 1, generation: 0 }
+}
+
+export function edit(session: Session, draft: string): Session {
+  return draft === session.draft ? session : { ...session, draft }
+}
+
+function send(session: Session, content: string, purpose: Request['purpose']): Session {
+  const request: Request = { token: session.nextToken, content, expectedHash: session.acknowledged.hash, purpose }
+  return { ...session, inFlight: request, queued: null, error: null, nextToken: session.nextToken + 1 }
+}
+
+/** Explicit Save (button, shortcut or Retry). Never sends concurrently; never sends an unchanged draft. */
+export function requestSave(session: Session): Session {
+  if (session.conflicted) return session
+  if (session.inFlight) {
+    if (session.draft === session.inFlight.content) return session.queued ? { ...session, queued: null } : session
+    return { ...session, queued: { content: session.draft } }
+  }
+  if (session.draft === session.acknowledged.content) return session.error ? { ...session, error: null } : session
+  return send(session, session.draft, 'save')
+}
+
+/** Revert restores the Edit baseline on disk through the same hash-checked pipeline. */
+export function requestRevert(session: Session): Session {
+  if (!canRevert(session)) return session
+  return send(session, session.baseline.content, 'revert')
+}
+
+export function settleSuccess(session: Session, token: number, hash: string): Session {
+  const request = session.inFlight
+  if (!request || request.token !== token) return session
+  const acknowledged = { content: request.content, hash }
+  const reverted = request.purpose === 'revert'
+  const draft = reverted ? request.content : session.draft
+  const settled: Session = { ...session, acknowledged, draft, inFlight: null, error: null, conflicted: false, generation: session.generation + (reverted ? 1 : 0) }
+  if (session.queued && session.queued.content !== acknowledged.content) return send(settled, session.queued.content, 'save')
+  return { ...settled, queued: null }
+}
+
+export function settleFailure(session: Session, token: number, error: SaveError): Session {
+  const request = session.inFlight
+  if (!request || request.token !== token) return session
+  return { ...session, inFlight: null, queued: null, error, conflicted: error.kind === 'conflict' }
+}
+
+/** A successful fresh read replaces baseline, acknowledged content and draft, and clears any conflict. */
+export function reloaded(session: Session, document: Snapshot): Session {
+  if (session.inFlight) return session
+  return { ...startSession(document), nextToken: session.nextToken, generation: session.generation + 1 }
+}
+
+export function status(session: Session): SaveStatus {
+  if (session.inFlight) return 'saving'
+  if (session.error) return 'error'
+  return session.draft === session.acknowledged.content ? 'saved' : 'unsaved'
+}
+
+export function canSave(session: Session): boolean {
+  return !session.conflicted
+}
+
+export function canRevert(session: Session): boolean {
+  if (session.conflicted || session.inFlight || session.queued) return false
+  return session.draft !== session.baseline.content || session.acknowledged.content !== session.baseline.content
+}
+
+/** Unsaved changes or a save that has not been acknowledged: what navigation guards and beforeunload care about. */
+export function hasUnacknowledgedWork(session: Session): boolean {
+  return session.inFlight !== null || session.queued !== null || session.draft !== session.acknowledged.content
+}
+
+export function isPending(session: Session): boolean {
+  return session.inFlight !== null || session.queued !== null
+}
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { FileRef } from '../graph/model.ts'
+import { SaveError, saveDocument } from './api.ts'
+import {
+  edit as editDraft,
+  reloaded as reloadSession,
+  requestRevert as revertRequest,
+  requestSave as saveRequest,
+  settleFailure,
+  settleSuccess,
+  startSession,
+  type Session,
+  type Snapshot,
+} from './editSession.ts'
+
+type Events = {
+  onSaved?: (purpose: 'save' | 'revert') => void
+  onFailed?: (error: SaveError, purpose: 'save' | 'revert') => void
+}
+
+/**
+ * Drives the pure session with real requests. Each request carries its token and the session identity
+ * it belongs to, so a late response can only ever settle the request that started it.
+ */
+export function useEditSession(ref: FileRef, initial: Snapshot, events: Events = {}) {
+  const [session, setSession] = useState(() => startSession(initial))
+  const dispatched = useRef(0)
+  const eventsRef = useRef(events)
+  useEffect(() => { eventsRef.current = events })
+  // StrictMode mounts, unmounts and remounts: liveness must be re-established on every mount.
+  const alive = useRef(true)
+  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+
+  useEffect(() => {
+    const request = session.inFlight
+    if (!request || request.token === dispatched.current) return
+    dispatched.current = request.token
+    void saveDocument(ref, request.content, request.expectedHash).then(
+      hash => {
+        if (!alive.current) return
+        setSession(current => settleSuccess(current, request.token, hash))
+        eventsRef.current.onSaved?.(request.purpose)
+      },
+      error => {
+        if (!alive.current) return
+        const failure = error instanceof SaveError ? error : new SaveError('failed', 'The save failed unexpectedly.')
+        setSession(current => settleFailure(current, request.token, { kind: failure.kind, message: failure.message }))
+        eventsRef.current.onFailed?.(failure, request.purpose)
+      },
+    )
+  }, [ref, session.inFlight])
+
+  const edit = useCallback((draft: string) => setSession(current => editDraft(current, draft)), [])
+  const save = useCallback(() => setSession(current => saveRequest(current)), [])
+  const revert = useCallback(() => setSession(current => revertRequest(current)), [])
+  const reload = useCallback((document: Snapshot) => setSession(current => reloadSession(current, document)), [])
+  return { session, edit, save, revert, reload }
+}
+
+export type EditSession = ReturnType<typeof useEditSession>
+export type { Session }
+import { Text } from '@codemirror/state'
+
+const BOM = '﻿'
+
+/**
+ * CodeMirror keeps lines, not line-ending bytes. A file is editable only when every line break is the same
+ * (all LF or all CRLF) so the original ending can be restored on serialization. A leading BOM is held aside
+ * and restored. Anything else (lone CR, mixed endings) cannot be round-tripped losslessly and stays read-only.
+ */
+export type TextAnalysis =
+  | { editable: true; bom: boolean; lineEnding: '\n' | '\r\n' }
+  | { editable: false; bom: boolean; lineEnding: '\n' | '\r\n'; reason: string }
+
+export function analyzeText(content: string): TextAnalysis {
+  const bom = content.startsWith(BOM)
+  const body = bom ? content.slice(1) : content
+  let crlf = 0
+  let lf = 0
+  let cr = 0
+  for (let i = 0; i < body.length; i += 1) {
+    const char = body.charCodeAt(i)
+    if (char === 13) {
+      if (body.charCodeAt(i + 1) === 10) { crlf += 1; i += 1 } else cr += 1
+    } else if (char === 10) lf += 1
+  }
+  if (cr > 0) return { editable: false, bom, lineEnding: '\n', reason: 'it contains bare carriage-return line endings' }
+  if (crlf > 0 && lf > 0) return { editable: false, bom, lineEnding: '\n', reason: 'it has mixed line endings (both CRLF and LF)' }
+  return { editable: true, bom, lineEnding: crlf > 0 ? '\r\n' : '\n' }
+}
+
+export function textFromContent(content: string, analysis: TextAnalysis): Text {
+  const body = analysis.bom ? content.slice(1) : content
+  return Text.of(body.split(analysis.lineEnding))
+}
+
+export function serializeText(text: Text, analysis: TextAnalysis): string {
+  return (analysis.bom ? BOM : '') + text.sliceString(0, text.length, analysis.lineEnding)
+}
+
+/** The SHA-256 the server would compute for this content encoded as UTF-8, as lowercase hex. */
+export async function contentHash(content: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content))
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+}
+import { useLayoutEffect, useRef, type ReactNode } from 'react'
+
+type Props = {
+  title: string
+  children: ReactNode
+  /** Which element receives focus when the dialog opens; the opener is refocused on close. */
+  initialFocus?: 'first-field' | 'cancel' | 'confirm'
+  pending?: boolean
+  onCancel: () => void
+}
+
+/**
+ * Native modal dialog: Escape cancels unless pending, the browser traps focus, and closing returns focus to the element that
+ * opened it. It is rendered only while open, so mounting shows it and unmounting closes it. The layout-effect
+ * cleanup runs before React detaches the element, which is what lets the opener be refocused.
+ */
+export function Modal({ title, children, initialFocus = 'confirm', pending = false, onCancel }: Props) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const latest = useRef({ onCancel, pending })
+  useLayoutEffect(() => { latest.current = { onCancel, pending } })
+  useLayoutEffect(() => {
+    const dialog = ref.current
+    if (!dialog) return
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    if (!dialog.open) dialog.showModal()
+    const selector = initialFocus === 'first-field'
+      ? 'input, select, textarea'
+      : initialFocus === 'cancel' ? '[data-dialog-cancel]' : '[data-dialog-confirm]'
+    dialog.querySelector<HTMLElement>(selector)?.focus()
+    const onNativeCancel = (event: Event) => { event.preventDefault(); if (!latest.current.pending) latest.current.onCancel() }
+    dialog.addEventListener('cancel', onNativeCancel)
+    return () => {
+      dialog.removeEventListener('cancel', onNativeCancel)
+      if (dialog.open) dialog.close()
+      opener?.focus()
+    }
+  }, [initialFocus])
+  return (
+    <dialog ref={ref} className="confirm-dialog" aria-labelledby="dialog-title">
+      <h2 id="dialog-title">{title}</h2>
+      {children}
+    </dialog>
+  )
+}
+import type { ReactNode } from 'react'
+import { Modal } from '../ui/Modal.tsx'
+
+type Props = {
+  title: string
+  children: ReactNode
+  confirmLabel: string
+  cancelLabel?: string
+  /** Destructive confirmations start with focus on Cancel. */
+  destructive?: boolean
+  pending?: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}
+
+export function ConfirmDialog({ title, children, confirmLabel, cancelLabel = 'Cancel', destructive = false, pending = false, onConfirm, onCancel }: Props) {
+  return (
+    <Modal title={title} initialFocus={destructive ? 'cancel' : 'confirm'} pending={pending} onCancel={onCancel}>
+      <form method="dialog" onSubmit={event => { event.preventDefault(); if (!pending) onConfirm() }}>
+        <div className="confirm-description">{children}</div>
+        <div className="confirm-actions">
+          <button type="button" className="button" data-dialog-cancel onClick={onCancel} disabled={pending}>{cancelLabel}</button>
+          <button type="submit" className={destructive ? 'button button-danger' : 'button'} data-dialog-confirm disabled={pending} aria-busy={pending}>{confirmLabel}</button>
+        </div>
+      </form>
+    </Modal>
+  )
+}
+import { memo } from 'react'
+import ReactMarkdown, { type Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+
+type Props = { content: string }
+
+const EXTERNAL_LINK = /^https?:\/\//i
+const REMOTE_IMAGE = /^https:\/\//i
+
+/**
+ * Rendering policy on top of react-markdown's defaults (raw HTML stays literal text; unsafe URL schemes
+ * such as javascript: are already stripped by the default URL transform):
+ * - http(s) links open in a new tab with noopener.
+ * - Every other link (relative documents, anchors, stripped unsafe URLs) is inert text.
+ * - Only https images are loaded, and they contact the remote server. Anything else shows an
+ *   accessible unavailable state and is never resolved against the app or an asset route.
+ */
+/** react-markdown passes the hast node alongside DOM props; it must not reach the DOM. */
+function domProps<T extends { node?: unknown }>(props: T): Omit<T, 'node'> {
+  const rest: T = { ...props }
+  delete rest.node
+  return rest
+}
+
+const components: Components = {
+  a(all) {
+    const { href, children, ...props } = domProps(all)
+    if (href && EXTERNAL_LINK.test(href)) {
+      return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>
+    }
+    return <span {...props} className="link-inert" title="This link is not followed in the viewer">{children}</span>
+  },
+  img(all) {
+    const { src, alt, ...props } = domProps(all)
+    const label = alt || 'Image'
+    if (src && REMOTE_IMAGE.test(src)) return <img {...props} src={src} alt={alt ?? ''} loading="lazy" />
+    return (
+      <span role="img" className="image-unavailable" aria-label={`${label} (image unavailable: only HTTPS images are shown)`}>
+        {label} (image unavailable)
+      </span>
+    )
+  },
+  table(all) {
+    return <div className="table-wrap"><table {...domProps(all)} /></div>
+  },
+}
+
+/** GitHub-flavored rendering with react-markdown defaults: raw HTML stays literal text, unsafe URLs are dropped. */
+export const Markdown = memo(function Markdown({ content }: Props) {
+  return (
+    <div className="markdown">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>{content}</ReactMarkdown>
+    </div>
+  )
+})
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)

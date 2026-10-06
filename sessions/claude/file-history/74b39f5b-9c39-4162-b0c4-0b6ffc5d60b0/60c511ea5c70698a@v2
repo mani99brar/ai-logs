@@ -1,0 +1,458 @@
+/// <reference lib="dom" />
+import { test as base, expect, type Page } from '@playwright/test'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+
+const fixtureRoot = fileURLToPath(new URL('../fixtures/', import.meta.url))
+const apiUrl = 'http://127.0.0.1:3001/api/entries'
+const run = promisify(execFile)
+
+type SourceSlug = 'pi' | 'claude'
+
+/**
+ * Mutation-based setup: every artifact lives under a uniquely named directory inside a committed source folder
+ * and is removed when the test ends, whether it passed or failed. Committed sample files are never touched.
+ */
+class Scratch {
+  private readonly created: string[] = []
+
+  /** Creates a uniquely named directory directly under fixtures/<source>/ and returns its name. */
+  async root(source: SourceSlug, suffix = ''): Promise<string> {
+    const name = `pw-${randomUUID().slice(0, 8)}${suffix}`
+    const absolute = join(fixtureRoot, source, name)
+    await mkdir(absolute)
+    this.created.push(absolute)
+    return name
+  }
+
+  async dir(source: SourceSlug, ...segments: string[]): Promise<void> {
+    await mkdir(join(fixtureRoot, source, ...segments), { recursive: true })
+  }
+
+  async file(source: SourceSlug, ...segments: string[]): Promise<void> {
+    await mkdir(join(fixtureRoot, source, ...segments.slice(0, -1)), { recursive: true })
+    await writeFile(join(fixtureRoot, source, ...segments), '')
+  }
+
+  async remove(source: SourceSlug, ...segments: string[]): Promise<void> {
+    await rm(join(fixtureRoot, source, ...segments), { recursive: true, force: true })
+  }
+
+  async cleanup(): Promise<void> {
+    for (const path of this.created.splice(0)) await rm(path, { recursive: true, force: true })
+  }
+}
+
+const test = base.extend<{ scratch: Scratch }>({
+  // eslint-disable-next-line no-empty-pattern -- Playwright fixture signature
+  scratch: async ({}, provide) => {
+    const scratch = new Scratch()
+    try {
+      await provide(scratch)
+    } finally {
+      await scratch.cleanup()
+    }
+  },
+})
+
+const href = (source: SourceSlug, ...segments: string[]) => '/' + [source, ...segments].map(encodeURIComponent).join('/')
+
+const rows = (page: Page) => page.locator('.rows > li')
+const rowNames = (page: Page) => page.locator('.rows .row__name')
+const folderRow = (page: Page, name: string) => page.getByRole('link', { name: `${name} Folder`, exact: true })
+const refreshButton = (page: Page) => page.getByRole('button', { name: 'Refresh' })
+const counts = (page: Page) => page.locator('.counts')
+const crumbs = (page: Page) => page.getByRole('navigation', { name: 'Breadcrumb' })
+const status = (page: Page) => page.getByRole('status')
+
+test.beforeAll(async ({ request }) => {
+  await expect.poll(async () => (await request.get(apiUrl)).status(), { timeout: 30_000 }).toBe(200)
+})
+
+test('home lists both sources as navigable rows and each opens its root', async ({ page }) => {
+  await page.goto('/')
+  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText('Home')
+  await expect(page.getByRole('link', { name: 'Pi Source', exact: true })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Claude Source', exact: true })).toBeVisible()
+
+  await page.getByRole('link', { name: 'Pi Source' }).click()
+  await expect(page).toHaveURL('/pi')
+  await expect(rowNames(page)).toHaveText(['skills', 'workflow.md'])
+  await expect(folderRow(page, 'skills')).toBeVisible()
+  await expect(counts(page)).toHaveText('1 folder · 1 file')
+  await expect(page.getByText('notes.txt')).toHaveCount(0)
+
+  await page.goto('/claude')
+  await expect(rowNames(page)).toHaveText(['subagents', 'empty.md', 'workflow.md'])
+  await expect(counts(page)).toHaveText('1 folder · 2 files')
+  // Duplicate filenames stay distinguishable by source: same name, different breadcrumb and URL.
+  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText('Claude')
+})
+
+test('folders precede files alphabetically, only Markdown files appear, and file rows are not interactive', async ({ page, scratch }) => {
+  const dir = await scratch.root('pi')
+  for (const folder of ['Zeta', 'alpha', '10-ten', '2-two']) await scratch.dir('pi', dir, folder)
+  for (const file of ['b.md', 'A.md', 'UPPER.MD', 'notes.txt', 'readme.markdown', 'x.md.bak']) await scratch.file('pi', dir, file)
+
+  await page.goto(href('pi', dir))
+  await expect(rowNames(page)).toHaveText(['2-two', '10-ten', 'alpha', 'Zeta', 'A.md', 'b.md', 'UPPER.MD'])
+  await expect(counts(page)).toHaveText('4 folders · 3 files')
+  await expect(page.getByText('notes.txt')).toHaveCount(0)
+  await expect(page.getByText('readme.markdown')).toHaveCount(0)
+
+  const fileRow = rows(page).filter({ hasText: 'A.md' })
+  await expect(fileRow.getByRole('link')).toHaveCount(0)
+  await expect(fileRow.locator('.row')).toHaveCSS('cursor', 'default')
+  await expect(rows(page).filter({ hasText: 'alpha' }).locator('.row')).toHaveCSS('cursor', 'pointer')
+})
+
+test('breadcrumbs reflect the path, mark the current folder, and navigate', async ({ page, scratch }) => {
+  const dir = await scratch.root('pi')
+  await scratch.dir('pi', dir, 'inner', 'deepest')
+
+  await page.goto(href('pi', dir, 'inner', 'deepest'))
+  await expect(crumbs(page).locator('.crumb__link, .crumb__current')).toHaveText(['Home', 'Pi', dir, 'inner', 'deepest'])
+  const current = crumbs(page).locator('[aria-current="page"]')
+  await expect(current).toHaveText('deepest')
+  await expect(current).not.toHaveRole('link')
+  await expect(page.getByText('This folder is empty.')).toBeVisible()
+
+  await crumbs(page).getByRole('link', { name: 'inner' }).click()
+  await expect(page).toHaveURL(href('pi', dir, 'inner'))
+  await expect(folderRow(page, 'deepest')).toBeVisible()
+
+  await crumbs(page).getByRole('link', { name: 'Home' }).click()
+  await expect(page).toHaveURL('/')
+  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText('Home')
+})
+
+test('folder names with spaces, #, ?, % and & survive links, reloads, and browser history', async ({ page, scratch }) => {
+  const dir = await scratch.root('pi', ' sp #hash ?q 100% a&b')
+  await scratch.file('pi', dir, 'inside.md')
+
+  await page.goto('/pi')
+  await folderRow(page, dir).click()
+  await expect(page).toHaveURL(href('pi', dir))
+  await expect(rowNames(page)).toHaveText(['inside.md'])
+  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(dir)
+
+  await page.reload()
+  await expect(rowNames(page)).toHaveText(['inside.md'])
+  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(dir)
+
+  await page.goBack()
+  await expect(page).toHaveURL('/pi')
+  await expect(folderRow(page, dir)).toBeVisible()
+  await page.goForward()
+  await expect(page).toHaveURL(href('pi', dir))
+  await expect(rowNames(page)).toHaveText(['inside.md'])
+})
+
+test('empty directories are listed and navigable', async ({ page, scratch }) => {
+  const dir = await scratch.root('pi')
+  await scratch.dir('pi', dir, 'hollow')
+
+  await page.goto(href('pi', dir))
+  await expect(folderRow(page, 'hollow')).toBeVisible()
+  await expect(counts(page)).toHaveText('1 folder · 0 files')
+  await folderRow(page, 'hollow').click()
+  await expect(page).toHaveURL(href('pi', dir, 'hollow'))
+  await expect(page.getByText('This folder is empty.')).toBeVisible()
+  await expect(rows(page)).toHaveCount(0)
+})
+
+test('missing folders explain and link to the source root; unknown sources link home', async ({ page }) => {
+  const missing = `pw-missing-${randomUUID().slice(0, 8)}`
+  await page.goto(href('pi', missing))
+  const notice = page.locator('[data-state="missing"]')
+  await expect(notice).toContainText(`The folder “${missing}” doesn’t exist in Pi`)
+  await notice.getByRole('link', { name: 'Go to Pi' }).click()
+  await expect(page).toHaveURL('/pi')
+  await expect(folderRow(page, 'skills')).toBeVisible()
+
+  // A file path is not a folder either.
+  await page.goto('/pi/skills/review.md')
+  await expect(page.locator('[data-state="missing"]')).toContainText('doesn’t exist in Pi')
+
+  await page.goto('/nope/anything')
+  await expect(page.locator('[data-state="missing"]')).toContainText('There is no source named “nope”')
+  await page.getByRole('link', { name: 'Go to Home' }).click()
+  await expect(page).toHaveURL('/')
+  await expect(page.getByRole('link', { name: 'Pi Source' })).toBeVisible()
+})
+
+test('refresh reflects additions and removals, keeps the current folder, and updates counts together', async ({ page, scratch }) => {
+  const dir = await scratch.root('pi')
+  await scratch.file('pi', dir, 'one.md')
+
+  await page.goto(href('pi', dir))
+  await expect(rowNames(page)).toHaveText(['one.md'])
+  await expect(counts(page)).toHaveText('0 folders · 1 file')
+
+  await scratch.file('pi', dir, 'two.md')
+  await scratch.dir('pi', dir, 'sub')
+  await refreshButton(page).focus()
+  await page.keyboard.press('Enter')
+  await expect(status(page)).toHaveText('Listing refreshed.')
+  await expect(rowNames(page)).toHaveText(['sub', 'one.md', 'two.md'])
+  await expect(counts(page)).toHaveText('1 folder · 2 files')
+  await expect(page).toHaveURL(href('pi', dir))
+  await expect(refreshButton(page)).toBeFocused()
+
+  await scratch.remove('pi', dir, 'two.md')
+  await scratch.remove('pi', dir, 'sub')
+  await refreshButton(page).click()
+  await expect(rowNames(page)).toHaveText(['one.md'])
+  await expect(counts(page)).toHaveText('0 folders · 1 file')
+})
+
+test('refresh is disabled while pending and sends a single request', async ({ page }) => {
+  await page.goto('/pi')
+  await expect(folderRow(page, 'skills')).toBeVisible()
+
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  let requests = 0
+  await page.route('**/api/entries', async route => {
+    requests += 1
+    await held
+    await route.continue()
+  })
+
+  await refreshButton(page).click()
+  await expect(refreshButton(page)).toBeDisabled()
+  await expect(status(page)).toHaveText('Refreshing…')
+  await refreshButton(page).click({ force: true })
+  await refreshButton(page).click({ force: true })
+  expect(requests).toBe(1)
+
+  release()
+  await expect(status(page)).toHaveText('Listing refreshed.')
+  await expect(refreshButton(page)).toBeEnabled()
+  await expect(folderRow(page, 'skills')).toBeVisible()
+})
+
+test('refresh failure keeps the previous rows and flags them as potentially outdated', async ({ page }) => {
+  await page.goto('/pi')
+  await expect(rowNames(page)).toHaveText(['skills', 'workflow.md'])
+
+  await page.route('**/api/entries', route => route.fulfill({ status: 500, json: { error: 'Listing failed' } }))
+  await refreshButton(page).click()
+  const alert = page.locator('[data-state="stale"]')
+  await expect(alert).toHaveRole('alert')
+  await expect(alert).toContainText('may be outdated')
+  await expect(alert).toContainText('refresh again')
+  await expect(rowNames(page)).toHaveText(['skills', 'workflow.md'])
+  await expect(counts(page)).toHaveText('1 folder · 1 file')
+
+  await page.unroute('**/api/entries')
+  await refreshButton(page).click()
+  await expect(status(page)).toHaveText('Listing refreshed.')
+  await expect(alert).toHaveCount(0)
+})
+
+test('a folder removed on disk shows the missing state after refresh', async ({ page, scratch }) => {
+  const dir = await scratch.root('pi')
+  await page.goto(href('pi', dir))
+  await expect(page.getByText('This folder is empty.')).toBeVisible()
+
+  await scratch.remove('pi', dir)
+  await refreshButton(page).click()
+  await expect(page.locator('[data-state="missing"]')).toContainText('doesn’t exist in Pi')
+  await page.getByRole('link', { name: 'Go to Pi' }).click()
+  await expect(page).toHaveURL('/pi')
+})
+
+test('initial loading state, then content', async ({ page }) => {
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/entries', async route => {
+    await held
+    await route.continue()
+  })
+  await page.goto('/pi')
+  await expect(status(page)).toHaveText('Loading folders…')
+  await expect(refreshButton(page)).toBeDisabled()
+  await expect(rows(page)).toHaveCount(0)
+  release()
+  await expect(folderRow(page, 'skills')).toBeVisible()
+  await expect(status(page)).toHaveText('')
+  await expect(refreshButton(page)).toBeEnabled()
+})
+
+for (const failure of ['http', 'network'] as const) {
+  test(`initial ${failure} failure shows an error with a working Retry`, async ({ page }) => {
+    await page.route('**/api/entries', route => failure === 'http'
+      ? route.fulfill({ status: 500, json: { error: 'Listing failed' } })
+      : route.abort())
+    await page.goto('/pi')
+    const alert = page.locator('[data-state="error"]')
+    await expect(alert).toHaveRole('alert')
+    await expect(alert).toContainText('Unable to load the Pi and Claude folders')
+    await expect(rows(page)).toHaveCount(0)
+
+    await page.unroute('**/api/entries')
+    await alert.getByRole('button', { name: 'Retry' }).click()
+    await expect(folderRow(page, 'skills')).toBeVisible()
+    await expect(alert).toHaveCount(0)
+  })
+}
+
+test('narrow screens hide the Type column but keep type information, wrap long names, and collapse breadcrumbs', async ({ page, scratch }) => {
+  const longFolder = 'a-very-long-folder-name-without-any-spaces-that-would-otherwise-force-horizontal-scrolling-on-phones'
+  const longFile = 'an-equally-long-markdown-file-name-without-spaces-that-must-wrap-instead-of-overflowing-the-page.md'
+  const dir = await scratch.root('pi')
+  await scratch.dir('pi', dir, 'inner', longFolder)
+  await scratch.file('pi', dir, 'inner', longFile)
+
+  await page.setViewportSize({ width: 375, height: 700 })
+  await page.goto(href('pi', dir, 'inner'))
+  await expect(folderRow(page, longFolder)).toBeVisible()
+
+  // Type column: visually hidden, but still part of every row's accessible name.
+  const typeHeader = page.locator('.rows-header__type')
+  expect((await typeHeader.boundingBox())?.width ?? 0).toBeLessThanOrEqual(1)
+  for (const cell of await page.locator('.row__type').all()) {
+    expect((await cell.boundingBox())?.width ?? 0).toBeLessThanOrEqual(1)
+  }
+  await expect(rows(page).filter({ hasText: longFile })).toHaveText(`${longFile}Markdown`)
+
+  // Long names wrap: no horizontal page scroll and the row stays inside the viewport.
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
+  const box = await folderRow(page, longFolder).boundingBox()
+  expect(box!.x + box!.width).toBeLessThanOrEqual(375)
+  expect(box!.height).toBeGreaterThan(40)
+
+  // Breadcrumbs: Home / … / inner, with an accessible control that reveals Pi and the scratch folder.
+  const ellipsis = crumbs(page).getByRole('button')
+  await expect(ellipsis).toBeVisible()
+  await expect(ellipsis).toHaveAccessibleName('Show 2 intermediate folders')
+  await expect(ellipsis).toHaveAttribute('aria-expanded', 'false')
+  await expect(crumbs(page).getByRole('link', { name: 'Pi' })).toBeHidden()
+  await expect(crumbs(page).getByRole('link', { name: 'Home' })).toBeVisible()
+  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText('inner')
+  await ellipsis.click()
+  await expect(ellipsis).toHaveAttribute('aria-expanded', 'true')
+  await expect(ellipsis).toHaveAccessibleName('Hide intermediate folders')
+  await expect(crumbs(page).getByRole('link', { name: 'Pi' })).toBeVisible()
+  await expect(crumbs(page).getByRole('link', { name: dir })).toBeVisible()
+  await crumbs(page).getByRole('link', { name: 'Pi' }).click()
+  await expect(page).toHaveURL('/pi')
+
+  // Wide screens show the Type column and never show the collapse control.
+  await page.setViewportSize({ width: 1100, height: 700 })
+  await page.goto(href('pi', dir, 'inner'))
+  await expect(folderRow(page, longFolder)).toBeVisible()
+  expect((await typeHeader.boundingBox())?.width ?? 0).toBeGreaterThan(20)
+  await expect(page.locator('.row__type').first()).toHaveText('Folder')
+  await expect(crumbs(page).getByRole('button')).toBeHidden()
+  await expect(crumbs(page).getByRole('link', { name: 'Pi' })).toBeVisible()
+})
+
+test('navigation and refresh work entirely by keyboard with visible focus, and file rows are skipped', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByRole('link', { name: 'Pi Source' })).toBeVisible()
+
+  await page.keyboard.press('Tab')
+  await expect(refreshButton(page)).toBeFocused()
+  await expect(refreshButton(page)).toHaveCSS('outline-style', 'solid')
+  await page.keyboard.press('Tab')
+  await expect(page.getByRole('link', { name: 'Pi Source' })).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page).toHaveURL('/pi')
+  // Focus continues from the current breadcrumb rather than falling off the page.
+  await expect(crumbs(page).locator('[aria-current="page"]')).toBeFocused()
+  await page.keyboard.press('Shift+Tab')
+  await expect(crumbs(page).getByRole('link', { name: 'Home' })).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(refreshButton(page)).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(status(page)).toHaveText('Listing refreshed.')
+  await expect(refreshButton(page)).toBeFocused()
+
+  await page.keyboard.press('Tab')
+  await expect(folderRow(page, 'skills')).toBeFocused()
+  await expect(folderRow(page, 'skills')).toHaveCSS('outline-style', 'solid')
+  await page.keyboard.press('Tab')
+  // workflow.md is a non-interactive file row: focus leaves the listing instead of landing on it.
+  expect(await page.evaluate(() => document.activeElement?.closest('.rows') === null)).toBe(true)
+
+  await page.keyboard.press('Shift+Tab')
+  await page.keyboard.press('Enter')
+  await expect(page).toHaveURL('/pi/skills')
+  await expect(rowNames(page)).toHaveText(['review.md'])
+})
+
+test('a scratch tree with several hundred files renders quickly; entering starts at the top and history restores position', async ({ page, scratch }) => {
+  const dir = await scratch.root('pi')
+  await scratch.dir('pi', dir, 'sub')
+  await Promise.all(Array.from({ length: 300 }, (_, index) => scratch.file('pi', dir, `note-${String(index).padStart(3, '0')}.md`)))
+
+  await page.goto(href('pi', dir))
+  await expect(rows(page)).toHaveCount(301, { timeout: 3_000 })
+  await expect(counts(page)).toHaveText('1 folder · 300 files')
+
+  await page.evaluate(() => window.scrollTo(0, 1500))
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(1500)
+  // Click the folder link without scrolling it into view, as a keyboard user or a scrolled reader would.
+  await page.evaluate(href => (document.querySelector(`a[href="${href}"]`) as HTMLAnchorElement).click(), href('pi', dir, 'sub'))
+  await expect(page).toHaveURL(href('pi', dir, 'sub'))
+  await expect(page.getByText('This folder is empty.')).toBeVisible()
+  expect(await page.evaluate(() => window.scrollY)).toBe(0)
+
+  await page.goBack()
+  await expect(page).toHaveURL(href('pi', dir))
+  await expect(rows(page)).toHaveCount(301)
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(1500)
+
+  await page.goForward()
+  await expect(page.getByText('This folder is empty.')).toBeVisible()
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0)
+
+  // A reload of a scrolled listing comes back at the same position once the rows have rendered.
+  await page.goBack()
+  await expect(rows(page)).toHaveCount(301)
+  await page.evaluate(() => window.scrollTo(0, 900))
+  await page.waitForTimeout(300)
+  await page.reload()
+  await expect(rows(page)).toHaveCount(301)
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(900)
+})
+
+test('only the entries endpoint is requested; no file contents are fetched', async ({ page }) => {
+  const apiRequests: string[] = []
+  page.on('request', request => {
+    const url = new URL(request.url())
+    if (url.pathname.startsWith('/api/') || url.pathname.toLowerCase().endsWith('.md')) apiRequests.push(url.pathname + url.search)
+  })
+  await page.goto('/')
+  await page.getByRole('link', { name: 'Pi Source' }).click()
+  await folderRow(page, 'skills').click()
+  await expect(rowNames(page)).toHaveText(['review.md'])
+  await refreshButton(page).click()
+  await expect(status(page)).toHaveText('Listing refreshed.')
+  await page.goto('/claude/subagents')
+  await expect(rowNames(page)).toHaveText(['implementer.md'])
+  expect(apiRequests.length).toBeGreaterThanOrEqual(3)
+  expect(new Set(apiRequests)).toEqual(new Set(['/api/entries']))
+})
+
+test('follows the system light or dark preference', async ({ page }) => {
+  await page.emulateMedia({ colorScheme: 'light' })
+  await page.goto('/')
+  await expect(page.getByRole('link', { name: 'Pi Source' })).toBeVisible()
+  const light = await page.evaluate(() => getComputedStyle(document.body).backgroundColor)
+  await page.emulateMedia({ colorScheme: 'dark' })
+  const dark = await page.evaluate(() => getComputedStyle(document.body).backgroundColor)
+  expect(light).toBe('rgb(245, 246, 248)')
+  expect(dark).toBe('rgb(17, 20, 24)')
+})
+
+test('fixtures are unchanged after the suite', async () => {
+  const { stdout } = await run('git', ['status', '--porcelain', '--', 'fixtures'], { cwd: fixtureRoot })
+  expect(stdout.trim()).toBe('')
+})

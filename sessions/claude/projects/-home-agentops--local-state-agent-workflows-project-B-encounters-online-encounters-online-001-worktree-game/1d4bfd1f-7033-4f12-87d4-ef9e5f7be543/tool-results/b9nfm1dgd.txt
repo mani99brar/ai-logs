@@ -1,0 +1,733 @@
+export * from "./state.js";
+export * from "./geometry.js";
+export * from "./modes.js";
+export * from "./step.js";
+export {
+  encounterRules,
+  secondsToTicks,
+  validateEncounterRules,
+  type AttackRules,
+  type EncounterRules,
+} from "@pirate-sea-race/content/encounters";
+export { hashState } from "../hash.js";
+import { seaMap, type SeaMapDefinition } from "@pirate-sea-race/content";
+import {
+  encounterRules as defaultEncounterRules,
+  validateEncounterRules,
+  type AttackRules,
+  type EncounterRules,
+} from "@pirate-sea-race/content/encounters";
+import { footPlaceholderRules, seaModeRules, type ModeRules } from "./modes.js";
+
+/** Ships attack ships with the grapple; players on foot challenge players on foot (§6). */
+export type EncounterMode = "ship" | "foot";
+export const ENCOUNTER_MODES: readonly EncounterMode[] = ["ship", "foot"];
+
+/** One attack kind in sub-units and ticks, with its mode's line-of-sight and return rules. */
+export interface AttackConfig {
+  readonly windupTicks: number;
+  /** Sub-units, centre to centre; exactly at the range is in range. */
+  readonly range: number;
+  readonly hitConeHeadings: number;
+  readonly targetConeHeadings: number;
+  readonly missCooldownTicks: number;
+  readonly rules: ModeRules;
+}
+
+/** Static encounter data for one match; the step reads it and it never changes. */
+export interface EncounterConfig {
+  readonly modes: Readonly<Record<EncounterMode, AttackConfig>>;
+  readonly maxDuels: number;
+  readonly transitionTicks: number;
+  readonly readyTimeoutTicks: number;
+  readonly spawnProtectionTicks: number;
+  readonly winProtectionTicks: number;
+  readonly drawProtectionTicks: number;
+  readonly respawnDelayTicks: number;
+  readonly respawnProtectionTicks: number;
+  /** Sub-units. */
+  readonly respawnClearRadius: number;
+  readonly drawReturnMinSeparation: number;
+  readonly drawReturnMaxDistance: number;
+}
+
+export interface EncounterConfigOptions {
+  /** The sea ships sail on; the slice sea by default. */
+  readonly map?: SeaMapDefinition;
+  readonly rules?: EncounterRules;
+  /** Replaces a mode's line-of-sight and return rules: `objectives-endgame` supplies the islands' own. */
+  readonly modeRules?: Partial<Record<EncounterMode, ModeRules>>;
+}
+
+/** Builds a match's encounter config from the content rules, refusing invalid rules. */
+export function createEncounterConfig(options: EncounterConfigOptions = {}): EncounterConfig {
+  const rules = validateEncounterRules(options.rules ?? defaultEncounterRules);
+  if (!rules.ok) throw new RangeError(`invalid encounter rules: ${rules.issues.join("; ")}`);
+  const map = options.map ?? seaMap;
+  const tile = map.subUnitsPerTile;
+  const r = rules.value;
+  const attack = (source: AttackRules, modeRules: ModeRules): AttackConfig => ({
+    windupTicks: source.windupTicks,
+    range: source.rangeTiles * tile,
+    hitConeHeadings: source.hitConeHeadings,
+    targetConeHeadings: source.targetConeHeadings,
+    missCooldownTicks: source.missCooldownTicks,
+    rules: modeRules,
+  });
+  return {
+    modes: {
+      ship: attack(r.grapple, options.modeRules?.ship ?? seaModeRules(map)),
+      foot: attack(r.challenge, options.modeRules?.foot ?? footPlaceholderRules),
+    },
+    maxDuels: r.maxDuels,
+    transitionTicks: r.transitionTicks,
+    readyTimeoutTicks: r.readyTimeoutTicks,
+    spawnProtectionTicks: r.spawnProtectionTicks,
+    winProtectionTicks: r.winProtectionTicks,
+    drawProtectionTicks: r.drawProtectionTicks,
+    respawnDelayTicks: r.respawnDelayTicks,
+    respawnProtectionTicks: r.respawnProtectionTicks,
+    respawnClearRadius: r.respawnClearRadiusTiles * tile,
+    drawReturnMinSeparation: r.drawReturnMinSeparationTiles * tile,
+    drawReturnMaxDistance: r.drawReturnMaxDistanceTiles * tile,
+  };
+}
+
+export type ProtectionSource = "spawn" | "win" | "draw" | "respawn";
+
+/** Protection (§2, §6): the player cannot be attacked while `tick < endTick`. */
+export interface Protection {
+  readonly source: ProtectionSource;
+  readonly endTick: number;
+}
+
+/** A loser waiting to respawn (§6), from settlement until `respawnTick`. */
+export interface Respawn {
+  readonly duelId: string;
+  readonly respawnTick: number;
+  /** The encounter position the dock is chosen from. */
+  readonly x: number;
+  readonly y: number;
+  /** The loser's own position when the hit landed (the mode's rule may keep them there). */
+  readonly ownX: number;
+  readonly ownY: number;
+  readonly mode: EncounterMode;
+}
+
+/** What the rules remember about a player. A player with nothing to remember has no record. */
+export interface EncounterPlayer {
+  readonly id: string;
+  readonly protection: Protection | null;
+  /** The player cannot start an attempt while `tick < cooldownEndTick`. */
+  readonly cooldownEndTick: number;
+  readonly respawn: Respawn | null;
+}
+
+/** A telegraphed attempt (§6): visible from `startTick`, it lands on `landTick`. One per attacker. */
+export interface EncounterAttempt {
+  readonly attackerId: string;
+  readonly defenderId: string;
+  readonly mode: EncounterMode;
+  /** The heading locked at the start: the bearing towards the defender (the attacker's heading at distance 0). */
+  readonly aim: number;
+  readonly startTick: number;
+  readonly landTick: number;
+}
+
+export type DuelOutcome = "win" | "draw" | "cancelled";
+
+/** How a duel ended: reported by the caller, or decided here by the readiness check. */
+export interface DuelEnd {
+  readonly tick: number;
+  readonly outcome: DuelOutcome;
+  readonly winner: string | null;
+  readonly loser: string | null;
+  /** `readiness`: a forfeit or cancel decided by the step; `report`: the caller's report. */
+  readonly cause: "readiness" | "report";
+}
+
+/**
+ * A reserved duel, from the hit to its settlement: `transition` (the countdown and ready check), `fighting`, then
+ * `ended` until the ledger settles it (after the theft choice). It counts towards the cap until then.
+ */
+export interface EncounterDuel {
+  readonly id: string;
+  readonly mode: EncounterMode;
+  /** Attacker, then defender. */
+  readonly players: readonly [string, string];
+  /** Each player's position when the hit landed, in `players` order. */
+  readonly positions: readonly [{ readonly x: number; readonly y: number }, { readonly x: number; readonly y: number }];
+  /** The encounter position: halfway between the two, rounded down. The duel marker stands here. */
+  readonly x: number;
+  readonly y: number;
+  readonly reservedTick: number;
+  readonly phase: "transition" | "fighting" | "ended";
+  /** The tick the fight started, after the countdown and both clients ready. */
+  readonly startTick: number | null;
+  readonly end: DuelEnd | null;
+}
+
+/**
+ * The encounter state: plain integer data that `hashState` covers entirely. Players are sorted by id, attempts by
+ * attacker id, duels in reservation order (`compareDuels`).
+ */
+export interface EncounterState {
+  /** The last world tick processed. */
+  readonly tick: number;
+  /** Set once the caller reports the match over; the state never changes afterwards. */
+  readonly closed: boolean;
+  readonly players: readonly EncounterPlayer[];
+  readonly attempts: readonly EncounterAttempt[];
+  readonly duels: readonly EncounterDuel[];
+}
+
+export interface EncounterStateOptions {
+  /** The first step processes `tick + 1`. */
+  readonly tick?: number;
+  /** Players who start with §2's departure protection, which ends `spawnProtectionTicks` after `tick`. */
+  readonly spawnProtected?: readonly string[];
+}
+
+/** A state before any tick, with the match's spawn protection. */
+export function createEncounterState(config: EncounterConfig, options: EncounterStateOptions = {}): EncounterState {
+  const tick = options.tick ?? 0;
+  if (!Number.isSafeInteger(tick)) throw new RangeError(`tick must be a safe integer, got ${tick}`);
+  const ids = [...new Set(options.spawnProtected ?? [])].sort(compareIds);
+  for (const id of ids) if (typeof id !== "string" || id.length === 0) throw new RangeError("player ids must be non-empty strings");
+  const players =
+    config.spawnProtectionTicks === 0
+      ? []
+      : ids.map((id) => ({ id, protection: { source: "spawn" as const, endTick: tick + config.spawnProtectionTicks }, cooldownEndTick: 0, respawn: null }));
+  return { tick, closed: false, players, attempts: [], duels: [] };
+}
+
+/** Lowest id by UTF-16 code units, independent of locale. */
+export function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Duels in reservation order: by tick, then attacker id (one attempt per attacker, so this is total). */
+export function compareDuels(a: EncounterDuel, b: EncounterDuel): number {
+  return a.reservedTick - b.reservedTick || compareIds(a.players[0], b.players[0]);
+}
+
+/** A duel's id, derived from the reservation tick and the two ids; the length prefix keeps it unambiguous. */
+export function duelIdFor(tick: number, attackerId: string, defenderId: string): string {
+  return `duel:${tick}:${attackerId.length}:${attackerId}:${defenderId}`;
+}
+
+/** What other players may know of a duel (§6): where it is and since when. Nothing names its players. */
+export interface DuelMarker {
+  readonly x: number;
+  readonly y: number;
+  /** The reservation tick; the elapsed time counts from it. */
+  readonly startTick: number;
+}
+
+/** The world's duel markers, in a fixed order that says nothing about who fights. */
+export function duelMarkers(state: EncounterState): DuelMarker[] {
+  return state.duels
+    .map((duel) => ({ x: duel.x, y: duel.y, startTick: duel.reservedTick }))
+    .sort((a, b) => a.startTick - b.startTick || a.x - b.x || a.y - b.y);
+}
+
+/** The duel a player is reserved for or fighting, until it settles. */
+export function duelOf(state: EncounterState, playerId: string): EncounterDuel | undefined {
+  return state.duels.find((duel) => duel.players.includes(playerId));
+}
+
+/** What the caller knows about one player on this tick. */
+export interface EncounterPlayerInput {
+  /** The stable player id; ties break on the lowest by UTF-16 code units. */
+  readonly id: string;
+  readonly mode: EncounterMode;
+  /** Position in sub-units: the ship's, or on foot the player's. */
+  readonly x: number;
+  readonly y: number;
+  /** 0 to 63; the target cone faces it. */
+  readonly heading: number;
+  /** A disconnected player can be attacked (§12) but cannot attack. */
+  readonly connected: boolean;
+  /** Pressed attack (grapple or challenge) on this tick. */
+  readonly attack: boolean;
+  /** The client has loaded the arena and is ready (read during a transition only). */
+  readonly ready: boolean;
+  /** The previous tick's claim or ledger ended this player's protection (§6: claiming or collecting). */
+  readonly protectionEndedBy: "claim" | "collection" | null;
+}
+
+/** The caller's report on a duel: how a fight that ran ended, or that the ledger settled it. */
+export type DuelReport =
+  | { readonly kind: "end"; readonly duelId: string; readonly tick: number; readonly outcome: "win"; readonly winner: string }
+  | { readonly kind: "end"; readonly duelId: string; readonly tick: number; readonly outcome: "draw" | "cancelled" }
+  | { readonly kind: "settled"; readonly duelId: string; readonly tick: number };
+
+/** One world tick's snapshot; order within the lists never matters. */
+export interface EncounterTickInput {
+  /** Must be the state's tick plus one. */
+  readonly tick: number;
+  /** Every player in the match; a player absent from the list is not in it and can neither attack nor be attacked. */
+  readonly players: readonly EncounterPlayerInput[];
+  readonly reports: readonly DuelReport[];
+  /** The match is over (§2): every attempt is cancelled and nothing starts again. */
+  readonly matchOver: boolean;
+}
+
+export type MissReason = "defender-ineligible" | "out-of-range" | "out-of-aim" | "no-line-of-sight";
+export type ProtectionEndReason = "expired" | "attack" | "claim" | "collection";
+export type ReportRefusal = "unknown-duel" | "already-ended" | "not-ended" | "invalid";
+
+/** Something that happened on a tick, for the caller to apply or announce. */
+export type EncounterEvent =
+  | { readonly kind: "protection-ended"; readonly tick: number; readonly playerId: string; readonly reason: ProtectionEndReason }
+  | { readonly kind: "report-refused"; readonly tick: number; readonly duelId: string; readonly report: "end" | "settled"; readonly reason: ReportRefusal }
+  /** The caller's end report was accepted. */
+  | { readonly kind: "duel-ended"; readonly tick: number; readonly duelId: string; readonly outcome: DuelOutcome; readonly winner: string | null; readonly endTick: number }
+  /** The ledger settled the duel: it no longer counts, and its players return (the events that follow). */
+  | { readonly kind: "duel-settled"; readonly tick: number; readonly duelId: string }
+  /** Put the player at this point with this protection: the winner, or both players of a draw or cancellation. */
+  | { readonly kind: "player-returned"; readonly tick: number; readonly duelId: string; readonly playerId: string; readonly x: number; readonly y: number; readonly protection: Protection }
+  /** The loser waits out of the world until `respawnTick`. */
+  | { readonly kind: "player-respawning"; readonly tick: number; readonly duelId: string; readonly playerId: string; readonly respawnTick: number }
+  | { readonly kind: "player-respawned"; readonly tick: number; readonly playerId: string; readonly x: number; readonly y: number; readonly dockId: number | null; readonly protection: Protection }
+  | { readonly kind: "duel-started"; readonly tick: number; readonly duelId: string }
+  /** One client was not ready in time: hand it to the ledger as a win for the other. */
+  | { readonly kind: "duel-forfeited"; readonly tick: number; readonly duelId: string; readonly forfeiter: string; readonly winner: string }
+  /** Neither client was ready in time (§12's same-tick double forfeit): hand it to the ledger as cancelled. */
+  | { readonly kind: "duel-cancelled"; readonly tick: number; readonly duelId: string }
+  | { readonly kind: "attempt-cancelled"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly reason: "attacker-ineligible" | "match-over" }
+  | { readonly kind: "attempt-missed"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly reason: MissReason; readonly cooldownEndTick: number }
+  /** A hit that lost a same-tick conflict, or found the duel cap reached: no cooldown. */
+  | { readonly kind: "attempt-preempted"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly reason: "conflict" | "duel-cap" }
+  /** Both players are reserved: hand it to the ledger's `reserveDuel`. */
+  | { readonly kind: "duel-reserved"; readonly tick: number; readonly duelId: string; readonly mode: EncounterMode; readonly players: readonly [string, string]; readonly x: number; readonly y: number }
+  | { readonly kind: "attempt-started"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly mode: EncounterMode; readonly aim: number; readonly landTick: number };
+
+export type EncounterEventKind = EncounterEvent["kind"];
+
+/** Every event kind. */
+export const ENCOUNTER_EVENT_KINDS: readonly EncounterEventKind[] = [
+  "protection-ended",
+  "report-refused",
+  "duel-ended",
+  "duel-settled",
+  "player-returned",
+  "player-respawning",
+  "player-respawned",
+  "duel-started",
+  "duel-forfeited",
+  "duel-cancelled",
+  "attempt-cancelled",
+  "attempt-missed",
+  "attempt-preempted",
+  "duel-reserved",
+  "attempt-started",
+];
+
+export interface EncounterStepResult {
+  readonly state: EncounterState;
+  readonly events: readonly EncounterEvent[];
+}
+import { HEADING_COUNT } from "@pirate-sea-race/content";
+import { hashState } from "../hash.js";
+import { bearing, distanceSquared, withinCone, withinRange, type EncounterPoint } from "./geometry.js";
+import {
+  compareDuels,
+  compareIds,
+  duelIdFor,
+  ENCOUNTER_MODES,
+  type DuelReport,
+  type EncounterAttempt,
+  type EncounterConfig,
+  type EncounterDuel,
+  type EncounterEvent,
+  type EncounterPlayer,
+  type EncounterPlayerInput,
+  type EncounterState,
+  type EncounterStepResult,
+  type EncounterTickInput,
+  type MissReason,
+  type Protection,
+} from "./state.js";
+
+function requireInteger(value: unknown, name: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
+}
+
+function requireBoolean(value: unknown, name: string): void {
+  if (typeof value !== "boolean") throw new RangeError(`${name} must be a boolean, got ${String(value)}`);
+}
+
+function requireId(value: unknown, name: string): void {
+  if (typeof value !== "string" || value.length === 0) throw new RangeError(`${name} must be a non-empty string`);
+}
+
+/** Refuses a malformed tick: a skipped or repeated tick, duplicate ids, a field of the wrong type. */
+function readInput(state: EncounterState, input: EncounterTickInput): Map<string, EncounterPlayerInput> {
+  requireInteger(input.tick, "tick");
+  if (input.tick !== state.tick + 1) throw new RangeError(`expected tick ${state.tick + 1}, got ${input.tick}`);
+  requireBoolean(input.matchOver, "matchOver");
+  const players = new Map<string, EncounterPlayerInput>();
+  for (const player of input.players) {
+    requireId(player.id, "player id");
+    if (players.has(player.id)) throw new RangeError(`player ${player.id} appears twice`);
+    if (!ENCOUNTER_MODES.includes(player.mode)) throw new RangeError(`${player.id}.mode must be ship or foot`);
+    requireInteger(player.x, `${player.id}.x`);
+    requireInteger(player.y, `${player.id}.y`);
+    requireInteger(player.heading, `${player.id}.heading`);
+    if (player.heading < 0 || player.heading >= HEADING_COUNT) throw new RangeError(`${player.id}.heading must be in [0, ${HEADING_COUNT})`);
+    for (const flag of ["connected", "attack", "ready"] as const) requireBoolean(player[flag], `${player.id}.${flag}`);
+    if (player.protectionEndedBy !== null && player.protectionEndedBy !== "claim" && player.protectionEndedBy !== "collection") {
+      throw new RangeError(`${player.id}.protectionEndedBy must be claim, collection or null`);
+    }
+    players.set(player.id, player);
+  }
+  for (const report of input.reports) {
+    requireId(report.duelId, "report duelId");
+    requireInteger(report.tick, `report ${report.duelId} tick`);
+    if (report.kind !== "end" && report.kind !== "settled") throw new RangeError(`report ${String((report as DuelReport).duelId)} has an unknown kind`);
+  }
+  return players;
+}
+
+/**
+ * A total order on reports that neither input order nor an order-preserving relabelling of players changes: reports
+ * on known duels in duel order, then the rest by id; for one duel, ends before settlements, then by content, so the
+ * first of two conflicting reports on one tick is always the same one.
+ */
+function compareReports(duels: ReadonlyMap<string, EncounterDuel>, a: DuelReport, b: DuelReport): number {
+  const duelA = duels.get(a.duelId);
+  const duelB = duels.get(b.duelId);
+  if (duelA !== undefined && duelB !== undefined && duelA !== duelB) return compareDuels(duelA, duelB);
+  if (duelA === undefined || duelB === undefined) {
+    if (duelA !== duelB) return duelA === undefined ? 1 : -1;
+    const byId = compareIds(a.duelId, b.duelId);
+    if (byId !== 0) return byId;
+  }
+  const detail = (report: DuelReport) =>
+    JSON.stringify(report.kind === "end" ? [0, report.tick, report.outcome, "winner" in report ? report.winner : null] : [1, report.tick]);
+  return compareIds(detail(a), detail(b));
+}
+
+const byAttacker = (a: EncounterAttempt, b: EncounterAttempt) => compareIds(a.attackerId, b.attackerId);
+
+/**
+ * One world tick of §6's encounter rules. The caller runs it before the claim channel (§5), with the previous tick's
+ * claim and ledger results in `protectionEndedBy`. In a fixed order: (0) a match reported over cancels every attempt
+ * and freezes the state; (1) protection expires or ends by an objective; (2) duel reports: ends, then settlements with
+ * their returns; (3) losers due to respawn respawn; (4) transitions start or time out; (5) attempts whose attacker is
+ * no longer eligible are cancelled, and every attempt landing on this tick resolves together: misses, then hits by
+ * distance, attacker id and defender id, each reserving a duel while both players are free and the cap allows;
+ * (6) presses start new attempts. Players, attempts and reports are read as sets, so their order in the input never
+ * matters. The input state is never mutated.
+ */
+export function stepEncounters(config: EncounterConfig, state: EncounterState, input: EncounterTickInput): EncounterStepResult {
+  if (state.closed) return { state, events: [] };
+  const snapshot = readInput(state, input);
+  const tick = input.tick;
+  const events: EncounterEvent[] = [];
+
+  let attempts = [...state.attempts].sort(byAttacker);
+
+  // 0. The match is over: nothing lands, nothing starts. Running duels end through the claim code (§2).
+  if (input.matchOver) {
+    for (const attempt of attempts) {
+      events.push({ kind: "attempt-cancelled", tick, attackerId: attempt.attackerId, defenderId: attempt.defenderId, reason: "match-over" });
+    }
+    return { state: { ...state, tick, closed: true, attempts: [] }, events };
+  }
+
+  const records = new Map<string, EncounterPlayer>(state.players.map((player) => [player.id, player]));
+  const record = (id: string): EncounterPlayer => records.get(id) ?? { id, protection: null, cooldownEndTick: 0, respawn: null };
+  const update = (id: string, change: Partial<Omit<EncounterPlayer, "id">>) => records.set(id, { ...record(id), ...change });
+  const sortedIds = () => [...records.keys()].sort(compareIds);
+
+  // 1. Protection ends when it runs out, or when last tick's claim or collection ended it (§6).
+  for (const id of sortedIds()) {
+    const protection = record(id).protection;
+    if (protection === null) continue;
+    const endedBy = snapshot.get(id)?.protectionEndedBy ?? null;
+    if (tick >= protection.endTick || endedBy !== null) {
+      update(id, { protection: null });
+      events.push({ kind: "protection-ended", tick, playerId: id, reason: tick >= protection.endTick ? "expired" : endedBy! });
+    }
+  }
+
+  // 2. Reports: an end once per duel, then the ledger's settlement, which returns the players.
+  const duels = new Map<string, EncounterDuel>(state.duels.map((duel) => [duel.id, duel]));
+  const reports = [...input.reports].sort((a, b) => compareReports(duels, a, b));
+  for (const report of reports) {
+    const duel = duels.get(report.duelId);
+    const refuse = (reason: "unknown-duel" | "already-ended" | "not-ended" | "invalid") =>
+      events.push({ kind: "report-refused", tick, duelId: report.duelId, report: report.kind, reason });
+    if (duel === undefined) {
+      refuse("unknown-duel");
+    } else if (report.kind === "end") {
+      if (duel.end !== null) {
+        refuse("already-ended");
+        continue;
+      }
+      const winner = report.outcome === "win" ? report.winner : null;
+      const valid =
+        report.tick >= duel.reservedTick &&
+        report.tick <= tick &&
+        (report.outcome === "win"
+          ? duel.players.includes(report.winner)
+          : (report.outcome === "draw" || report.outcome === "cancelled") && (report as { winner?: unknown }).winner === undefined);
+      if (!valid) {
+        refuse("invalid");
+        continue;
+      }
+      const loser = winner === null ? null : duel.players[0] === winner ? duel.players[1] : duel.players[0];
+      duels.set(duel.id, { ...duel, phase: "ended", end: { tick: report.tick, outcome: report.outcome, winner, loser, cause: "report" } });
+      events.push({ kind: "duel-ended", tick, duelId: duel.id, outcome: report.outcome, winner, endTick: report.tick });
+    } else {
+      const end = duel.end;
+      if (end === null) {
+        refuse("not-ended");
+        continue;
+      }
+      if (report.tick < end.tick || report.tick > tick) {
+        refuse("invalid");
+        continue;
+      }
+      duels.delete(duel.id);
+      events.push({ kind: "duel-settled", tick, duelId: duel.id });
+      settle(config, duel, end, report.tick, tick, events, update);
+    }
+  }
+
+  // 3. Losers whose 15 s have run respawn at a dock away from opponents, chosen from this tick's positions.
+  const respawning = new Set(sortedIds().filter((id) => record(id).respawn !== null));
+  for (const id of [...respawning]) {
+    const respawn = record(id).respawn!;
+    if (respawn.respawnTick > tick) continue;
+    const opponents = [...snapshot.values()]
+      .filter((player) => player.id !== id && !respawning.has(player.id))
+      .sort((a, b) => compareIds(a.id, b.id))
+      .map((player) => ({ x: player.x, y: player.y }));
+    const point = config.modes[respawn.mode].rules.respawnPoint({
+      encounter: { x: respawn.x, y: respawn.y },
+      own: { x: respawn.ownX, y: respawn.ownY },
+      opponents,
+      clearRadius: config.respawnClearRadius,
+    });
+    const protection: Protection = { source: "respawn", endTick: tick + config.respawnProtectionTicks };
+    update(id, { respawn: null, protection: protection.endTick > tick ? protection : null });
+    events.push({ kind: "player-respawned", tick, playerId: id, x: point.x, y: point.y, dockId: point.dockId, protection });
+  }
+
+  // 4. Transitions: the fight starts after the countdown with both clients ready; at the timeout, the unready forfeit.
+  for (const { id } of [...duels.values()].sort(compareDuels)) {
+    const duel = duels.get(id)!;
+    if (duel.phase !== "transition") continue;
+    const ready = duel.players.map((playerId) => snapshot.get(playerId)?.ready === true);
+    if (tick >= duel.reservedTick + config.transitionTicks && ready[0] && ready[1]) {
+      duels.set(id, { ...duel, phase: "fighting", startTick: tick });
+      events.push({ kind: "duel-started", tick, duelId: id });
+    } else if (tick >= duel.reservedTick + config.readyTimeoutTicks) {
+      if (!ready[0] && !ready[1]) {
+        duels.set(id, { ...duel, phase: "ended", end: { tick, outcome: "cancelled", winner: null, loser: null, cause: "readiness" } });
+        events.push({ kind: "duel-cancelled", tick, duelId: id });
+      } else {
+        const [winner, loser] = ready[0] ? [duel.players[0], duel.players[1]] : [duel.players[1], duel.players[0]];
+        duels.set(id, { ...duel, phase: "ended", end: { tick, outcome: "win", winner, loser, cause: "readiness" } });
+        events.push({ kind: "duel-forfeited", tick, duelId: id, forfeiter: loser, winner });
+      }
+    }
+  }
+
+  const inDuel = new Set<string>();
+  for (const duel of duels.values()) for (const playerId of duel.players) inDuel.add(playerId);
+  const isRespawning = (id: string) => record(id).respawn !== null;
+  const isProtected = (id: string) => record(id).protection !== null;
+  /** In the match, of this mode, free of duels and respawns; protection and the cap are checked by the caller of this. */
+  const free = (id: string, mode: EncounterPlayerInput["mode"]) => {
+    const player = snapshot.get(id);
+    return player !== undefined && player.mode === mode && !inDuel.has(id) && !isRespawning(id);
+  };
+  const cancel = (attempt: EncounterAttempt, reason: "attacker-ineligible") =>
+    events.push({ kind: "attempt-cancelled", tick, attackerId: attempt.attackerId, defenderId: attempt.defenderId, reason });
+
+  // 5a. An attacker who left, disconnected, changed mode, or was reserved or respawns loses the attempt, no cooldown.
+  attempts = attempts.filter((attempt) => {
+    const keep = free(attempt.attackerId, attempt.mode) && snapshot.get(attempt.attackerId)!.connected;
+    if (!keep) cancel(attempt, "attacker-ineligible");
+    return keep;
+  });
+
+  // 5b. Everything landing on this tick resolves together (§5): misses first, then hits in a fixed order.
+  const hits: { attempt: EncounterAttempt; distance: number; attacker: EncounterPoint; defender: EncounterPoint }[] = [];
+  for (const attempt of attempts) {
+    if (attempt.landTick !== tick) continue;
+    const mode = config.modes[attempt.mode];
+    const attacker = snapshot.get(attempt.attackerId)!;
+    const defender = snapshot.get(attempt.defenderId);
+    let reason: MissReason | null = null;
+    if (defender === undefined || !free(defender.id, attempt.mode) || isProtected(defender.id)) reason = "defender-ineligible";
+    else if (!withinRange(attacker, defender, mode.range)) reason = "out-of-range";
+    else if (!withinCone(attacker, defender, attempt.aim, mode.hitConeHeadings)) reason = "out-of-aim";
+    else if (!mode.rules.lineOfSight(attacker, defender)) reason = "no-line-of-sight";
+    if (reason === null) {
+      hits.push({ attempt, distance: distanceSquared(attacker, defender!), attacker, defender: defender! });
+    } else {
+      const cooldownEndTick = tick + mode.missCooldownTicks;
+      update(attempt.attackerId, { cooldownEndTick });
+      events.push({ kind: "attempt-missed", tick, attackerId: attempt.attackerId, defenderId: attempt.defenderId, reason, cooldownEndTick });
+    }
+  }
+  hits.sort(
+    (a, b) => a.distance - b.distance || compareIds(a.attempt.attackerId, b.attempt.attackerId) || compareIds(a.attempt.defenderId, b.attempt.defenderId),
+  );
+  for (const { attempt, attacker, defender } of hits) {
+    const { attackerId, defenderId } = attempt;
+    if (inDuel.has(attackerId) || inDuel.has(defenderId)) {
+      events.push({ kind: "attempt-preempted", tick, attackerId, defenderId, reason: "conflict" });
+    } else if (duels.size >= config.maxDuels) {
+      events.push({ kind: "attempt-preempted", tick, attackerId, defenderId, reason: "duel-cap" });
+    } else {
+      const id = duelIdFor(tick, attackerId, defenderId);
+      const x = Math.floor((attacker.x + defender.x) / 2);
+      const y = Math.floor((attacker.y + defender.y) / 2);
+      duels.set(id, {
+        id,
+        mode: attempt.mode,
+        players: [attackerId, defenderId],
+        positions: [
+          { x: attacker.x, y: attacker.y },
+          { x: defender.x, y: defender.y },
+        ],
+        x,
+        y,
+        reservedTick: tick,
+        phase: "transition",
+        startTick: null,
+        end: null,
+      });
+      inDuel.add(attackerId);
+      inDuel.add(defenderId);
+      events.push({ kind: "duel-reserved", tick, duelId: id, mode: attempt.mode, players: [attackerId, defenderId], x, y });
+    }
+  }
+  attempts = attempts.filter((attempt) => {
+    if (attempt.landTick === tick) return false;
+    // A player just reserved as a defender loses their own attempt.
+    if (!inDuel.has(attempt.attackerId)) return true;
+    cancel(attempt, "attacker-ineligible");
+    return false;
+  });
+
+  // 6. Presses. Every target is chosen from the state before any of this tick's starts, so a protected player who
+  // attacks on this tick is still not a target on it, whatever order the presses arrive in.
+  const attacking = new Set(attempts.map((attempt) => attempt.attackerId));
+  const started: EncounterAttempt[] = [];
+  const protectedBefore = new Set([...records.values()].filter((player) => player.protection !== null).map((player) => player.id));
+  if (duels.size < config.maxDuels) {
+    const players = [...snapshot.values()].sort((a, b) => compareIds(a.id, b.id));
+    for (const attacker of players) {
+      if (!attacker.attack || !attacker.connected || attacking.has(attacker.id) || !free(attacker.id, attacker.mode)) continue;
+      if (tick < record(attacker.id).cooldownEndTick) continue;
+      const mode = config.modes[attacker.mode];
+      let target: { player: EncounterPlayerInput; distance: number } | null = null;
+      for (const defender of players) {
+        if (defender.id === attacker.id || !free(defender.id, attacker.mode) || protectedBefore.has(defender.id)) continue;
+        if (!withinRange(attacker, defender, mode.range) || !withinCone(attacker, defender, attacker.heading, mode.targetConeHeadings)) continue;
+        if (!mode.rules.lineOfSight(attacker, defender)) continue;
+        // Players are in id order, so a strictly nearer one replaces the choice and an equal one never does.
+        const distance = distanceSquared(attacker, defender);
+        if (target === null || distance < target.distance) target = { player: defender, distance };
+      }
+      if (target === null) continue;
+      if (protectedBefore.has(attacker.id)) {
+        update(attacker.id, { protection: null });
+        events.push({ kind: "protection-ended", tick, playerId: attacker.id, reason: "attack" });
+      }
+      const aim = bearing(attacker, target.player) ?? attacker.heading;
+      const attempt: EncounterAttempt = {
+        attackerId: attacker.id,
+        defenderId: target.player.id,
+        mode: attacker.mode,
+        aim,
+        startTick: tick,
+        landTick: tick + mode.windupTicks,
+      };
+      started.push(attempt);
+      events.push({ kind: "attempt-started", tick, attackerId: attacker.id, defenderId: target.player.id, mode: attacker.mode, aim, landTick: attempt.landTick });
+    }
+  }
+
+  // Records with nothing left to remember are dropped, so equal situations hash equally.
+  const players = sortedIds()
+    .map(record)
+    .filter((player) => player.protection !== null || player.cooldownEndTick > tick || player.respawn !== null)
+    .map((player) => (player.cooldownEndTick > tick ? player : { ...player, cooldownEndTick: 0 }));
+  return {
+    state: {
+      tick,
+      closed: false,
+      players,
+      attempts: [...attempts, ...started].sort(byAttacker),
+      duels: [...duels.values()].sort(compareDuels),
+    },
+    events,
+  };
+}
+
+/** §6's return at settlement: the winner stays with 8 s, the loser waits to respawn, a draw separates both. */
+function settle(
+  config: EncounterConfig,
+  duel: EncounterDuel,
+  end: NonNullable<EncounterDuel["end"]>,
+  settledTick: number,
+  tick: number,
+  events: EncounterEvent[],
+  update: (id: string, change: Partial<Omit<EncounterPlayer, "id">>) => void,
+): void {
+  const guard = (protection: Protection) => (protection.endTick > tick ? protection : null);
+  const returned = (playerId: string, point: EncounterPoint, protection: Protection) => {
+    update(playerId, { protection: guard(protection) });
+    events.push({ kind: "player-returned", tick, duelId: duel.id, playerId, x: point.x, y: point.y, protection });
+  };
+  if (end.outcome === "win") {
+    const winner = end.winner!;
+    const loser = end.loser!;
+    const own = duel.positions[duel.players.indexOf(winner)]!;
+    returned(winner, own, { source: "win", endTick: settledTick + config.winProtectionTicks });
+    // The respawn counts from the fight's end, not the settlement, so the theft choice does not lengthen it.
+    const respawnTick = Math.max(end.tick + config.respawnDelayTicks, tick);
+    const loserOwn = duel.positions[duel.players.indexOf(loser)]!;
+    update(loser, {
+      protection: null,
+      respawn: { duelId: duel.id, respawnTick, x: duel.x, y: duel.y, ownX: loserOwn.x, ownY: loserOwn.y, mode: duel.mode },
+    });
+    events.push({ kind: "player-respawning", tick, duelId: duel.id, playerId: loser, respawnTick });
+    return;
+  }
+  const points = config.modes[duel.mode].rules.separateReturn({
+    encounter: { x: duel.x, y: duel.y },
+    players: duel.positions,
+    minSeparation: config.drawReturnMinSeparation,
+    maxDistance: config.drawReturnMaxDistance,
+  });
+  const protection: Protection = { source: "draw", endTick: settledTick + config.drawProtectionTicks };
+  returned(duel.players[0], points[0], protection);
+  returned(duel.players[1], points[1], protection);
+}
+
+export interface EncounterReplay {
+  readonly state: EncounterState;
+  readonly events: readonly EncounterEvent[];
+  readonly hash: string;
+}
+
+/** Steps a sequence of ticks from a state, collecting every event; `hash` is the final state's `hashState`. */
+export function replayEncounters(config: EncounterConfig, state: EncounterState, inputs: readonly EncounterTickInput[]): EncounterReplay {
+  let current = state;
+  const events: EncounterEvent[] = [];
+  for (const input of inputs) {
+    const stepped = stepEncounters(config, current, input);
+    current = stepped.state;
+    events.push(...stepped.events);
+  }
+  return { state: current, events, hash: hashState(current) };
+}

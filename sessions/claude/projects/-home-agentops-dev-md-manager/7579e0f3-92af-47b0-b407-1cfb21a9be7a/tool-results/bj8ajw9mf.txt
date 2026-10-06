@@ -1,0 +1,193 @@
+On branch fix/int-docs
+nothing to commit, working tree clean
+7f8d3b6 wait_handoffs: a lane whose completion was accepted keeps its deadline met if its session works again
+a6d47f1 repair: a repair whose continuation failed its lane's check again is continued
+26b5e83 workflow: repair a frozen lane with an operator's fix commit, before review
+### Finding 6 (P2, seam guardrails-py) `--accept-challenge` is refused after a controller checkout or interpreter change, because the pinned task now contains the controller's path
+File: workflow/guardrails.py:579
+Two branches collide here. challenge-resume (12a64da) added `changed_pins`, which decides whether a task file was edited by rebuilding `pinned_task(path.read_text(), worker)` and comparing it with `plan.nodes[lane].task`. browser-rules (710ae43) made `pinned_task` append `BROWSER_RULES` with `CHECK_REPORT` (line 142). `CHECK_REPORT` is built at import time from `Path(__file__).resolve().parents[1]` and `sys.executable`. So the rebuilt text depends on which checkout and which interpreter run `resume`, not only on the task file. `refuse_unused_edits` (called at line 634) then reports an unchanged file as edited. A probe confirmed it: an unchanged `ui.md`, pinned by a controller at /home/agentops/dev/md-manager and checked from /home/agentops/dev/mdm-integrate, comes back from `changed_pins` as changed.
+Failure scenario: A 2.2.0 run with a browser lane pauses at the design challenge. Either it was prepared from ~/dev/md-manager and resumed from another worktree of the tool, or with another `$PY` path (python vs python3), or it was prepared before 710ae43 and resumed after this merge. `resume RUN --accept-challenge "reason"` exits 1 with: `Feature files changed since they were pinned (features/<f>/<lane>-task.md) ... Rerun resume without --accept-challenge ..., or revert them`. Nothing was edited, so there is nothing to revert, and the documented override (RUNBOOK line 47) does not work. The only way on is a full challenge rerun.
+Reviewer's suggested fix: Compare only the authored text. Either store the raw task text (or its digest) in the plan at prepare and repin and compare `path.read_text()` against that, or strip the suffix before comparing: `plan_task.startswith(path.read_text() + "\nApproved ownership and checks:\n")`. Add a test that pins with one `CHECK_REPORT` and runs `changed_pins` or the override with another.
+Verifier's reasoning (first): I confirmed this on the combined branch at 7f8d3b6.
+
+- At 7c5e37e, `pinned_task` returned `text + "\nApproved ownership and checks:\n" + json.dumps(worker)`. That depended only on the file and the policy.
+- 710ae43 now appends `BROWSER_RULES.format(check_report=CHECK_REPORT, ...)` for every lane with a browser check (guardrails.py:152-158). `CHECK_REPORT` (guardrails.py:142) is computed at import time from `Path(__file__).resolve().parents[1]` and `sys.executable`.
+- `changed_pins` (guardrails.py:573-587) decides whether a task file was edited by rebuilding `pinned_task(path.read_text(), worker)` with the current process's `CHECK_REPORT` and comparing it with `plan["nodes"][node]["task"]`. Only `refuse_unused_edits` (line 600) calls it, and only on the `--accept-challenge` path (line 634).
+
+Probe: I pinned a browser-lane task in a plan, then called `changed_pins` twice. With the same `CHECK_REPORT` it returned `[]`. With only the controller checkout path changed in `CHECK_REPORT`, it returned the unchanged `ui.md`. `refuse_unused_edits` then raises "Feature files changed since they were pinned ... revert them", although nothing was edited and nothing can be reverted.
+
+The scenario is realistic. The operator's own recorded practice is to run a fixed controller mid-run from a separate worktree of main (for example `~/dev/md-manager-ctl`). The RUNBOOK also writes `$PY` two ways: `$PWD/.venv/bin/python` at line 111 and `$HOME/dev/md-manager/.venv/bin/python` at line 320. A 2.2.0 run prepared before 710ae43 and resumed after it hits the same refusal.
+
+The other uses are not affected:
+- `pinned_digests` hashes the plan's stored text, so it is stable.
+- `repin` on the plain `resume` path re-pins with the current `CHECK_REPORT`, which is correct.
+
+Severity stays P2, not P1. The override fails only when resume runs from a different checkout or interpreter path than prepare. There are two workarounds:
+- Run from the original checkout with the same interpreter path.
+- Rerun `resume` without `--accept-challenge`. This costs a new challenge attempt, which may pause again.
+
+Nothing launches wrongly and no data is lost. The error message is misleading, and the documented override (RUNBOOK:47) does not work in that setup.
+Verifier's suggested fix: In `changed_pins`, compare only the authored part of the pinned task. Two options:
+
+1. Record the raw text at `prepare` (pipeline.py:897) and at `repin` (guardrails.py:440), for example `plan["nodes"][node]["task_text"]` or its sha256. Then check `path.read_text()` against that record.
+2. Without a plan change, strip the suffix:
+   `prefix = path.read_text() + "\nApproved ownership and checks:\n" + json.dumps(workers[node])`
+   `stored = plan["nodes"][node]["task"]`
+   `changed if not (stored == prefix or stored.startswith(prefix + "\nBrowser scenarios:"))`
+
+Add a test in `test_guardrails`: pin a browser lane, patch `guardrails.CHECK_REPORT` to a different checkout path, and assert that `changed_pins` returns `[]` and that `resume --accept-challenge` succeeds. The same test should still flag a real edit.
+
+### Finding 11 (P2, seam panes-launch-worktrees) resume --accept-challenge wrongly sees browser-lane task files as changed when run with another interpreter or checkout
+File: workflow/guardrails.py:579
+changed_pins (from the 12a64da/ad89f79 resume work) recomputes `pinned_task(path.read_text(), worker)` and compares it with the plan's pinned task. Since 710ae43, pinned_task appends CHECK_REPORT, which embeds `sys.executable` and the tool checkout path of the current process (guardrails.py:142). So an unchanged task file of any browser lane compares as changed whenever the override is run by a different interpreter spelling (.venv/bin/python3 vs python) or from another md-manager checkout or worktree. The same happens for any plan pinned before this branch, which has no browser rules in its tasks. refuse_unused_edits then refuses the documented override.
+Failure scenario: Reproduced: the plan is pinned by .venv/bin/python and changed_pins returns []. Run by .venv/bin/python3 (same venv, same files), changed_pins returns [.../ui-task.md]. `resume "$RUN" --accept-challenge "..."` then exits 1 with "Feature files changed since they were pinned (features/x/ui-task.md)", although nothing changed.
+Reviewer's suggested fix: Compare the authored text, not the rendered task. Pin the task file's own text or its digest in the plan and compare that in changed_pins. Alternatively, record the CHECK_REPORT string in the plan at prepare or repin and pass it into pinned_task, so a recomputation reuses it.
+Verifier's reasoning (first): Confirmed as a seam between two commits. 12a64da added `changed_pins` (workflow/guardrails.py:573-587). At line 579 it rebuilds `pinned_task(path.read_text(), workers[node])` and compares the result with `plan["nodes"][node]["task"]`. At that commit `pinned_task` was deterministic: the text plus "Approved ownership and checks" plus the worker JSON, as at 7c5e37e. Then 710ae43 made `pinned_task` add `BROWSER_RULES` with `CHECK_REPORT` for any lane with a browser check. `CHECK_REPORT` (guardrails.py:142) is built when the module is imported. It contains `sys.executable`, which Python does not resolve through symlinks, and `Path(__file__).resolve().parents[1]` of the running process. So the rebuilt task depends on how and where `resume` is run, not only on the files.
+
+Reproduced with a probe run from mdm-integrate. The plan was built with .venv/bin/python, which is a symlink to python3. `changed_pins` run with `.venv/bin/python` returned `[]`. Run with `.venv/bin/python3`, same venv and same unchanged files, it returned `[.../ui-task.md]`. `refuse_unused_edits` (line 600) turns that into the ValueError "Feature files changed since they were pinned (...)". `resume_challenge` calls it at line 634 before accepting, so `--accept-challenge` exits with a false refusal. The same happens when the override runs from another md-manager checkout or worktree than the launch, and after any tool update between the pause and the override that changes the `BROWSER_RULES` wording. It also happens for a 2.2.0 plan pinned before 710ae43, whose tasks have no browser rules.
+
+Why P2 and not P1: the documented setup does not hit it. The RUNBOOK's `PY` (lines 111 and 320, `$PWD/.venv/bin/python` or `$HOME/dev/md-manager/.venv/bin/python`) and the relative `.venv/bin/python` at line 26 both give the same absolute `sys.executable`. `paused_message` prints the resume and override commands with the launch's own `sys.executable`, so copying them works. The failure is a refusal, not a silent wrong launch, and rerunning `resume` without the flag, or with the exact printed interpreter, gets past it. test_guardrails misses it because every step there uses the same `sys.executable`.
+Verifier's suggested fix: Stop rebuilding the rendered task in `changed_pins`. At prepare (pipeline.py:897) and in `repin` (guardrails.py:440), store the authored text's digest in the plan, e.g. `plan["nodes"][node]["task_source_sha256"] = digest_bytes(text.encode())`. In `changed_pins`, compare `digest_bytes(path.read_text().encode())` with that digest. For plans without the key, fall back to a prefix check: the pinned task must equal `text + "\nApproved ownership and checks:\n" + json.dumps(worker)`, optionally followed by a suffix starting with "\nBrowser scenarios:". This comparison ignores `CHECK_REPORT`, which varies by interpreter and checkout. Add a test in test_guardrails that pins a browser-lane plan and then runs the override with a different `CHECK_REPORT` (patch guardrails.CHECK_REPORT) and expects it to be accepted.
+
+### Finding 18 (P2, seam docs-vs-code) `--accept-challenge` reports unchanged browser task files as changed when the interpreter, checkout or rule text differs from prepare
+File: workflow/guardrails.py:579
+The browser-rules fix makes `pinned_task` append `BROWSER_RULES` with `CHECK_REPORT`, which contains this process's `sys.executable` and the tool checkout path (line 142). The challenge-resume fix's `changed_pins` compares `pinned_task(file text)` from the current process against the plan's copy, so any difference in interpreter path, tool checkout or rule wording flags every browser lane's task as changed. The refusal then says "Feature files changed since they were pinned (...); ... or revert them", but there is nothing to revert.
+Failure scenario: A 2.2.0 run with a browser lane pauses at the challenge. The tool is updated (this integration itself changes BROWSER_RULES), or the operator runs the paused message's `resume --accept-challenge` from another md-manager checkout or with another interpreter path. The override is refused for an untouched task file. The only way on is a plain `resume`, which spends another challenge job and may pause again.
+Reviewer's suggested fix: Compare the authored text instead: store each lane's raw task-file digest in the plan at prepare and repin, and compare that. Or strip the generated suffix before comparing, so the interpreter path and rule wording are not part of the pin.
+Verifier's reasoning (first): I tried to refute this and could not. The defect is real.
+
+Code path (workflow/guardrails.py):
+- `CHECK_REPORT` (line 142) is set when the module is imported. It contains the running process's `sys.executable` and `Path(__file__).resolve().parents[1]`, which is the tool checkout. It came from 710ae43, and `BROWSER_RULES` came from c245a9a; the base 7c5e37e had neither.
+- `pinned_task` (lines 152-158) appends `BROWSER_RULES.format(check_report=CHECK_REPORT, ...)` for every lane that has a browser check.
+- `changed_pins` (lines 573-587, from the challenge-resume fix) builds `pinned_task(path.read_text(), worker)` again in the current process and compares it with `plan["nodes"][node]["task"]`, which prepare (pipeline.py:897) or `repin` (line 440) wrote in the earlier process.
+- `refuse_unused_edits` (line 600) turns any mismatch into "Feature files changed since they were pinned (...) ... or revert them".
+
+Probe: I built a plan with a browser lane `ui` and a unit lane `api` from task files that were never edited. With the same `CHECK_REPORT`, `changed_pins` returned []. After replacing the checkout path and the interpreter name in `guardrails.CHECK_REPORT`, it returned [ui.md]. The unedited browser task was flagged and the non-browser lane was not.
+
+Why this can happen in practice:
+- The paused message prints the current process's `sys.executable`.
+- The saved notes on live runs say that, mid-run, the operator runs a fixed controller from a separate worktree (for example ~/dev/md-manager-ctl) with `python -m workflow`. That gives a different `parents[1]`.
+- Updating the tool checkout also changes the text whenever the rule wording changes. This integration adds `BROWSER_RULES` itself, so a run prepared before it gets the same mismatch.
+- Starting the interpreter as `python3` instead of `python` changes `sys.executable` too.
+
+In each case `--accept-challenge` is refused for a file nobody changed. RUNBOOK.md:47 says the override refuses only when "a pinned feature file no longer holds the plan's copy, edited or committed by hand", and tells the operator to revert it. Here there is nothing to revert. So the documentation contradicts the code, and the refusal message is misleading.
+
+Workarounds exist: rerun from the original checkout and interpreter, or run a plain `resume`. A plain `resume` re-pins with the new `CHECK_REPORT` and spends another challenge job, which can pause again. No data is lost, the run is not silently wrong, and the normal copy-paste path works. That makes it P2, not P1.
+Verifier's suggested fix: Compare the authored files in `changed_pins`, not the generated task:
+- At prepare (pipeline.py around line 897) and in `repin` (guardrails.py line 440), save each lane's raw task-file text or its sha256 in the plan, for example `plan["task_texts"][node]`.
+- In `changed_pins`, compare `path.read_text()` (or its digest) with that saved value.
+- For plans saved before this change, compare only the part of the pinned text that does not depend on the process. Let `base = text + "\nApproved ownership and checks:\n" + json.dumps(worker)`. Treat the file as unchanged when `plan_task == base or plan_task.startswith(base + "\nBrowser scenarios:")`. This keeps `sys.executable`, the tool checkout path and the `BROWSER_RULES` wording out of the comparison.
+
+Also add a test to test_guardrails that pins a browser lane, patches `guardrails.CHECK_REPORT`, and checks that `--accept-challenge` still succeeds on the untouched files.
+
+### Finding 5 (P2, seam controller-paths) For an interrupted check, the repair refusal and the RUNBOOK send automatic runs to `retry`, which the same section forbids
+File: workflow/repair.py:164
+`blocked_step` refuses with 'Interrupted check at <folder>; use retry --phase <phase> --node <lane>', and RUNBOOK:314 says '`retry` an infrastructure failure or an interrupted check'. RUNBOOK:312 says '`automatic --live` is the only continuation of an automatic run: `freeze` and `retry` would run its review node in the CLI process'. `retry` does not refuse automatic plans: after `retry_check`, it calls `graph.invoke`, which runs verify, candidate, the review node (native reviewers launched and waited for by the retry CLI, with no supervisor), the automatic approval and integration. `automatic --live` cannot recover an interrupted check either: `verify_revision` raises 'Interrupted check attempt exists', and `advance_failed_checks` finds no packet at that attempt, so drive raises 'Non-retryable graph failure'.
+Failure scenario: A repair continuation (`automatic --live`) is interrupted with Ctrl+C while verify_ui runs. The attempt directory is left without packet.json. `repair ... --workspace` is refused with 'use retry --phase worker --node ui'. `automatic --live` is blocked with 'Non-retryable graph failure'. Following the refusal, `retry --phase worker --node ui` runs the rest of the run, including the reviewer launches, in the foreground CLI process, which the RUNBOOK says must not happen.
+Reviewer's suggested fix: For an automatic plan, give the interrupted-check recovery a supervisor path. For example, `retry --phase P --node N` could only raise the counter (no graph.invoke) when `plan.automatic` is set and then print `automatic --live`. Or `advance_failed_checks` could treat an attempt directory without a packet at the current attempt as retryable once. Then fix the refusal text and RUNBOOK:314 to name that command for automatic runs.
+Verifier's reasoning (first): The finding holds in the combined branch. It is a guidance contradiction, not broken behaviour.
+
+- **RUNBOOK:312** (from 26b5e83) says: "`automatic --live` is the only continuation of an automatic run: `freeze` and `retry` would run its review node in the CLI process."
+- **RUNBOOK:314** (last changed by a6d47f1) sends a refused repair to "`retry` an infrastructure failure or an interrupted check". This applies to every run, automatic or not.
+- **workflow/repair.py:164** refuses with the same unqualified advice: `Interrupted check at {folder}; use retry --phase {phase} --node {node}`.
+
+What the code does, checked by reading it:
+
+1. **`retry` accepts automatic plans** (pipeline.py:1039-1057). It calls `refuse_recorded` and `retry_check`, then `graph.invoke(value, config)` runs in the CLI process. Nothing checks `plan.automatic`.
+2. **The review node launches the reviewers from that process.** For an automatic plan it calls `review_candidate` (pipeline.py:694-699), which launches the native reviewers (automatic.py:487-516) and waits for them. Approval is then automatic and integration follows. This is the in-process tail that RUNBOOK:312, and caveat 12 of lane-repair-design.md, say to avoid.
+3. **`automatic --live` cannot recover an interrupted check.**
+   - Rerunning the verify at the same attempt hits checks.py:238-239: `Interrupted check attempt exists; use an explicitly incremented attempt`.
+   - `advance_failed_checks` (automatic.py:830-866) retries only attempts that have a packet, and this attempt has none, so it returns False.
+   - `drive` then raises `Non-retryable graph failure` (automatic.py:1082-1084).
+
+So for an automatic run left with an attempt directory and no packet (a Ctrl+C during verify, a crash or reboot, or a `git worktree add` failure after the `mkdir` at checks.py:240), the only working recovery is the command RUNBOOK:312 rules out. The refusal and RUNBOOK:314 prescribe it without warning. The RUNBOOK now contradicts itself, and the refusal points automatic runs at the path the same section rules out.
+
+Why P2 and not P1:
+- `retry` works. The run can finish from the CLI process, and a transient failure during the in-process review stays recoverable through `automatic --live` (`review_interrupted` / `resume_interrupted_review`).
+- No session is launched twice and no evidence is mixed.
+- Base 7c5e37e already told every run to use `retry --phase/--node` for failed checks (RUNBOOK:280/283). The repair commits made the contradiction explicit, and the design doc left the in-process tail as "a separate issue to fix".
+
+The test at test_repair.py:565-569 checks only the refusal text, not whether the advised command suits an automatic plan.
+
+A caveat on the finding's first suggested fix: raising the counter without `graph.invoke` is not enough on its own. Once `automatic --live` has recorded the verify error, `drive` calls `advance_failed_checks`. That returns False when the current attempt has no packet, so `drive` still raises `Non-re
+Verifier's suggested fix: Pick one of these:
+
+**(a) Code fix: give automatic runs a supervisor path.**
+1. In pipeline.py's `retry` branch: when `runtime.plan.get("automatic")`, call only `runtime.retry_check(phase, node)`. Do not call `graph.invoke`. Print `continue with: python -m workflow automatic "$RUN" --live`.
+2. In `advance_failed_checks` (automatic.py), also treat as ready to invoke a failed `verify_<lane>`/`candidate` task whose current attempt directory does not exist yet (the operator already raised the counter). Also return True when every target is in that state, so `drive` calls `graph.invoke` instead of raising `Non-retryable graph failure`.
+3. Change the repair.py:164 refusal so an automatic plan gets `retry --phase P --node N (raises the attempt only), then automatic --live`.
+4. Update RUNBOOK:314, and the `retry` row at RUNBOOK:360, to match.
+
+**(b) Documentation-only fix:**
+1. Qualify RUNBOOK:312: `retry --phase/--node` is the one exception.
+2. State in RUNBOOK:314 and in the repair.py:164 refusal that on an automatic run this `retry` continues the whole run, reviewer launches included, in the CLI process.
+
+Either way, add a test that an automatic plan with an interrupted attempt directory can be continued the way the refusal says.
+
+### Finding 12 (P2, seam panes-launch-worktrees) RUNBOOK's worktree-failure recovery contradicts its rule that automatic runs continue only with automatic --live
+File: workflow/RUNBOOK.md:283
+b4d7c6d added "Worktree creation failed: … delete the named .lock file, then retry the step as above", which means `retry "$RUN" --phase <p> --node <lane>`. The repair section merged beside it (line 312) says "`automatic --live` is the only continuation of an automatic run: `freeze` and `retry` would run its review node in the CLI process." For an automatic run whose verify failed in git_worktree, the attempt directory has no packet. advance_failed_checks therefore returns False and `automatic --live` stops with "Non-retryable graph failure". The only recovery the RUNBOOK documents (repair.blocked_step also prints "use retry --phase … --node …") then launches and waits for the reviewers inside that unsupervised CLI process.
+Failure scenario: In an automatic run, verify_ui's `git worktree add` fails on a stale `.lock` after the 5 retries. The operator deletes the lock and runs `retry "$RUN" --phase worker --node ui` as documented. That process re-verifies, builds the candidate and runs review_candidate in-process, launching native reviewers outside the supervisor; a Ctrl-C or SSH drop there is the case the repair section warns about. `automatic --live` cannot be used instead.
+Reviewer's suggested fix: Let the automatic controller advance an attempt directory whose verification worktree was never created (no packet, no worktree), or add a `retry --phase/--node` mode that only raises the counter, and tell automatic runs to continue with `automatic --live`. Otherwise, state the in-process caveat in the Worktree creation failed and interrupted-check guidance.
+Verifier's reasoning (first): I tried to refute this and could not. Everything below was checked in /home/agentops/dev/mdm-integrate at 7f8d3b6.
+
+**Where each sentence came from**
+- b4d7c6d added RUNBOOK.md:283 ("delete the named .lock file, then retry the step as above", where "as above" means `retry "$RUN" --phase worker --node <lane>`).
+- 26b5e83 (repair) added RUNBOOK.md:312 ("`automatic --live` is the only continuation of an automatic run: `freeze` and `retry` would run its review node in the CLI process").
+- The two were reviewed separately and now contradict each other for automatic runs.
+
+**What the code does**
+1. checks.py:240-242: `verify_revision` creates the attempt directory before `git_worktree(... "add" ...)`. When the add fails after the 5 lock retries, the directory is left with no packet.json. The next plain run of that attempt raises "Interrupted check attempt exists" (checks.py:239).
+2. automatic.py:847/855: `advance_failed_checks` only advances an attempt that has a packet, so it returns False here. A probe with a packetless `verification/worker/ui/1` and a failed `verify_ui` task printed `advance: False`.
+3. `reviewer_stop_pending` and `review_interrupted` both need the failure to be exactly ["review"], so drive() raises "Non-retryable graph failure" (automatic.py:1083-1084). `automatic --live` therefore cannot recover this case.
+4. The only documented way out is `retry`. That applies to RUNBOOK:283, the Refused bullet at RUNBOOK:314 ("`retry` … an interrupted check") and repair.blocked_step at repair.py:164 ("use retry --phase … --node …").
+5. `retry` (pipeline.py:1039-1056) has no guard for automatic plans. It raises the counter and calls `graph.invoke`. For an automatic plan the review node calls `review_candidate` (pipeline.py:696-698), which launches the native reviewers, and approval and integration then continue in that same CLI process.
+6. That is what RUNBOOK:312 and repair.continuation() (repair.py:110-114, "Automatic plans continue only under the supervisor") rule out. It also launches Claude reviewer sessions from a command without `--live`, against RUNBOOK:324 ("Nothing launches a Claude session without `--live`").
+
+**Why P2 and not higher**
+- The in-process review runs the same `review_candidate` code. A Ctrl-C or a TransientInfraError leaves the reviewers running, and a later `automatic --live` can rebind them. The run is not lost.
+- The main differences are that an unavailable Claude Code ends as "Blocked" (exit 1) rather than exit 75, the reviewers start without `--live`, and nothing is supervised.
+- This is a doc-versus-doc and doc-versus-code contradiction created where the two commits meet, so P2 fits.
+- The same "or retry" wording also appears in the command table (RUNBOOK:359, repair: "continue with `automatic --live` or `retry`") and in README.md:23. Those also contradict RUNBOOK:312 and `continuation()`.
+Verifier's suggested fix: Pick one:
+
+**(a) Code fix**
+- Make `retry --phase/--node` on an automatic plan only raise the counter (no `graph.invoke`) and print `automatic "$RUN" --live`.
+- Teach `advance_failed_checks` to return True without raising the counter again when a failed `verify_<lane>` or candidate step meets all of these:
+  - its current attempt directory does not exist yet;
+  - that attempt is above the revision's floor;
+  - the previous attempt directory has no packet.json (so the operator already moved past an interrupted or worktree-failed attempt).
+- Keep the condition this narrow. A cherry-pick conflict or a partial candidate must still stop the run.
+- Update repair.py:164 to name the automatic continuation when the plan is automatic.
+
+**(b) Doc-only fix**
+- In RUNBOOK:283 and in the "interrupted check" parts of :314, say that for an automatic run `retry --phase/--node` also carries the run through review and integration in the CLI process. That launches the reviewers without `--live` and outside the supervisor, so it should be run in a persistent terminal (a Herdr pane), and an interruption is resumed with `automatic --live`.
+- Soften :312 to match.
+- Make RUNBOOK:359 and README.md:23 agree with whichever rule you keep.
+
+### Finding 17 (P2, seam docs-vs-code) After a challenge checkout failure, "fix it and rerun the same command" does not work for `launch` users
+File: workflow/RUNBOOK.md:42
+After a checkout failure, the RUNBOOK says to rerun the same command. Most runs start with `launch --live [--automatic]`, which then exits 1 ("Launch blocked: Command [... start ...] returned non-zero exit status 1"). Rerunning `launch` is refused with "Run already exists". Rerunning `start "$RUN" --live --herdr` launches the workers but never starts the supervisor for an automatic run, and the RUNBOOK does not say to follow it with `automatic --live`. The only test (ChallengeCheckoutFails) covers `start` alone.
+Failure scenario: `launch f --live --automatic` finds a stale `challenge-worktree` path, so start exits 1. The operator removes it and reruns `launch`, which is refused. If they run `start` instead, the workers launch unsupervised: no deadlines are enforced, no automatic freeze or review happens, and no timeline prints until someone runs `automatic --live`.
+Reviewer's suggested fix: Tell the operator to run `"$PY" -m workflow resume "$RUN" [--herdr]`, which runs attempt 1 once the checkout is fixed, launches the workers and supervises an automatic run. Or say `start "$RUN" --live [--herdr]`, then `automatic "$RUN" --live` for an automatic run.
+Verifier's reasoning (first): I could not refute the defect, but one detail of the finding is wrong.
+
+What the runbook says. workflow/RUNBOOK.md:42 (the sentence came in with ad3e0db) says a challenge checkout that cannot be created, or is not the clean base commit, blocks `start`, and then: "fix it and rerun the same command". The runbook presents `launch` as the main entry point ("One-command launch").
+
+What the code does:
+- A `launch` rerun is refused. workflow/launch.py:293-294 raises "Run already exists: ... do not launch duplicate workers" once the run directory exists, and `prepare` already created it.
+- The first `launch` shows no next step. `challenge_worktree` (guardrails.py:286-295) fails inside `run_challenge` (guardrails.py:300-305) before `challenge.running.json` is written. The `start` child exits 1 with "Blocked: <git error>" or "...reconcile before rerunning the challenge", which names no command. `launch` then prints "Launch blocked: Command [... start ...] returned non-zero exit status 1 ... Inspect any retained branch/run state" (launch.py:337-338).
+- `start` alone launches the workers and then stops at the `handoff` interrupt (pipeline.py:686-689, 964-976, 1053-1058). It never supervises. For `--automatic`, `launch` runs `automatic <run> --live` as a separate fifth command (launch.py:224-230). So an operator who reruns only the `start` shown in the error gets workers with bypassed permissions and no supervisor: no deadlines, no automatic freeze or review, no timeline. That lasts until someone runs `automatic --live`, and line 42 does not mention it.
+- The only test, ChallengeCheckoutFails (test_guardrails.py:370-388), covers `start` alone.
+
+The suggested fix works. I ran a scratchpad copy of ChallengeCheckoutFails that calls `resume_main` instead of the second `start`. It exited 0 and printed "Design challenge passed (attempt 1); workers launched: ui, adapter". `challenge.json` was passed at attempt 1, the launches were [challenge, adapter, ui], and no `challenge-revision.json` was left behind. For an automatic plan, `resume_main` then calls `supervise()` (guardrails.py:885-891).
+
+The correction. The finding's example, a stale `challenge-worktree` path at `launch`, cannot happen. `launch` refuses an existing run directory and `prepare` creates it fresh, so no stale path can be there. The failure can still happen at launch in other ways:
+- `git worktree add` keeps failing after its five lock retries. The runbook's "Worktree creation failed" bullet documents this, and concurrent runs over one repository are supported.
+- `git worktree add` fails for some other Git reason.
+- The target's post-checkout hook dirties the new checkout.
+
+A related doc gap: that "Worktree creation failed" bullet says "retry the step as above", but `retry` needs a failed graph step. It refuses a challenge checkout failure, which happens before the graph is ever invoked.
+
+Why P2 and not P1. Nothing is lost or run twice: the `launch` rerun is refused cleanly. The unsupervised case nee
+Verifier's suggested fix: Change the end of the checkout sentence at workflow/RUNBOOK.md:42 to something like: "fix it, then run `"$PY" -m workflow resume "$RUN" [--herdr]`: no job ran, so it runs attempt 1, launches the workers and supervises an automatic run. `launch` cannot be rerun on an existing run directory. `start "$RUN" --live [--herdr]` also works, but after a `launch --automatic` it must be followed by `automatic "$RUN" --live`." Optionally, have `challenge_worktree`'s RuntimeError, and `run_challenge`'s blocked event for a WorktreeError, append `resume_command(directory)`, so that `launch` users see the command. Add a test that fails the checkout under an automatic plan and checks that `resume` then launches the workers and calls `supervise`. Separately, the "Worktree creation failed ... retry the step as above" bullet should say that a challenge checkout is retried with `resume` (or `start`), not `retry`.

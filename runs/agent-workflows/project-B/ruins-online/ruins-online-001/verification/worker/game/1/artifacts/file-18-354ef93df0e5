@@ -1,0 +1,481 @@
+import { WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import {
+  parseRuinClueMessage,
+  parseRuinResultMessage,
+  RUIN_SYMBOL_NAMES,
+  RuinMessageType,
+  type AnswerRuinMessage,
+  type OpenRuinMessage,
+  type RuinClueMessage,
+  type RuinMoveName,
+  type RuinOpenedMessage,
+  type RuinResultMessage,
+  type RuinSymbolName,
+} from "@pirate-sea-race/protocol";
+import { tabletText } from "@pirate-sea-race/simulation/ruins";
+
+/**
+ * §3's ruins in the browser: the HUD's ruin line at an island, and the ruin panel. A player moored at an island whose
+ * ruin they have not solved presses R; the server answers with the clue (to them only), which the panel lays out to
+ * read at a glance: six tablets with their inscriptions, or the grid with its start, goal and blocked cells. The
+ * answer is entered with clicks or keys (1–6 for symbols, the arrows or WASD for moves, Backspace to undo, Enter to
+ * submit) and sent as `answer-ruin`; the server's verdict shows as a lockout countdown or as the gold and the unlock.
+ * Everything below `RuinPanel` is plain data, for unit tests; `RuinPanel` and `applyRuin` touch the page.
+ */
+
+/** This player's ruin fields from its private status. */
+export interface RuinStatus {
+  /** "locked", "unlocked", "solved", or "" away from an island with a ruin. */
+  readonly ruin: string;
+  readonly ruinOpen: boolean;
+  readonly ruinLockedUntil: number;
+}
+
+/** An island's ruin marker as the server sent it: only islands in sight, or where the player is moored. */
+export interface RuinMarker {
+  readonly island: number;
+  readonly unlocked: boolean;
+}
+
+export interface Line {
+  readonly text: string;
+  readonly state: string;
+  readonly seconds?: number;
+}
+
+const SYMBOLS: Readonly<Record<RuinSymbolName, { readonly name: string; readonly glyph: string }>> = {
+  sun: { name: "Sun", glyph: "☀" },
+  moon: { name: "Moon", glyph: "☾" },
+  tide: { name: "Tide", glyph: "≈" },
+  storm: { name: "Storm", glyph: "ϟ" },
+  anchor: { name: "Anchor", glyph: "⚓" },
+  skull: { name: "Skull", glyph: "☠" },
+};
+
+/** Whole seconds left until a world tick, rounded up; 0 once it has passed. */
+function secondsUntil(tick: number, worldTick: number): number {
+  return Math.max(0, Math.ceil((tick - worldTick) / WORLD_STEPS_PER_SECOND));
+}
+
+/**
+ * The HUD's ruin line at the island the player is moored at (the Island line names it): sealed (press R), opened by
+ * someone else (R still pays the solver's gold), or solved by this player. Nothing away from a ruin.
+ */
+export function ruinLine(status: RuinStatus | undefined): Line {
+  switch (status?.ruin) {
+    case "locked":
+      return { text: "Sealed: rubbings locked. Press R for the clue", state: "locked" };
+    case "unlocked":
+      return { text: "Opened by another captain. R: solve it too (+40 gold)", state: "unlocked" };
+    case "solved":
+      return { text: "Solved by you", state: "solved" };
+    default:
+      return { text: "", state: "none" };
+  }
+}
+
+/** Whether R opens a ruin now: moored at an island whose ruin this player has not solved. */
+export function canOpenRuin(status: RuinStatus | undefined): boolean {
+  return status?.ruin === "locked" || status?.ruin === "unlocked";
+}
+
+/** The ruins of islands in sight (or where moored): "Palm Key: sealed, Ember Rock: open". */
+export function sightedRuinsLine(markers: readonly RuinMarker[], islandName: (island: number) => string): Line {
+  if (markers.length === 0) return { text: "", state: "none" };
+  const sorted = [...markers].sort((a, b) => a.island - b.island);
+  return {
+    text: sorted.map((marker) => `${islandName(marker.island)}: ${marker.unlocked ? "open" : "sealed"}`).join(", "),
+    state: sorted.map((marker) => `${marker.island}:${marker.unlocked ? "open" : "sealed"}`).join(","),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The clue, laid out
+
+export interface TabletView {
+  /** 1 to 6: the key and the display order. */
+  readonly key: number;
+  readonly symbol: RuinSymbolName;
+  readonly name: string;
+  readonly glyph: string;
+  /** The inscription, such as "Tide comes right after Sun". */
+  readonly text: string;
+}
+
+export type CellKind = "start" | "goal" | "blocked" | "open";
+
+export interface CellView {
+  readonly x: number;
+  readonly y: number;
+  readonly kind: CellKind;
+}
+
+/** The six tablets in display order, each with its key, glyph and inscription. */
+export function tabletsOf(clue: Extract<RuinClueMessage, { kind: "sequence" }>): TabletView[] {
+  return clue.tablets.map((tablet, index) => ({
+    key: index + 1,
+    symbol: tablet.symbol,
+    name: SYMBOLS[tablet.symbol].name,
+    glyph: SYMBOLS[tablet.symbol].glyph,
+    text: tabletText(tablet, clue.length),
+  }));
+}
+
+/** The grid row by row from the north: each cell the start, the goal, blocked or open. */
+export function gridOf(clue: Extract<RuinClueMessage, { kind: "navigation" }>): CellView[][] {
+  const blocked = new Set(clue.blocked.map((cell) => `${cell.x},${cell.y}`));
+  return Array.from({ length: clue.size }, (_, y) =>
+    Array.from({ length: clue.size }, (_, x) => {
+      const kind: CellKind =
+        x === clue.start.x && y === clue.start.y ? "start" : x === clue.goal.x && y === clue.goal.y ? "goal" : blocked.has(`${x},${y}`) ? "blocked" : "open";
+      return { x, y, kind };
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Entering the answer
+
+const MOVE_KEYS: Readonly<Record<string, RuinMoveName>> = {
+  ArrowUp: "N",
+  KeyW: "N",
+  ArrowRight: "E",
+  KeyD: "E",
+  ArrowDown: "S",
+  KeyS: "S",
+  ArrowLeft: "W",
+  KeyA: "W",
+};
+const STEPS: Readonly<Record<RuinMoveName, { x: number; y: number }>> = { N: { x: 0, y: -1 }, E: { x: 1, y: 0 }, S: { x: 0, y: 1 }, W: { x: -1, y: 0 } };
+/** The longest path the panel takes: a 4 × 4 grid's every cell. */
+const MAX_PATH_MOVES = 16;
+
+/** What a key does in the panel. */
+export type PanelKey = { kind: "symbol"; symbol: RuinSymbolName } | { kind: "move"; move: RuinMoveName } | { kind: "undo" } | { kind: "submit" } | { kind: "close" };
+
+/** A key (its `KeyboardEvent.code`) in a panel showing a clue of this kind, or undefined for a key it does not use. */
+export function panelKey(kind: RuinClueMessage["kind"], code: string): PanelKey | undefined {
+  if (code === "Backspace") return { kind: "undo" };
+  if (code === "Enter" || code === "NumpadEnter") return { kind: "submit" };
+  if (code === "Escape") return { kind: "close" };
+  if (kind === "sequence") {
+    const digit = /^(?:Digit|Numpad)([1-6])$/.exec(code)?.[1];
+    return digit === undefined ? undefined : { kind: "symbol", symbol: RUIN_SYMBOL_NAMES[Number(digit) - 1]! };
+  }
+  const move = MOVE_KEYS[code];
+  return move === undefined ? undefined : { kind: "move", move };
+}
+
+/** The answer being entered: symbols in order for a sequence, moves for a grid. */
+export interface Entry {
+  readonly symbols: readonly RuinSymbolName[];
+  readonly moves: readonly RuinMoveName[];
+}
+
+export const EMPTY_ENTRY: Entry = { symbols: [], moves: [] };
+
+/** The cells a path visits, from the start: one more than its moves. */
+export function pathCells(clue: Extract<RuinClueMessage, { kind: "navigation" }>, moves: readonly RuinMoveName[]): { x: number; y: number }[] {
+  const cells = [{ ...clue.start }];
+  for (const move of moves) {
+    const last = cells.at(-1)!;
+    cells.push({ x: last.x + STEPS[move].x, y: last.y + STEPS[move].y });
+  }
+  return cells;
+}
+
+/**
+ * The entry after one key or click. A sequence takes a symbol not yet chosen until it is complete; a path takes a move
+ * that stays on the grid and off the blocked cells. Undo takes the last one back. Anything else changes nothing.
+ */
+export function enter(clue: RuinClueMessage, entry: Entry, key: PanelKey): Entry {
+  if (key.kind === "undo") return clue.kind === "sequence" ? { ...entry, symbols: entry.symbols.slice(0, -1) } : { ...entry, moves: entry.moves.slice(0, -1) };
+  if (key.kind === "symbol" && clue.kind === "sequence") {
+    if (entry.symbols.includes(key.symbol) || entry.symbols.length >= clue.length) return entry;
+    return { ...entry, symbols: [...entry.symbols, key.symbol] };
+  }
+  if (key.kind === "move" && clue.kind === "navigation") {
+    if (entry.moves.length >= MAX_PATH_MOVES) return entry;
+    const at = pathCells(clue, entry.moves).at(-1)!;
+    const next = { x: at.x + STEPS[key.move].x, y: at.y + STEPS[key.move].y };
+    const off = next.x < 0 || next.y < 0 || next.x >= clue.size || next.y >= clue.size;
+    if (off || clue.blocked.some((cell) => cell.x === next.x && cell.y === next.y)) return entry;
+    return { ...entry, moves: [...entry.moves, key.move] };
+  }
+  return entry;
+}
+
+/** The attempt to send, once the entry is complete: every symbol of the sequence, or a path that ends on the goal. */
+export function attemptOf(clue: RuinClueMessage, entry: Entry): AnswerRuinMessage["attempt"] | undefined {
+  if (clue.kind === "sequence") return entry.symbols.length === clue.length ? { kind: "sequence", symbols: [...entry.symbols] } : undefined;
+  const end = pathCells(clue, entry.moves).at(-1)!;
+  // The start is never the goal, so an empty path never ends there.
+  return end.x === clue.goal.x && end.y === clue.goal.y ? { kind: "navigation", moves: [...entry.moves] } : undefined;
+}
+
+/** The entry as the panel writes it: "☀ Sun → ≈ Tide → _" or "N E E S". */
+export function entryText(clue: RuinClueMessage, entry: Entry): string {
+  if (clue.kind === "sequence") {
+    const chosen = entry.symbols.map((symbol) => `${SYMBOLS[symbol].glyph} ${SYMBOLS[symbol].name}`);
+    return [...chosen, ...Array.from({ length: clue.length - chosen.length }, () => "_")].join(" → ");
+  }
+  return entry.moves.length === 0 ? "Start at S; walk to G" : entry.moves.join(" ");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Verdicts
+
+const REFUSALS: Readonly<Record<string, string>> = {
+  "locked-out": "Still locked out: wait for the countdown",
+  "already-solved": "You already solved this ruin",
+  "not-at-ruin": "You are no longer at the ruin",
+  "no-session": "Open the ruin again (R)",
+  "in-duel": "Not during a duel",
+};
+
+/** A verdict as the player reads it: the gold and the unlock, a wrong answer, or why it was refused. */
+export function verdictLines(result: RuinResultMessage): Line[] {
+  if (result.outcome === "solved") {
+    const lines: Line[] = [{ text: `Ruin solved: +${result.gold} gold`, state: "solved" }];
+    if (result.unlocked) lines.push({ text: "The island's rubbings are unlocked", state: "unlocked" });
+    return lines;
+  }
+  if (result.outcome === "wrong") return [{ text: "Wrong answer: the ruin locks you out for a moment", state: "wrong" }];
+  return [{ text: REFUSALS[result.reason ?? ""] ?? "The ruin did not take that answer", state: `refused:${result.reason ?? ""}` }];
+}
+
+/** The lockout's countdown while it runs. */
+export function lockoutLine(lockedUntil: number, worldTick: number): Line {
+  const seconds = secondsUntil(lockedUntil, worldTick);
+  return seconds > 0 ? { text: `Locked out: try again in ${seconds} s`, state: "locked", seconds } : { text: "", state: "none" };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The panel
+
+/** What the panel shows: hidden, or a clue with the entry, its lockout and the last verdict. */
+export interface RuinPanelView {
+  readonly hidden: boolean;
+  readonly kind: string;
+  readonly island: number;
+  readonly tablets: readonly TabletView[];
+  readonly grid: readonly (readonly CellView[])[];
+  /** The cells the entered path visits, as "x,y". */
+  readonly path: readonly string[];
+  readonly chosen: readonly RuinSymbolName[];
+  readonly entry: string;
+  readonly canSubmit: boolean;
+  readonly lockout: Line;
+  readonly verdict: readonly Line[];
+}
+
+export function ruinPanelView(opened: RuinOpenedMessage | undefined, entry: Entry, lockedUntil: number, worldTick: number, verdict: readonly Line[]): RuinPanelView {
+  if (opened === undefined) {
+    return { hidden: true, kind: "", island: -1, tablets: [], grid: [], path: [], chosen: [], entry: "", canSubmit: false, lockout: { text: "", state: "none" }, verdict };
+  }
+  const clue = opened.clue;
+  const lockout = lockoutLine(lockedUntil, worldTick);
+  return {
+    hidden: false,
+    kind: clue.kind,
+    island: opened.island,
+    tablets: clue.kind === "sequence" ? tabletsOf(clue) : [],
+    grid: clue.kind === "navigation" ? gridOf(clue) : [],
+    path: clue.kind === "navigation" ? pathCells(clue, entry.moves).map((cell) => `${cell.x},${cell.y}`) : [],
+    chosen: entry.symbols,
+    entry: entryText(clue, entry),
+    canSubmit: attemptOf(clue, entry) !== undefined && lockout.state === "none",
+    lockout,
+    verdict,
+  };
+}
+
+/**
+ * The ruin panel's behaviour, as `main.ts` wires it: R opens the ruin (when the HUD offers it), the clue shows the
+ * panel, keys and clicks enter the answer, Enter or Submit sends it with a fresh request id, and the server's verdict
+ * shows. The panel closes when the session does (casting off, a duel, a disconnect), on Escape, and after a solve (so
+ * E collects at once).
+ */
+export class RuinPanel {
+  private opened: RuinOpenedMessage | undefined;
+  private entry: Entry = EMPTY_ENTRY;
+  private lockedUntil = 0;
+  private verdict: readonly Line[] = [];
+  /** The panel saw its session open on the server, so a closed session closes it. */
+  private sessionSeen = false;
+  private requests = 0;
+  private status: RuinStatus | undefined;
+  private worldTick = 0;
+
+  constructor(
+    private readonly send: (type: string, message: unknown) => void,
+    private readonly render: (view: RuinPanelView) => void,
+    private readonly requestPrefix: string = Date.now().toString(36),
+  ) {}
+
+  get isOpen(): boolean {
+    return this.opened !== undefined;
+  }
+
+  /** The last verdict, for the HUD while the panel is closed. */
+  get lastVerdict(): readonly Line[] {
+    return this.verdict;
+  }
+
+  /** The latest private status and world tick: a session the server closed closes the panel. */
+  update(status: RuinStatus | undefined, worldTick: number): void {
+    this.status = status;
+    this.worldTick = worldTick;
+    if (this.opened !== undefined && status?.ruinOpen === true) this.sessionSeen = true;
+    if (this.opened !== undefined && this.sessionSeen && status?.ruinOpen !== true) this.close();
+    if (status?.ruin === "") this.verdict = [];
+    this.draw();
+  }
+
+  /** The server's clue (only ever for this player's own open ruin). */
+  clue(message: unknown): void {
+    const opened = parseRuinClueMessage(message);
+    if (opened === undefined || opened.solved) return;
+    if (this.opened?.island !== opened.island) this.entry = EMPTY_ENTRY;
+    this.opened = opened;
+    this.lockedUntil = opened.lockedUntil;
+    this.sessionSeen = this.status?.ruinOpen === true;
+    this.draw();
+  }
+
+  /** The server's verdict on one of this player's answers. */
+  result(message: unknown): void {
+    const result = parseRuinResultMessage(message);
+    if (result === undefined) return;
+    this.verdict = verdictLines(result);
+    this.lockedUntil = Math.max(this.lockedUntil, result.lockedUntil);
+    if (result.outcome === "wrong") this.entry = EMPTY_ENTRY;
+    if (result.outcome === "solved") this.close();
+    this.draw();
+  }
+
+  /** A key in the page: R opens the ruin; the panel's own keys when it is open. True when the key was the panel's. */
+  keydown(event: Pick<KeyboardEvent, "code" | "repeat">): boolean {
+    if (this.opened === undefined) {
+      if (event.code !== "KeyR" || event.repeat || !canOpenRuin(this.status)) return false;
+      this.verdict = [];
+      this.send(RuinMessageType.Open, {} satisfies OpenRuinMessage);
+      return true;
+    }
+    const key = panelKey(this.opened.clue.kind, event.code);
+    if (key === undefined) return false;
+    this.press(key);
+    return true;
+  }
+
+  /** A click on a tablet or a button, or a key the panel read. */
+  press(key: PanelKey): void {
+    const opened = this.opened;
+    if (opened === undefined) return;
+    if (key.kind === "close") this.close();
+    else if (key.kind === "submit") this.submit(opened.clue);
+    else this.entry = enter(opened.clue, this.entry, key);
+    this.draw();
+  }
+
+  private submit(clue: RuinClueMessage): void {
+    const attempt = attemptOf(clue, this.entry);
+    if (attempt === undefined || lockoutLine(this.lockedUntil, this.worldTick).state !== "none") return;
+    this.send(RuinMessageType.Answer, { requestId: `${this.requestPrefix}-${++this.requests}`, attempt } satisfies AnswerRuinMessage);
+  }
+
+  private close(): void {
+    this.opened = undefined;
+    this.entry = EMPTY_ENTRY;
+    this.sessionSeen = false;
+  }
+
+  private draw(): void {
+    this.render(ruinPanelView(this.opened, this.entry, this.lockedUntil, this.worldTick, this.verdict));
+  }
+}
+
+function field(root: ParentNode, id: string): HTMLElement {
+  const element = root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  if (element === null) throw new Error(`missing ruin field ${id}`);
+  return element;
+}
+
+function write(element: HTMLElement, line: Line): void {
+  element.textContent = line.text;
+  element.dataset["state"] = line.state;
+  if (line.seconds === undefined) delete element.dataset["seconds"];
+  else element.dataset["seconds"] = String(line.seconds);
+}
+
+/** Writes the panel into the page: the tablets or the grid (rebuilt only when the clue changes), the entry and lines. */
+export function applyRuin(root: ParentNode, view: RuinPanelView): void {
+  const panel = field(root, "ruin-panel");
+  panel.hidden = view.hidden;
+  panel.dataset["kind"] = view.kind;
+  panel.dataset["island"] = String(view.island);
+  const tablets = field(root, "ruin-tablets");
+  tablets.hidden = view.kind !== "sequence";
+  const tabletKey = view.tablets.map((tablet) => `${tablet.symbol}:${tablet.text}`).join("|");
+  if (tablets.dataset["clue"] !== tabletKey) {
+    tablets.dataset["clue"] = tabletKey;
+    tablets.replaceChildren(
+      ...view.tablets.map((tablet) => {
+        const item = document.createElement("li");
+        item.dataset["testid"] = "ruin-tablet";
+        item.dataset["symbol"] = tablet.symbol;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset["symbol"] = tablet.symbol;
+        button.setAttribute("aria-label", `${tablet.key}: ${tablet.name}`);
+        button.textContent = `${tablet.key} ${tablet.glyph} ${tablet.name}`;
+        const text = document.createElement("span");
+        text.className = "inscription";
+        text.dataset["testid"] = "ruin-inscription";
+        text.textContent = tablet.text;
+        item.append(button, text);
+        return item;
+      }),
+    );
+  }
+  for (const item of tablets.querySelectorAll<HTMLElement>("li[data-symbol]")) {
+    const order = view.chosen.indexOf(item.dataset["symbol"] as RuinSymbolName);
+    item.dataset["chosen"] = order < 0 ? "" : String(order + 1);
+  }
+  const grid = field(root, "ruin-grid");
+  grid.hidden = view.kind !== "navigation";
+  const gridKey = view.grid.map((row) => row.map((cell) => cell.kind[0]).join("")).join("/");
+  if (grid.dataset["clue"] !== gridKey) {
+    grid.dataset["clue"] = gridKey;
+    grid.style.setProperty("--size", String(view.grid.length));
+    grid.replaceChildren(
+      ...view.grid.flat().map((cell) => {
+        const square = document.createElement("span");
+        square.className = "cell";
+        square.dataset["cell"] = `${cell.x},${cell.y}`;
+        square.dataset["kind"] = cell.kind;
+        square.textContent = cell.kind === "start" ? "S" : cell.kind === "goal" ? "G" : cell.kind === "blocked" ? "▩" : "";
+        return square;
+      }),
+    );
+  }
+  const path = new Set(view.path);
+  for (const square of grid.querySelectorAll<HTMLElement>("[data-cell]")) square.dataset["path"] = String(path.has(square.dataset["cell"]!));
+  grid.dataset["path"] = view.path.join(" ");
+  const entry = field(root, "ruin-entry");
+  entry.textContent = view.entry;
+  entry.dataset["symbols"] = view.chosen.join(",");
+  (field(root, "ruin-submit") as HTMLButtonElement).disabled = !view.canSubmit;
+  write(field(root, "ruin-lockout"), view.lockout);
+  write(field(root, "ruin-verdict"), view.verdict[0] ?? { text: "", state: "none" });
+}
+
+/** The HUD's ruin lines: the ruin where the player is moored, the last verdict, and the ruins of islands in sight. */
+export function renderRuinHud(root: ParentNode, model: { status: RuinStatus | undefined; verdict: readonly Line[]; sighted: Line }): void {
+  write(field(root, "hud-ruin"), ruinLine(model.status));
+  write(field(root, "hud-ruin-verdict"), {
+    text: model.verdict.map((line) => line.text).join(". "),
+    state: model.verdict.length === 0 ? "none" : model.verdict.map((line) => line.state).join(","),
+  });
+  write(field(root, "hud-ruins-sighted"), model.sighted);
+}

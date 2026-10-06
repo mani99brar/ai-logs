@@ -1,0 +1,33 @@
+import React from "react";
+import styled from "styled-components";
+
+import { Address } from "viem";
+
+import { VotingHistoryQuery } from "src/graphql/graphql";
+
+import { responsiveSize } from "styles/responsiveSize";
+
+import DisputeTimeline from "./DisputeTimeline";
+import FinalDecision from "./FinalDecision";
+
+const Container = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: ${responsiveSize(16, 24)};
+`;
+
+interface IVerdict {
+  arbitrable?: Address;
+  votingHistory: VotingHistoryQuery | undefined;
+}
+
+const Verdict: React.FC<IVerdict> = ({ arbitrable, votingHistory }) => {
+  return (
+    <Container>
+      <FinalDecision {...{ votingHistory, arbitrable }} />
+      <DisputeTimeline {...{ arbitrable }} />
+    </Container>
+  );
+};
+
+export default Verdict;

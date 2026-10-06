@@ -1,0 +1,2518 @@
+diff --git a/docs/encounters.md b/docs/encounters.md
+new file mode 100644
+index 0000000..fff40f0
+--- /dev/null
++++ b/docs/encounters.md
+@@ -0,0 +1,65 @@
++# Encounters
++
++§6's rules for starting and leaving duels, as pure code: `@pirate-sea-race/simulation/encounters` (`stepEncounters`), with the tuning in `@pirate-sea-race/content/encounters` (`encounterRules`, validated by `validateEncounterRules`). They decide who can attack whom, the telegraphed attempt and its escape, same-tick reservation, the ready check and the return to the world. They move no ship, run no duel and touch no inventory. The caller (the match room, `encounters-online`) does those things and reports back. Like `stepClaim`, `stepEncounters(config, state, input) → { state, events }` reads one tick's snapshot, never mutates its input, and uses only integers. Players, attempts and reports are read as sets, so their order in the input never matters.
++
++## Attacks
++
++| | Sea grapple (`ship`) | Island challenge (`foot`) |
++| --- | --- | --- |
++| Windup | 20 ticks (1 s) | 12 ticks (0.6 s) |
++| Range | 6 tiles (`ENGAGEMENT_RANGE_TILES`) | 2 tiles |
++| Target cone at the start / hit area at landing | ±8 / ±4 headings | ±8 / ±4 headings |
++| Line of sight | supercover line touching no land | placeholder: never blocked |
++| Miss cooldown | 120 ticks (6 s) | 120 ticks (6 s) |
++
++A press starts an attempt only if the rules find a target: the nearest eligible player of the same mode in range, in line of sight and in the ±8 front cone of the attacker's heading, ties to the lower id. Otherwise nothing happens and nothing is spent. The aim locks to the bearing toward the target. At the landing tick the attempt hits if the defender is still eligible, in range, within ±4 of the aim and in line of sight. Otherwise it misses, and the attacker's cooldown starts.
++
++**Eligibility.** The attacker must be in the snapshot, connected, not in a duel, not respawning, out of cooldown and without an attempt already running. The defender must be in the snapshot (it may be disconnected, §12), in the same mode, not in a duel, not respawning and unprotected. Fewer than `maxDuels` (4) duels may be unsettled. An attacker who disconnects, leaves, changes mode or is reserved during the windup loses the attempt (`attempt-cancelled`, no cooldown). A defender who has become ineligible by the landing tick is a miss (`defender-ineligible`), as §6 says.
++
++**Geometry**, defined once in `geometry.ts`. Positions are sub-units (256 a tile), and distances are compared squared: exactly at the range is in range. The *bearing* is the heading (of 64) whose table vector has the largest dot product with the offset, ties to the lower heading. *Within ±N* means a circular heading difference of at most N. Distance 0 has no bearing and is inside every cone. *Line of sight* (sea) is the supercover line between the centres of the two ships' tiles: every tile the segment touches, and both side tiles where it passes exactly through a corner. It is the same set in both directions. A land tile or a tile off the map blocks. Shoals and docks do not.
++
++**Per-mode rules** (`ModeRules` in `modes.ts`: `lineOfSight`, `separateReturn`, `respawnPoint`) come from the config. `seaModeRules(map)` is complete. `footPlaceholderRules` never blocks line of sight and returns every player to where they stood. `objectives-endgame` replaces it through `createEncounterConfig({ modeRules: { foot } })`.
++
++## State
++
++`EncounterState` is plain data that `hashState` covers:
++
++- `tick`: the last tick processed.
++- `closed`: set when the caller reports the match over. The step then ignores every later input.
++- `players`: records only for players with something to remember, sorted by id. Each has `protection` (`{ source: spawn | win | draw | respawn, endTick }`, protected while `tick < endTick`), `cooldownEndTick`, and `respawn` (a loser waiting out of the world until `respawnTick`).
++- `attempts`: one per attacker, with `defenderId`, `mode`, `aim`, `startTick` and `landTick`. These are the telegraphs to draw.
++- `duels`: every duel from reservation to settlement, in reservation order. Each has `id = duel:<tick>:<attacker id length>:<attacker>:<defender>`, `mode`, `players` (attacker, defender), each player's position at the hit, and the encounter position (their midpoint). `phase` is `transition`, `fighting` or `ended`, and the duel also holds `startTick` and `end`.
++
++`duelMarkers(state)` gives other players what §6 allows: `{ x, y, startTick }` for each duel, with no id and no player names. Spawn protection comes from `createEncounterState(config, { tick, spawnProtected: ids })` (45 s, §2).
++
++## One tick, and where the caller runs it
++
++The room runs `stepEncounters` first in each world tick, **before `stepClaim`** (§5: accepted reservations first). It passes the previous tick's claim and ledger outcomes as `protectionEndedBy` (`claim` after a `protection-ended` from `stepClaim`, `collection` after a ledger collection start). A protection ended by an objective therefore reaches the encounter rules one tick (50 ms) late. This lag is accepted. Within the step:
++
++1. **Match over** (`matchOver: true`): every attempt is cancelled (`match-over`), and the state closes.
++2. **Protection** that has run out (`expired`), or that last tick's claim or collection ended, ends.
++3. **Reports**, in a fixed order. An `end` report is accepted once per duel (`duel-ended`), in `transition` or `fighting`, with its tick between the reservation and now. A second end report, an unknown duel, a stranger as winner, a future tick or a settlement before the end each give `report-refused` and change nothing. A `settled` report removes the duel (`duel-settled`) and returns its players:
++   - after a **win**, the winner goes back to their own position at the hit (`player-returned`, `win`, 8 s from the settlement tick). The loser is `player-respawning` until 15 s after the fight's *end* tick, or the settlement tick if that is later, so the theft choice doesn't lengthen the wait;
++   - after a **draw or cancellation**, both players go to the centres of two distinct navigable tiles within 6 tiles of the encounter and at least 3 tiles apart (`player-returned`, `draw`, 8 s). The pair chosen is the one nearest to where each player stood, ties row-major.
++4. **Respawns** that are due take place (`player-respawned`, `respawn`, 20 s). The loser goes to the dock nearest the encounter with no other player (except those still respawning) within `SIGHT_RADIUS_TILES`, ties by dock id. If every dock has an opponent that close, the loser goes to the dock farthest from its nearest opponent. The dock is chosen from positions on the respawn tick.
++5. **Transitions.** A fight starts once the 3 s countdown is over and both clients report `ready` (`duel-started`). If a client is still not ready 10 s after the reservation, it forfeits (`duel-forfeited`, which ends the duel with that tick as its end tick). If both are still not ready, the duel is cancelled (`duel-cancelled`, §12's double forfeit).
++6. **Attempts.** Attempts whose attacker is no longer eligible are cancelled. Every attempt landing on this tick is resolved at once. Misses come first. Hits are sorted by attacker-to-defender distance, then attacker id, then defender id. A hit reserves a duel (`duel-reserved`) if both of its players are still free and the cap allows another duel. If a player is already taken, the hit is `attempt-preempted` (`conflict`). If the cap is reached, the hit is `attempt-preempted` (`duel-cap`). Neither costs a cooldown. Pending attempts by players just reserved are cancelled.
++7. **Presses** start attempts (`attempt-started`, with `protection-ended`/`attack` first if the attacker was protected). Targets are chosen from the state before any of this tick's starts, so a protected player who attacks on this tick becomes a target only from the next tick.
++
++## Mapping onto the ledger and the claim
++
++| Event or report | The caller does |
++| --- | --- |
++| `duel-reserved` | `reserveDuel({ duelId, players, tick })`. Pass `state.duels` as the claim's `encounters` (`{ id, playerIds: players }`). |
++| `duel-forfeited` | `reportDuelResult({ duelId, tick, outcome: "win", winner })`. Do not send an `end` report back. |
++| `duel-cancelled` | `reportDuelResult({ duelId, tick, outcome: "cancelled" })`. Do not send an `end` report back. |
++| A fight that ran ends (or a player quits, or the server faults) | `reportDuelResult` with the result, and an `end` report (`win` + `winner`, `draw` or `cancelled`) with the tick it ended. |
++| The ledger settles the duel (a draw or cancellation at once, a win at `chooseTheft` or `advanceLedger`) | A `settled` report with the ledger's settlement tick. |
++| `player-returned`, `player-respawned` | Move the ship (or player) to `x, y`. `protection` is also the claim's `protected` flag. |
++| `stepClaim` emits `protection-ended`, or the ledger starts a collection | Set `protectionEndedBy` next tick. |
++| `stepClaim` emits `match-ended` (its `duel-ended-without-theft` ends running duels) | Set `matchOver: true` next tick. |
++
++## Open points
++
++- Island walking doesn't exist yet. The island challenge is tested for timing, range, cone and cooldown only, with caller-supplied positions.
++- If a sea has no valid pair of draw points within 6 tiles, both ships stay where they were. The property tests check the spacing on every draw they produce.
+diff --git a/packages/content/package.json b/packages/content/package.json
+index 64bc7a4..7facf62 100644
+--- a/packages/content/package.json
++++ b/packages/content/package.json
+@@ -27,6 +27,11 @@
+       "@pirate-sea-race/source": "./src/objectives/index.ts",
+       "types": "./dist/objectives/index.d.ts",
+       "default": "./dist/objectives/index.js"
++    },
++    "./encounters": {
++      "@pirate-sea-race/source": "./src/encounters/index.ts",
++      "types": "./dist/encounters/index.d.ts",
++      "default": "./dist/encounters/index.js"
+     }
+   },
+   "files": [
+diff --git a/packages/content/src/encounters/encounters.test.ts b/packages/content/src/encounters/encounters.test.ts
+new file mode 100644
+index 0000000..9dba588
+--- /dev/null
++++ b/packages/content/src/encounters/encounters.test.ts
+@@ -0,0 +1,52 @@
++import { describe, expect, it } from "vitest";
++import { ENGAGEMENT_RANGE_TILES, SIGHT_RADIUS_TILES, WORLD_STEPS_PER_SECOND } from "../sailing.js";
++import { encounterRules, secondsToTicks, validateEncounterRules } from "./index.js";
++
++function issuesOf(candidate: unknown): string[] {
++  const result = validateEncounterRules(candidate);
++  return result.ok ? [] : result.issues;
++}
++
++describe("encounter rules (§2, §6, §14)", () => {
++  it("hold §6's timings in world ticks and the decided ranges and cones", () => {
++    expect(WORLD_STEPS_PER_SECOND).toBe(20);
++    expect(secondsToTicks(0.6)).toBe(12);
++    expect(encounterRules.grapple).toEqual({ windupTicks: 20, rangeTiles: ENGAGEMENT_RANGE_TILES, hitConeHeadings: 4, targetConeHeadings: 8, missCooldownTicks: 120 });
++    expect(encounterRules.challenge).toEqual({ windupTicks: 12, rangeTiles: 2, hitConeHeadings: 4, targetConeHeadings: 8, missCooldownTicks: 120 });
++    expect(encounterRules).toMatchObject({
++      maxDuels: 4,
++      transitionTicks: 60,
++      readyTimeoutTicks: 200,
++      spawnProtectionTicks: 900,
++      winProtectionTicks: 160,
++      drawProtectionTicks: 160,
++      respawnDelayTicks: 300,
++      respawnProtectionTicks: 400,
++      respawnClearRadiusTiles: SIGHT_RADIUS_TILES,
++      drawReturnMinSeparationTiles: 3,
++      drawReturnMaxDistanceTiles: 6,
++    });
++    expect(validateEncounterRules(encounterRules)).toEqual({ ok: true, value: encounterRules });
++  });
++
++  it("refuse a negative duration", () => {
++    expect(issuesOf({ ...encounterRules, respawnDelayTicks: -1 })[0]).toMatch(/^respawnDelayTicks:/);
++    expect(issuesOf({ ...encounterRules, grapple: { ...encounterRules.grapple, missCooldownTicks: -120 } })[0]).toMatch(/^grapple\.missCooldownTicks:/);
++    expect(issuesOf({ ...encounterRules, challenge: { ...encounterRules.challenge, windupTicks: -12 } })[0]).toMatch(/^challenge\.windupTicks:/);
++  });
++
++  it("refuse a range above the sight radius, but allow one exactly at it", () => {
++    const beyond = { ...encounterRules, grapple: { ...encounterRules.grapple, rangeTiles: SIGHT_RADIUS_TILES + 1 } };
++    expect(issuesOf(beyond)[0]).toMatch(/^grapple\.rangeTiles:/);
++    expect(issuesOf({ ...encounterRules, challenge: { ...encounterRules.challenge, rangeTiles: SIGHT_RADIUS_TILES } })).toEqual([]);
++  });
++
++  it("refuse a zero windup, fractional ticks, cones past a half turn, bad return geometry and unknown fields", () => {
++    expect(issuesOf({ ...encounterRules, grapple: { ...encounterRules.grapple, windupTicks: 0 } })[0]).toMatch(/^grapple\.windupTicks:/);
++    expect(issuesOf({ ...encounterRules, transitionTicks: 1.5 })[0]).toMatch(/^transitionTicks:/);
++    expect(issuesOf({ ...encounterRules, grapple: { ...encounterRules.grapple, hitConeHeadings: 33 } })[0]).toMatch(/^grapple\.hitConeHeadings:/);
++    expect(issuesOf({ ...encounterRules, readyTimeoutTicks: 59 })[0]).toMatch(/^readyTimeoutTicks:/);
++    expect(issuesOf({ ...encounterRules, drawReturnMinSeparationTiles: 13 })[0]).toMatch(/^drawReturnMinSeparationTiles:/);
++    expect(issuesOf({ ...encounterRules, extra: 1 })).toHaveLength(1);
++  });
++});
+diff --git a/packages/content/src/encounters/index.ts b/packages/content/src/encounters/index.ts
+new file mode 100644
+index 0000000..0afde2d
+--- /dev/null
++++ b/packages/content/src/encounters/index.ts
+@@ -0,0 +1 @@
++export * from "./rules.js";
+diff --git a/packages/content/src/encounters/rules.ts b/packages/content/src/encounters/rules.ts
+new file mode 100644
+index 0000000..2cced82
+--- /dev/null
++++ b/packages/content/src/encounters/rules.ts
+@@ -0,0 +1,127 @@
++import { z } from "zod";
++import { formatIssues, type ValidationResult } from "../rules.js";
++import { ENGAGEMENT_RANGE_TILES, SIGHT_RADIUS_TILES, WORLD_STEPS_PER_SECOND } from "../sailing.js";
++
++/** §6 at sea: the grapple's telegraphed windup. */
++export const GRAPPLE_WINDUP_SECONDS = 1;
++/** §6 on islands: the visible lunge. */
++export const CHALLENGE_LUNGE_SECONDS = 0.6;
++/** §6 on islands: "close range". A placeholder until walking on islands exists. */
++export const CHALLENGE_RANGE_TILES = 2;
++/** §6: a miss costs this long before the next attempt; the grapple uses the challenge's six seconds. */
++export const MISS_COOLDOWN_SECONDS = 6;
++/** The hit area at landing: within this many headings (of 64) of the aim locked at the start, ±22.5°. */
++export const HIT_CONE_HEADINGS = 4;
++/** Target choice at the start: within this many headings of the attacker's own heading, ±45°. */
++export const TARGET_CONE_HEADINGS = 8;
++/** §14: at most this many 1v1 duels at once, counted from reservation to settlement. */
++export const MAX_SIMULTANEOUS_DUELS = 4;
++/** §6: the transition's visible countdown. */
++export const TRANSITION_COUNTDOWN_SECONDS = 3;
++/** §6: a client not ready this long after the reservation forfeits. */
++export const READY_TIMEOUT_SECONDS = 10;
++/** §2: departure protection from the start of player control. */
++export const SPAWN_PROTECTION_SECONDS = 45;
++/** §6: the winner's escape protection. */
++export const WIN_PROTECTION_SECONDS = 8;
++/** §6: a draw's (or a cancellation's) protection. */
++export const DRAW_PROTECTION_SECONDS = 8;
++/** §6: the loser respawns this long after the fight ended... */
++export const RESPAWN_DELAY_SECONDS = 15;
++/** ...with this long of protection. */
++export const RESPAWN_PROTECTION_SECONDS = 20;
++/** §6: a draw returns both players to separate points at least this far apart... */
++export const DRAW_RETURN_MIN_SEPARATION_TILES = 3;
++/** ...and within this far of the encounter. */
++export const DRAW_RETURN_MAX_DISTANCE_TILES = 6;
++
++/** Whole world ticks (20 a second) for a duration in seconds. */
++export function secondsToTicks(seconds: number): number {
++  return Math.round(seconds * WORLD_STEPS_PER_SECOND);
++}
++
++const ticks = z.int().nonnegative();
++const headings = z.int().min(0).max(32);
++
++/** One attack kind (§6): the sea grapple or the island challenge. */
++export const attackRulesSchema = z.strictObject({
++  /** The telegraph: the attempt lands this many ticks after it starts. At least one, so it can be escaped. */
++  windupTicks: z.int().positive(),
++  /** Centre to centre, at the start and at landing; within the sight radius, so no one attacks what they cannot see. */
++  rangeTiles: z.int().positive().max(SIGHT_RADIUS_TILES),
++  hitConeHeadings: headings,
++  targetConeHeadings: headings,
++  missCooldownTicks: ticks,
++});
++
++export type AttackRules = z.infer<typeof attackRulesSchema>;
++
++/** The encounter rules of §2, §6 and §14 in world ticks and tiles; the simulation converts tiles to sub-units. */
++export const encounterRulesSchema = z
++  .strictObject({
++    grapple: attackRulesSchema,
++    challenge: attackRulesSchema,
++    maxDuels: z.int().positive(),
++    transitionTicks: ticks,
++    readyTimeoutTicks: ticks,
++    spawnProtectionTicks: ticks,
++    winProtectionTicks: ticks,
++    drawProtectionTicks: ticks,
++    respawnDelayTicks: ticks,
++    respawnProtectionTicks: ticks,
++    /** A loser respawns at the nearest dock with no opponent this close (the sight radius, §3). */
++    respawnClearRadiusTiles: z.int().positive(),
++    drawReturnMinSeparationTiles: z.int().positive(),
++    drawReturnMaxDistanceTiles: z.int().positive(),
++  })
++  .superRefine((rules, ctx) => {
++    if (rules.readyTimeoutTicks < rules.transitionTicks) {
++      ctx.addIssue({
++        code: "custom",
++        path: ["readyTimeoutTicks"],
++        message: `the ready timeout (${rules.readyTimeoutTicks} ticks) ends before the countdown (${rules.transitionTicks} ticks)`,
++      });
++    }
++    if (rules.drawReturnMinSeparationTiles > 2 * rules.drawReturnMaxDistanceTiles) {
++      ctx.addIssue({
++        code: "custom",
++        path: ["drawReturnMinSeparationTiles"],
++        message: `two points within ${rules.drawReturnMaxDistanceTiles} tiles cannot be ${rules.drawReturnMinSeparationTiles} tiles apart`,
++      });
++    }
++  });
++
++export type EncounterRules = z.infer<typeof encounterRulesSchema>;
++
++export const encounterRules: EncounterRules = {
++  grapple: {
++    windupTicks: secondsToTicks(GRAPPLE_WINDUP_SECONDS),
++    rangeTiles: ENGAGEMENT_RANGE_TILES,
++    hitConeHeadings: HIT_CONE_HEADINGS,
++    targetConeHeadings: TARGET_CONE_HEADINGS,
++    missCooldownTicks: secondsToTicks(MISS_COOLDOWN_SECONDS),
++  },
++  challenge: {
++    windupTicks: secondsToTicks(CHALLENGE_LUNGE_SECONDS),
++    rangeTiles: CHALLENGE_RANGE_TILES,
++    hitConeHeadings: HIT_CONE_HEADINGS,
++    targetConeHeadings: TARGET_CONE_HEADINGS,
++    missCooldownTicks: secondsToTicks(MISS_COOLDOWN_SECONDS),
++  },
++  maxDuels: MAX_SIMULTANEOUS_DUELS,
++  transitionTicks: secondsToTicks(TRANSITION_COUNTDOWN_SECONDS),
++  readyTimeoutTicks: secondsToTicks(READY_TIMEOUT_SECONDS),
++  spawnProtectionTicks: secondsToTicks(SPAWN_PROTECTION_SECONDS),
++  winProtectionTicks: secondsToTicks(WIN_PROTECTION_SECONDS),
++  drawProtectionTicks: secondsToTicks(DRAW_PROTECTION_SECONDS),
++  respawnDelayTicks: secondsToTicks(RESPAWN_DELAY_SECONDS),
++  respawnProtectionTicks: secondsToTicks(RESPAWN_PROTECTION_SECONDS),
++  respawnClearRadiusTiles: SIGHT_RADIUS_TILES,
++  drawReturnMinSeparationTiles: DRAW_RETURN_MIN_SEPARATION_TILES,
++  drawReturnMaxDistanceTiles: DRAW_RETURN_MAX_DISTANCE_TILES,
++};
++
++export function validateEncounterRules(candidate: unknown): ValidationResult<EncounterRules> {
++  const parsed = encounterRulesSchema.safeParse(candidate);
++  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, issues: formatIssues(parsed.error) };
++}
+diff --git a/packages/simulation/package.json b/packages/simulation/package.json
+index b2caab1..294f505 100644
+--- a/packages/simulation/package.json
++++ b/packages/simulation/package.json
+@@ -29,6 +29,11 @@
+       "@pirate-sea-race/source": "./src/netcode/index.ts",
+       "types": "./dist/netcode/index.d.ts",
+       "default": "./dist/netcode/index.js"
++    },
++    "./encounters": {
++      "@pirate-sea-race/source": "./src/encounters/index.ts",
++      "types": "./dist/encounters/index.d.ts",
++      "default": "./dist/encounters/index.js"
+     }
+   },
+   "files": [
+diff --git a/packages/simulation/src/encounters/determinism.test.ts b/packages/simulation/src/encounters/determinism.test.ts
+new file mode 100644
+index 0000000..ead7ab0
+--- /dev/null
++++ b/packages/simulation/src/encounters/determinism.test.ts
+@@ -0,0 +1,388 @@
++import { createSeaMap, HEADING_COUNT, isNavigable, seaMap, type SeaMapDefinition } from "@pirate-sea-race/content";
++import { describe, expect, it } from "vitest";
++import { nextInt } from "../random.js";
++import {
++  bearing,
++  createEncounterConfig,
++  createEncounterState,
++  ENCOUNTER_EVENT_KINDS,
++  encounterRules,
++  hashState,
++  stepEncounters,
++  tileCentre,
++  tileOf,
++  type DuelReport,
++  type EncounterConfig,
++  type EncounterEvent,
++  type EncounterMode,
++  type EncounterPlayerInput,
++  type EncounterState,
++  type EncounterTickInput,
++} from "./index.js";
++
++type Draw = (bound: number) => number;
++
++function generator(seed: number): Draw {
++  let rng = seed;
++  return (bound) => {
++    const drawn = nextInt(rng, bound);
++    rng = drawn.state;
++    return drawn.value;
++  };
++}
++
++function shuffled<T>(items: readonly T[], draw: Draw): T[] {
++  const copy = [...items];
++  for (let index = copy.length - 1; index > 0; index--) {
++    const other = draw(index + 1);
++    [copy[index], copy[other]] = [copy[other]!, copy[index]!];
++  }
++  return copy;
++}
++
++/** A small synthetic sea: scattered land and shoals, and a dock on each side. */
++function syntheticSea(seed: number, size: number): SeaMapDefinition {
++  const draw = generator(seed);
++  const rows = Array.from({ length: size }, (_, row) =>
++    Array.from({ length: size }, (_, column) => {
++      if ((row === 1 && column === Math.floor(size / 2)) || (row === size - 2 && column === 2) || (column === size - 2 && row === 3)) return "D";
++      const roll = draw(100);
++      return roll < 7 ? "#" : roll < 12 ? "%" : ".";
++    }).join(""),
++  );
++  return createSeaMap({ name: `synthetic-${seed}`, widthTiles: size, heightTiles: size, rows, islands: [], spawnSlots: [], hub: { tileX: size >> 1, tileY: size >> 1 } });
++}
++
++interface Scenario {
++  readonly name: string;
++  readonly map: SeaMapDefinition;
++  readonly config: EncounterConfig;
++  /** Players on foot are allowed (the islands' placeholder rules). */
++  readonly foot: boolean;
++  /** Players start within this many tiles of the map's hub. */
++  readonly spread: number;
++}
++
++const sliceScenario: Scenario = { name: "slice sea", map: seaMap, config: createEncounterConfig(), foot: false, spread: 7 };
++const smallA = syntheticSea(11, 20);
++const smallB = syntheticSea(23, 14);
++const scenarios: readonly Scenario[] = [
++  sliceScenario,
++  { name: "synthetic 20×20", map: smallA, config: createEncounterConfig({ map: smallA }), foot: true, spread: 9 },
++  // A cap of two duels, so a hit meets the cap often.
++  { name: "synthetic 14×14, cap 2", map: smallB, config: createEncounterConfig({ map: smallB, rules: { ...encounterRules, maxDuels: 2 } }), foot: true, spread: 6 },
++  { name: "synthetic 20×20, cap 1", map: smallA, config: createEncounterConfig({ map: smallA, rules: { ...encounterRules, maxDuels: 1 } }), foot: false, spread: 5 },
++];
++
++const ID_POOL = ["p1", "p10", "p2", "P3", "a", "B", "crew", "Z9", "m", "q7", "x"];
++
++interface DuelPlan {
++  readonly readyAt: readonly [number | null, number | null];
++  readonly fightTicks: number;
++  readonly outcome: "win" | "draw" | "cancelled";
++  readonly winner: 0 | 1;
++  readonly settleDelay: number;
++}
++
++interface Run {
++  readonly spawnProtected: readonly string[];
++  readonly inputs: readonly EncounterTickInput[];
++  readonly states: readonly EncounterState[];
++  readonly hashes: readonly string[];
++  readonly events: readonly (readonly EncounterEvent[])[];
++}
++
++/**
++ * A reactive match: players wander (ships over navigable tiles only), turn, press, disconnect, change mode, and
++ * report objective ends; a duel plan decides each reserved duel's readiness, fight, result and settlement, reported
++ * as the caller would; returns move the players. Now and then it sends a stray report the rules must refuse.
++ */
++function play(scenario: Scenario, seed: number, ticks: number): Run {
++  const { map, config } = scenario;
++  const draw = generator(seed);
++  const chance = (perMille: number) => draw(1000) < perMille;
++  const count = 4 + draw(ID_POOL.length - 3);
++  const ids = shuffled(ID_POOL, draw).slice(0, count);
++  const hub = map.hub;
++  const navigableNear = (tileX: number, tileY: number, radius: number) => {
++    for (let attempt = 0; attempt < 200; attempt++) {
++      const x = tileX + draw(2 * radius + 1) - radius;
++      const y = tileY + draw(2 * radius + 1) - radius;
++      if (isNavigable(map, x, y)) return tileCentre(map, { tileX: x, tileY: y });
++    }
++    return null;
++  };
++  const players = new Map<string, EncounterPlayerInput>();
++  for (const id of ids) {
++    const at = navigableNear(hub.tileX, hub.tileY, scenario.spread)!;
++    players.set(id, { id, mode: "ship", ...at, heading: draw(HEADING_COUNT), connected: true, attack: false, ready: false, protectionEndedBy: null });
++  }
++  const matchOverAt = seed % 5 === 0 ? ticks - 30 - draw(200) : -1;
++  const spawnProtected = ids.filter(() => draw(3) === 0);
++  let state = createEncounterState(config, { spawnProtected });
++  const plans = new Map<string, DuelPlan>();
++  const inputs: EncounterTickInput[] = [];
++  const states: EncounterState[] = [];
++  const events: EncounterEvent[][] = [];
++
++  for (let tick = 1; tick <= ticks; tick++) {
++    // Now and then everyone presses at once, so hits land together and conflict.
++    const volley = chance(25) || (tick >= matchOverAt - 10 && tick < matchOverAt);
++    const inDuel = new Set(state.duels.flatMap((duel) => duel.players));
++    const respawning = new Set(state.players.filter((player) => player.respawn !== null).map((player) => player.id));
++    for (const id of ids) {
++      let player = { ...players.get(id)!, attack: false, protectionEndedBy: null as EncounterPlayerInput["protectionEndedBy"] };
++      if (!inDuel.has(id) && !respawning.has(id)) {
++        if (player.mode === "ship") {
++          if (chance(500)) {
++            const x = player.x + draw(97) - 48;
++            const y = player.y + draw(97) - 48;
++            const tile = tileOf(map, { x, y });
++            if (isNavigable(map, tile.tileX, tile.tileY)) player = { ...player, x, y };
++          }
++          if (chance(30)) {
++            const tile = tileOf(map, player);
++            const jump = navigableNear(tile.tileX, tile.tileY, 3);
++            if (jump !== null) player = { ...player, ...jump };
++          }
++          // Closing in: a jump to within two tiles of someone else.
++          if (chance(15)) {
++            const tile = tileOf(map, players.get(ids[draw(ids.length)]!)!);
++            const jump = navigableNear(tile.tileX, tile.tileY, 2);
++            if (jump !== null) player = { ...player, ...jump };
++          }
++        } else if (chance(500)) {
++          const limit = map.widthTiles * map.subUnitsPerTile - 1;
++          player = { ...player, x: Math.min(limit, Math.max(0, player.x + draw(129) - 64)), y: Math.min(limit, Math.max(0, player.y + draw(129) - 64)) };
++        }
++        if (chance(200)) player = { ...player, heading: (player.heading + draw(9) - 4 + HEADING_COUNT) % HEADING_COUNT };
++        // Chasing: turn towards someone, as a player lining up a grapple would.
++        if (chance(40)) {
++          const other = players.get(ids[draw(ids.length)]!)!;
++          player = { ...player, heading: bearing(player, other) ?? player.heading };
++        }
++        if (chance(20)) player = { ...player, heading: draw(HEADING_COUNT) };
++        if (scenario.foot && chance(4)) {
++          const tile = tileOf(map, player);
++          const mode: EncounterMode = player.mode === "ship" ? "foot" : "ship";
++          if (mode === "foot" || isNavigable(map, tile.tileX, tile.tileY)) player = { ...player, mode };
++        }
++        if (volley || chance(80)) player = { ...player, attack: true };
++      }
++      if (chance(5)) player = { ...player, connected: !player.connected };
++      if (chance(6)) player = { ...player, protectionEndedBy: draw(2) === 0 ? "claim" : "collection" };
++      players.set(id, player);
++    }
++
++    // Readiness, results and settlements, as the room and the ledger would report them.
++    const reports: DuelReport[] = [];
++    for (const duel of state.duels) {
++      let plan = plans.get(duel.id);
++      if (plan === undefined) {
++        const style = draw(10);
++        const soon = () => duel.reservedTick + draw(90);
++        const readyAt: [number | null, number | null] = style < 6 ? [soon(), soon()] : style < 8 ? (draw(2) === 0 ? [soon(), null] : [null, soon()]) : [null, null];
++        const roll = draw(10);
++        plan = { readyAt, fightTicks: 20 + draw(200), outcome: roll < 7 ? "win" : roll < 9 ? "draw" : "cancelled", winner: draw(2) as 0 | 1, settleDelay: draw(10) < 7 ? draw(120) : 280 + draw(120) };
++        plans.set(duel.id, plan);
++      }
++      duel.players.forEach((id, index) => {
++        const readyAt = plan.readyAt[index] ?? null;
++        players.set(id, { ...players.get(id)!, ready: readyAt !== null && tick >= readyAt });
++      });
++      if (duel.phase === "fighting" && tick >= duel.startTick! + plan.fightTicks) {
++        const at = Math.max(duel.startTick!, tick - draw(2));
++        reports.push(plan.outcome === "win" ? { kind: "end", duelId: duel.id, tick: at, outcome: "win", winner: duel.players[plan.winner] } : { kind: "end", duelId: duel.id, tick: at, outcome: plan.outcome });
++      }
++      if (duel.phase === "ended" && tick >= duel.end!.tick + (duel.end!.outcome === "win" ? plan.settleDelay : 1)) {
++        reports.push({ kind: "settled", duelId: duel.id, tick: Math.max(duel.end!.tick, tick - draw(2)) });
++      }
++      if (chance(4)) reports.push({ kind: "end", duelId: duel.id, tick: tick - draw(3), outcome: "draw" });
++      if (chance(3)) reports.push({ kind: "settled", duelId: duel.id, tick });
++      if (chance(2)) reports.push({ kind: "end", duelId: duel.id, tick, outcome: "win", winner: "nobody" });
++    }
++    if (chance(3)) reports.push({ kind: "settled", duelId: "ghost", tick });
++
++    const input: EncounterTickInput = { tick, players: ids.map((id) => players.get(id)!), reports, matchOver: tick >= matchOverAt && matchOverAt > 0 };
++    const stepped = stepEncounters(config, state, input);
++    for (const event of stepped.events) {
++      if (event.kind === "player-returned" || event.kind === "player-respawned") {
++        players.set(event.playerId, { ...players.get(event.playerId)!, x: event.x, y: event.y, ready: false });
++      }
++    }
++    inputs.push(input);
++    states.push(stepped.state);
++    events.push([...stepped.events]);
++    state = stepped.state;
++  }
++  return { spawnProtected, inputs, states, hashes: states.map(hashState), events };
++}
++
++/** Steps recorded inputs without reacting to anything. */
++function replay(config: EncounterConfig, inputs: readonly EncounterTickInput[], spawnProtected: readonly string[]): Run {
++  let state = createEncounterState(config, { spawnProtected });
++  const states: EncounterState[] = [];
++  const events: EncounterEvent[][] = [];
++  for (const input of inputs) {
++    const stepped = stepEncounters(config, state, input);
++    state = stepped.state;
++    states.push(state);
++    events.push([...stepped.events]);
++  }
++  return { spawnProtected, inputs, states, hashes: states.map(hashState), events };
++}
++
++const spawnProtectedOf = (run: Run) => run.spawnProtected;
++
++const TICKS = 1600;
++const SEEDS = Array.from({ length: 40 }, (_, index) => index + 1);
++const cases = SEEDS.map((seed) => ({ seed, scenario: scenarios[seed % scenarios.length]! }));
++const runs = new Map<number, Run>();
++function runFor(seed: number): Run {
++  let run = runs.get(seed);
++  if (run === undefined) {
++    run = play(scenarios[seed % scenarios.length]!, seed, TICKS);
++    runs.set(seed, run);
++  }
++  return run;
++}
++
++function isProtectedOnTick(state: EncounterState, input: EncounterTickInput, id: string): boolean {
++  const protection = state.players.find((player) => player.id === id)?.protection ?? null;
++  const reported = input.players.find((player) => player.id === id)?.protectionEndedBy ?? null;
++  return protection !== null && input.tick < protection.endTick && reported === null;
++}
++
++describe("seeded random matches (§6 invariants)", () => {
++  it.each(cases)("seed $seed ($scenario.name) keeps every invariant after every tick", ({ seed, scenario }) => {
++    const { config, map } = scenario;
++    const run = runFor(seed);
++    let previous = createEncounterState(config, { spawnProtected: spawnProtectedOf(run) });
++    run.states.forEach((state, index) => {
++      const input = run.inputs[index]!;
++      const events = run.events[index]!;
++      const inDuels = state.duels.flatMap((duel) => duel.players);
++      // No player in two duels; never more than the cap, itself at most four.
++      expect(new Set(inDuels).size).toBe(inDuels.length);
++      expect(state.duels.length).toBeLessThanOrEqual(config.maxDuels);
++      expect(config.maxDuels).toBeLessThanOrEqual(4);
++      // No attempt belongs to a reserved or respawning attacker, and each attacker has one.
++      for (const attempt of state.attempts) {
++        expect(inDuels).not.toContain(attempt.attackerId);
++        expect(state.players.find((player) => player.id === attempt.attackerId)?.respawn ?? null).toBeNull();
++      }
++      expect(new Set(state.attempts.map((attempt) => attempt.attackerId)).size).toBe(state.attempts.length);
++      const wasInDuel = new Set(previous.duels.flatMap((duel) => duel.players));
++      for (const event of events) {
++        if (event.kind === "duel-reserved") {
++          // No hit on a protected, reserved or respawning defender; nor by one.
++          for (const id of event.players) {
++            expect(wasInDuel.has(id)).toBe(false);
++            expect(previous.players.find((player) => player.id === id)?.respawn ?? null).toBeNull();
++          }
++          expect(isProtectedOnTick(previous, input, event.players[1])).toBe(false);
++          expect(state.players.find((player) => player.id === event.players[1])?.protection ?? null).toBeNull();
++          expect(input.players.find((player) => player.id === event.players[0])?.connected).toBe(true);
++        }
++        // Every ship-mode return point is navigable; a draw's two are apart and near the encounter.
++        if (event.kind === "player-returned") {
++          const duel = previous.duels.find((candidate) => candidate.id === event.duelId)!;
++          if (duel.mode === "ship") {
++            const tile = tileOf(map, event);
++            expect(isNavigable(map, tile.tileX, tile.tileY)).toBe(true);
++          }
++        }
++        if (event.kind === "player-respawned") {
++          const respawn = previous.players.find((player) => player.id === event.playerId)?.respawn;
++          const mode = respawn?.mode ?? state.duels.find((duel) => duel.players.includes(event.playerId))?.mode;
++          if (mode === "ship" || respawn === undefined) {
++            const tile = tileOf(map, event);
++            expect(isNavigable(map, tile.tileX, tile.tileY)).toBe(true);
++            expect(event.dockId).not.toBeNull();
++          }
++        }
++      }
++      const returns = events.filter((event) => event.kind === "player-returned");
++      for (const duelId of new Set(returns.map((event) => event.duelId))) {
++        const pair = returns.filter((event) => event.duelId === duelId);
++        const duel = previous.duels.find((candidate) => candidate.id === duelId)!;
++        if (pair.length !== 2 || duel.mode !== "ship") continue;
++        const [p, q] = pair as [(typeof pair)[0], (typeof pair)[0]];
++        const tile = map.subUnitsPerTile;
++        expect((p.x - q.x) ** 2 + (p.y - q.y) ** 2).toBeGreaterThanOrEqual((3 * tile) ** 2);
++        for (const point of pair) expect((point.x - duel.x) ** 2 + (point.y - duel.y) ** 2).toBeLessThanOrEqual((6 * tile) ** 2);
++      }
++      previous = state;
++    });
++  });
++
++  it.each(cases.slice(0, 12))("seed $seed ($scenario.name) replays to the same hashState on every tick", ({ seed, scenario }) => {
++    const run = runFor(seed);
++    const again = replay(scenario.config, JSON.parse(JSON.stringify(run.inputs)) as EncounterTickInput[], spawnProtectedOf(run));
++    expect(again.hashes).toEqual(run.hashes);
++    expect(again.events).toEqual(run.events);
++  });
++
++  it("EXERCISED: every event kind and every reason occurs across the seeds", () => {
++    const seen = new Set<string>();
++    for (const { seed } of cases) {
++      for (const event of runFor(seed).events.flat()) {
++        seen.add(event.kind);
++        if ("reason" in event) seen.add(`${event.kind}:${event.reason}`);
++      }
++    }
++    const EXERCISED = [
++      ...ENCOUNTER_EVENT_KINDS,
++      ...["expired", "attack", "claim", "collection"].map((reason) => `protection-ended:${reason}`),
++      ...["unknown-duel", "already-ended", "not-ended", "invalid"].map((reason) => `report-refused:${reason}`),
++      ...["attacker-ineligible", "match-over"].map((reason) => `attempt-cancelled:${reason}`),
++      ...["defender-ineligible", "out-of-range", "out-of-aim", "no-line-of-sight"].map((reason) => `attempt-missed:${reason}`),
++      ...["conflict", "duel-cap"].map((reason) => `attempt-preempted:${reason}`),
++    ];
++    expect(EXERCISED.filter((entry) => !seen.has(entry))).toEqual([]);
++  });
++});
++
++/** Renames player ids, and the player ids inside duel ids, everywhere in a value. */
++function renamer(rename: (id: string) => string, ids: ReadonlySet<string>) {
++  const renameString = (value: string): string => {
++    if (ids.has(value)) return rename(value);
++    const match = /^duel:(\d+):(\d+):(.*)$/.exec(value);
++    if (match === null) return value;
++    const length = Number(match[2]);
++    const attacker = match[3]!.slice(0, length);
++    const defender = match[3]!.slice(length + 1);
++    const renamed = rename(attacker);
++    return `duel:${match[1]}:${renamed.length}:${renamed}:${rename(defender)}`;
++  };
++  const walk = (value: unknown): unknown => {
++    if (typeof value === "string") return renameString(value);
++    if (Array.isArray(value)) return value.map(walk);
++    if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, walk(inner)]));
++    return value;
++  };
++  return walk;
++}
++
++describe("symmetry (§5 ordering)", () => {
++  it.each(cases.slice(0, 12))("seed $seed: the order of players and reports in each tick never matters", ({ seed, scenario }) => {
++    const run = runFor(seed);
++    const draw = generator(seed * 7919);
++    const reordered = run.inputs.map((input) => ({ ...input, players: shuffled(input.players, draw), reports: shuffled(input.reports, draw) }));
++    const again = replay(scenario.config, reordered, spawnProtectedOf(run));
++    expect(again.hashes).toEqual(run.hashes);
++    expect(again.events).toEqual(run.events);
++  });
++
++  it.each(cases.slice(0, 12))("seed $seed: relabelling players in an order-preserving way relabels the outcome and nothing else", ({ seed, scenario }) => {
++    const run = runFor(seed);
++    const ids = new Set(run.inputs[0]!.players.map((player) => player.id));
++    const sorted = [...ids].sort();
++    for (const rename of [(id: string) => `crew-${id}`, (id: string) => `n${String(sorted.indexOf(id)).padStart(2, "0")}`]) {
++      const walk = renamer(rename, ids);
++      const relabelled = replay(scenario.config, walk(run.inputs) as EncounterTickInput[], spawnProtectedOf(run).map(rename));
++      expect(relabelled.events).toEqual(walk(run.events));
++      expect(relabelled.states).toEqual(walk(run.states));
++    }
++  });
++});
+diff --git a/packages/simulation/src/encounters/encounters.test.ts b/packages/simulation/src/encounters/encounters.test.ts
+new file mode 100644
+index 0000000..7069318
+--- /dev/null
++++ b/packages/simulation/src/encounters/encounters.test.ts
+@@ -0,0 +1,625 @@
++import { createSeaMap, isNavigable, type SeaMapDefinition } from "@pirate-sea-race/content";
++import { describe, expect, it } from "vitest";
++import {
++  createEncounterConfig,
++  createEncounterState,
++  duelMarkers,
++  hashState,
++  stepEncounters,
++  tileCentre,
++  tileOf,
++  type DuelReport,
++  type EncounterConfig,
++  type EncounterEvent,
++  type EncounterPlayerInput,
++  type EncounterState,
++  type EncounterStateOptions,
++} from "./index.js";
++
++/**
++ * A 40 × 24 test sea: land at column 20, rows 3–6, a shoal at (20, 10), and a dock in each corner (ids 0–3:
++ * (1,1), (38,1), (1,22), (38,22)).
++ */
++const ROWS = Array.from({ length: 24 }, (_, row) => {
++  const tiles = Array.from({ length: 40 }, () => ".");
++  if (row >= 3 && row <= 6) tiles[20] = "#";
++  if (row === 10) tiles[20] = "%";
++  if (row === 1 || row === 22) tiles[1] = tiles[38] = "D";
++  return tiles.join("");
++});
++const map: SeaMapDefinition = createSeaMap({ name: "test", widthTiles: 40, heightTiles: 24, rows: ROWS, islands: [], spawnSlots: [], hub: { tileX: 20, tileY: 12 } });
++const config = createEncounterConfig({ map });
++const TILE = map.subUnitsPerTile;
++const at = (tileX: number, tileY: number) => tileCentre(map, { tileX, tileY });
++
++function ship(id: string, tileX: number, tileY: number, heading = 0, extra: Partial<EncounterPlayerInput> = {}): EncounterPlayerInput {
++  return { id, mode: "ship", ...at(tileX, tileY), heading, connected: true, attack: false, ready: false, protectionEndedBy: null, ...extra };
++}
++
++interface TickOptions {
++  readonly press?: readonly string[];
++  readonly reports?: readonly DuelReport[];
++  readonly matchOver?: boolean;
++}
++
++/** A scripted match: players persist between ticks; presses last one tick. */
++class World {
++  state: EncounterState;
++  readonly players = new Map<string, EncounterPlayerInput>();
++  readonly log: EncounterEvent[] = [];
++
++  constructor(
++    players: readonly EncounterPlayerInput[],
++    options: EncounterStateOptions = {},
++    readonly cfg: EncounterConfig = config,
++  ) {
++    this.state = createEncounterState(cfg, options);
++    for (const player of players) this.players.set(player.id, player);
++  }
++
++  get tick(): number {
++    return this.state.tick;
++  }
++
++  set(id: string, change: Partial<EncounterPlayerInput>): void {
++    this.players.set(id, { ...this.players.get(id)!, ...change });
++  }
++
++  remove(id: string): void {
++    this.players.delete(id);
++  }
++
++  step(options: TickOptions = {}): EncounterEvent[] {
++    const press = new Set(options.press ?? []);
++    const players = [...this.players.values()].map((player) => ({ ...player, attack: press.has(player.id) }));
++    const result = stepEncounters(this.cfg, this.state, { tick: this.state.tick + 1, players, reports: options.reports ?? [], matchOver: options.matchOver ?? false });
++    this.state = result.state;
++    this.log.push(...result.events);
++    // Reported protection ends are one-tick signals.
++    for (const player of this.players.values()) if (player.protectionEndedBy !== null) this.set(player.id, { protectionEndedBy: null });
++    return [...result.events];
++  }
++
++  /** Steps until `tick` has been processed, returning every event on the way. */
++  runTo(tick: number): EncounterEvent[] {
++    const events: EncounterEvent[] = [];
++    while (this.state.tick < tick) events.push(...this.step());
++    return events;
++  }
++
++  record(id: string) {
++    return this.state.players.find((player) => player.id === id);
++  }
++}
++
++const kinds = (events: readonly EncounterEvent[]) => events.map((event) => event.kind);
++const started = (events: readonly EncounterEvent[]) => events.filter((event) => event.kind === "attempt-started");
++const ofKind = <K extends EncounterEvent["kind"]>(events: readonly EncounterEvent[], kind: K) =>
++  events.filter((event): event is Extract<EncounterEvent, { kind: K }> => event.kind === kind);
++
++/** Presses once on tick 1 and runs to the landing tick (21). */
++function grapple(world: World, attacker: string): EncounterEvent[] {
++  const events = world.step({ press: [attacker] });
++  return [...events, ...world.runTo(1 + config.modes.ship.windupTicks)];
++}
++
++describe("starting an attempt (§6)", () => {
++  it("picks the nearest eligible ship in range, line of sight and the front cone, and locks the aim toward it", () => {
++    const world = new World([ship("a", 5, 12), ship("far", 9, 12), ship("near", 8, 12), ship("behind", 3, 12)]);
++    const events = world.step({ press: ["a"] });
++    expect(events).toEqual([{ kind: "attempt-started", tick: 1, attackerId: "a", defenderId: "near", mode: "ship", aim: 0, landTick: 21 }]);
++    expect(world.state.attempts).toEqual([{ attackerId: "a", defenderId: "near", mode: "ship", aim: 0, startTick: 1, landTick: 21 }]);
++  });
++
++  it("takes a target at the ±8 cone's edge and not one just outside it", () => {
++    // (2, -2) tiles is heading 56, 8 off heading 0; (1, -2) is heading 53, 11 off.
++    const edge = new World([ship("a", 5, 12), ship("edge", 7, 10), ship("ahead", 9, 12)]);
++    expect(started(edge.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "edge", aim: 56 });
++    const outside = new World([ship("a", 5, 12), ship("steep", 6, 10), ship("ahead", 9, 12)]);
++    expect(started(outside.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "ahead", aim: 0 });
++  });
++
++  it("reaches exactly the grapple range and not one sub-unit further", () => {
++    const world = new World([ship("a", 5, 12), { ...ship("b", 11, 12), x: at(5, 12).x + 6 * TILE + 1 }]);
++    expect(world.step({ press: ["a"] })).toEqual([]);
++    world.set("b", { x: at(5, 12).x + 6 * TILE });
++    expect(started(world.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "b" });
++  });
++
++  it("passes over a nearer ship behind land, but not one behind a shoal", () => {
++    // Land at column 20 rows 3–6; a shoal at (20, 10).
++    const land = new World([ship("a", 17, 5), ship("hidden", 22, 5), ship("seen", 17, 9, 16)]);
++    land.set("a", { heading: 0 });
++    expect(land.step({ press: ["a"] })).toEqual([]);
++    const shoal = new World([ship("a", 17, 10), ship("reef", 22, 10)]);
++    expect(started(shoal.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "reef" });
++  });
++
++  it("breaks a distance tie to the lower id, wherever the players stand and whatever order they arrive in", () => {
++    for (const [first, second] of [
++      ["zed", "bob"],
++      ["bob", "zed"],
++    ] as const) {
++      const world = new World([ship(first, 8, 11), ship("a", 5, 12), ship(second, 8, 13)]);
++      expect(started(world.step({ press: ["a"] }))[0]).toMatchObject({ defenderId: "bob" });
++    }
++  });
++
++  it("starts nothing and costs nothing when a press finds no target", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 12, 12)], { spawnProtected: ["a"] });
++    expect(world.step({ press: ["a"] })).toEqual([]);
++    expect(world.state.attempts).toEqual([]);
++    // No cooldown and the attacker keeps their protection.
++    expect(world.record("a")).toEqual({ id: "a", protection: { source: "spawn", endTick: 900 }, cooldownEndTick: 0, respawn: null });
++    world.set("b", { ...at(10, 12) });
++    expect(kinds(world.step({ press: ["a"] }))).toEqual(["protection-ended", "attempt-started"]);
++  });
++
++  it("ignores a press while the player's own attempt winds up", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 6, 12)]);
++    world.step({ press: ["a"] });
++    expect(world.step({ press: ["a"] })).toEqual([]);
++    expect(world.state.attempts).toHaveLength(1);
++  });
++});
++
++describe("escape (§6)", () => {
++  it("lands a hit on a defender who stayed", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
++    const events = grapple(world, "a");
++    expect(ofKind(events, "duel-reserved")).toEqual([
++      { kind: "duel-reserved", tick: 21, duelId: "duel:21:1:a:b", mode: "ship", players: ["a", "b"], x: Math.floor((at(5, 12).x + at(8, 12).x) / 2), y: at(5, 12).y },
++    ]);
++    expect(world.state.attempts).toEqual([]);
++  });
++
++  it("misses a defender who left the range, costing the attacker the cooldown", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
++    world.step({ press: ["a"] });
++    world.runTo(20);
++    world.set("b", at(12, 12));
++    expect(world.step()).toEqual([{ kind: "attempt-missed", tick: 21, attackerId: "a", defenderId: "b", reason: "out-of-range", cooldownEndTick: 141 }]);
++  });
++
++  it("misses a defender who left the aim, even within range", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
++    world.step({ press: ["a"] });
++    world.runTo(20);
++    // (3, -3) tiles: heading 56, 8 off the locked aim of 0.
++    world.set("b", at(8, 9));
++    expect(ofKind(world.step(), "attempt-missed")[0]).toMatchObject({ reason: "out-of-aim" });
++  });
++
++  it("misses a defender who slipped behind land", () => {
++    const world = new World([ship("a", 16, 7), ship("b", 21, 7)]);
++    world.step({ press: ["a"] });
++    world.runTo(20);
++    // (5, -1) tiles: heading 62, inside the aim, but the line crosses the land at (20, 6).
++    world.set("b", at(21, 6));
++    expect(ofKind(world.step(), "attempt-missed")[0]).toMatchObject({ reason: "no-line-of-sight" });
++  });
++
++  it("follows the aim while the defender stays inside it: moving within ±4 headings is no escape", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 9, 12)]);
++    world.step({ press: ["a"] });
++    world.runTo(20);
++    world.set("b", at(9, 11)); // (4, -1): heading 60, 4 off.
++    expect(kinds(world.step())).toEqual(["duel-reserved"]);
++  });
++});
++
++describe("cooldown on a miss only", () => {
++  it("refuses presses until the six seconds are over, then starts again", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
++    world.step({ press: ["a"] });
++    world.runTo(20);
++    world.set("b", at(12, 12));
++    world.step();
++    world.set("b", at(8, 12));
++    for (let tick = 22; tick < 141; tick++) expect(world.step({ press: ["a"] })).toEqual([]);
++    expect(world.record("a")?.cooldownEndTick).toBe(141);
++    expect(started(world.step({ press: ["a"] }))).toHaveLength(1);
++    expect(world.tick).toBe(141);
++    // A record with nothing left to remember is dropped.
++    expect(world.record("a")).toBeUndefined();
++  });
++
++  it("costs nothing for a preempted hit or a cancelled attempt", () => {
++    // b's attempt on c loses to a's closer hit on b, so b is reserved: a preemption.
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 10, 12), ship("d", 5, 20), ship("e", 7, 20)]);
++    world.step({ press: ["a", "b", "d"] });
++    world.set("d", { connected: false });
++    const events = world.runTo(21);
++    expect(ofKind(events, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "b", defenderId: "c", reason: "conflict" }]);
++    expect(ofKind(events, "attempt-cancelled")).toEqual([{ kind: "attempt-cancelled", tick: 2, attackerId: "d", defenderId: "e", reason: "attacker-ineligible" }]);
++    expect(world.record("d")).toBeUndefined();
++    world.set("d", { connected: true });
++    expect(started(world.step({ press: ["d"] }))).toHaveLength(1);
++  });
++});
++
++describe("eligibility at the start and at landing", () => {
++  it("never targets a protected defender, and a protected attacker's start ends their own protection", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 9, 12)], { spawnProtected: ["a", "b"] });
++    const events = world.step({ press: ["a"] });
++    expect(events).toEqual([
++      { kind: "protection-ended", tick: 1, playerId: "a", reason: "attack" },
++      { kind: "attempt-started", tick: 1, attackerId: "a", defenderId: "c", mode: "ship", aim: 0, landTick: 21 },
++    ]);
++    expect(world.record("b")?.protection).toEqual({ source: "spawn", endTick: 900 });
++  });
++
++  it("targets a protected player who presses on the same tick only from the next tick, whatever the input order", () => {
++    for (const order of [["a", "b"], ["b", "a"]]) {
++      const players = { a: ship("a", 5, 12), b: ship("b", 7, 12, 32) };
++      const world = new World(order.map((id) => players[id as "a" | "b"]), { spawnProtected: ["b"] });
++      const events = world.step({ press: ["a", "b"] });
++      expect(started(events).map((event) => [event.attackerId, event.defenderId])).toEqual([["b", "a"]]);
++    }
++  });
++
++  it("misses a defender reserved by someone else's hit during the windup, and never targets a reserved one", () => {
++    const world2 = new World([ship("a", 3, 12), ship("b", 7, 12), ship("c", 9, 12, 32)]);
++    world2.step({ press: ["c"] }); // c → b lands on tick 21
++    world2.runTo(5);
++    world2.step({ press: ["a"] }); // a → b, lands on tick 26
++    expect(ofKind(world2.runTo(21), "duel-reserved")).toHaveLength(1);
++    expect(world2.step({ press: ["a"] })).toEqual([]); // already attacking; and b is reserved anyway
++    expect(ofKind(world2.runTo(26), "attempt-missed")).toEqual([
++      { kind: "attempt-missed", tick: 26, attackerId: "a", defenderId: "b", reason: "defender-ineligible", cooldownEndTick: 146 },
++    ]);
++    // A fresh attacker finds no target among the reserved.
++    const world3 = new World([ship("a", 3, 12), ship("b", 7, 12), ship("c", 9, 12, 32)]);
++    world3.step({ press: ["c"] });
++    world3.runTo(21);
++    expect(world3.step({ press: ["a"] })).toEqual([]);
++  });
++
++  it("neither lets a respawning loser attack nor be attacked", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 8, 12)]);
++    world.set("a", { ready: true });
++    world.set("b", { ready: true });
++    grapple(world, "a");
++    world.runTo(81);
++    world.step({ reports: [{ kind: "end", duelId: "duel:21:1:a:b", tick: 82, outcome: "win", winner: "a" }] });
++    world.step({ reports: [{ kind: "settled", duelId: "duel:21:1:a:b", tick: 83 }] });
++    expect(world.record("b")?.respawn).toMatchObject({ respawnTick: 382 });
++    world.players.set("c", ship("c", 6, 12));
++    world.set("b", { heading: 32 });
++    expect(world.step({ press: ["c", "b"] })).toEqual([]);
++  });
++
++  it("refuses new attempts at the cap of four duels and preempts a hit that would exceed it, without cooldown", () => {
++    const pairs = [1, 8, 15, 22].flatMap((row, index) => [ship(`p${index}a`, 3, row), ship(`p${index}b`, 5, row)]);
++    const world = new World([...pairs, ship("x", 30, 12), ship("y", 32, 12)]);
++    world.step({ press: ["p0a", "p1a", "p2a", "p3a"] });
++    expect(ofKind(world.runTo(21), "duel-reserved")).toHaveLength(4);
++    expect(world.step({ press: ["x"] })).toEqual([]);
++    expect(duelMarkers(world.state)).toHaveLength(4);
++
++    // Three duels running, two hits landing together: the nearer takes the last place.
++    const three = [1, 8, 15].flatMap((row, index) => [ship(`p${index}a`, 3, row), ship(`p${index}b`, 5, row)]);
++    const race = new World([...three, ship("q", 28, 4), ship("r", 30, 4), ship("s", 28, 16), ship("t", 31, 16)]);
++    race.step({ press: ["p0a", "p1a", "p2a", "q", "s"] });
++    const events = race.runTo(21);
++    expect(ofKind(events, "duel-reserved").map((event) => event.players)).toEqual([
++      ["p0a", "p0b"],
++      ["p1a", "p1b"],
++      ["p2a", "p2b"],
++      ["q", "r"],
++    ]);
++    expect(ofKind(events, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "s", defenderId: "t", reason: "duel-cap" }]);
++    expect(race.record("s")).toBeUndefined();
++  });
++
++  it("keeps modes apart: a ship never grapples a player on foot, and changing mode during the windup escapes", () => {
++    const world = new World([ship("a", 5, 12), { ...ship("walker", 6, 12), mode: "foot" }]);
++    expect(world.step({ press: ["a", "walker"] })).toEqual([]);
++    const escape = new World([ship("a", 5, 12), ship("b", 7, 12)]);
++    escape.step({ press: ["a"] });
++    escape.set("b", { mode: "foot" });
++    expect(ofKind(escape.runTo(21), "attempt-missed")[0]).toMatchObject({ reason: "defender-ineligible" });
++  });
++
++  it("lets a disconnected defender be attacked (§12) but not a disconnected attacker start", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12, 32, { connected: false })]);
++    expect(world.step({ press: ["b"] })).toEqual([]);
++    world.step({ press: ["a"] });
++    expect(ofKind(world.runTo(22), "duel-reserved")).toHaveLength(1);
++  });
++
++  it("cancels an attempt whose attacker leaves the match, with no cooldown", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12)]);
++    world.step({ press: ["a"] });
++    world.remove("a");
++    expect(world.step()).toEqual([{ kind: "attempt-cancelled", tick: 2, attackerId: "a", defenderId: "b", reason: "attacker-ineligible" }]);
++  });
++});
++
++describe("same-tick resolution (§5)", () => {
++  it("resolves a chain by distance: A→B and B→C on one tick", () => {
++    const chain = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 10, 12)]);
++    chain.step({ press: ["a", "b"] });
++    expect(kinds(chain.runTo(21))).toEqual(["duel-reserved", "attempt-preempted"]);
++    expect(chain.state.duels.map((duel) => duel.players)).toEqual([["a", "b"]]);
++
++    const reversed = new World([ship("a", 4, 12), ship("b", 7, 12), ship("c", 9, 12)]);
++    reversed.step({ press: ["a", "b"] });
++    const reversedEvents = reversed.runTo(21);
++    expect(ofKind(reversedEvents, "duel-reserved").map((event) => event.players)).toEqual([["b", "c"]]);
++    expect(ofKind(reversedEvents, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "a", defenderId: "b", reason: "conflict" }]);
++  });
++
++  it("resolves mutual attacks A→B and B→A to the lower attacker id", () => {
++    for (const [left, right] of [
++      ["a", "b"],
++      ["b", "a"],
++    ] as const) {
++      const world = new World([ship(left, 5, 12, 0), ship(right, 7, 12, 32)]);
++      world.step({ press: [left, right] });
++      expect(world.state.attempts).toHaveLength(2);
++      const events = world.runTo(21);
++      expect(ofKind(events, "duel-reserved")[0]!.players).toEqual(["a", "b"]);
++      expect(ofKind(events, "attempt-preempted")).toEqual([{ kind: "attempt-preempted", tick: 21, attackerId: "b", defenderId: "a", reason: "conflict" }]);
++    }
++  });
++
++  it("cancels the pending attempt of a player reserved as a defender", () => {
++    const world = new World([ship("a", 5, 12, 0), ship("b", 7, 12, 32)]);
++    world.step({ press: ["a"] });
++    world.runTo(4);
++    world.step({ press: ["b"] });
++    expect(world.runTo(21).filter((event) => event.kind !== "duel-reserved")).toEqual([
++      { kind: "attempt-cancelled", tick: 21, attackerId: "b", defenderId: "a", reason: "attacker-ineligible" },
++    ]);
++  });
++});
++
++describe("reservation and transition", () => {
++  function reserved(ready: { a: boolean; b: boolean }): World {
++    const world = new World([ship("a", 5, 12, 0, { ready: ready.a }), ship("b", 8, 12, 0, { ready: ready.b })]);
++    grapple(world, "a");
++    expect(world.state.duels[0]).toMatchObject({ id: "duel:21:1:a:b", phase: "transition", reservedTick: 21 });
++    return world;
++  }
++
++  it("starts the fight once the three-second countdown is over with both clients ready", () => {
++    const world = reserved({ a: true, b: true });
++    expect(world.runTo(80)).toEqual([]);
++    expect(world.step()).toEqual([{ kind: "duel-started", tick: 81, duelId: "duel:21:1:a:b" }]);
++    expect(world.state.duels[0]).toMatchObject({ phase: "fighting", startTick: 81 });
++  });
++
++  it("waits for a late client and starts when it is ready", () => {
++    const world = reserved({ a: true, b: false });
++    world.runTo(120);
++    world.set("b", { ready: true });
++    expect(world.step()).toEqual([{ kind: "duel-started", tick: 121, duelId: "duel:21:1:a:b" }]);
++  });
++
++  it("forfeits a client still not ready ten seconds after the reservation, ending the duel in the state", () => {
++    const world = reserved({ a: true, b: false });
++    expect(world.runTo(220)).toEqual([]);
++    expect(world.step()).toEqual([{ kind: "duel-forfeited", tick: 221, duelId: "duel:21:1:a:b", forfeiter: "b", winner: "a" }]);
++    expect(world.state.duels[0]).toMatchObject({ phase: "ended", end: { tick: 221, outcome: "win", winner: "a", loser: "b", cause: "readiness" } });
++    // The caller reports only the settlement; a second end is refused and changes nothing.
++    const before = world.state;
++    const refused = world.step({ reports: [{ kind: "end", duelId: "duel:21:1:a:b", tick: 222, outcome: "draw" }] });
++    expect(refused).toEqual([{ kind: "report-refused", tick: 222, duelId: "duel:21:1:a:b", report: "end", reason: "already-ended" }]);
++    expect(world.state).toEqual({ ...before, tick: 222 });
++  });
++
++  it("cancels when both clients are still not ready at ten seconds (§12's double forfeit)", () => {
++    const world = reserved({ a: false, b: false });
++    world.runTo(220);
++    expect(world.step()).toEqual([{ kind: "duel-cancelled", tick: 221, duelId: "duel:21:1:a:b" }]);
++    expect(world.state.duels[0]!.end).toEqual({ tick: 221, outcome: "cancelled", winner: null, loser: null, cause: "readiness" });
++  });
++
++  it("shows other players only a marker: position and start tick", () => {
++    const world = reserved({ a: true, b: true });
++    expect(duelMarkers(world.state)).toEqual([{ x: Math.floor((at(5, 12).x + at(8, 12).x) / 2), y: at(5, 12).y, startTick: 21 }]);
++  });
++});
++
++describe("duel reports", () => {
++  function fighting(): World {
++    const world = new World([ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true })]);
++    grapple(world, "a");
++    world.runTo(81);
++    return world;
++  }
++  const id = "duel:21:1:a:b";
++
++  it("accept one end per duel and refuse a second, an unknown duel, a stranger's win, a future tick and an early settlement", () => {
++    const world = fighting();
++    expect(world.step({ reports: [{ kind: "settled", duelId: id, tick: 82 }] })).toEqual([
++      { kind: "report-refused", tick: 82, duelId: id, report: "settled", reason: "not-ended" },
++    ]);
++    expect(world.step({ reports: [{ kind: "end", duelId: "ghost", tick: 83, outcome: "draw" }] })[0]).toMatchObject({ reason: "unknown-duel" });
++    expect(world.step({ reports: [{ kind: "end", duelId: id, tick: 84, outcome: "win", winner: "c" }] })[0]).toMatchObject({ reason: "invalid" });
++    expect(world.step({ reports: [{ kind: "end", duelId: id, tick: 99, outcome: "draw" }] })[0]).toMatchObject({ reason: "invalid" });
++    // Two ends on one tick: the draw sorts first, whatever order they arrive in.
++    const both: DuelReport[] = [
++      { kind: "end", duelId: id, tick: 86, outcome: "win", winner: "b" },
++      { kind: "end", duelId: id, tick: 86, outcome: "draw" },
++    ];
++    const events = world.step({ reports: [...both].reverse() });
++    expect(events).toEqual([
++      { kind: "duel-ended", tick: 86, duelId: id, outcome: "draw", winner: null, endTick: 86 },
++      { kind: "report-refused", tick: 86, duelId: id, report: "end", reason: "already-ended" },
++    ]);
++  });
++});
++
++describe("return to the world (§6)", () => {
++  const id = "duel:21:1:a:b";
++  function ended(outcome: "win" | "draw" | "cancelled", players = [ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true })]): World {
++    const world = new World(players);
++    grapple(world, "a");
++    world.runTo(99);
++    const report: DuelReport = outcome === "win" ? { kind: "end", duelId: id, tick: 100, outcome, winner: "a" } : { kind: "end", duelId: id, tick: 100, outcome };
++    world.step({ reports: [report] });
++    return world;
++  }
++
++  it("returns the winner where they were with eight seconds, and respawns the loser 15 s after the fight at the nearest clear dock", () => {
++    const world = ended("win");
++    world.runTo(150);
++    const events = world.step({ reports: [{ kind: "settled", duelId: id, tick: 150 }] });
++    expect(events).toEqual([
++      { kind: "duel-settled", tick: 151, duelId: id },
++      { kind: "player-returned", tick: 151, duelId: id, playerId: "a", ...at(5, 12), protection: { source: "win", endTick: 310 } },
++      { kind: "player-respawning", tick: 151, duelId: id, playerId: "b", respawnTick: 400 },
++    ]);
++    expect(world.state.duels).toEqual([]);
++    expect(world.runTo(399)).toEqual([{ kind: "protection-ended", tick: 310, playerId: "a", reason: "expired" }]);
++    // The encounter is at column 6.5, row 12: the south-west dock (1, 22) is nearest, and nobody is near it.
++    expect(world.step()).toEqual([
++      { kind: "player-respawned", tick: 400, playerId: "b", ...at(1, 22), dockId: 2, protection: { source: "respawn", endTick: 800 } },
++    ]);
++    expect(world.record("b")).toEqual({ id: "b", protection: { source: "respawn", endTick: 800 }, cooldownEndTick: 0, respawn: null });
++  });
++
++  it("skips a dock with an opponent within sight, and falls back to the dock farthest from its nearest opponent", () => {
++    const camped = ended("win", [ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true }), ship("camper", 3, 20)]);
++    camped.step({ reports: [{ kind: "settled", duelId: id, tick: 101 }] });
++    expect(ofKind(camped.runTo(400), "player-respawned")[0]).toMatchObject({ dockId: 0, ...at(1, 1) });
++
++    // Every dock watched: the north-east one's watcher is farthest from it.
++    const watchers = [ship("w0", 3, 3), ship("w1", 33, 5), ship("w2", 3, 20), ship("w3", 36, 20)];
++    const everywhere = ended("win", [ship("a", 5, 12, 0, { ready: true }), ship("b", 8, 12, 0, { ready: true }), ...watchers]);
++    everywhere.step({ reports: [{ kind: "settled", duelId: id, tick: 101 }] });
++    expect(ofKind(everywhere.runTo(400), "player-respawned")[0]).toMatchObject({ dockId: 1, ...at(38, 1) });
++  });
++
++  it("respawns at the settlement when it comes more than 15 s after the fight", () => {
++    const world = ended("win");
++    world.runTo(449);
++    const events = world.step({ reports: [{ kind: "settled", duelId: id, tick: 450 }] });
++    expect(kinds(events)).toEqual(["duel-settled", "player-returned", "player-respawning", "player-respawned"]);
++    expect(ofKind(events, "player-respawning")[0]!.respawnTick).toBe(450);
++  });
++
++  it.each(["draw", "cancelled"] as const)("returns both players of a %s to separate navigable points nearby with eight seconds", (outcome) => {
++    const world = ended(outcome);
++    const events = world.step({ reports: [{ kind: "settled", duelId: id, tick: 101 }] });
++    const returns = ofKind(events, "player-returned");
++    expect(returns.map((event) => [event.playerId, event.protection])).toEqual([
++      ["a", { source: "draw", endTick: 261 }],
++      ["b", { source: "draw", endTick: 261 }],
++    ]);
++    checkSeparated(returns, world.state, { x: Math.floor((at(5, 12).x + at(8, 12).x) / 2), y: at(5, 12).y });
++  });
++
++  it("separates a readiness cancellation's players too, next to land", () => {
++    const world = new World([ship("a", 18, 5), ship("b", 18, 7)]);
++    world.set("a", { heading: 16 });
++    grapple(world, "a");
++    world.runTo(221);
++    const events = world.step({ reports: [{ kind: "settled", duelId: "duel:21:1:a:b", tick: 221 }] });
++    checkSeparated(ofKind(events, "player-returned"), world.state, { x: at(18, 6).x, y: at(18, 6).y - 128 });
++  });
++
++  function checkSeparated(returns: readonly Extract<EncounterEvent, { kind: "player-returned" }>[], state: EncounterState, encounter: { x: number; y: number }): void {
++    expect(returns).toHaveLength(2);
++    const [p, q] = returns as [(typeof returns)[0], (typeof returns)[0]];
++    for (const point of [p, q]) {
++      const tile = tileOf(map, point);
++      expect(isNavigable(map, tile.tileX, tile.tileY)).toBe(true);
++      expect((point.x - encounter.x) ** 2 + (point.y - encounter.y) ** 2).toBeLessThanOrEqual((6 * TILE) ** 2);
++    }
++    expect((p.x - q.x) ** 2 + (p.y - q.y) ** 2).toBeGreaterThanOrEqual((3 * TILE) ** 2);
++    expect(state.duels).toEqual([]);
++  }
++});
++
++describe("protection (§2, §6)", () => {
++  it("ends by expiry, by an attack, and by a collection or claim reported from the previous tick", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12), ship("c", 5, 18), ship("d", 5, 4)], { spawnProtected: ["a", "b", "c", "d"] });
++    world.set("c", { protectionEndedBy: "collection" });
++    world.set("d", { protectionEndedBy: "claim" });
++    expect(world.step()).toEqual([
++      { kind: "protection-ended", tick: 1, playerId: "c", reason: "collection" },
++      { kind: "protection-ended", tick: 1, playerId: "d", reason: "claim" },
++    ]);
++    // An ended protection makes the player a target on that same tick.
++    world.set("b", { protectionEndedBy: "collection" });
++    expect(world.step({ press: ["a"] })).toEqual([
++      { kind: "protection-ended", tick: 2, playerId: "b", reason: "collection" },
++      { kind: "protection-ended", tick: 2, playerId: "a", reason: "attack" },
++      { kind: "attempt-started", tick: 2, attackerId: "a", defenderId: "b", mode: "ship", aim: 0, landTick: 22 },
++    ]);
++    expect(world.runTo(899).filter((event) => event.kind === "protection-ended")).toEqual([]);
++    expect(world.step().filter((event) => event.kind === "protection-ended")).toEqual([]);
++  });
++
++  it("expires at its end tick", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12)], { spawnProtected: ["b"] });
++    world.runTo(899);
++    expect(world.step({ press: ["a"] })).toEqual([
++      { kind: "protection-ended", tick: 900, playerId: "b", reason: "expired" },
++      { kind: "attempt-started", tick: 900, attackerId: "a", defenderId: "b", mode: "ship", aim: 0, landTick: 920 },
++    ]);
++  });
++});
++
++describe("match end", () => {
++  it("cancels every attempt, stops new ones and freezes the state", () => {
++    const world = new World([ship("a", 5, 12), ship("b", 7, 12, 32), ship("c", 5, 18, 0, { ready: true }), ship("d", 7, 18, 0, { ready: true })]);
++    world.step({ press: ["c"] });
++    world.runTo(10);
++    world.step({ press: ["a", "b"] });
++    const events = world.step({ matchOver: true });
++    expect(events).toEqual([
++      { kind: "attempt-cancelled", tick: 12, attackerId: "a", defenderId: "b", reason: "match-over" },
++      { kind: "attempt-cancelled", tick: 12, attackerId: "b", defenderId: "a", reason: "match-over" },
++      { kind: "attempt-cancelled", tick: 12, attackerId: "c", defenderId: "d", reason: "match-over" },
++    ]);
++    const frozen = world.state;
++    expect(frozen.closed).toBe(true);
++    expect(world.step({ press: ["a", "b", "c", "d"] })).toEqual([]);
++    expect(world.state).toBe(frozen);
++    expect(hashState(world.state)).toBe(hashState(frozen));
++  });
++});
++
++describe("the island challenge (foot mode)", () => {
++  const foot = (id: string, x: number, y: number, heading = 0): EncounterPlayerInput => ({ ...ship(id, 0, 0, heading), mode: "foot", x, y });
++
++  it("lunges for 0.6 s within two tiles and the cone, and costs six seconds on a miss", () => {
++    const world = new World([foot("a", 1000, 1000), foot("b", 1000 + 2 * TILE + 1, 1000)]);
++    expect(world.step({ press: ["a"] })).toEqual([]);
++    world.set("b", { x: 1000 + 2 * TILE });
++    expect(started(world.step({ press: ["a"] }))[0]).toMatchObject({ mode: "foot", landTick: 2 + 12 });
++    world.set("b", { x: 1000 + 2 * TILE + 1 });
++    world.runTo(13);
++    expect(world.step()).toEqual([{ kind: "attempt-missed", tick: 14, attackerId: "a", defenderId: "b", reason: "out-of-range", cooldownEndTick: 134 }]);
++    world.set("b", { x: 1100 });
++    expect(world.runTo(133).filter((event) => event.kind === "attempt-started")).toEqual([]);
++  });
++
++  it("hits within ±4 of the aim and picks targets in the ±8 front cone", () => {
++    const behind = new World([foot("a", 1000, 1000), foot("b", 800, 1000)]);
++    expect(behind.step({ press: ["a"] })).toEqual([]);
++    const world = new World([foot("a", 1000, 1000), foot("b", 1300, 1000)]);
++    world.step({ press: ["a"] });
++    world.runTo(12);
++    expect(kinds(world.step())).toEqual(["duel-reserved"]);
++    expect(world.state.duels[0]!.mode).toBe("foot");
++  });
++
++  it("returns a draw's players to where they stood and respawns a loser in place, until walking exists", () => {
++    const world = new World([
++      { ...foot("a", 1000, 1000), ready: true },
++      { ...foot("b", 1300, 1000), ready: true },
++    ]);
++    world.step({ press: ["a"] });
++    world.runTo(73);
++    const idOf = world.state.duels[0]!.id;
++    world.step({ reports: [{ kind: "end", duelId: idOf, tick: 74, outcome: "win", winner: "b" }] });
++    const events = world.step({ reports: [{ kind: "settled", duelId: idOf, tick: 75 }] });
++    expect(ofKind(events, "player-returned")[0]).toMatchObject({ playerId: "b", x: 1300, y: 1000 });
++    expect(ofKind(world.runTo(374), "player-respawned")[0]).toMatchObject({ playerId: "a", x: 1000, y: 1000, dockId: null });
++  });
++});
+diff --git a/packages/simulation/src/encounters/geometry.test.ts b/packages/simulation/src/encounters/geometry.test.ts
+new file mode 100644
+index 0000000..210e277
+--- /dev/null
++++ b/packages/simulation/src/encounters/geometry.test.ts
+@@ -0,0 +1,178 @@
++import { createSeaMap, HEADING_COUNT, seaMap, Terrain, terrainAt, type SeaMapDefinition } from "@pirate-sea-race/content";
++import { describe, expect, it } from "vitest";
++import { HEADING_DX, HEADING_DY, normalizeHeading } from "../heading.js";
++import { nextInt } from "../random.js";
++import { bearing, headingDifference, seaLineOfSight, supercover, tileCentre, withinCone, withinRange, type TileCell } from "./index.js";
++
++function sea(rows: readonly string[]): SeaMapDefinition {
++  return createSeaMap({ name: "test", widthTiles: rows[0]!.length, heightTiles: rows.length, rows, islands: [], spawnSlots: [], hub: { tileX: 0, tileY: 0 } });
++}
++
++const key = (cell: TileCell) => `${cell.tileX},${cell.tileY}`;
++const cellSet = (cells: readonly TileCell[]) => [...new Set(cells.map(key))].sort();
++
++/**
++ * The reference: the tiles whose closed square the segment between the two tile centres meets, by exact rational
++ * clipping in doubled coordinates. A segment through a tile corner meets all four tiles around it, which is the
++ * supercover's rule for a corner crossing.
++ */
++function touchedTiles(from: TileCell, to: TileCell): string[] {
++  const touched: string[] = [];
++  const [x0, y0, dx, dy] = [2 * from.tileX + 1, 2 * from.tileY + 1, 2 * (to.tileX - from.tileX), 2 * (to.tileY - from.tileY)];
++  for (let tileY = Math.min(from.tileY, to.tileY); tileY <= Math.max(from.tileY, to.tileY); tileY++) {
++    for (let tileX = Math.min(from.tileX, to.tileX); tileX <= Math.max(from.tileX, to.tileX); tileX++) {
++      // The parameter interval [lo, hi] as fractions with positive denominators; start with [0, 1].
++      let lo: [number, number] = [0, 1];
++      let hi: [number, number] = [1, 1];
++      let empty = false;
++      for (const [origin, delta, cell] of [
++        [x0, dx, tileX],
++        [y0, dy, tileY],
++      ] as const) {
++        const [min, max] = [2 * cell, 2 * cell + 2];
++        if (delta === 0) {
++          if (origin < min || origin > max) empty = true;
++          continue;
++        }
++        let enter: [number, number] = [min - origin, delta];
++        let leave: [number, number] = [max - origin, delta];
++        if (delta < 0) [enter, leave] = [[origin - max, -delta], [origin - min, -delta]];
++        if (enter[0] * lo[1] > lo[0] * enter[1]) lo = enter;
++        if (leave[0] * hi[1] < hi[0] * leave[1]) hi = leave;
++      }
++      if (!empty && lo[0] * hi[1] <= hi[0] * lo[1]) touched.push(key({ tileX, tileY }));
++    }
++  }
++  return touched.sort();
++}
++
++describe("supercover line", () => {
++  it("counts both tiles beside an exact corner crossing", () => {
++    expect(cellSet(supercover({ tileX: 0, tileY: 0 }, { tileX: 2, tileY: 2 }))).toEqual(["0,0", "0,1", "1,0", "1,1", "1,2", "2,1", "2,2"]);
++    expect(cellSet(supercover({ tileX: 0, tileY: 0 }, { tileX: 3, tileY: 0 }))).toEqual(["0,0", "1,0", "2,0", "3,0"]);
++    expect(cellSet(supercover({ tileX: 4, tileY: 4 }, { tileX: 4, tileY: 4 }))).toEqual(["4,4"]);
++  });
++
++  it("is exactly the set of tiles the segment touches, the same in both directions", () => {
++    let pairs = 0;
++    for (let a = 0; a < 81; a++) {
++      for (let b = 0; b < 81; b++) {
++        const from = { tileX: a % 9, tileY: Math.floor(a / 9) };
++        const to = { tileX: b % 9, tileY: Math.floor(b / 9) };
++        const forward = supercover(from, to);
++        expect(cellSet(forward)).toEqual(touchedTiles(from, to));
++        expect(cellSet(supercover(to, from))).toEqual(cellSet(forward));
++        expect(forward[0]).toEqual(from);
++        expect(forward.at(-1)).toEqual(to);
++        pairs++;
++      }
++    }
++    expect(pairs).toBe(6561);
++  });
++});
++
++describe("ship line of sight", () => {
++  const map = sea([
++    "..........", //
++    "....#.....",
++    "..........",
++    "....%.....",
++    "....D.....",
++    "..........",
++  ]);
++  const at = (tileX: number, tileY: number) => tileCentre(map, { tileX, tileY });
++
++  it("is blocked by land and not by shoals or docks, in both directions", () => {
++    expect(seaLineOfSight(map, at(1, 1), at(8, 1))).toBe(false);
++    expect(seaLineOfSight(map, at(8, 1), at(1, 1))).toBe(false);
++    expect(seaLineOfSight(map, at(1, 3), at(8, 3))).toBe(true);
++    expect(seaLineOfSight(map, at(8, 3), at(1, 3))).toBe(true);
++    expect(seaLineOfSight(map, at(1, 4), at(8, 4))).toBe(true);
++    expect(seaLineOfSight(map, at(1, 0), at(8, 0))).toBe(true);
++  });
++
++  it("is blocked when the line only grazes a land tile's corner", () => {
++    // From (6,0) to (4,2) the segment passes exactly through the corner (5,2) of the land tile (4,1) without entering it.
++    expect(seaLineOfSight(map, at(6, 0), at(4, 2))).toBe(false);
++    expect(seaLineOfSight(map, at(4, 2), at(6, 0))).toBe(false);
++    // One tile further east it passes the corners (7,1) and (6,2): clear.
++    expect(seaLineOfSight(map, at(7, 0), at(5, 2))).toBe(true);
++    // Straight past the land tile's side, touching no corner of it.
++    expect(seaLineOfSight(map, at(5, 0), at(5, 2))).toBe(true);
++  });
++
++  it("is symmetric over every pair of sea tiles within engagement range on the slice sea", () => {
++    let seeded = 0x5eed;
++    let blocked = 0;
++    let clear = 0;
++    for (let trial = 0; trial < 3000; trial++) {
++      const draw = (bound: number) => {
++        const next = nextInt(seeded, bound);
++        seeded = next.state;
++        return next.value;
++      };
++      const a = { tileX: draw(seaMap.widthTiles), tileY: draw(seaMap.heightTiles) };
++      const b = { tileX: Math.min(seaMap.widthTiles - 1, Math.max(0, a.tileX + draw(13) - 6)), tileY: Math.min(seaMap.heightTiles - 1, Math.max(0, a.tileY + draw(13) - 6)) };
++      const forward = seaLineOfSight(seaMap, tileCentre(seaMap, a), tileCentre(seaMap, b));
++      expect(seaLineOfSight(seaMap, tileCentre(seaMap, b), tileCentre(seaMap, a))).toBe(forward);
++      const land = supercover(a, b).some((cell) => terrainAt(seaMap, cell.tileX, cell.tileY) === Terrain.Land);
++      expect(forward).toBe(!land);
++      if (forward) clear++;
++      else blocked++;
++    }
++    expect(blocked).toBeGreaterThan(20);
++    expect(clear).toBeGreaterThan(20);
++  });
++});
++
++describe("bearing and cones", () => {
++  const origin = { x: 10_000, y: 10_000 };
++  const along = (heading: number, scale = 3) => ({ x: origin.x + HEADING_DX[normalizeHeading(heading)]! * scale, y: origin.y + HEADING_DY[normalizeHeading(heading)]! * scale });
++
++  it("gives every table heading as its own bearing, and none for a zero offset", () => {
++    for (let heading = 0; heading < HEADING_COUNT; heading++) expect(bearing(origin, along(heading))).toBe(heading);
++    expect(bearing(origin, origin)).toBeNull();
++  });
++
++  it("breaks an exact tie between two headings to the lower one, across the wrap too", () => {
++    // (20, 1)·(1024, 0) = 20480 = (20, 1)·(1019, 100); likewise (20, -1) between headings 63 and 0.
++    expect(20 * HEADING_DX[0]! + 1 * HEADING_DY[0]!).toBe(20 * HEADING_DX[1]! + 1 * HEADING_DY[1]!);
++    expect(bearing({ x: 0, y: 0 }, { x: 20, y: 1 })).toBe(0);
++    expect(20 * HEADING_DX[63]! - 1 * HEADING_DY[63]!).toBe(20 * HEADING_DX[0]! - 1 * HEADING_DY[0]!);
++    expect(bearing({ x: 0, y: 0 }, { x: 20, y: -1 })).toBe(0);
++  });
++
++  it("measures ±N as the circular difference", () => {
++    expect(headingDifference(62, 2)).toBe(4);
++    expect(headingDifference(2, 62)).toBe(4);
++    expect(headingDifference(0, 32)).toBe(32);
++    expect(headingDifference(10, 10)).toBe(0);
++  });
++
++  it.each([4, 8])("includes a target exactly ±%i headings off and excludes one a heading further", (cone) => {
++    for (const aim of [0, 5, 30, 62]) {
++      expect(withinCone(origin, along(aim + cone), aim, cone)).toBe(true);
++      expect(withinCone(origin, along(aim - cone), aim, cone)).toBe(true);
++      expect(withinCone(origin, along(aim + cone + 1), aim, cone)).toBe(false);
++      expect(withinCone(origin, along(aim - cone - 1), aim, cone)).toBe(false);
++    }
++  });
++
++  it("counts distance 0 inside every cone", () => {
++    for (const heading of [0, 17, 63]) expect(withinCone(origin, origin, heading, 0)).toBe(true);
++  });
++});
++
++describe("squared-distance ranges", () => {
++  it("include the exact boundary and exclude one sub-unit beyond, on the axes and diagonally", () => {
++    const range = 6 * 256;
++    const origin = { x: 0, y: 0 };
++    expect(withinRange(origin, { x: range, y: 0 }, range)).toBe(true);
++    expect(withinRange(origin, { x: 0, y: -range }, range)).toBe(true);
++    expect(withinRange(origin, { x: range + 1, y: 0 }, range)).toBe(false);
++    // 2·1086² = 2 358 792 ≤ 1536² = 2 359 296 < 1087² + 1086² = 2 360 965.
++    expect(withinRange(origin, { x: 1086, y: 1086 }, range)).toBe(true);
++    expect(withinRange(origin, { x: 1087, y: -1086 }, range)).toBe(false);
++    expect(withinRange(origin, origin, range)).toBe(true);
++  });
++});
+diff --git a/packages/simulation/src/encounters/geometry.ts b/packages/simulation/src/encounters/geometry.ts
+new file mode 100644
+index 0000000..935acf0
+--- /dev/null
++++ b/packages/simulation/src/encounters/geometry.ts
+@@ -0,0 +1,127 @@
++import { HEADING_COUNT, Terrain, terrainAt, type SeaMapDefinition } from "@pirate-sea-race/content";
++import { HEADING_DX, HEADING_DY, normalizeHeading } from "../heading.js";
++
++/**
++ * The encounter geometry, defined once (docs/encounters.md): integer sub-units, squared distances, the 64-heading
++ * table. Nothing here rounds a fraction or calls a transcendental function.
++ */
++
++/** A point in integer sub-units. */
++export interface EncounterPoint {
++  readonly x: number;
++  readonly y: number;
++}
++
++/** Squared distance, refusing coordinates whose square would not be an exact integer. */
++export function distanceSquared(from: EncounterPoint, to: EncounterPoint): number {
++  const dx = to.x - from.x;
++  const dy = to.y - from.y;
++  const squared = dx * dx + dy * dy;
++  if (!Number.isSafeInteger(squared)) throw new RangeError(`(${from.x}, ${from.y}) and (${to.x}, ${to.y}) are too far apart`);
++  return squared;
++}
++
++/** Within `range` sub-units, centre to centre; a point exactly on the boundary is inside. */
++export function withinRange(from: EncounterPoint, to: EncounterPoint, range: number): boolean {
++  return distanceSquared(from, to) <= range * range;
++}
++
++/**
++ * The heading (of 64) pointing most nearly along the offset: the one whose unit vector has the largest dot product
++ * with it, ties to the lower heading. A zero offset has no bearing (null).
++ */
++export function bearing(from: EncounterPoint, to: EncounterPoint): number | null {
++  const dx = to.x - from.x;
++  const dy = to.y - from.y;
++  if (dx === 0 && dy === 0) return null;
++  let best = 0;
++  let bestDot = dx * HEADING_DX[0]! + dy * HEADING_DY[0]!;
++  for (let heading = 1; heading < HEADING_COUNT; heading++) {
++    const dot = dx * HEADING_DX[heading]! + dy * HEADING_DY[heading]!;
++    if (dot > bestDot) {
++      best = heading;
++      bestDot = dot;
++    }
++  }
++  return best;
++}
++
++/** The circular difference between two headings, 0 to 32. */
++export function headingDifference(a: number, b: number): number {
++  const difference = normalizeHeading(a - b);
++  return Math.min(difference, HEADING_COUNT - difference);
++}
++
++/**
++ * Whether `to` lies within ±`cone` headings of `heading` seen from `from`. Distance 0 is inside every cone:
++ * overlapping ships do not block each other.
++ */
++export function withinCone(from: EncounterPoint, to: EncounterPoint, heading: number, cone: number): boolean {
++  const toward = bearing(from, to);
++  return toward === null || headingDifference(toward, heading) <= cone;
++}
++
++/** A tile, by its column and row. */
++export interface TileCell {
++  readonly tileX: number;
++  readonly tileY: number;
++}
++
++/**
++ * Every tile the segment between the centres of two tiles touches: a supercover line. Where it passes exactly
++ * through a tile corner, both tiles beside the corner count. The set is the same in either direction; the list runs
++ * from `from` to `to`.
++ */
++export function supercover(from: TileCell, to: TileCell): TileCell[] {
++  const nx = Math.abs(to.tileX - from.tileX);
++  const ny = Math.abs(to.tileY - from.tileY);
++  const sx = to.tileX > from.tileX ? 1 : -1;
++  const sy = to.tileY > from.tileY ? 1 : -1;
++  let x = from.tileX;
++  let y = from.tileY;
++  const cells: TileCell[] = [{ tileX: x, tileY: y }];
++  let ix = 0;
++  let iy = 0;
++  while (ix < nx || iy < ny) {
++    // Compares where the segment next crosses a vertical and a horizontal tile edge, in exact integers.
++    const decision = (1 + 2 * ix) * ny - (1 + 2 * iy) * nx;
++    if (decision === 0) {
++      cells.push({ tileX: x + sx, tileY: y }, { tileX: x, tileY: y + sy });
++      x += sx;
++      y += sy;
++      ix++;
++      iy++;
++    } else if (decision < 0) {
++      x += sx;
++      ix++;
++    } else {
++      y += sy;
++      iy++;
++    }
++    cells.push({ tileX: x, tileY: y });
++  }
++  return cells;
++}
++
++/** The tile holding a point. */
++export function tileOf(map: SeaMapDefinition, point: EncounterPoint): TileCell {
++  return { tileX: Math.floor(point.x / map.subUnitsPerTile), tileY: Math.floor(point.y / map.subUnitsPerTile) };
++}
++
++/** The centre of a tile, in sub-units. */
++export function tileCentre(map: SeaMapDefinition, tile: TileCell): EncounterPoint {
++  const half = Math.floor(map.subUnitsPerTile / 2);
++  return { x: tile.tileX * map.subUnitsPerTile + half, y: tile.tileY * map.subUnitsPerTile + half };
++}
++
++/**
++ * Ship line of sight: the supercover line between the centres of the two ships' tiles touches no land. Shoals and
++ * docks do not block (ships see over reefs); a tile off the map blocks.
++ */
++export function seaLineOfSight(map: SeaMapDefinition, from: EncounterPoint, to: EncounterPoint): boolean {
++  for (const cell of supercover(tileOf(map, from), tileOf(map, to))) {
++    const terrain = terrainAt(map, cell.tileX, cell.tileY);
++    if (terrain === undefined || terrain === Terrain.Land) return false;
++  }
++  return true;
++}
+diff --git a/packages/simulation/src/encounters/index.ts b/packages/simulation/src/encounters/index.ts
+new file mode 100644
+index 0000000..27f1098
+--- /dev/null
++++ b/packages/simulation/src/encounters/index.ts
+@@ -0,0 +1,12 @@
++export * from "./state.js";
++export * from "./geometry.js";
++export * from "./modes.js";
++export * from "./step.js";
++export {
++  encounterRules,
++  secondsToTicks,
++  validateEncounterRules,
++  type AttackRules,
++  type EncounterRules,
++} from "@pirate-sea-race/content/encounters";
++export { hashState } from "../hash.js";
+diff --git a/packages/simulation/src/encounters/modes.ts b/packages/simulation/src/encounters/modes.ts
+new file mode 100644
+index 0000000..59bf1da
+--- /dev/null
++++ b/packages/simulation/src/encounters/modes.ts
+@@ -0,0 +1,118 @@
++import { isNavigable, type SeaMapDefinition } from "@pirate-sea-race/content";
++import { distanceSquared, seaLineOfSight, tileCentre, tileOf, type EncounterPoint } from "./geometry.js";
++
++/** Where a draw or cancellation returns its two players, in the duel's player order. */
++export interface SeparateReturnRequest {
++  /** The encounter position: between the two players where the hit landed. */
++  readonly encounter: EncounterPoint;
++  /** Each player's own position when the hit landed. */
++  readonly players: readonly [EncounterPoint, EncounterPoint];
++  /** Sub-units: the two points are at least this far apart... */
++  readonly minSeparation: number;
++  /** ...and each is within this far of the encounter position. */
++  readonly maxDistance: number;
++}
++
++export interface RespawnRequest {
++  readonly encounter: EncounterPoint;
++  /** The loser's own position when the hit landed. */
++  readonly own: EncounterPoint;
++  /** Every other active player's position (§6: away from nearby opponents). */
++  readonly opponents: readonly EncounterPoint[];
++  /** Sub-units: a dock is clear when no opponent is this close to it. */
++  readonly clearRadius: number;
++}
++
++export interface RespawnPoint {
++  readonly x: number;
++  readonly y: number;
++  /** The dock the loser respawns at, or null where the mode has no docks. */
++  readonly dockId: number | null;
++}
++
++/**
++ * What differs between the sea and the islands: line of sight and where a duel's players return. Each is a pure
++ * function of its arguments; the step calls it with the duel's mode.
++ */
++export interface ModeRules {
++  lineOfSight(from: EncounterPoint, to: EncounterPoint): boolean;
++  separateReturn(request: SeparateReturnRequest): readonly [EncounterPoint, EncounterPoint];
++  respawnPoint(request: RespawnRequest): RespawnPoint;
++}
++
++/**
++ * The sea (§6 at sea), fully specified:
++ * - line of sight: the supercover line between the ships' tiles touches no land;
++ * - a draw returns both ships to the centres of two distinct navigable tiles within `maxDistance` of the encounter
++ *   and at least `minSeparation` apart, the pair nearest (by the sum of squared distances) to where each ship was,
++ *   ties to the lower first tile then the lower second tile, row-major; a sea with no such pair leaves each ship
++ *   where it was;
++ * - a loser respawns at the centre of the dock nearest the encounter with no opponent within `clearRadius`, ties to
++ *   the lower dock id; if every dock has one, the dock farthest from its nearest opponent, ties to the lower id.
++ */
++export function seaModeRules(map: SeaMapDefinition): ModeRules {
++  if (map.docks.length === 0) throw new RangeError(`${map.name} has no dock to respawn at`);
++  const docks = map.docks.map((dock) => ({ id: dock.id, point: tileCentre(map, dock) }));
++  return {
++    lineOfSight: (from, to) => seaLineOfSight(map, from, to),
++
++    separateReturn({ encounter, players, minSeparation, maxDistance }) {
++      const reach = Math.ceil(maxDistance / map.subUnitsPerTile) + 1;
++      const centre = tileOf(map, encounter);
++      const candidates: EncounterPoint[] = [];
++      for (let tileY = centre.tileY - reach; tileY <= centre.tileY + reach; tileY++) {
++        for (let tileX = centre.tileX - reach; tileX <= centre.tileX + reach; tileX++) {
++          if (!isNavigable(map, tileX, tileY)) continue;
++          const point = tileCentre(map, { tileX, tileY });
++          if (distanceSquared(encounter, point) <= maxDistance * maxDistance) candidates.push(point);
++        }
++      }
++      const [a, b] = players;
++      const toA = candidates.map((point) => distanceSquared(a, point));
++      const toB = candidates.map((point) => distanceSquared(b, point));
++      let best: { cost: number; p: number; q: number } | null = null;
++      for (let p = 0; p < candidates.length; p++) {
++        for (let q = 0; q < candidates.length; q++) {
++          if (p === q || distanceSquared(candidates[p]!, candidates[q]!) < minSeparation * minSeparation) continue;
++          const cost = toA[p]! + toB[q]!;
++          // Strictly less keeps the first pair in (p, q) order among equals.
++          if (best === null || cost < best.cost) best = { cost, p, q };
++        }
++      }
++      if (best === null) return [{ x: a.x, y: a.y }, { x: b.x, y: b.y }];
++      return [candidates[best.p]!, candidates[best.q]!];
++    },
++
++    respawnPoint({ encounter, opponents, clearRadius }) {
++      const nearestOpponent = (point: EncounterPoint) =>
++        opponents.reduce((nearest, opponent) => Math.min(nearest, distanceSquared(point, opponent)), Number.MAX_SAFE_INTEGER);
++      let chosen: { id: number; point: EncounterPoint; key: number } | null = null;
++      for (const dock of docks) {
++        if (nearestOpponent(dock.point) <= clearRadius * clearRadius) continue;
++        const key = distanceSquared(encounter, dock.point);
++        if (chosen === null || key < chosen.key) chosen = { ...dock, key };
++      }
++      if (chosen === null) {
++        for (const dock of docks) {
++          const key = nearestOpponent(dock.point);
++          if (chosen === null || key > chosen.key) chosen = { ...dock, key };
++        }
++      }
++      const { id, point } = chosen!;
++      return { x: point.x, y: point.y, dockId: id };
++    },
++  };
++}
++
++/**
++ * The islands, as a placeholder until walking on islands exists (`objectives-endgame` replaces it): nothing blocks
++ * line of sight, and every return stays at the player's own position.
++ */
++export const footPlaceholderRules: ModeRules = {
++  lineOfSight: () => true,
++  separateReturn: ({ players: [a, b] }) => [
++    { x: a.x, y: a.y },
++    { x: b.x, y: b.y },
++  ],
++  respawnPoint: ({ own }) => ({ x: own.x, y: own.y, dockId: null }),
++};
+diff --git a/packages/simulation/src/encounters/state.ts b/packages/simulation/src/encounters/state.ts
+new file mode 100644
+index 0000000..dc8732f
+--- /dev/null
++++ b/packages/simulation/src/encounters/state.ts
+@@ -0,0 +1,318 @@
++import { seaMap, type SeaMapDefinition } from "@pirate-sea-race/content";
++import {
++  encounterRules as defaultEncounterRules,
++  validateEncounterRules,
++  type AttackRules,
++  type EncounterRules,
++} from "@pirate-sea-race/content/encounters";
++import { footPlaceholderRules, seaModeRules, type ModeRules } from "./modes.js";
++
++/** Ships attack ships with the grapple; players on foot challenge players on foot (§6). */
++export type EncounterMode = "ship" | "foot";
++export const ENCOUNTER_MODES: readonly EncounterMode[] = ["ship", "foot"];
++
++/** One attack kind in sub-units and ticks, with its mode's line-of-sight and return rules. */
++export interface AttackConfig {
++  readonly windupTicks: number;
++  /** Sub-units, centre to centre; exactly at the range is in range. */
++  readonly range: number;
++  readonly hitConeHeadings: number;
++  readonly targetConeHeadings: number;
++  readonly missCooldownTicks: number;
++  readonly rules: ModeRules;
++}
++
++/** Static encounter data for one match; the step reads it and it never changes. */
++export interface EncounterConfig {
++  readonly modes: Readonly<Record<EncounterMode, AttackConfig>>;
++  readonly maxDuels: number;
++  readonly transitionTicks: number;
++  readonly readyTimeoutTicks: number;
++  readonly spawnProtectionTicks: number;
++  readonly winProtectionTicks: number;
++  readonly drawProtectionTicks: number;
++  readonly respawnDelayTicks: number;
++  readonly respawnProtectionTicks: number;
++  /** Sub-units. */
++  readonly respawnClearRadius: number;
++  readonly drawReturnMinSeparation: number;
++  readonly drawReturnMaxDistance: number;
++}
++
++export interface EncounterConfigOptions {
++  /** The sea ships sail on; the slice sea by default. */
++  readonly map?: SeaMapDefinition;
++  readonly rules?: EncounterRules;
++  /** Replaces a mode's line-of-sight and return rules: `objectives-endgame` supplies the islands' own. */
++  readonly modeRules?: Partial<Record<EncounterMode, ModeRules>>;
++}
++
++/** Builds a match's encounter config from the content rules, refusing invalid rules. */
++export function createEncounterConfig(options: EncounterConfigOptions = {}): EncounterConfig {
++  const rules = validateEncounterRules(options.rules ?? defaultEncounterRules);
++  if (!rules.ok) throw new RangeError(`invalid encounter rules: ${rules.issues.join("; ")}`);
++  const map = options.map ?? seaMap;
++  const tile = map.subUnitsPerTile;
++  const r = rules.value;
++  const attack = (source: AttackRules, modeRules: ModeRules): AttackConfig => ({
++    windupTicks: source.windupTicks,
++    range: source.rangeTiles * tile,
++    hitConeHeadings: source.hitConeHeadings,
++    targetConeHeadings: source.targetConeHeadings,
++    missCooldownTicks: source.missCooldownTicks,
++    rules: modeRules,
++  });
++  return {
++    modes: {
++      ship: attack(r.grapple, options.modeRules?.ship ?? seaModeRules(map)),
++      foot: attack(r.challenge, options.modeRules?.foot ?? footPlaceholderRules),
++    },
++    maxDuels: r.maxDuels,
++    transitionTicks: r.transitionTicks,
++    readyTimeoutTicks: r.readyTimeoutTicks,
++    spawnProtectionTicks: r.spawnProtectionTicks,
++    winProtectionTicks: r.winProtectionTicks,
++    drawProtectionTicks: r.drawProtectionTicks,
++    respawnDelayTicks: r.respawnDelayTicks,
++    respawnProtectionTicks: r.respawnProtectionTicks,
++    respawnClearRadius: r.respawnClearRadiusTiles * tile,
++    drawReturnMinSeparation: r.drawReturnMinSeparationTiles * tile,
++    drawReturnMaxDistance: r.drawReturnMaxDistanceTiles * tile,
++  };
++}
++
++export type ProtectionSource = "spawn" | "win" | "draw" | "respawn";
++
++/** Protection (§2, §6): the player cannot be attacked while `tick < endTick`. */
++export interface Protection {
++  readonly source: ProtectionSource;
++  readonly endTick: number;
++}
++
++/** A loser waiting to respawn (§6), from settlement until `respawnTick`. */
++export interface Respawn {
++  readonly duelId: string;
++  readonly respawnTick: number;
++  /** The encounter position the dock is chosen from. */
++  readonly x: number;
++  readonly y: number;
++  /** The loser's own position when the hit landed (the mode's rule may keep them there). */
++  readonly ownX: number;
++  readonly ownY: number;
++  readonly mode: EncounterMode;
++}
++
++/** What the rules remember about a player. A player with nothing to remember has no record. */
++export interface EncounterPlayer {
++  readonly id: string;
++  readonly protection: Protection | null;
++  /** The player cannot start an attempt while `tick < cooldownEndTick`. */
++  readonly cooldownEndTick: number;
++  readonly respawn: Respawn | null;
++}
++
++/** A telegraphed attempt (§6): visible from `startTick`, it lands on `landTick`. One per attacker. */
++export interface EncounterAttempt {
++  readonly attackerId: string;
++  readonly defenderId: string;
++  readonly mode: EncounterMode;
++  /** The heading locked at the start: the bearing towards the defender (the attacker's heading at distance 0). */
++  readonly aim: number;
++  readonly startTick: number;
++  readonly landTick: number;
++}
++
++export type DuelOutcome = "win" | "draw" | "cancelled";
++
++/** How a duel ended: reported by the caller, or decided here by the readiness check. */
++export interface DuelEnd {
++  readonly tick: number;
++  readonly outcome: DuelOutcome;
++  readonly winner: string | null;
++  readonly loser: string | null;
++  /** `readiness`: a forfeit or cancel decided by the step; `report`: the caller's report. */
++  readonly cause: "readiness" | "report";
++}
++
++/**
++ * A reserved duel, from the hit to its settlement: `transition` (the countdown and ready check), `fighting`, then
++ * `ended` until the ledger settles it (after the theft choice). It counts towards the cap until then.
++ */
++export interface EncounterDuel {
++  readonly id: string;
++  readonly mode: EncounterMode;
++  /** Attacker, then defender. */
++  readonly players: readonly [string, string];
++  /** Each player's position when the hit landed, in `players` order. */
++  readonly positions: readonly [{ readonly x: number; readonly y: number }, { readonly x: number; readonly y: number }];
++  /** The encounter position: halfway between the two, rounded down. The duel marker stands here. */
++  readonly x: number;
++  readonly y: number;
++  readonly reservedTick: number;
++  readonly phase: "transition" | "fighting" | "ended";
++  /** The tick the fight started, after the countdown and both clients ready. */
++  readonly startTick: number | null;
++  readonly end: DuelEnd | null;
++}
++
++/**
++ * The encounter state: plain integer data that `hashState` covers entirely. Players are sorted by id, attempts by
++ * attacker id, duels in reservation order (`compareDuels`).
++ */
++export interface EncounterState {
++  /** The last world tick processed. */
++  readonly tick: number;
++  /** Set once the caller reports the match over; the state never changes afterwards. */
++  readonly closed: boolean;
++  readonly players: readonly EncounterPlayer[];
++  readonly attempts: readonly EncounterAttempt[];
++  readonly duels: readonly EncounterDuel[];
++}
++
++export interface EncounterStateOptions {
++  /** The first step processes `tick + 1`. */
++  readonly tick?: number;
++  /** Players who start with §2's departure protection, which ends `spawnProtectionTicks` after `tick`. */
++  readonly spawnProtected?: readonly string[];
++}
++
++/** A state before any tick, with the match's spawn protection. */
++export function createEncounterState(config: EncounterConfig, options: EncounterStateOptions = {}): EncounterState {
++  const tick = options.tick ?? 0;
++  if (!Number.isSafeInteger(tick)) throw new RangeError(`tick must be a safe integer, got ${tick}`);
++  const ids = [...new Set(options.spawnProtected ?? [])].sort(compareIds);
++  for (const id of ids) if (typeof id !== "string" || id.length === 0) throw new RangeError("player ids must be non-empty strings");
++  const players =
++    config.spawnProtectionTicks === 0
++      ? []
++      : ids.map((id) => ({ id, protection: { source: "spawn" as const, endTick: tick + config.spawnProtectionTicks }, cooldownEndTick: 0, respawn: null }));
++  return { tick, closed: false, players, attempts: [], duels: [] };
++}
++
++/** Lowest id by UTF-16 code units, independent of locale. */
++export function compareIds(a: string, b: string): number {
++  return a < b ? -1 : a > b ? 1 : 0;
++}
++
++/** Duels in reservation order: by tick, then attacker id (one attempt per attacker, so this is total). */
++export function compareDuels(a: EncounterDuel, b: EncounterDuel): number {
++  return a.reservedTick - b.reservedTick || compareIds(a.players[0], b.players[0]);
++}
++
++/** A duel's id, derived from the reservation tick and the two ids; the length prefix keeps it unambiguous. */
++export function duelIdFor(tick: number, attackerId: string, defenderId: string): string {
++  return `duel:${tick}:${attackerId.length}:${attackerId}:${defenderId}`;
++}
++
++/** What other players may know of a duel (§6): where it is and since when. Nothing names its players. */
++export interface DuelMarker {
++  readonly x: number;
++  readonly y: number;
++  /** The reservation tick; the elapsed time counts from it. */
++  readonly startTick: number;
++}
++
++/** The world's duel markers, in a fixed order that says nothing about who fights. */
++export function duelMarkers(state: EncounterState): DuelMarker[] {
++  return state.duels
++    .map((duel) => ({ x: duel.x, y: duel.y, startTick: duel.reservedTick }))
++    .sort((a, b) => a.startTick - b.startTick || a.x - b.x || a.y - b.y);
++}
++
++/** The duel a player is reserved for or fighting, until it settles. */
++export function duelOf(state: EncounterState, playerId: string): EncounterDuel | undefined {
++  return state.duels.find((duel) => duel.players.includes(playerId));
++}
++
++/** What the caller knows about one player on this tick. */
++export interface EncounterPlayerInput {
++  /** The stable player id; ties break on the lowest by UTF-16 code units. */
++  readonly id: string;
++  readonly mode: EncounterMode;
++  /** Position in sub-units: the ship's, or on foot the player's. */
++  readonly x: number;
++  readonly y: number;
++  /** 0 to 63; the target cone faces it. */
++  readonly heading: number;
++  /** A disconnected player can be attacked (§12) but cannot attack. */
++  readonly connected: boolean;
++  /** Pressed attack (grapple or challenge) on this tick. */
++  readonly attack: boolean;
++  /** The client has loaded the arena and is ready (read during a transition only). */
++  readonly ready: boolean;
++  /** The previous tick's claim or ledger ended this player's protection (§6: claiming or collecting). */
++  readonly protectionEndedBy: "claim" | "collection" | null;
++}
++
++/** The caller's report on a duel: how a fight that ran ended, or that the ledger settled it. */
++export type DuelReport =
++  | { readonly kind: "end"; readonly duelId: string; readonly tick: number; readonly outcome: "win"; readonly winner: string }
++  | { readonly kind: "end"; readonly duelId: string; readonly tick: number; readonly outcome: "draw" | "cancelled" }
++  | { readonly kind: "settled"; readonly duelId: string; readonly tick: number };
++
++/** One world tick's snapshot; order within the lists never matters. */
++export interface EncounterTickInput {
++  /** Must be the state's tick plus one. */
++  readonly tick: number;
++  /** Every player in the match; a player absent from the list is not in it and can neither attack nor be attacked. */
++  readonly players: readonly EncounterPlayerInput[];
++  readonly reports: readonly DuelReport[];
++  /** The match is over (§2): every attempt is cancelled and nothing starts again. */
++  readonly matchOver: boolean;
++}
++
++export type MissReason = "defender-ineligible" | "out-of-range" | "out-of-aim" | "no-line-of-sight";
++export type ProtectionEndReason = "expired" | "attack" | "claim" | "collection";
++export type ReportRefusal = "unknown-duel" | "already-ended" | "not-ended" | "invalid";
++
++/** Something that happened on a tick, for the caller to apply or announce. */
++export type EncounterEvent =
++  | { readonly kind: "protection-ended"; readonly tick: number; readonly playerId: string; readonly reason: ProtectionEndReason }
++  | { readonly kind: "report-refused"; readonly tick: number; readonly duelId: string; readonly report: "end" | "settled"; readonly reason: ReportRefusal }
++  /** The caller's end report was accepted. */
++  | { readonly kind: "duel-ended"; readonly tick: number; readonly duelId: string; readonly outcome: DuelOutcome; readonly winner: string | null; readonly endTick: number }
++  /** The ledger settled the duel: it no longer counts, and its players return (the events that follow). */
++  | { readonly kind: "duel-settled"; readonly tick: number; readonly duelId: string }
++  /** Put the player at this point with this protection: the winner, or both players of a draw or cancellation. */
++  | { readonly kind: "player-returned"; readonly tick: number; readonly duelId: string; readonly playerId: string; readonly x: number; readonly y: number; readonly protection: Protection }
++  /** The loser waits out of the world until `respawnTick`. */
++  | { readonly kind: "player-respawning"; readonly tick: number; readonly duelId: string; readonly playerId: string; readonly respawnTick: number }
++  | { readonly kind: "player-respawned"; readonly tick: number; readonly playerId: string; readonly x: number; readonly y: number; readonly dockId: number | null; readonly protection: Protection }
++  | { readonly kind: "duel-started"; readonly tick: number; readonly duelId: string }
++  /** One client was not ready in time: hand it to the ledger as a win for the other. */
++  | { readonly kind: "duel-forfeited"; readonly tick: number; readonly duelId: string; readonly forfeiter: string; readonly winner: string }
++  /** Neither client was ready in time (§12's same-tick double forfeit): hand it to the ledger as cancelled. */
++  | { readonly kind: "duel-cancelled"; readonly tick: number; readonly duelId: string }
++  | { readonly kind: "attempt-cancelled"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly reason: "attacker-ineligible" | "match-over" }
++  | { readonly kind: "attempt-missed"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly reason: MissReason; readonly cooldownEndTick: number }
++  /** A hit that lost a same-tick conflict, or found the duel cap reached: no cooldown. */
++  | { readonly kind: "attempt-preempted"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly reason: "conflict" | "duel-cap" }
++  /** Both players are reserved: hand it to the ledger's `reserveDuel`. */
++  | { readonly kind: "duel-reserved"; readonly tick: number; readonly duelId: string; readonly mode: EncounterMode; readonly players: readonly [string, string]; readonly x: number; readonly y: number }
++  | { readonly kind: "attempt-started"; readonly tick: number; readonly attackerId: string; readonly defenderId: string; readonly mode: EncounterMode; readonly aim: number; readonly landTick: number };
++
++export type EncounterEventKind = EncounterEvent["kind"];
++
++/** Every event kind. */
++export const ENCOUNTER_EVENT_KINDS: readonly EncounterEventKind[] = [
++  "protection-ended",
++  "report-refused",
++  "duel-ended",
++  "duel-settled",
++  "player-returned",
++  "player-respawning",
++  "player-respawned",
++  "duel-started",
++  "duel-forfeited",
++  "duel-cancelled",
++  "attempt-cancelled",
++  "attempt-missed",
++  "attempt-preempted",
++  "duel-reserved",
++  "attempt-started",
++];
++
++export interface EncounterStepResult {
++  readonly state: EncounterState;
++  readonly events: readonly EncounterEvent[];
++}
+diff --git a/packages/simulation/src/encounters/step.ts b/packages/simulation/src/encounters/step.ts
+new file mode 100644
+index 0000000..ebf0ca0
+--- /dev/null
++++ b/packages/simulation/src/encounters/step.ts
+@@ -0,0 +1,403 @@
++import { HEADING_COUNT } from "@pirate-sea-race/content";
++import { hashState } from "../hash.js";
++import { bearing, distanceSquared, withinCone, withinRange, type EncounterPoint } from "./geometry.js";
++import {
++  compareDuels,
++  compareIds,
++  duelIdFor,
++  ENCOUNTER_MODES,
++  type DuelReport,
++  type EncounterAttempt,
++  type EncounterConfig,
++  type EncounterDuel,
++  type EncounterEvent,
++  type EncounterPlayer,
++  type EncounterPlayerInput,
++  type EncounterState,
++  type EncounterStepResult,
++  type EncounterTickInput,
++  type MissReason,
++  type Protection,
++} from "./state.js";
++
++function requireInteger(value: unknown, name: string): void {
++  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
++}
++
++function requireBoolean(value: unknown, name: string): void {
++  if (typeof value !== "boolean") throw new RangeError(`${name} must be a boolean, got ${String(value)}`);
++}
++
++function requireId(value: unknown, name: string): void {
++  if (typeof value !== "string" || value.length === 0) throw new RangeError(`${name} must be a non-empty string`);
++}
++
++/** Refuses a malformed tick: a skipped or repeated tick, duplicate ids, a field of the wrong type. */
++function readInput(state: EncounterState, input: EncounterTickInput): Map<string, EncounterPlayerInput> {
++  requireInteger(input.tick, "tick");
++  if (input.tick !== state.tick + 1) throw new RangeError(`expected tick ${state.tick + 1}, got ${input.tick}`);
++  requireBoolean(input.matchOver, "matchOver");
++  const players = new Map<string, EncounterPlayerInput>();
++  for (const player of input.players) {
++    requireId(player.id, "player id");
++    if (players.has(player.id)) throw new RangeError(`player ${player.id} appears twice`);
++    if (!ENCOUNTER_MODES.includes(player.mode)) throw new RangeError(`${player.id}.mode must be ship or foot`);
++    requireInteger(player.x, `${player.id}.x`);
++    requireInteger(player.y, `${player.id}.y`);
++    requireInteger(player.heading, `${player.id}.heading`);
++    if (player.heading < 0 || player.heading >= HEADING_COUNT) throw new RangeError(`${player.id}.heading must be in [0, ${HEADING_COUNT})`);
++    for (const flag of ["connected", "attack", "ready"] as const) requireBoolean(player[flag], `${player.id}.${flag}`);
++    if (player.protectionEndedBy !== null && player.protectionEndedBy !== "claim" && player.protectionEndedBy !== "collection") {
++      throw new RangeError(`${player.id}.protectionEndedBy must be claim, collection or null`);
++    }
++    players.set(player.id, player);
++  }
++  for (const report of input.reports) {
++    requireId(report.duelId, "report duelId");
++    requireInteger(report.tick, `report ${report.duelId} tick`);
++    if (report.kind !== "end" && report.kind !== "settled") throw new RangeError(`report ${String((report as DuelReport).duelId)} has an unknown kind`);
++  }
++  return players;
++}
++
++/**
++ * A total order on reports that neither input order nor an order-preserving relabelling of players changes: reports
++ * on known duels in duel order, then the rest by id; for one duel, ends before settlements, then by content, so the
++ * first of two conflicting reports on one tick is always the same one.
++ */
++function compareReports(duels: ReadonlyMap<string, EncounterDuel>, a: DuelReport, b: DuelReport): number {
++  const duelA = duels.get(a.duelId);
++  const duelB = duels.get(b.duelId);
++  if (duelA !== undefined && duelB !== undefined && duelA !== duelB) return compareDuels(duelA, duelB);
++  if (duelA === undefined || duelB === undefined) {
++    if (duelA !== duelB) return duelA === undefined ? 1 : -1;
++    const byId = compareIds(a.duelId, b.duelId);
++    if (byId !== 0) return byId;
++  }
++  const detail = (report: DuelReport) =>
++    JSON.stringify(report.kind === "end" ? [0, report.tick, report.outcome, "winner" in report ? report.winner : null] : [1, report.tick]);
++  return compareIds(detail(a), detail(b));
++}
++
++const byAttacker = (a: EncounterAttempt, b: EncounterAttempt) => compareIds(a.attackerId, b.attackerId);
++
++/**
++ * One world tick of §6's encounter rules. The caller runs it before the claim channel (§5), with the previous tick's
++ * claim and ledger results in `protectionEndedBy`. In a fixed order: (0) a match reported over cancels every attempt
++ * and freezes the state; (1) protection expires or ends by an objective; (2) duel reports: ends, then settlements with
++ * their returns; (3) losers due to respawn respawn; (4) transitions start or time out; (5) attempts whose attacker is
++ * no longer eligible are cancelled, and every attempt landing on this tick resolves together: misses, then hits by
++ * distance, attacker id and defender id, each reserving a duel while both players are free and the cap allows;
++ * (6) presses start new attempts. Players, attempts and reports are read as sets, so their order in the input never
++ * matters. The input state is never mutated.
++ */
++export function stepEncounters(config: EncounterConfig, state: EncounterState, input: EncounterTickInput): EncounterStepResult {
++  if (state.closed) return { state, events: [] };
++  const snapshot = readInput(state, input);
++  const tick = input.tick;
++  const events: EncounterEvent[] = [];
++
++  let attempts = [...state.attempts].sort(byAttacker);
++
++  // 0. The match is over: nothing lands, nothing starts. Running duels end through the claim code (§2).
++  if (input.matchOver) {
++    for (const attempt of attempts) {
++      events.push({ kind: "attempt-cancelled", tick, attackerId: attempt.attackerId, defenderId: attempt.defenderId, reason: "match-over" });
++    }
++    return { state: { ...state, tick, closed: true, attempts: [] }, events };
++  }
++
++  const records = new Map<string, EncounterPlayer>(state.players.map((player) => [player.id, player]));
++  const record = (id: string): EncounterPlayer => records.get(id) ?? { id, protection: null, cooldownEndTick: 0, respawn: null };
++  const update = (id: string, change: Partial<Omit<EncounterPlayer, "id">>) => records.set(id, { ...record(id), ...change });
++  const sortedIds = () => [...records.keys()].sort(compareIds);
++
++  // 1. Protection ends when it runs out, or when last tick's claim or collection ended it (§6).
++  for (const id of sortedIds()) {
++    const protection = record(id).protection;
++    if (protection === null) continue;
++    const endedBy = snapshot.get(id)?.protectionEndedBy ?? null;
++    if (tick >= protection.endTick || endedBy !== null) {
++      update(id, { protection: null });
++      events.push({ kind: "protection-ended", tick, playerId: id, reason: tick >= protection.endTick ? "expired" : endedBy! });
++    }
++  }
++
++  // 2. Reports: an end once per duel, then the ledger's settlement, which returns the players.
++  const duels = new Map<string, EncounterDuel>(state.duels.map((duel) => [duel.id, duel]));
++  const reports = [...input.reports].sort((a, b) => compareReports(duels, a, b));
++  for (const report of reports) {
++    const duel = duels.get(report.duelId);
++    const refuse = (reason: "unknown-duel" | "already-ended" | "not-ended" | "invalid") =>
++      events.push({ kind: "report-refused", tick, duelId: report.duelId, report: report.kind, reason });
++    if (duel === undefined) {
++      refuse("unknown-duel");
++    } else if (report.kind === "end") {
++      if (duel.end !== null) {
++        refuse("already-ended");
++        continue;
++      }
++      const winner = report.outcome === "win" ? report.winner : null;
++      const valid =
++        report.tick >= duel.reservedTick &&
++        report.tick <= tick &&
++        (report.outcome === "win"
++          ? duel.players.includes(report.winner)
++          : (report.outcome === "draw" || report.outcome === "cancelled") && (report as { winner?: unknown }).winner === undefined);
++      if (!valid) {
++        refuse("invalid");
++        continue;
++      }
++      const loser = winner === null ? null : duel.players[0] === winner ? duel.players[1] : duel.players[0];
++      duels.set(duel.id, { ...duel, phase: "ended", end: { tick: report.tick, outcome: report.outcome, winner, loser, cause: "report" } });
++      events.push({ kind: "duel-ended", tick, duelId: duel.id, outcome: report.outcome, winner, endTick: report.tick });
++    } else {
++      const end = duel.end;
++      if (end === null) {
++        refuse("not-ended");
++        continue;
++      }
++      if (report.tick < end.tick || report.tick > tick) {
++        refuse("invalid");
++        continue;
++      }
++      duels.delete(duel.id);
++      events.push({ kind: "duel-settled", tick, duelId: duel.id });
++      settle(config, duel, end, report.tick, tick, events, update);
++    }
++  }
++
++  // 3. Losers whose 15 s have run respawn at a dock away from opponents, chosen from this tick's positions.
++  const respawning = new Set(sortedIds().filter((id) => record(id).respawn !== null));
++  for (const id of [...respawning]) {
++    const respawn = record(id).respawn!;
++    if (respawn.respawnTick > tick) continue;
++    const opponents = [...snapshot.values()]
++      .filter((player) => player.id !== id && !respawning.has(player.id))
++      .sort((a, b) => compareIds(a.id, b.id))
++      .map((player) => ({ x: player.x, y: player.y }));
++    const point = config.modes[respawn.mode].rules.respawnPoint({
++      encounter: { x: respawn.x, y: respawn.y },
++      own: { x: respawn.ownX, y: respawn.ownY },
++      opponents,
++      clearRadius: config.respawnClearRadius,
++    });
++    const protection: Protection = { source: "respawn", endTick: tick + config.respawnProtectionTicks };
++    update(id, { respawn: null, protection: protection.endTick > tick ? protection : null });
++    events.push({ kind: "player-respawned", tick, playerId: id, x: point.x, y: point.y, dockId: point.dockId, protection });
++  }
++
++  // 4. Transitions: the fight starts after the countdown with both clients ready; at the timeout, the unready forfeit.
++  for (const { id } of [...duels.values()].sort(compareDuels)) {
++    const duel = duels.get(id)!;
++    if (duel.phase !== "transition") continue;
++    const ready = duel.players.map((playerId) => snapshot.get(playerId)?.ready === true);
++    if (tick >= duel.reservedTick + config.transitionTicks && ready[0] && ready[1]) {
++      duels.set(id, { ...duel, phase: "fighting", startTick: tick });
++      events.push({ kind: "duel-started", tick, duelId: id });
++    } else if (tick >= duel.reservedTick + config.readyTimeoutTicks) {
++      if (!ready[0] && !ready[1]) {
++        duels.set(id, { ...duel, phase: "ended", end: { tick, outcome: "cancelled", winner: null, loser: null, cause: "readiness" } });
++        events.push({ kind: "duel-cancelled", tick, duelId: id });
++      } else {
++        const [winner, loser] = ready[0] ? [duel.players[0], duel.players[1]] : [duel.players[1], duel.players[0]];
++        duels.set(id, { ...duel, phase: "ended", end: { tick, outcome: "win", winner, loser, cause: "readiness" } });
++        events.push({ kind: "duel-forfeited", tick, duelId: id, forfeiter: loser, winner });
++      }
++    }
++  }
++
++  const inDuel = new Set<string>();
++  for (const duel of duels.values()) for (const playerId of duel.players) inDuel.add(playerId);
++  const isRespawning = (id: string) => record(id).respawn !== null;
++  const isProtected = (id: string) => record(id).protection !== null;
++  /** In the match, of this mode, free of duels and respawns; protection and the cap are checked by the caller of this. */
++  const free = (id: string, mode: EncounterPlayerInput["mode"]) => {
++    const player = snapshot.get(id);
++    return player !== undefined && player.mode === mode && !inDuel.has(id) && !isRespawning(id);
++  };
++  const cancel = (attempt: EncounterAttempt, reason: "attacker-ineligible") =>
++    events.push({ kind: "attempt-cancelled", tick, attackerId: attempt.attackerId, defenderId: attempt.defenderId, reason });
++
++  // 5a. An attacker who left, disconnected, changed mode, or was reserved or respawns loses the attempt, no cooldown.
++  attempts = attempts.filter((attempt) => {
++    const keep = free(attempt.attackerId, attempt.mode) && snapshot.get(attempt.attackerId)!.connected;
++    if (!keep) cancel(attempt, "attacker-ineligible");
++    return keep;
++  });
++
++  // 5b. Everything landing on this tick resolves together (§5): misses first, then hits in a fixed order.
++  const hits: { attempt: EncounterAttempt; distance: number; attacker: EncounterPoint; defender: EncounterPoint }[] = [];
++  for (const attempt of attempts) {
++    if (attempt.landTick !== tick) continue;
++    const mode = config.modes[attempt.mode];
++    const attacker = snapshot.get(attempt.attackerId)!;
++    const defender = snapshot.get(attempt.defenderId);
++    let reason: MissReason | null = null;
++    if (defender === undefined || !free(defender.id, attempt.mode) || isProtected(defender.id)) reason = "defender-ineligible";
++    else if (!withinRange(attacker, defender, mode.range)) reason = "out-of-range";
++    else if (!withinCone(attacker, defender, attempt.aim, mode.hitConeHeadings)) reason = "out-of-aim";
++    else if (!mode.rules.lineOfSight(attacker, defender)) reason = "no-line-of-sight";
++    if (reason === null) {
++      hits.push({ attempt, distance: distanceSquared(attacker, defender!), attacker, defender: defender! });
++    } else {
++      const cooldownEndTick = tick + mode.missCooldownTicks;
++      update(attempt.attackerId, { cooldownEndTick });
++      events.push({ kind: "attempt-missed", tick, attackerId: attempt.attackerId, defenderId: attempt.defenderId, reason, cooldownEndTick });
++    }
++  }
++  hits.sort(
++    (a, b) => a.distance - b.distance || compareIds(a.attempt.attackerId, b.attempt.attackerId) || compareIds(a.attempt.defenderId, b.attempt.defenderId),
++  );
++  for (const { attempt, attacker, defender } of hits) {
++    const { attackerId, defenderId } = attempt;
++    if (inDuel.has(attackerId) || inDuel.has(defenderId)) {
++      events.push({ kind: "attempt-preempted", tick, attackerId, defenderId, reason: "conflict" });
++    } else if (duels.size >= config.maxDuels) {
++      events.push({ kind: "attempt-preempted", tick, attackerId, defenderId, reason: "duel-cap" });
++    } else {
++      const id = duelIdFor(tick, attackerId, defenderId);
++      const x = Math.floor((attacker.x + defender.x) / 2);
++      const y = Math.floor((attacker.y + defender.y) / 2);
++      duels.set(id, {
++        id,
++        mode: attempt.mode,
++        players: [attackerId, defenderId],
++        positions: [
++          { x: attacker.x, y: attacker.y },
++          { x: defender.x, y: defender.y },
++        ],
++        x,
++        y,
++        reservedTick: tick,
++        phase: "transition",
++        startTick: null,
++        end: null,
++      });
++      inDuel.add(attackerId);
++      inDuel.add(defenderId);
++      events.push({ kind: "duel-reserved", tick, duelId: id, mode: attempt.mode, players: [attackerId, defenderId], x, y });
++    }
++  }
++  attempts = attempts.filter((attempt) => {
++    if (attempt.landTick === tick) return false;
++    // A player just reserved as a defender loses their own attempt.
++    if (!inDuel.has(attempt.attackerId)) return true;
++    cancel(attempt, "attacker-ineligible");
++    return false;
++  });
++
++  // 6. Presses. Every target is chosen from the state before any of this tick's starts, so a protected player who
++  // attacks on this tick is still not a target on it, whatever order the presses arrive in.
++  const attacking = new Set(attempts.map((attempt) => attempt.attackerId));
++  const started: EncounterAttempt[] = [];
++  const protectedBefore = new Set([...records.values()].filter((player) => player.protection !== null).map((player) => player.id));
++  if (duels.size < config.maxDuels) {
++    const players = [...snapshot.values()].sort((a, b) => compareIds(a.id, b.id));
++    for (const attacker of players) {
++      if (!attacker.attack || !attacker.connected || attacking.has(attacker.id) || !free(attacker.id, attacker.mode)) continue;
++      if (tick < record(attacker.id).cooldownEndTick) continue;
++      const mode = config.modes[attacker.mode];
++      let target: { player: EncounterPlayerInput; distance: number } | null = null;
++      for (const defender of players) {
++        if (defender.id === attacker.id || !free(defender.id, attacker.mode) || protectedBefore.has(defender.id)) continue;
++        if (!withinRange(attacker, defender, mode.range) || !withinCone(attacker, defender, attacker.heading, mode.targetConeHeadings)) continue;
++        if (!mode.rules.lineOfSight(attacker, defender)) continue;
++        // Players are in id order, so a strictly nearer one replaces the choice and an equal one never does.
++        const distance = distanceSquared(attacker, defender);
++        if (target === null || distance < target.distance) target = { player: defender, distance };
++      }
++      if (target === null) continue;
++      if (protectedBefore.has(attacker.id)) {
++        update(attacker.id, { protection: null });
++        events.push({ kind: "protection-ended", tick, playerId: attacker.id, reason: "attack" });
++      }
++      const aim = bearing(attacker, target.player) ?? attacker.heading;
++      const attempt: EncounterAttempt = {
++        attackerId: attacker.id,
++        defenderId: target.player.id,
++        mode: attacker.mode,
++        aim,
++        startTick: tick,
++        landTick: tick + mode.windupTicks,
++      };
++      started.push(attempt);
++      events.push({ kind: "attempt-started", tick, attackerId: attacker.id, defenderId: target.player.id, mode: attacker.mode, aim, landTick: attempt.landTick });
++    }
++  }
++
++  // Records with nothing left to remember are dropped, so equal situations hash equally.
++  const players = sortedIds()
++    .map(record)
++    .filter((player) => player.protection !== null || player.cooldownEndTick > tick || player.respawn !== null)
++    .map((player) => (player.cooldownEndTick > tick ? player : { ...player, cooldownEndTick: 0 }));
++  return {
++    state: {
++      tick,
++      closed: false,
++      players,
++      attempts: [...attempts, ...started].sort(byAttacker),
++      duels: [...duels.values()].sort(compareDuels),
++    },
++    events,
++  };
++}
++
++/** §6's return at settlement: the winner stays with 8 s, the loser waits to respawn, a draw separates both. */
++function settle(
++  config: EncounterConfig,
++  duel: EncounterDuel,
++  end: NonNullable<EncounterDuel["end"]>,
++  settledTick: number,
++  tick: number,
++  events: EncounterEvent[],
++  update: (id: string, change: Partial<Omit<EncounterPlayer, "id">>) => void,
++): void {
++  const guard = (protection: Protection) => (protection.endTick > tick ? protection : null);
++  const returned = (playerId: string, point: EncounterPoint, protection: Protection) => {
++    update(playerId, { protection: guard(protection) });
++    events.push({ kind: "player-returned", tick, duelId: duel.id, playerId, x: point.x, y: point.y, protection });
++  };
++  if (end.outcome === "win") {
++    const winner = end.winner!;
++    const loser = end.loser!;
++    const own = duel.positions[duel.players.indexOf(winner)]!;
++    returned(winner, own, { source: "win", endTick: settledTick + config.winProtectionTicks });
++    // The respawn counts from the fight's end, not the settlement, so the theft choice does not lengthen it.
++    const respawnTick = Math.max(end.tick + config.respawnDelayTicks, tick);
++    const loserOwn = duel.positions[duel.players.indexOf(loser)]!;
++    update(loser, {
++      protection: null,
++      respawn: { duelId: duel.id, respawnTick, x: duel.x, y: duel.y, ownX: loserOwn.x, ownY: loserOwn.y, mode: duel.mode },
++    });
++    events.push({ kind: "player-respawning", tick, duelId: duel.id, playerId: loser, respawnTick });
++    return;
++  }
++  const points = config.modes[duel.mode].rules.separateReturn({
++    encounter: { x: duel.x, y: duel.y },
++    players: duel.positions,
++    minSeparation: config.drawReturnMinSeparation,
++    maxDistance: config.drawReturnMaxDistance,
++  });
++  const protection: Protection = { source: "draw", endTick: settledTick + config.drawProtectionTicks };
++  returned(duel.players[0], points[0], protection);
++  returned(duel.players[1], points[1], protection);
++}
++
++export interface EncounterReplay {
++  readonly state: EncounterState;
++  readonly events: readonly EncounterEvent[];
++  readonly hash: string;
++}
++
++/** Steps a sequence of ticks from a state, collecting every event; `hash` is the final state's `hashState`. */
++export function replayEncounters(config: EncounterConfig, state: EncounterState, inputs: readonly EncounterTickInput[]): EncounterReplay {
++  let current = state;
++  const events: EncounterEvent[] = [];
++  for (const input of inputs) {
++    const stepped = stepEncounters(config, current, input);
++    current = stepped.state;
++    events.push(...stepped.events);
++  }
++  return { state: current, events, hash: hashState(current) };
++}

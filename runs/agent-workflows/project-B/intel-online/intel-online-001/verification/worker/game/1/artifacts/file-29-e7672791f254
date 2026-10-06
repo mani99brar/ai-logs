@@ -1,0 +1,111 @@
+import { expect, test, type Page } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/index.js";
+import { attachScreenshot, createMatch, joinMatch, place, readout, selfId, startMatch } from "./helpers.js";
+
+/** Palm Key's west dock, in the north-west sector. */
+const PALM_WEST = seaMap.docks[0]!;
+
+const rumors = (page: Page) => page.getByTestId("journal-rumors").locator("li");
+
+/**
+ * Records every sector name the sea shows from now on, as the page reports it (`data-sector-name` on the game): a
+ * MutationObserver catches a name however briefly it shows. `sectorNamesSeen(page)` returns them.
+ */
+async function recordSectorNames(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const seen: string[] = [];
+    (window as unknown as { __sectorNames: string[] }).__sectorNames = seen;
+    const game = document.querySelector<HTMLElement>('[data-testid="game"]')!;
+    new MutationObserver(() => seen.push(game.dataset["sectorName"] ?? "")).observe(game, { attributes: true, attributeFilter: ["data-sector-name"] });
+  });
+}
+
+async function sectorNamesSeen(page: Page): Promise<string[]> {
+  return page.evaluate(() => (window as unknown as { __sectorNames: string[] }).__sectorNames);
+}
+
+test("two browsers start a private match; the host opens the journal with M and reads its start rumor, moors at a dock, buys a targeted rumor with the keyboard and sees its gold drop by 25 and a new entry marked targeted; the guest's page never shows the host's rumors [scenario:rumor-journal]", async ({ browser, request }, testInfo) => {
+  test.setTimeout(90_000);
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+    const code = await createMatch(host);
+    await joinMatch(guest, code);
+    await startMatch(host, guest);
+    const hostId = await selfId(host);
+
+    // M opens the journal: its start rumor names a type and an island (or a sector), with its reason.
+    const journal = host.getByTestId("journal");
+    await expect(journal).toBeHidden();
+    await host.keyboard.press("m");
+    await expect(journal).toBeVisible();
+    const start = rumors(host).and(host.locator('[data-reason="start"]'));
+    await expect(start).toHaveCount(1);
+    const startText = (await start.textContent())!;
+    const [, type, target] = /^#1 (Sun|Moon): (?:(.+) \(island\)|a recovery cache in (.+?))\s*start/.exec(startText) ?? [];
+    expect(type, startText).toBeDefined();
+    expect(target, startText).toBeDefined();
+    expect(seaMap.islands.map((island) => island.name)).toContain(target);
+    // Its kit and collected types are there too; at sea, nothing is for sale.
+    await expect(host.getByTestId("journal-kit")).toHaveText("Duelist");
+    await expect(host.getByTestId("journal-collected")).toHaveText("none yet");
+    await expect(host.getByTestId("journal-buys").locator("button")).toHaveCount(2);
+    for (const button of await host.getByTestId("journal-buys").locator("button").all()) await expect(button).toBeDisabled();
+    // The helm stays live with the journal open: ahead moves the ship.
+    const before = (await readout(host, hostId))!;
+    await host.keyboard.down("ArrowUp");
+    await expect.poll(async () => (await readout(host, hostId))!.speed).not.toBe(0);
+    await host.keyboard.up("ArrowUp");
+    expect(before.speed).toBe(0);
+
+    // Moored at Palm Key's west dock (E), the journal offers a rumor about each missing type, for 25 gold. Arriving
+    // there, the sea (its sector borders shown while the journal is open) names the sector the ship entered.
+    // (From the hub first, in Central Waters: the ship's spawn slot may already lie in the north-west sector.)
+    await place(request, host, code, seaMap.hub.tileX, seaMap.hub.tileY, 0);
+    await recordSectorNames(host);
+    await place(request, host, code, PALM_WEST.tileX, PALM_WEST.tileY, 0);
+    await expect.poll(() => sectorNamesSeen(host)).toContain("North-West Reach");
+    await host.keyboard.press("e");
+    await expect(host.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(PALM_WEST.id));
+    const buy = host.getByTestId("journal-buys").locator('button[data-state="available"]').first();
+    await expect(buy).toBeEnabled();
+    await expect(buy).toHaveText(/: Buy a rumor \(25 gold\)$/);
+    const gold = Number(await host.getByTestId("purse-gold").getAttribute("data-gold"));
+    // Tab moves focus among the journal's buttons; Enter presses the focused one.
+    const bought = (await buy.getAttribute("data-type"))!;
+    for (let presses = 0; presses < 4 && !(await buy.evaluate((element) => element === document.activeElement)); presses++) await host.keyboard.press("Tab");
+    await expect(buy).toBeFocused();
+    await host.keyboard.press("Enter");
+
+    // Gold drops by 25, a new entry is marked targeted, and a toast announced it.
+    await expect(host.getByTestId("purse-gold")).toHaveAttribute("data-gold", String(gold - 25));
+    const targeted = rumors(host).and(host.locator('[data-reason="targeted"]'));
+    await expect(targeted).toHaveCount(1);
+    await expect(targeted).toHaveAttribute("data-type", bought);
+    await expect(host.getByTestId("journal-message")).toHaveText(/^Bought a rumor about (Sun|Moon) \(−25 gold\)$/);
+    await expect(host.getByTestId("toast-title")).toHaveText(/^New lead \(targeted\): (Sun|Moon)$/);
+    // The sector borders show while the journal is open, and hide when it closes (no sector lead here).
+    await expect(host.getByTestId("game")).toHaveAttribute("data-sectors", /^shown:\d$/);
+    await attachScreenshot(host, testInfo, "rumor-journal");
+    await host.keyboard.press("Escape");
+    await expect(journal).toBeHidden();
+    await expect(host.getByTestId("game")).toHaveAttribute("data-sectors", "hidden");
+
+    // The guest's journal holds its own start rumor only: never the host's purchase, and no toast of it.
+    await guest.keyboard.press("m");
+    await expect(guest.getByTestId("journal")).toBeVisible();
+    await expect(rumors(guest)).toHaveCount(1);
+    await expect(rumors(guest).and(guest.locator('[data-reason="start"]'))).toHaveCount(1);
+    await expect(guest.locator('[data-reason="targeted"]')).toHaveCount(0);
+    await expect(guest.getByTestId("purse-gold")).toHaveAttribute("data-gold", "50");
+    await expect(guest.getByTestId("toast-title")).not.toHaveText(/targeted/);
+    // Its Close button closes it.
+    await guest.getByTestId("journal-close").click();
+    await expect(guest.getByTestId("journal")).toBeHidden();
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

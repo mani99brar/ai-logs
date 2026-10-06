@@ -1,0 +1,317 @@
+import { RUIN_MOVES, type RuinMove, type RuinRules, type RuinSymbol } from "@pirate-sea-race/content/ruins";
+import { nextInt } from "../random.js";
+
+/**
+ * What one tablet says about its own symbol. Positions count from 0. Every hint the generator writes is true of the
+ * answer, and the six hints together admit exactly one sequence.
+ *
+ * - `absent` / `present`: the symbol is not / is in the sequence.
+ * - `at` / `not-at`: the symbol is / is not at `position` (an absent symbol is at no position).
+ * - `right-after` / `right-before`: both are in the sequence, the symbol immediately after / before `other`.
+ * - `after` / `before`: both are in the sequence, the symbol somewhere after / before `other`.
+ */
+export type SequenceRelation =
+  | "absent"
+  | "present"
+  | "at"
+  | "not-at"
+  | "right-after"
+  | "right-before"
+  | "after"
+  | "before";
+
+export interface SequenceHint {
+  readonly relation: SequenceRelation;
+  /** The symbol the relation refers to, for the four relational hints; otherwise null. */
+  readonly other: RuinSymbol | null;
+  /** The position of `at` and `not-at`; otherwise null. */
+  readonly position: number | null;
+}
+
+/** A carved tablet at the site: a symbol and its hint. A sequence ruin shows one for every symbol. */
+export interface SequenceTablet {
+  readonly symbol: RuinSymbol;
+  readonly hint: SequenceHint;
+}
+
+export interface SequencePuzzle {
+  readonly kind: "sequence";
+  /** Secret: the symbols in order. */
+  readonly answer: readonly RuinSymbol[];
+  /** Every symbol of the rules, in the rules' fixed order, whatever the answer. */
+  readonly tablets: readonly SequenceTablet[];
+}
+
+/** A grid cell: x grows east, y grows south. */
+export interface Cell {
+  readonly x: number;
+  readonly y: number;
+}
+
+export interface NavigationPuzzle {
+  readonly kind: "navigation";
+  readonly size: number;
+  readonly start: Cell;
+  readonly goal: Cell;
+  /** Sorted by row, then column. */
+  readonly blocked: readonly Cell[];
+  /** Secret, though a reader can work it out: the number of moves of every accepted answer. */
+  readonly minMoves: number;
+}
+
+export type RuinPuzzle = SequencePuzzle | NavigationPuzzle;
+export type RuinKind = RuinPuzzle["kind"];
+
+/** The only view of a ruin a client may receive (§16): what the site shows, never the answer. */
+export type RuinClue =
+  | { readonly kind: "sequence"; readonly length: number; readonly tablets: readonly SequenceTablet[] }
+  | { readonly kind: "navigation"; readonly size: number; readonly start: Cell; readonly goal: Cell; readonly blocked: readonly Cell[] };
+
+export type RuinAttempt =
+  | { readonly kind: "sequence"; readonly symbols: readonly RuinSymbol[] }
+  | { readonly kind: "navigation"; readonly moves: readonly RuinMove[] };
+
+/** A threaded seeded generator: each draw advances `rng`. */
+export interface Draw {
+  rng: number;
+}
+
+/** An integer in [0, bound) from the threaded generator. */
+export function drawInt(source: Draw, bound: number): number {
+  const drawn = nextInt(source.rng, bound);
+  source.rng = drawn.state;
+  return drawn.value;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sequence puzzles
+
+/** Whether a hint about `symbol` holds for the candidate sequence `order`. */
+export function sequenceHintHolds(symbol: RuinSymbol, hint: SequenceHint, order: readonly RuinSymbol[]): boolean {
+  const index = order.indexOf(symbol);
+  const other = hint.other === null ? -1 : order.indexOf(hint.other);
+  switch (hint.relation) {
+    case "absent":
+      return index < 0;
+    case "present":
+      return index >= 0;
+    case "at":
+      return index >= 0 && index === hint.position;
+    case "not-at":
+      return index !== hint.position;
+    case "right-after":
+      return index >= 0 && other >= 0 && index === other + 1;
+    case "right-before":
+      return index >= 0 && other >= 0 && index + 1 === other;
+    case "after":
+      return index >= 0 && other >= 0 && index > other;
+    case "before":
+      return index >= 0 && other >= 0 && index < other;
+  }
+}
+
+/** Every ordered sequence of `length` distinct symbols (120 for six symbols and three places). */
+export function allSequences(symbols: readonly RuinSymbol[], length: number): RuinSymbol[][] {
+  if (length === 0) return [[]];
+  return symbols.flatMap((symbol) =>
+    allSequences(
+      symbols.filter((other) => other !== symbol),
+      length - 1,
+    ).map((rest) => [symbol, ...rest]),
+  );
+}
+
+/** The sequences every tablet's hint admits. */
+export function sequencesMatching(tablets: readonly SequenceTablet[], symbols: readonly RuinSymbol[], length: number): RuinSymbol[][] {
+  return allSequences(symbols, length).filter((order) => tablets.every((tablet) => sequenceHintHolds(tablet.symbol, tablet.hint, order)));
+}
+
+function hint(relation: SequenceRelation, other: RuinSymbol | null = null, position: number | null = null): SequenceHint {
+  return { relation, other, position };
+}
+
+/**
+ * The true hints a tablet may carry, repeated to weight the draw. An absent symbol mostly says so outright and
+ * otherwise names a place it does not take; a present symbol may name its place, a neighbour or just its presence.
+ */
+function candidateHints(symbol: RuinSymbol, answer: readonly RuinSymbol[]): SequenceHint[] {
+  const last = answer.length - 1;
+  const index = answer.indexOf(symbol);
+  if (index < 0) return [hint("absent"), hint("absent"), hint("absent"), hint("not-at", null, 0), hint("not-at", null, last)];
+  const hints = [hint("present"), hint("at", null, index), hint("at", null, index)];
+  for (let position = 0; position <= last; position++) if (position !== index) hints.push(hint("not-at", null, position));
+  if (index > 0) hints.push(hint("right-after", answer[index - 1]!), hint("right-after", answer[index - 1]!));
+  if (index < last) hints.push(hint("right-before", answer[index + 1]!), hint("right-before", answer[index + 1]!));
+  answer.forEach((other, position) => {
+    if (position < index) hints.push(hint("after", other));
+    if (position > index) hints.push(hint("before", other));
+  });
+  return hints;
+}
+
+/** Draws of the six hints before falling back to the plainest unique set. */
+const SEQUENCE_HINT_TRIES = 200;
+
+/**
+ * Deals a sequence: the answer is uniform over every ordered choice of distinct symbols, then each tablet draws a true
+ * hint until the hints together admit only the answer. The tablets stay in the rules' symbol order, so their layout
+ * says nothing about the answer.
+ */
+export function generateSequence(rules: RuinRules, source: Draw): SequencePuzzle {
+  const pool = [...rules.symbols];
+  const answer: RuinSymbol[] = [];
+  for (let place = 0; place < rules.sequenceLength; place++) {
+    const pick = drawInt(source, pool.length);
+    answer.push(pool[pick]!);
+    pool.splice(pick, 1);
+  }
+  for (let attempt = 0; attempt < SEQUENCE_HINT_TRIES; attempt++) {
+    const tablets = rules.symbols.map((symbol) => {
+      const hints = candidateHints(symbol, answer);
+      return { symbol, hint: hints[drawInt(source, hints.length)]! };
+    });
+    if (sequencesMatching(tablets, rules.symbols, rules.sequenceLength).length === 1) return { kind: "sequence", answer, tablets };
+  }
+  const tablets = rules.symbols.map((symbol) => {
+    const index = answer.indexOf(symbol);
+    return { symbol, hint: index < 0 ? hint("absent") : hint("at", null, index) };
+  });
+  return { kind: "sequence", answer, tablets };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Navigation puzzles
+
+const STEPS: Readonly<Record<RuinMove, Cell>> = { N: { x: 0, y: -1 }, E: { x: 1, y: 0 }, S: { x: 0, y: 1 }, W: { x: -1, y: 0 } };
+
+function cellIndex(size: number, cell: Cell): number {
+  return cell.y * size + cell.x;
+}
+
+function cellAt(size: number, index: number): Cell {
+  return { x: index % size, y: Math.floor(index / size) };
+}
+
+/** Moves from start to goal over open cells, by breadth-first search; -1 when the goal cannot be reached. */
+export function shortestPathMoves(size: number, start: Cell, goal: Cell, blocked: readonly Cell[]): number {
+  const closed = new Set(blocked.map((cell) => cellIndex(size, cell)));
+  if (closed.has(cellIndex(size, start)) || closed.has(cellIndex(size, goal))) return -1;
+  const distance = new Map([[cellIndex(size, start), 0]]);
+  const queue = [start];
+  for (let head = 0; head < queue.length; head++) {
+    const cell = queue[head]!;
+    const moves = distance.get(cellIndex(size, cell))!;
+    if (cell.x === goal.x && cell.y === goal.y) return moves;
+    for (const move of RUIN_MOVES) {
+      const next = { x: cell.x + STEPS[move].x, y: cell.y + STEPS[move].y };
+      if (next.x < 0 || next.y < 0 || next.x >= size || next.y >= size) continue;
+      const index = cellIndex(size, next);
+      if (closed.has(index) || distance.has(index)) continue;
+      distance.set(index, moves + 1);
+      queue.push(next);
+    }
+  }
+  return -1;
+}
+
+/** Whether the moves walk from start to goal in exactly `minMoves` steps without leaving the grid or entering a block. */
+export function walksToGoal(puzzle: NavigationPuzzle, moves: readonly RuinMove[]): boolean {
+  if (moves.length !== puzzle.minMoves) return false;
+  const closed = new Set(puzzle.blocked.map((cell) => cellIndex(puzzle.size, cell)));
+  let cell = puzzle.start;
+  for (const move of moves) {
+    cell = { x: cell.x + STEPS[move].x, y: cell.y + STEPS[move].y };
+    if (cell.x < 0 || cell.y < 0 || cell.x >= puzzle.size || cell.y >= puzzle.size) return false;
+    if (closed.has(cellIndex(puzzle.size, cell))) return false;
+  }
+  return cell.x === puzzle.goal.x && cell.y === puzzle.goal.y;
+}
+
+/** Layouts drawn before giving up; a draw outside the path bounds is simply drawn again. */
+const NAVIGATION_TRIES = 10_000;
+
+/**
+ * Deals a navigation grid: a start, a different goal and a number of blocked cells within the rules' bounds, drawn
+ * again until the shortest path is within the rules' move bounds.
+ */
+export function generateNavigation(rules: RuinRules, source: Draw): NavigationPuzzle {
+  const size = rules.gridSize;
+  const cells = size * size;
+  for (let attempt = 0; attempt < NAVIGATION_TRIES; attempt++) {
+    const open = Array.from({ length: cells }, (_, index) => index);
+    const take = () => open.splice(drawInt(source, open.length), 1)[0]!;
+    const start = cellAt(size, take());
+    const goal = cellAt(size, take());
+    const count = rules.minBlockedCells + drawInt(source, rules.maxBlockedCells - rules.minBlockedCells + 1);
+    const blocked = Array.from({ length: count }, take)
+      .sort((a, b) => a - b)
+      .map((index) => cellAt(size, index));
+    const minMoves = shortestPathMoves(size, start, goal, blocked);
+    if (minMoves >= rules.minPathMoves && minMoves <= rules.maxPathMoves) {
+      return { kind: "navigation", size, start, goal, blocked, minMoves };
+    }
+  }
+  throw new Error(`no ${size} × ${size} grid with a shortest path of ${rules.minPathMoves}–${rules.maxPathMoves} moves in ${NAVIGATION_TRIES} draws`);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Clues and answers
+
+/** The clue a player at the ruin reads. It is built field by field, so no secret can ride along. */
+export function puzzleClue(puzzle: RuinPuzzle): RuinClue {
+  if (puzzle.kind === "sequence") {
+    return {
+      kind: "sequence",
+      length: puzzle.answer.length,
+      tablets: puzzle.tablets.map((tablet) => ({ symbol: tablet.symbol, hint: { ...tablet.hint } })),
+    };
+  }
+  return {
+    kind: "navigation",
+    size: puzzle.size,
+    start: { ...puzzle.start },
+    goal: { ...puzzle.goal },
+    blocked: puzzle.blocked.map((cell) => ({ ...cell })),
+  };
+}
+
+/** Whether an attempt (already checked for shape) solves the puzzle. */
+export function attemptSolves(puzzle: RuinPuzzle, attempt: RuinAttempt): boolean {
+  if (puzzle.kind === "sequence") {
+    return attempt.kind === "sequence" && attempt.symbols.length === puzzle.answer.length && attempt.symbols.every((symbol, index) => symbol === puzzle.answer[index]);
+  }
+  return attempt.kind === "navigation" && walksToGoal(puzzle, attempt.moves);
+}
+
+const NAMES: Readonly<Record<RuinSymbol, string>> = { sun: "Sun", moon: "Moon", tide: "Tide", storm: "Storm", anchor: "Anchor", skull: "Skull" };
+
+function placeName(position: number, length: number): string {
+  if (position === 0) return "first";
+  if (position === length - 1) return "last";
+  return length === 3 ? "in the middle" : `in place ${position + 1}`;
+}
+
+/** A tablet's inscription, such as "Tide comes right after Sun". */
+export function tabletText(tablet: SequenceTablet, length: number): string {
+  const { symbol, hint } = tablet;
+  const name = NAMES[symbol];
+  const other = hint.other === null ? "" : NAMES[hint.other];
+  switch (hint.relation) {
+    case "absent":
+      return `${name} is not in the sequence`;
+    case "present":
+      return `${name} is in the sequence`;
+    case "at":
+      return `${name} comes ${placeName(hint.position ?? 0, length)}`;
+    case "not-at":
+      return `${name} does not come ${placeName(hint.position ?? 0, length)}`;
+    case "right-after":
+      return `${name} comes right after ${other}`;
+    case "right-before":
+      return `${name} comes right before ${other}`;
+    case "after":
+      return `${name} comes somewhere after ${other}`;
+    case "before":
+      return `${name} comes somewhere before ${other}`;
+  }
+}

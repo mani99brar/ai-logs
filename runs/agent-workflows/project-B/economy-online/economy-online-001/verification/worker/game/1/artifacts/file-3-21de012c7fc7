@@ -1,0 +1,157 @@
+import {
+  INPUT_HOLD_FRAMES,
+  MAX_INPUT_MESSAGES_PER_SECOND,
+  validateInputMessage,
+  WORLD_HOLD_BUTTONS,
+  WORLD_HOLD_GRACE_FRAMES,
+  type InputContext,
+  type InputRejection,
+} from "@pirate-sea-race/protocol";
+import { NEUTRAL_INPUT, quantizeAxis, STEPS_PER_SECOND, type PlayerInput } from "@pirate-sea-race/simulation";
+
+export type DropReason = InputRejection | "rate-limited";
+
+/** A protocol validator: `validateInputMessage` for world input, `validateDuelInputMessage` for duel input. */
+export type InputValidator<T extends { readonly seq: number }> = (
+  message: unknown,
+  context: InputContext,
+) => { ok: true; input: T } | { ok: false; reason: InputRejection };
+
+/**
+ * The admission both input gates share, so their limits cannot drift apart: at most MAX_INPUT_MESSAGES_PER_SECOND
+ * messages in each window of STEPS_PER_SECOND room ticks, then the protocol's validation (size, schema, a sequence
+ * number above the last accepted one, the future-frame limit). Every drop is counted by reason.
+ */
+export class InputAdmission<T extends { readonly seq: number }> {
+  private lastAcceptedSeq = 0;
+  private windowStart = 0;
+  private windowCount = 0;
+  readonly dropped: Record<DropReason, number> = {
+    "rate-limited": 0,
+    oversized: 0,
+    malformed: 0,
+    "stale-sequence": 0,
+    "future-frame": 0,
+  };
+
+  constructor(private readonly validate: InputValidator<T>) {}
+
+  /**
+   * Takes one untrusted message at room tick `tick` (for the rate window) when the server's frame is `serverFrame`
+   * (for the future-frame limit). Returns the accepted message, or why it was dropped.
+   */
+  admit(message: unknown, tick: number, serverFrame: number): { ok: true; input: T } | { ok: false; reason: DropReason } {
+    if (tick - this.windowStart >= STEPS_PER_SECOND) {
+      this.windowStart = tick;
+      this.windowCount = 0;
+    }
+    if (++this.windowCount > MAX_INPUT_MESSAGES_PER_SECOND) return this.drop("rate-limited");
+    const result = this.validate(message, { lastAcceptedSeq: this.lastAcceptedSeq, serverFrame });
+    if (!result.ok) return this.drop(result.reason);
+    this.lastAcceptedSeq = result.input.seq;
+    return result;
+  }
+
+  private drop(reason: DropReason): { ok: false; reason: DropReason } {
+    this.dropped[reason]++;
+    return { ok: false, reason };
+  }
+}
+
+/**
+ * One client's input channel on the server: it admits messages under the rate cap, validates them against the
+ * protocol and the client's last sequence, and holds the latest accepted intent for the simulation. A held input
+ * lapses to neutral when no fresh one arrives within INPUT_HOLD_FRAMES (§15). World logic reads input only every
+ * third frame, so a button pressed at any point since the last world step is latched until the next one (see
+ * `worldStepTaken`): a quick tap released between two world steps still counts.
+ *
+ * The room's hold reads (a collection, a cache claim, eating, the treasure claim) use `holdButtonsAt` instead: a held
+ * world hold button survives gaps of up to WORLD_HOLD_GRACE_FRAMES between received messages, so a short network stall
+ * does not reset a six-second hold. Only those reads bridge the gap; what the simulation gets (`lapsedAt`, `inputAt`)
+ * still lapses after INPUT_HOLD_FRAMES. An accepted message without the button releases it at once.
+ */
+export class InputGate {
+  private readonly admission = new InputAdmission(validateInputMessage);
+  private held: PlayerInput = NEUTRAL_INPUT;
+  private heldAtFrame = 0;
+  /** Buttons seen in any accepted message since the last world step. */
+  private latchedButtons = 0;
+  /** A held hold button is being carried across a gap past the input's own lapse. */
+  private bridging = false;
+  /** A held hold button lapsed after the grace window, and has not been sent again since. */
+  private lapsed = false;
+  /** Gaps past the input's lapse that a held hold button survived, and holds that lapsed after the grace window. */
+  private readonly holds = { gapsBridged: 0, holdsLapsed: 0 };
+
+  /** The hold diagnostics: gaps bridged and holds lapsed so far. */
+  get holdDiagnostics(): { readonly gapsBridged: number; readonly holdsLapsed: number } {
+    return { ...this.holds };
+  }
+
+  /** Messages dropped, by reason. */
+  get dropped(): Record<DropReason, number> {
+    return this.admission.dropped;
+  }
+
+  /** Takes one untrusted message at the server's current frame. Returns why it was dropped, or undefined. */
+  receive(message: unknown, serverFrame: number): DropReason | undefined {
+    // The match room ticks once per frame, so its frame is also the rate window's clock.
+    const result = this.admission.admit(message, serverFrame, serverFrame);
+    if (!result.ok) return result.reason;
+    this.held = {
+      buttons: result.input.buttons,
+      moveX: quantizeAxis(result.input.moveX),
+      moveY: quantizeAxis(result.input.moveY),
+    };
+    this.heldAtFrame = serverFrame;
+    this.latchedButtons |= result.input.buttons;
+    if (this.bridging) this.holds.gapsBridged++;
+    this.bridging = false;
+    this.lapsed = false;
+    return undefined;
+  }
+
+  /**
+   * Whether the client has sent nothing the simulation could use at `frame`: its held input has lapsed and no button
+   * is latched. The match room then gives the simulation no input for the ship at all, rather than neutral input, so a
+   * stall cannot release the throttle a moored ship keeps (see `StepInputs`).
+   */
+  lapsedAt(frame: number): boolean {
+    return frame - this.heldAtFrame > INPUT_HOLD_FRAMES && this.latchedButtons === 0;
+  }
+
+  /** The intent the simulation uses for `frame`: the held input, plus any button latched since the last world step. */
+  inputAt(frame: number): PlayerInput {
+    const held = frame - this.heldAtFrame > INPUT_HOLD_FRAMES ? NEUTRAL_INPUT : this.held;
+    const buttons = held.buttons | this.latchedButtons;
+    return buttons === held.buttons ? held : { ...held, buttons };
+  }
+
+  /**
+   * The world hold buttons (interact, fruit) the room's hold reads see at `frame`: those of the last accepted message
+   * while it is at most WORLD_HOLD_GRACE_FRAMES old, plus any latched since the last world step. Never for sailing.
+   */
+  holdButtonsAt(frame: number): number {
+    const held = frame - this.heldAtFrame > WORLD_HOLD_GRACE_FRAMES ? 0 : this.held.buttons;
+    return (held | this.latchedButtons) & WORLD_HOLD_BUTTONS;
+  }
+
+  /**
+   * Called after each world step at `frame` has read the gate: latched buttons have been seen and are released. It
+   * also counts the holds: a held hold button past the input's lapse is being bridged (counted when the next message
+   * arrives in time); past the grace window, it has lapsed. Returns the gap in frames when a hold lapsed on this step.
+   */
+  worldStepTaken(frame: number): number | undefined {
+    this.latchedButtons = 0;
+    const gap = frame - this.heldAtFrame;
+    if ((this.held.buttons & WORLD_HOLD_BUTTONS) === 0 || gap <= INPUT_HOLD_FRAMES || this.lapsed) return undefined;
+    if (gap <= WORLD_HOLD_GRACE_FRAMES) {
+      this.bridging = true;
+      return undefined;
+    }
+    this.bridging = false;
+    this.lapsed = true;
+    this.holds.holdsLapsed++;
+    return gap;
+  }
+}

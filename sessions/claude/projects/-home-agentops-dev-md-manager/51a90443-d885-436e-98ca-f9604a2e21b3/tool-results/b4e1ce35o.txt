@@ -1,0 +1,467 @@
+diff --git a/contracts/workflow/verification.schema.json b/contracts/workflow/verification.schema.json
+index 827671d..6d10c4f 100644
+--- a/contracts/workflow/verification.schema.json
++++ b/contracts/workflow/verification.schema.json
+@@ -1,12 +1,26 @@
+ {
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+-  "title": "Workflow verification policy v1",
++  "title": "Workflow verification policy v1 / v1.1",
+   "type": "object",
+   "additionalProperties": false,
+   "required": ["version", "feature", "workers", "independent_review", "integration_approval"],
++  "allOf": [{
++    "if": {"properties": {"version": {"const": "1.0.0"}}},
++    "then": {"not": {"anyOf": [{"required": ["max_verification_attempts"]}, {"required": ["failure_drill"]}]}}
++  }],
+   "properties": {
+-    "version": {"const": "1.0.0"},
++    "version": {"enum": ["1.0.0", "1.1.0"]},
+     "feature": {"type": "string", "minLength": 1},
++    "max_verification_attempts": {"type": "integer", "minimum": 1, "maximum": 10},
++    "failure_drill": {
++      "type": "object", "additionalProperties": false,
++      "required": ["node_id", "phase", "attempt"],
++      "properties": {
++        "node_id": {"enum": ["ui", "adapter"]},
++        "phase": {"const": "worker"},
++        "attempt": {"const": 1}
++      }
++    },
+     "setup": {
+       "type": "array",
+       "items": {
+diff --git a/workflow/__main__.py b/workflow/__main__.py
+index 957473c..5c2c03a 100644
+--- a/workflow/__main__.py
++++ b/workflow/__main__.py
+@@ -1,5 +1,10 @@
+ """`python -m workflow` exposes the complete operator-driven pipeline CLI."""
+-from .pipeline import main
++import sys
+ 
+ if __name__ == "__main__":
+-    main()
++    if len(sys.argv) > 1 and sys.argv[1] == "launch":
++        from .launch import main
++        main(sys.argv[2:])
++    else:
++        from .pipeline import main
++        main()
+diff --git a/workflow/checks.py b/workflow/checks.py
+index ab15c3c..149dcca 100644
+--- a/workflow/checks.py
++++ b/workflow/checks.py
+@@ -165,7 +165,8 @@ def verify_revision(run: Path, plan: dict, policy: dict, node: str, commit: str,
+     if sys.platform == "linux":
+         env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path(env.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ms-playwright"))
+     env.update(PATH=str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", ""),
+-               PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", FORCE_COLOR="0", CI="1")
++               PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", FORCE_COLOR="0", CI="1",
++               WORKFLOW_VERIFICATION_PHASE=phase)
+     for name in ("TMPDIR", "XDG_CACHE_HOME", "npm_config_cache"):
+         path = directory / name.lower()
+         path.mkdir()
+diff --git a/workflow/interactive.py b/workflow/interactive.py
+index af0c0cf..59c71d6 100644
+--- a/workflow/interactive.py
++++ b/workflow/interactive.py
+@@ -8,6 +8,7 @@ import re
+ import shlex
+ import subprocess
+ import sys
++from datetime import datetime, timezone
+ from pathlib import Path
+ 
+ from langgraph.checkpoint.sqlite import SqliteSaver
+@@ -90,7 +91,7 @@ class InteractiveSessions(ClaudeSessions):
+             row = self.locate(node, self.inventory())
+             if row is None:
+                 raise RuntimeError("Existing launch cannot be reconciled; no automatic relaunch")
+-            receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"])
++            receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"], native_started_at=row.get("startedAt"))
+             receipt.pop("error", None)
+             save_json(path, receipt)
+             return receipt
+@@ -102,7 +103,8 @@ class InteractiveSessions(ClaudeSessions):
+             raise RuntimeError("Unowned session already exists with this launch name")
+         receipt = {"node_id": node, "session_id": None, "launch_token": info["session_id"], "plan_digest": digest,
+                    "worktree": str(cwd), "base_commit": self.plan["base_commit"],
+-                   "status": "launching", "attempt": 1}
++                   "status": "launching", "attempt": 1, "launcher_invocations": 1,
++                   "launch_requested_at": datetime.now(timezone.utc).isoformat()}
+         save_json(path, receipt)
+         tools = "Read,Glob,Grep,Edit,Write" if self.plan["allow_edits"] else "Read,Glob,Grep"
+         prompt = ("You are a workflow worker in your own worktree. A human can type directly into this terminal. "
+@@ -128,7 +130,7 @@ class InteractiveSessions(ClaudeSessions):
+             row = self.locate(node, self.inventory())
+             if row is None:
+                 raise RuntimeError("No exact matching background session after launch")
+-            receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"])
++            receipt.update(status="attached_session_available", background_id=row["id"], session_id=row["sessionId"], observed_state=row["state"], native_started_at=row.get("startedAt"))
+         except BaseException as error:
+             receipt.update(status="needs_reconciliation", error=str(error))
+             raise
+diff --git a/workflow/pipeline.py b/workflow/pipeline.py
+index 42419a0..640f964 100644
+--- a/workflow/pipeline.py
++++ b/workflow/pipeline.py
+@@ -21,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
+ from langgraph.types import Command, interrupt
+ 
+ from .checks import now, recheck_packet, verify_revision
++from .export_state import export_state
+ from .interactive import InteractiveSessions, attach_panels
+ from .sessions import NODES, git, prepare, read_json, run_lock, save_json
+ from .verification import owns, policy_digest, safe_path, validate_policy
+@@ -191,7 +192,25 @@ class Pipeline:
+ 
+     def attempt(self, phase: str, node: str) -> int:
+         path = self.directory / "attempts.json"
+-        return read_json(path).get(f"{phase}:{node}", 1) if path.exists() else 1
++        value = read_json(path).get(f"{phase}:{node}", 1) if path.exists() else 1
++        if type(value) is not int or value < 1 or value > self.policy.get("max_verification_attempts", 3):
++            raise ValueError("Verification attempt exceeds the run's hard limit")
++        return value
++
++    def retry_check(self, phase: str, node: str) -> int:
++        value = self.attempt(phase, node) + 1
++        if value > self.policy.get("max_verification_attempts", 3):
++            raise ValueError("Verification attempt limit reached; inspect evidence and create an explicitly revised run")
++        path = self.directory / "attempts.json"
++        attempts = read_json(path) if path.exists() else {}
++        attempts[f"{phase}:{node}"] = value
++        save_json(path, attempts)
++        return value
++
++    def native_evidence(self) -> dict:
++        return {node: {key: read_json(self.directory / f"{node}.interactive.json").get(key)
++                       for key in ("session_id", "background_id", "launcher_invocations", "native_started_at")}
++                for node in NODES}
+ 
+     def verify(self, node: str, snapshots: dict) -> str:
+         snap = snapshots[node]
+@@ -199,6 +218,17 @@ class Pipeline:
+         self.event(f"verify_{node}", "running", f"Attempt {attempt}; revision {snap['commit']}")
+         packet = verify_revision(self.directory, self.plan, self.policy, node, snap["commit"], snap["changed_files"], snap["session_id"], attempt=attempt)
+         path = self.directory / "verification" / "worker" / node / str(attempt) / "packet.json"
++        drill = self.policy.get("failure_drill")
++        if drill and drill["node_id"] == node and attempt == 1:
++            marker = "Intentional lab drill: verification branch failure, not a worker or test failure"
++            if marker not in packet["capture_errors"]:
++                packet["capture_errors"].append(marker)
++                packet["gate"]["reasons"].append(marker)
++            packet["gate"]["status"] = "blocked"
++            drill_path = self.directory / "failure-drill.json"
++            if not drill_path.exists():
++                save_json(drill_path, {"node_id": node, "phase": "worker", "attempt": 1,
++                                       "injected_at": now(), "native_before": self.native_evidence()})
+         packet["result"]["summary"] = snap["summary"]
+         packet["result"]["open_assumptions"] = snap["open_assumptions"]
+         save_json(path, packet)
+@@ -244,6 +274,16 @@ class Pipeline:
+                   "snapshots": state["snapshots"],
+                   "packets": [{"path": str(path), "sha256": digest_file(path)} for path in worker_paths + candidate_paths]}
+         path = self.directory / "review-bundle.json"
++        drill_path = self.directory / "failure-drill.json"
++        if drill_path.exists():
++            before = read_json(drill_path)["native_before"]
++            after = self.native_evidence()
++            audit = {"run_id": self.plan["run_id"], "native_before": before, "native_after": after,
++                     "workers_with_changed_launch_evidence": [node for node in NODES if before[node] != after[node]],
++                     "verification_attempts": {node: sorted(int(item.name) for item in (self.directory / "verification" / "worker" / node).iterdir() if item.is_dir() and item.name.isdigit()) for node in NODES},
++                     "scope": "Pipeline-issued sessions; native launch times/counts are null when unavailable. Out-of-band manual restarts are not certified."}
++            save_json(self.directory / "failure-report.json", audit)
++            bundle["failure_drill"] = audit
+         save_json(path, bundle)
+         return str(path)
+ 
+@@ -346,6 +386,7 @@ def build_pipeline(checkpointer, runtime: Pipeline):
+ 
+ def report(runtime: Pipeline, state) -> Path:
+     """Escaped local results viewer, generated on every CLI boundary; no server needed."""
++    export_state(runtime, state)
+     events_path = runtime.directory / "events.jsonl"
+     events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
+     packets = list((runtime.directory / "verification").glob("*/*/*/packet.json"))
+@@ -437,9 +478,11 @@ def main():
+             for worker in policy["workers"]:
+                 tasks[worker["node_id"]] += "\nApproved ownership and checks:\n" + json.dumps(worker)
+             plan = prepare(directory, args.repo, "HEAD", tasks, True)
+-            plan.update(mode="interactive", policy_sha256=policy_digest(policy), source_branch=git(args.repo.resolve(), "symbolic-ref", "--short", "HEAD"))
++            plan.update(mode="interactive", policy_sha256=policy_digest(policy), created_at=now(), source_branch=git(args.repo.resolve(), "symbolic-ref", "--short", "HEAD"))
+             save_json(directory / "policy.json", policy)
+             save_json(directory / "plan.json", plan)
++            from types import SimpleNamespace
++            export_state(Pipeline(directory), SimpleNamespace(values={}, next=("launch_ui", "launch_adapter"), tasks=[]))
+             print(f"Prepared {directory}; no agents launched. Pin: {plan['base_commit']}")
+             return
+         with run_lock(directory):
+@@ -494,11 +537,7 @@ def main():
+                         step = f"verify_{args.node}" if args.phase == "worker" else "candidate"
+                         if step not in state.next:
+                             parser.error("Selected check is not a failed/pending step")
+-                        attempts_path = directory / "attempts.json"
+-                        attempts = read_json(attempts_path) if attempts_path.exists() else {}
+-                        key = f"{args.phase}:{args.node}"
+-                        attempts[key] = attempts.get(key, 1) + 1
+-                        save_json(attempts_path, attempts)
++                        runtime.retry_check(args.phase, args.node)
+                     # No new agent launch is ever permitted during retry.
+                     if any(step.startswith("launch_") for step in state.next):
+                         parser.error("Launch failure requires explicit session reconciliation; do not blindly retry")
+diff --git a/workflow/test_pipeline.py b/workflow/test_pipeline.py
+index b5f889b..c080ccb 100644
+--- a/workflow/test_pipeline.py
++++ b/workflow/test_pipeline.py
+@@ -178,6 +178,34 @@ test('[scenario:ready] shows the worker change', async ({{page}}, testInfo) => {
+         with self.assertRaisesRegex(ValueError, "artifact"):
+             self.runtime.validate_bundle()
+ 
++    def test_configured_failure_drill_reopens_checkpoint_and_enforces_attempt_cap(self):
++        self.policy.update(version="1.1.0", max_verification_attempts=2,
++                           failure_drill={"node_id": "adapter", "phase": "worker", "attempt": 1})
++        self.plan["policy_sha256"] = policy_digest(self.policy)
++        save_json(self.directory / "policy.json", self.policy)
++        save_json(self.directory / "plan.json", self.plan)
++        self.runtime = OfflinePipeline(self.directory, self.sessions)
++        with SqliteSaver.from_conn_string(str(self.directory / "graph.sqlite")) as saver:
++            graph = build_pipeline(saver, self.runtime)
++            graph.invoke({"run_id": "run"}, self.config)
++            with self.assertRaisesRegex(RuntimeError, "adapter verification blocked"):
++                graph.invoke(Command(resume={"freeze": True}), self.config)
++        ui_path = self.directory / "verification/worker/ui/1/packet.json"
++        original = digest_file(ui_path)
++        self.assertEqual(self.runtime.retry_check("worker", "adapter"), 2)
++        with SqliteSaver.from_conn_string(str(self.directory / "graph.sqlite")) as saver:
++            graph = build_pipeline(saver, self.runtime)
++            outcome = graph.invoke(None, self.config)
++            self.assertEqual(outcome["__interrupt__"][0].value["kind"], "independent_review")
++        audit = read_json(self.directory / "failure-report.json")
++        self.assertEqual(audit["workers_with_changed_launch_evidence"], [])
++        self.assertEqual(audit["verification_attempts"], {"ui": [1], "adapter": [1, 2]})
++        self.assertEqual(sorted(self.sessions.starts), ["adapter", "ui"])
++        self.assertEqual(digest_file(ui_path), original)
++        with self.assertRaisesRegex(ValueError, "limit reached"):
++            self.runtime.retry_check("worker", "adapter")
++        self.assertEqual(self.runtime.attempt("worker", "adapter"), 2)
++
+     def test_wrong_role_mapping_cannot_disable_required_gate_categories(self):
+         for role in ("backend", "frontend"):
+             policy = copy.deepcopy(self.policy)
+diff --git a/workflow/verification.py b/workflow/verification.py
+index c274bb6..687429a 100644
+--- a/workflow/verification.py
++++ b/workflow/verification.py
+@@ -66,6 +66,9 @@ def validate_policy(policy: dict) -> dict:
+             unique(check["scenarios"], "id")
+             if (check["kind"] == "browser") != bool(check["scenarios"]):
+                 raise ValueError("Browser checks require named scenarios; other checks must not have scenarios")
++    drill = policy.get("failure_drill")
++    if drill and (drill["node_id"] not in workers or policy.get("max_verification_attempts", 3) < 2):
++        raise ValueError("Failure drill requires a configured worker and at least two allowed verification attempts")
+     return policy
+ 
+ 
+=====
+features/project-workflows/adapter-task.md
+features/project-workflows/README.md
+features/project-workflows/feature.json
+features/project-workflows/ui-task.md
+features/project-workflows/policy.json
+=====
+# Runbook: supervised two-worker LangGraph workflow
+
+**Entry point: `python -m workflow`.** This is the complete operator-driven path. The older `workflow.demo`, `workflow.live` and `workflow.interactive` entry points remain focused development examples, not the full integration workflow.
+
+```text
+              launch_ui ─────┐
+START ────────               ├─ handoff / freeze ─┬─ verify_ui ──────┐
+              launch_adapter ┘                   └─ verify_adapter ┴─ candidate + combined checks
+                                                                         │
+                                                            independent review (interrupt)
+                                                                         │
+                                                            integration approval (interrupt)
+                                                                         │
+                                                             fast-forward source branch
+```
+
+## Guarantees and boundaries
+
+- At most two implementation workers; each is a native interactive Claude background terminal in its own worktree. A dedicated Herdr tab attaches both terminals with keyboard input enabled.
+- Exact shared starting Git revision is recorded and verified. Frozen ownership is checked against actual captured files, not just agent reports. The fixed graph requires `ui/frontend` and `adapter/backend` policies; relabelling a worker cannot bypass required tests.
+- **Idle is not complete.** The operator gathers handoff summaries/assumptions and explicitly freezes the run. The runtime stops both worker processes before snapshotting. Source ownership violations or uncertain termination block capture.
+- Verification runs in fresh worktrees, with separate cache, temp, browser-output and artifact directories. Installed Python/Node/browser executables may be shared read-only; do not share mutable dependency installations.
+- Frontend: build plus real Playwright scenarios and a PNG attachment per scenario. Backend: unit tests, plus any configured contract/integration checks. Missing tests, skipped required scenarios, flaky browser retries, nonzero exits and missing/tampered artifacts block the graph.
+- Both worker snapshots are checked separately, then the combined integration candidate is checked again. Thus individually passing workers are not sufficient for integration.
+- Review is performed by Pi/a fresh reviewer or a human against the exact bundle and candidate. The CLI imports that review; it does not spawn an unconfigured Pi model or fabricate independent review. Review identity is an operator attestation, not a cryptographic identity service.
+- Explicit approval authorizes a **local fast-forward of the original source branch**. Source drift/dirty state blocks it. Nothing pushes, publishes, deletes worktrees, or changes provider/billing plans automatically.
+- This is a trusted local development tool, not a sandbox or multi-tenant service. Tests/configuration are executable code. Review policy commands and task ownership before approving a run. CLI/manual terminal input is trusted operator authority.
+
+## Install and validate without launching workers
+
+Tested environment: Linux, Python 3.12, Claude CLI 2.1.278, Herdr 0.9.0, repository Playwright dependencies.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r workflow/requirements.lock
+npm ci
+npx --no-install playwright install chromium
+
+.venv/bin/python -m unittest \
+  workflow.test_graph workflow.test_sessions workflow.test_interactive \
+  workflow.test_verification workflow.test_pipeline -v
+npm run test:contracts
+```
+
+The tests use fake workers and mocked native lifecycle controls. The end-to-end test uses real temporary Git worktrees, Python unit tests, headless Chromium, screenshot files, review/approval interrupts and a fast-forward of a **temporary test repository**. It makes no Claude model calls. A second test injects a check failure, reopens checkpoints and verifies that only the failed verification attempt reruns.
+
+## 1. Define and commit the feature contract
+
+Commit shared application types/API expectations and the workflow contract before either worker starts. Define:
+
+- UI and adapter task files, with distinct responsibilities.
+- `ui`/`frontend` and `adapter`/`backend` owned path prefixes (no globs or overlaps).
+- A verification policy matching `contracts/workflow/verification.schema.json`.
+- Tests for the named browser scenarios, following the attachment convention below. These can be part of the workers' deliverables; required test files missing at verification block the run.
+
+`contracts/workflow/verification.example.json` is illustrative, not a runnable feature test suite. Replace its commands/scenarios with the chosen feature's actual acceptance criteria.
+
+Optional policy `setup` is an array of approved `{ "argv": [...], "timeout_seconds": 300 }` commands, run once in every fresh verification worktree. For a Node project this could be `npm ci`; scripts are trusted code, so do not add setup commands casually. Python checks use the controller's virtualenv through PATH. No dependency directories are symlinked between writers/verifiers.
+
+## 2. Preflight and prepare (no model calls)
+
+Use a new run directory outside the source repository. Keep the source clean, and use a named source branch.
+
+```bash
+RUN="$HOME/.local/state/md-manager-workflows/my-feature-001"
+PY="$PWD/.venv/bin/python"
+
+"$PY" -m workflow preflight "$RUN" --repo "$PWD" --policy /path/to/policy.json --herdr
+"$PY" -m workflow prepare "$RUN" --repo "$PWD" --policy /path/to/policy.json \
+  --ui-task /path/to/ui-task.txt --adapter-task /path/to/adapter-task.txt
+```
+
+Preflight checks policy roles, source cleanliness, CLI flags/authentication and required executables. It does not run the feature's tests or assume future dependencies are already installed. `prepare` creates verified worktrees and pins the policy digest/starting revision/branch. Run configuration is immutable after preparation; change feature requirements by creating a new run.
+
+## 3. Start and interact (explicit model usage)
+
+```bash
+"$PY" -m workflow start "$RUN" --live --herdr
+```
+
+This is the only initial launch command. Native Claude assigns actual session IDs; receipts and worktree identity bind them to graph nodes. `start` refuses an already-started run. Keep the initial controller call in a persistent terminal to protect startup from SSH disconnects.
+
+Select `Claude: ui` or `Claude: adapter` in the dedicated workflow tab and type normally. Manual permission prompts are yours to answer. File read/edit tools are enabled; shell tools and nested agents are disabled in this training profile. The trusted verifier, not the worker, executes tests later.
+
+Ctrl+Z detaches without stopping the native terminal. Closing a panel only detaches it. To reconnect a worker in an available terminal, use the validated attachment entry point:
+
+```bash
+"$PY" -m workflow.interactive attach-one "$RUN" --node ui
+```
+
+If `start` was used without `--herdr`, `python -m workflow attach "$RUN"` creates the dedicated tab. Partial/duplicate panel allocations are preserved and reported, not silently replaced.
+
+While workers run, do one independent task outside their worktrees and leave `$RUN/return-note.md` describing the run, independent task, current state and next action.
+
+## 4. Explicit handoff, freeze and verification
+
+Ask each worker for its final summary and open assumptions. The operator saves each handoff as:
+
+```json
+{"summary": "Implemented the assigned UI behavior", "open_assumptions": []}
+```
+
+Then:
+
+```bash
+"$PY" -m workflow freeze "$RUN" \
+  --ui-handoff /path/to/ui-handoff.json --adapter-handoff /path/to/adapter-handoff.json
+```
+
+Both handoffs are validated **before stopping** workers. Do not continue typing or manually restart workers after freeze. The runtime stops only the recorded native sessions, establishes termination, captures immutable commits with a private Git index, checks ownership, runs checks, creates an integration candidate and rechecks it.
+
+Worker worktree HEADs are not committed/rewritten; private snapshot refs preserve their captured contents. Source branch integration occurs only after the later approval. All partial worktrees, native logs and check evidence remain available on failure.
+
+### Playwright evidence convention
+
+Every required scenario ID must appear in exactly one test title, and its test must attach a screenshot:
+
+```ts
+import { test, expect } from '@playwright/test'
+
+test('[scenario:failed-worker] shows a useful error', async ({ page }, testInfo) => {
+  await page.goto(process.env.WORKFLOW_TEST_URL!) // use your isolated local test server
+  // Drive and assert the real feature behavior here.
+  await expect(page.getByText('Worker failed')).toBeVisible()
+  const image = testInfo.outputPath('failed-worker.png')
+  await page.screenshot({ path: image, fullPage: true })
+  await testInfo.attach('screenshot:failed-worker', { path: image, contentType: 'image/png' })
+})
+```
+
+The runner adds `--reporter=json`, an isolated `--output`, `--workers=1`, and `--retries=0`, and controls `PLAYWRIGHT_JSON_OUTPUT_FILE`. These trusted additions are recorded separately as `effective_commands`; the v1 command field retains the approved policy argv. Use a distinct scenario ID for each viewport/project variant. Failed/skipped/flaky cases do not satisfy required scenarios. No automatic screenshot is substituted for a missing attachment.
+
+Have your Playwright config start/stop an isolated local web server on a nonconflicting port. Workers are stopped before checks, but the two verification lanes can execute concurrently. Never reuse a developer's existing server and call it isolated verification. Process groups are terminated after each check, including timeout cleanup.
+
+Python unittest and Node TAP/spec summaries are supported for non-browser test counts. Unsupported/custom test reporters produce missing test evidence and block rather than infer success. Browser assertions/reporting and screenshot inspection remain the reviewer's responsibility; PNG headers/hashes do not prove visual quality.
+
+## 5. Review the exact candidate
+
+Successful verification interrupts at `independent_review` and produces:
+
+- `review-bundle.json`: frozen revisions, policy digest and packet hashes.
+- `verification/worker/.../packet.json`: worker checks, logs, screenshots, file lists and assumptions.
+- `verification/candidate/.../packet.json`: checks of the combined candidate. These are candidate-verification records, not per-worker ownership claims.
+- `candidate/`: clean candidate worktree for read-only inspection.
+- `report.html`: local visual graph, pending state/errors, timeline, checks and artifact/screenshot links.
+
+Ask Pi to assign an independent read-only reviewer against these exact artifacts. If the reviewer needs to run commands, give it another isolated worktree; do not let it mutate the captured candidate/check worktrees. The review JSON is:
+
+```json
+{
+  "run_id": "my-feature-001",
+  "bundle_sha256": "<SHA-256 of review-bundle.json>",
+  "candidate_commit": "<candidate SHA from bundle>",
+  "reviewer": "<independent Pi review run ID or human identity>",
+  "independent": true,
+  "verdict": "approved",
+  "findings": []
+}
+```
+
+Findings, if present, contain `severity` (`P0`, `P1`, `P2`), `message`, and `disposition` (`open`, `resolved`, `accepted`). P0/P1 must be resolved. Do not relabel a rejected review as approved. Code changes require new snapshots, verification and review—start a revised run rather than mutate an approved bundle.
+
+```bash
+"$PY" -m workflow review "$RUN" --review-file /path/to/independent-review.json
+```
+
+Review does not integrate. The graph then waits at a separate approval interrupt.
+
+## 6. Approve local integration
+
+```bash
+"$PY" -m workflow approve "$RUN" --bundle-sha256 <exact-reviewed-bundle-hash>
+```
+
+This explicitly authorizes a fast-forward of the original source branch. It checks review, packet/artifact hashes, source branch identity, clean source state and unchanged starting HEAD again. No push occurs. Do not allow another writer in the source checkout during this operation.
+
+## Status, failures and recovery
+
+```bash
+"$PY" -m workflow status "$RUN"
+```
+
+Status refreshes `report.html`. It is a local snapshot viewer, not a live multi-user HTTP dashboard. Open it where its relative artifact files are accessible, or use your trusted SSH/local file-viewing setup; do not publish the run directory or logs. There are no unauthenticated HTTP execution controls.
+
+- **Failed verification:** inspect its packet/log. For a transient check/environment failure at the same immutable revision, explicitly retry only that lane:
+  `python -m workflow retry "$RUN" --phase worker --node adapter`.
+- **Failed combined check:** use `--phase candidate --node ui` (or adapter). Already successful candidate checks are reused after artifact validation.
+- **Failure after stopping/snapshotting or integrating:** `retry "$RUN"` resumes only failed graph steps; it never launches a new Claude worker. Stop-intent recovery checks whether the prior stop already completed before issuing another native stop.
+- **Ambiguous startup:** inspect receipts/native inventory, then `reconcile "$RUN"`. It only permits existing durable launch intents and exact surviving sessions; no new native process is launched during reconciliation. Missing proof remains blocked.
+- **Changed code/policy:** create a new run. Do not modify frozen snapshots/evidence and reuse approvals.
+- **Partial candidate/worktree allocation:** preserve and inspect it. Automatic destructive cleanup or speculative Git conflict resolution is intentionally unavailable.
+- **Usage exhausted:** workers stay at the manual terminal/handoff boundary. Preserve their receipts/worktrees, record the decision, and ask the owner to wait or approve a new plan/provider. The system never switches to another payment/provider mode or replays an opaque Claude workflow automatically.
+- **Stopping an unfinished run:** use the exact native IDs from its receipts with Claude's `stop` command after verifying identity. Closing Herdr alone is not a stop. All run artifacts/worktrees are retained; cleanup is a separate operator decision.
+
+The two-worker limit is a training constraint, not an optimality claim. Selective check recovery is tested independently of Claude's own workflow-relaunch semantics.

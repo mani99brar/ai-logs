@@ -1,0 +1,326 @@
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { describe, expect, it } from "vitest";
+import { nextInt } from "../random.js";
+import {
+  canStartClaim,
+  claimDistanceSquared,
+  createClaimConfig,
+  createClaimState,
+  hashState,
+  stepClaim,
+  type ClaimConfig,
+  type ClaimEncounter,
+  type ClaimEvent,
+  type ClaimPlayer,
+  type ClaimState,
+  type ClaimTickInput,
+} from "./index.js";
+
+const POINT = { x: 20_000, y: 30_000 };
+/** A short match with a short channel, so random ticks produce wins, interrupts and timeouts. */
+const config = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: 30, deadlineTicks: 400 } });
+
+/** Ids whose code-unit order differs from numeric and case-insensitive order. */
+const IDS = ["p1", "p10", "p2", "P3", "a", "B", "crew", "Z9"];
+/** Offsets from the claim point: several at the same distance (300), the circle's edge (1024) and outside it. */
+const SPOTS: readonly (readonly [number, number])[] = [
+  [0, 0],
+  [300, 0],
+  [0, 300],
+  [-300, 0],
+  [180, -240],
+  [500, 500],
+  [1024, 0],
+  [0, -1024],
+  [1025, 0],
+  [2000, 2000],
+];
+
+type Draw = (bound: number) => number;
+
+function generator(seed: number): Draw {
+  let rng = seed;
+  return (bound) => {
+    const drawn = nextInt(rng, bound);
+    rng = drawn.state;
+    return drawn.value;
+  };
+}
+
+function shuffled<T>(items: readonly T[], draw: Draw): T[] {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index--) {
+    const other = draw(index + 1);
+    [copy[index], copy[other]] = [copy[other]!, copy[index]!];
+  }
+  return copy;
+}
+
+/**
+ * A seeded script of ticks from `start + 1` to past the deadline: players wander between spots, gain and lose their
+ * set, press and release interact, disconnect, gain protection, and pair off into duels that later end. `calm` (per
+ * mille) scales how rarely anything changes, so some scripts let a channel run to completion.
+ */
+function randomScript(seed: number, start: number, calm: number): ClaimTickInput[] {
+  const draw = generator(seed);
+  const chance = (perMille: number) => draw(1000) < Math.floor((perMille * (1000 - calm)) / 1000);
+  const count = 2 + draw(5);
+  const ids = shuffled(IDS, draw).slice(0, count);
+  const players = new Map<string, ClaimPlayer>();
+  for (const id of ids) {
+    const [dx, dy] = SPOTS[draw(SPOTS.length)]!;
+    players.set(id, { id, x: POINT.x + dx, y: POINT.y + dy, speed: 0, holdsAllTypes: draw(4) > 0, interact: draw(2) === 0, connected: true, protected: draw(3) === 0 });
+  }
+  let encounters: ClaimEncounter[] = [];
+  let encounterCount = 0;
+  const script: ClaimTickInput[] = [];
+  for (let tick = start + 1; tick <= config.deadlineTick + 20; tick++) {
+    for (const id of ids) {
+      let next = players.get(id)!;
+      if (next.speed !== 0) next = { ...next, speed: 0 };
+      if (chance(40)) {
+        const [dx, dy] = SPOTS[draw(SPOTS.length)]!;
+        next = { ...next, x: POINT.x + dx, y: POINT.y + dy, speed: 1 + draw(64) };
+      }
+      if (chance(20)) next = { ...next, holdsAllTypes: !next.holdsAllTypes };
+      if (chance(60)) next = { ...next, interact: !next.interact };
+      if (chance(15)) next = { ...next, connected: !next.connected };
+      if (chance(10)) next = { ...next, protected: !next.protected };
+      players.set(id, next);
+    }
+    encounters = encounters.filter(() => !chance(80));
+    if (chance(60)) {
+      const reserved = new Set(encounters.flatMap((encounter) => encounter.playerIds));
+      const free = ids.filter((id) => !reserved.has(id));
+      if (free.length >= 2) {
+        const [a, b] = shuffled(free, draw);
+        encounters = [...encounters, { id: `e${encounterCount++}`, playerIds: [a!, b!] }];
+      }
+    }
+    // Now and then a player drops out of the snapshot altogether.
+    const present = ids.filter(() => !chance(10));
+    script.push({ tick, players: present.map((id) => players.get(id)!), encounters });
+  }
+  return script;
+}
+
+interface Run {
+  readonly states: readonly ClaimState[];
+  readonly hashes: readonly string[];
+  readonly events: readonly (readonly ClaimEvent[])[];
+}
+
+function run(cfg: ClaimConfig, start: ClaimState, script: readonly ClaimTickInput[]): Run {
+  const states: ClaimState[] = [];
+  const events: ClaimEvent[][] = [];
+  let state = start;
+  for (const input of script) {
+    const stepped = stepClaim(cfg, state, input);
+    state = stepped.state;
+    states.push(state);
+    events.push([...stepped.events]);
+  }
+  return { states, hashes: states.map(hashState), events };
+}
+
+/** The same script with every tick's players and encounters in a different order. */
+function reorder(script: readonly ClaimTickInput[], seed: number): ClaimTickInput[] {
+  const draw = generator(seed);
+  return script.map((input) => ({ ...input, players: shuffled(input.players, draw), encounters: shuffled(input.encounters, draw) }));
+}
+
+/** The same script with ids renamed and positions moved by a distance-preserving map about the claim point. */
+function transform(
+  script: readonly ClaimTickInput[],
+  rename: (id: string) => string,
+  move: (dx: number, dy: number) => readonly [number, number],
+): ClaimTickInput[] {
+  return script.map((input) => ({
+    tick: input.tick,
+    players: input.players.map((player) => {
+      const [dx, dy] = move(player.x - POINT.x, player.y - POINT.y);
+      return { ...player, id: rename(player.id), x: POINT.x + dx, y: POINT.y + dy };
+    }),
+    encounters: input.encounters.map((encounter) => ({
+      id: encounter.id,
+      playerIds: [rename(encounter.playerIds[0]), rename(encounter.playerIds[1])] as const,
+    })),
+  }));
+}
+
+function renameEvents(events: readonly (readonly ClaimEvent[])[], rename: (id: string) => string): ClaimEvent[][] {
+  return events.map((tick) =>
+    tick.map((event) => {
+      switch (event.kind) {
+        case "duel-ended-without-theft":
+          return { ...event, playerIds: [rename(event.playerIds[0]), rename(event.playerIds[1])] as const };
+        case "match-ended":
+          return { ...event, winner: event.winner === null ? null : rename(event.winner) };
+        default:
+          return { ...event, playerId: rename(event.playerId) };
+      }
+    }),
+  );
+}
+
+const SEEDS = Array.from({ length: 60 }, (_, index) => index + 1);
+const scriptFor = (seed: number) => randomScript(seed, 0, [0, 500, 800][seed % 3]!);
+
+describe("seeded random ticks (§19 Endgame)", () => {
+  it.each(SEEDS)("seed %i commits at most one winner, freezes after the result and keeps every invariant", (seed) => {
+    const script = scriptFor(seed);
+    const { states, hashes, events } = run(config, createClaimState(config), script);
+    const all = events.flat();
+    const completed = all.filter((event) => event.kind === "claim-completed");
+    const ended = all.filter((event) => event.kind === "match-ended");
+    expect(completed.length).toBeLessThanOrEqual(1);
+    expect(ended).toHaveLength(1);
+
+    const resolvedAt = states.findIndex((state) => state.result !== null);
+    expect(resolvedAt).toBeGreaterThanOrEqual(0);
+    const result = states[resolvedAt]!.result!;
+    expect(ended[0]).toMatchObject({ tick: result.tick, reason: result.reason, winner: result.winner });
+    if (completed.length === 1) {
+      expect(result).toEqual({ reason: "claim", winner: completed[0]!.playerId, tick: completed[0]!.tick });
+    } else {
+      expect(result).toEqual({ reason: "deadline", winner: null, tick: config.deadlineTick });
+    }
+    // After the result nothing changes, whatever arrives.
+    for (let index = resolvedAt + 1; index < states.length; index++) {
+      expect(states[index]).toBe(states[resolvedAt]);
+      expect(hashes[index]).toBe(hashes[resolvedAt]);
+      expect(events[index]).toEqual([]);
+    }
+
+    for (let index = 0; index < resolvedAt; index++) {
+      const input = script[index]!;
+      const state = states[index]!;
+      const reserved = new Set(input.encounters.flatMap((encounter) => encounter.playerIds));
+      const channel = state.channel;
+      if (channel !== null) {
+        // The channeller is eligible this tick, where the channel started, and short of completion.
+        const player = input.players.find((candidate) => candidate.id === channel.playerId);
+        expect(player).toBeDefined();
+        expect(canStartClaim(config, player!, reserved.has(player!.id))).toBe(true);
+        expect([player!.x, player!.y]).toEqual([channel.x, channel.y]);
+        expect(channel.progress).toBe(input.tick - channel.startTick);
+        expect(channel.progress).toBeLessThan(config.channelTicks);
+      } else {
+        // A free channel is never left free while someone eligible is waiting.
+        expect(input.players.some((player) => canStartClaim(config, player, reserved.has(player.id)))).toBe(false);
+      }
+    }
+  });
+
+  it("exercise wins, timeouts and every interrupt reason across the seeds", () => {
+    const outcomes = { winners: 0, timeouts: 0, reasons: new Set<string>() };
+    for (const seed of SEEDS) {
+      const all = run(config, createClaimState(config), scriptFor(seed)).events.flat();
+      if (all.some((event) => event.kind === "claim-completed")) outcomes.winners++;
+      else outcomes.timeouts++;
+      for (const event of all) if (event.kind === "claim-interrupted") outcomes.reasons.add(event.reason);
+    }
+    expect(outcomes.winners).toBeGreaterThan(5);
+    expect(outcomes.timeouts).toBeGreaterThan(5);
+    expect([...outcomes.reasons].sort()).toEqual(["deadline", "disconnected", "duel", "ineligible", "moved", "released"]);
+  });
+
+  it.each(SEEDS.slice(0, 20))("seed %i hashes identically on replay, tick by tick", (seed) => {
+    const first = run(config, createClaimState(config), scriptFor(seed));
+    const replayed = run(config, createClaimState(config), JSON.parse(JSON.stringify(scriptFor(seed))) as ClaimTickInput[]);
+    expect(replayed.hashes).toEqual(first.hashes);
+    expect(replayed.events).toEqual(first.events);
+  });
+
+  it("changes the hash from the tick one input changes: a channeller releasing interact", () => {
+    let changed = 0;
+    for (const seed of SEEDS.slice(0, 20)) {
+      const script = scriptFor(seed);
+      const first = run(config, createClaimState(config), script);
+      const at = first.states.findIndex((state, index) => state.channel !== null && state.channel.progress > 0 && index + 1 < script.length);
+      if (at < 0) continue;
+      const channeller = first.states[at]!.channel!.playerId;
+      const altered = script.map((input, index) =>
+        index === at ? { ...input, players: input.players.map((player) => (player.id === channeller ? { ...player, interact: false } : player)) } : input,
+      );
+      const second = run(config, createClaimState(config), altered);
+      expect(second.hashes.slice(0, at)).toEqual(first.hashes.slice(0, at));
+      expect(second.hashes[at]).not.toBe(first.hashes[at]);
+      expect(second.events[at]).toContainEqual(expect.objectContaining({ kind: "claim-interrupted", playerId: channeller, reason: "released" }));
+      changed++;
+    }
+    expect(changed).toBeGreaterThan(10);
+  });
+});
+
+describe("symmetry (§5 ordering)", () => {
+  it.each(SEEDS.slice(0, 20))("seed %i: the order of players and encounters in each tick never matters", (seed) => {
+    const script = scriptFor(seed);
+    const first = run(config, createClaimState(config), script);
+    const again = run(config, createClaimState(config), reorder(script, seed * 7919));
+    expect(again.hashes).toEqual(first.hashes);
+    expect(again.events).toEqual(first.events);
+  });
+
+  const moves: [string, (dx: number, dy: number) => readonly [number, number]][] = [
+    ["a quarter turn", (dx, dy) => [-dy, dx]],
+    ["a half turn", (dx, dy) => [-dx, -dy]],
+    ["a mirror", (dx, dy) => [-dx, dy]],
+    ["a diagonal mirror", (dx, dy) => [dy, dx]],
+  ];
+
+  it.each(moves)("rotating or mirroring every position about the claim point by %s gives the same events", (_, move) => {
+    for (const seed of SEEDS.slice(0, 20)) {
+      const script = scriptFor(seed);
+      const first = run(config, createClaimState(config), script);
+      const moved = run(config, createClaimState(config), transform(script, (id) => id, move));
+      expect(moved.events).toEqual(first.events);
+      expect(moved.states.map((state) => state.result)).toEqual(first.states.map((state) => state.result));
+    }
+  });
+
+  it("relabelling players in an order-preserving way relabels the outcome and nothing else", () => {
+    const rename = (id: string) => `crew-${id}`;
+    for (const seed of SEEDS.slice(0, 20)) {
+      const script = scriptFor(seed);
+      const first = run(config, createClaimState(config), script);
+      const relabelled = run(config, createClaimState(config), transform(script, rename, (dx, dy) => [dx, dy]));
+      expect(relabelled.events).toEqual(renameEvents(first.events, rename));
+    }
+  });
+
+  it("starts the claimer the rule names, closest then lowest id, under any relabelling and input order", () => {
+    const draw = generator(424242);
+    const start = createClaimState(config);
+    let ties = 0;
+    for (let trial = 0; trial < 1000; trial++) {
+      const ids = shuffled(IDS, draw).slice(0, 2 + draw(6));
+      const players: ClaimPlayer[] = ids.map((id) => {
+        const [dx, dy] = SPOTS[draw(6)]!;
+        return { id, x: POINT.x + dx, y: POINT.y + dy, speed: draw(8) === 0 ? 1 : 0, holdsAllTypes: draw(8) > 0, interact: draw(8) > 0, connected: draw(12) > 0, protected: draw(2) === 0 };
+      });
+      const encounters: ClaimEncounter[] = draw(3) === 0 && ids.length >= 3 ? [{ id: "e", playerIds: [ids[1]!, ids[2]!] }] : [];
+      // Any relabelling: a random permutation of the id pool.
+      const pool = shuffled(IDS, draw);
+      const relabel = (id: string) => pool[IDS.indexOf(id)]!;
+
+      for (const rename of [(id: string) => id, relabel]) {
+        const renamedPlayers = players.map((player) => ({ ...player, id: rename(player.id) }));
+        const renamedEncounters = encounters.map((encounter) => ({ id: encounter.id, playerIds: [rename(encounter.playerIds[0]), rename(encounter.playerIds[1])] as const }));
+        const reserved = new Set(renamedEncounters.flatMap((encounter) => encounter.playerIds));
+        const eligible = renamedPlayers
+          .filter((player) => canStartClaim(config, player, reserved.has(player.id)))
+          .map((player) => ({ id: player.id, distance: claimDistanceSquared(config, player.x, player.y) }))
+          .sort((a, b) => a.distance - b.distance || (a.id < b.id ? -1 : 1));
+        if (eligible.length >= 2 && eligible[0]!.distance === eligible[1]!.distance) ties++;
+        const expected = eligible[0]?.id ?? null;
+        for (const order of [renamedPlayers, [...renamedPlayers].reverse(), shuffled(renamedPlayers, draw)]) {
+          const stepped = stepClaim(config, start, { tick: 1, players: order, encounters: shuffled(renamedEncounters, draw) });
+          expect(stepped.state.channel?.playerId ?? null).toBe(expected);
+        }
+      }
+    }
+    // The trials include plenty of distance ties, so the id rule is exercised.
+    expect(ties).toBeGreaterThan(100);
+  });
+});

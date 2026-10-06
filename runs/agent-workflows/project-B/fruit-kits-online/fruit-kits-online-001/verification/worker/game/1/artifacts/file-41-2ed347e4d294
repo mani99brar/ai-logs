@@ -1,0 +1,261 @@
+import { performance } from "node:perf_hooks";
+import { Client, type Room } from "@colyseus/sdk";
+import {
+  DUEL_ROOM,
+  duelFrameBundleSchema,
+  DuelMessageType,
+  duelProbeSchema,
+  normalizeMatchCode,
+  parseDuelKits,
+  PROTOCOL_VERSION,
+  type DuelFrameBundle,
+  type DuelPracticeMessage,
+  type DuelProbeReply,
+  type DuelRoomPhase,
+  type DummyBehaviour,
+} from "@pirate-sea-race/protocol";
+import type { DuelRoomStateSchema } from "@pirate-sea-race/server/schema";
+import { createDuelState, defaultDuelConfig, type DuelState, type PlayerIndex } from "@pirate-sea-race/simulation/duel";
+import { DuelClientSession, type DuelSessionStats } from "@pirate-sea-race/simulation/netcode";
+import { newCreateToken, sleep } from "./headlessClient.js";
+
+/**
+ * What a scripted player holds at each of its client frames (the frame it is on, before the input delay), like keys
+ * held down: `script(frame)` is called once per tick with the client's current frame.
+ */
+export type DuelScript = (clientFrame: number, session: DuelClientSession) => number;
+
+export interface HeadlessDuelOptions {
+  readonly protocolVersion?: number;
+  /** How often the client ticks, in milliseconds (the browser ticks about every 4 ms). */
+  readonly tickMs?: number;
+}
+
+/** A duel's synced lobby as a client reads it: a duel room's state, or this fighter's duel in a match room's state. */
+export interface DuelLobbyView {
+  readonly phase: string;
+  readonly countdown: number;
+  readonly seed: number;
+  /** Both fighters' kits, player one's first ("ember,duelist"): part of the frame-0 state. */
+  readonly kits: string;
+  readonly inputDelay: number;
+  readonly seats: Iterable<{ readonly sessionId: string; readonly slot: number; readonly connected: boolean }>;
+  readonly winner: number;
+  readonly reason: string;
+}
+
+/**
+ * Where a duel client finds its duel on the room it plays over: the lobby, and a key that changes when a new duel
+ * begins (a match room holds a fighter's duels one after another), which restarts the session.
+ */
+export interface DuelLobbySource {
+  lobby(): DuelLobbyView | undefined;
+  key(): string | undefined;
+}
+
+/**
+ * A browserless duel player on the real Colyseus SDK that runs the same `DuelClientSession` as the browser: it answers
+ * the server's round-trip probes, feeds frame bundles to the rollback core, and ticks the session every few
+ * milliseconds with the input its script holds, sending what the session returns. It records every bundle, so a test
+ * can replay what the server confirmed. It plays over a standalone duel room (`create`, `join`) or, as a fighter at
+ * sea, over a match room (`overMatch`, which `HeadlessClient` does): the same messages, a different lobby.
+ */
+export class HeadlessDuelClient<State = DuelRoomStateSchema> {
+  private session: DuelClientSession | undefined;
+  private sessionKey: string | undefined;
+  private script: DuelScript = () => 0;
+  private readonly timer: NodeJS.Timeout;
+  private open = true;
+  private dropped = false;
+  /** The frame bundles of the current duel. */
+  readonly bundles: DuelFrameBundle[] = [];
+
+  private constructor(
+    readonly room: Room<unknown, State>,
+    options: HeadlessDuelOptions,
+    private readonly source: DuelLobbySource,
+  ) {
+    room.onMessage(DuelMessageType.Probe, (message: unknown) => {
+      const probe = duelProbeSchema.parse(message);
+      room.send(DuelMessageType.Probe, { id: probe.id } satisfies DuelProbeReply);
+      this.ensureSession()?.receiveProbe(probe, performance.now());
+    });
+    room.onMessage(DuelMessageType.Frames, (message: unknown) => {
+      const bundle = duelFrameBundleSchema.parse(message);
+      this.ensureSession();
+      this.bundles.push(bundle);
+      this.session?.receiveBundle(bundle, performance.now());
+    });
+    room.onDrop(() => {
+      this.dropped = true;
+    });
+    room.onReconnect(() => {
+      this.dropped = false;
+    });
+    room.onLeave(() => {
+      this.open = false;
+      clearInterval(this.timer);
+    });
+    this.timer = setInterval(() => this.tick(), options.tickMs ?? 4);
+  }
+
+  /** Creates a duel (or a practice duel against the dummy) on the server at `endpoint`. */
+  static async create(endpoint: string, options: HeadlessDuelOptions & { readonly practice?: boolean } = {}): Promise<HeadlessDuelClient> {
+    const room = await new Client(endpoint).create<DuelRoomStateSchema>(DUEL_ROOM, {
+      protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
+      createToken: newCreateToken(),
+      ...(options.practice === true ? { practice: true } : {}),
+    });
+    const client = HeadlessDuelClient.overDuelRoom(room, options);
+    await client.waitFor(() => client.code !== "" && client.slot !== undefined);
+    return client;
+  }
+
+  /** Joins the duel with `code` (any case). */
+  static async join(endpoint: string, code: string, options: HeadlessDuelOptions = {}): Promise<HeadlessDuelClient> {
+    const room = await new Client(endpoint).join<DuelRoomStateSchema>(DUEL_ROOM, {
+      protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
+      code: normalizeMatchCode(code),
+    });
+    const client = HeadlessDuelClient.overDuelRoom(room, options);
+    await client.waitFor(() => client.slot !== undefined);
+    return client;
+  }
+
+  private static overDuelRoom(room: Room<unknown, DuelRoomStateSchema>, options: HeadlessDuelOptions): HeadlessDuelClient {
+    return new HeadlessDuelClient(room, options, { lobby: () => room.state, key: () => (room.state === undefined ? undefined : "duel") });
+  }
+
+  /** A fighter's duel client over a room that holds its duels in some other lobby (a match room: `HeadlessClient`). */
+  static overMatch<State>(room: Room<unknown, State>, source: DuelLobbySource, options: HeadlessDuelOptions = {}): HeadlessDuelClient<State> {
+    return new HeadlessDuelClient(room, options, source);
+  }
+
+  get sessionId(): string {
+    return this.room.sessionId;
+  }
+
+  get code(): string {
+    return (this.room.state as { code?: string } | undefined)?.code ?? "";
+  }
+
+  /** The current duel's lobby, if there is one. */
+  get lobby(): DuelLobbyView | undefined {
+    return this.source.lobby();
+  }
+
+  get phase(): DuelRoomPhase | "" {
+    return (this.lobby?.phase ?? "") as DuelRoomPhase | "";
+  }
+
+  get connected(): boolean {
+    return this.open && !this.dropped;
+  }
+
+  /** This player's index: 0 for the creator, 1 for the joiner. */
+  get slot(): PlayerIndex | undefined {
+    const seats = this.lobby?.seats;
+    const seat = seats === undefined ? undefined : [...seats].find((entry) => entry.sessionId === this.room.sessionId);
+    return seat === undefined ? undefined : (seat.slot as PlayerIndex);
+  }
+
+  /** The rollback session, once the room's seed and this client's seat are known. */
+  get duel(): DuelClientSession | undefined {
+    return this.ensureSession();
+  }
+
+  get stats(): DuelSessionStats | undefined {
+    return this.session?.stats;
+  }
+
+  /** The newest state stepped from the server's confirmed inputs. */
+  get confirmedState(): DuelState | undefined {
+    return this.session?.confirmedState;
+  }
+
+  /** Holds inputs from now on according to `script`. */
+  play(script: DuelScript): void {
+    this.script = script;
+  }
+
+  /** Practice rooms: switch the dummy between idle and guarding. */
+  setDummy(dummy: DummyBehaviour): void {
+    this.room.send(DuelMessageType.Practice, { dummy } satisfies DuelPracticeMessage);
+  }
+
+  /** Sends anything at all on the duel's input channel, for tests of the server's validation. */
+  sendRaw(type: string, payload: unknown): void {
+    this.room.send(type, payload);
+  }
+
+  /** Resolves once `predicate` holds; rejects after `timeoutMs`. */
+  async waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs} ms`);
+      await sleep(10);
+    }
+  }
+
+  /** Resolves once the duel's confirmed frame reaches `frame`. */
+  async waitForConfirmed(frame: number, timeoutMs = 20_000): Promise<void> {
+    await this.waitFor(() => (this.session?.rollback.confirmedFrame ?? -1) >= frame, timeoutMs);
+  }
+
+  /** Stops ticking (the room is left by whoever owns it). */
+  async stop(): Promise<void> {
+    clearInterval(this.timer);
+  }
+
+  /** Leaves the duel; a client whose connection is down stops reconnecting and closes instead. */
+  async leave(): Promise<void> {
+    clearInterval(this.timer);
+    if (!this.open) return;
+    this.room.reconnection.enabled = false;
+    if (this.room.connection?.isOpen !== true) {
+      this.open = false;
+      return;
+    }
+    await Promise.race([this.room.leave(true).catch(() => undefined), sleep(2000)]);
+  }
+
+  /**
+   * The session of the current duel, created once its lobby is known. A new duel (another lobby key) starts a new
+   * session. So does a fight at sea that begins after a `waiting` pause (a fighter was slow to load): the session is
+   * dropped while waiting, so its clock starts from the fight's own frames rather than from a countdown that paused.
+   */
+  private ensureSession(): DuelClientSession | undefined {
+    const lobby = this.lobby;
+    const key = this.source.key();
+    if (key !== this.sessionKey || lobby === undefined || lobby.phase === "waiting") {
+      if (key !== this.sessionKey) this.bundles.length = 0;
+      this.session = undefined;
+      this.sessionKey = key;
+    }
+    if (this.session !== undefined) return this.session;
+    const slot = this.slot;
+    const kits = parseDuelKits(lobby?.kits);
+    if (lobby === undefined || lobby.phase === "waiting" || slot === undefined || lobby.seed === undefined || kits === undefined) return undefined;
+    this.session = new DuelClientSession({
+      config: defaultDuelConfig,
+      player: slot,
+      // The kits are part of the frame-0 state, as the server created it: the per-frame hashes cover them.
+      initial: createDuelState(defaultDuelConfig, { seed: lobby.seed, kits }),
+    });
+    return this.session;
+  }
+
+  private tick(): void {
+    const session = this.ensureSession();
+    if (session === undefined) return;
+    // As in the browser: after the result, no more input, but the final bundle is stepped.
+    if (this.phase === "over") {
+      session.finish();
+      return;
+    }
+    const delay = this.lobby?.inputDelay ?? 0;
+    if (delay > 0) session.inputDelay = delay;
+    const message = session.tick(performance.now(), this.script(session.frame ?? 0, session));
+    if (message !== undefined) this.room.send(DuelMessageType.Input, message);
+  }
+}

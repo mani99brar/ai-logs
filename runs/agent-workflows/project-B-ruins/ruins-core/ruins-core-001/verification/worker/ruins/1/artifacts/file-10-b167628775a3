@@ -1,0 +1,442 @@
+import { WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import { RUIN_LOCKOUT_SECONDS, RUIN_MOVES, RUIN_SYMBOLS, ruinRules, type RuinMove, type RuinSymbol } from "@pirate-sea-race/content/ruins";
+import { describe, expect, it } from "vitest";
+import {
+  answerRuin,
+  clueFor,
+  createRuins,
+  hashState,
+  openRuin,
+  reportPresence,
+  ruinIslands,
+  tabletText,
+  type Ruin,
+  type RuinAttempt,
+  type RuinClue,
+  type RuinsState,
+  type SequenceTablet,
+} from "./index.js";
+
+/**
+ * Generation, clues and timing (§3, §16), checked with evaluators written here, independent of the generator's own
+ * helpers, so that one bug in the generator's semantics cannot pass both sides.
+ */
+
+const SEEDS = 500;
+const ISLANDS = [0, 1, 2, 3].map((island) => ({ island, sourceIds: [`source-${island}-0`, `source-${island}-1`] }));
+const LOCKOUT_TICKS = RUIN_LOCKOUT_SECONDS * WORLD_STEPS_PER_SECOND;
+
+function ruinsOf(state: RuinsState): Ruin[] {
+  return ruinIslands(state).map((island) => state.ruins[String(island)]!);
+}
+
+const ALL = Array.from({ length: SEEDS }, (_, seed) => ({ seed, state: createRuins({ seed, islands: ISLANDS }) }));
+const SEQUENCE_RUINS = ALL.flatMap(({ seed, state }) => ruinsOf(state).filter((ruin) => ruin.puzzle.kind === "sequence").map((ruin) => ({ seed, ruin })));
+const NAVIGATION_RUINS = ALL.flatMap(({ seed, state }) => ruinsOf(state).filter((ruin) => ruin.puzzle.kind === "navigation").map((ruin) => ({ seed, ruin })));
+
+// ---------------------------------------------------------------------------------------------------------------
+// Independent evaluators
+
+type Triple = readonly [RuinSymbol, RuinSymbol, RuinSymbol];
+
+/** All 120 ordered triples of distinct symbols, by three plain loops. */
+function everyTriple(): Triple[] {
+  const triples: Triple[] = [];
+  for (const a of RUIN_SYMBOLS) for (const b of RUIN_SYMBOLS) for (const c of RUIN_SYMBOLS) if (a !== b && b !== c && a !== c) triples.push([a, b, c]);
+  return triples;
+}
+
+/** Reads one tablet literally against a triple: the documented meaning of each relation, from first principles. */
+function tabletTrue(tablet: SequenceTablet, triple: Triple): boolean {
+  const place: Partial<Record<RuinSymbol, number>> = {};
+  triple.forEach((symbol, index) => (place[symbol] = index + 1));
+  const mine = place[tablet.symbol] ?? 0;
+  const theirs = tablet.hint.other === null ? 0 : (place[tablet.hint.other] ?? 0);
+  const both = mine > 0 && theirs > 0;
+  switch (tablet.hint.relation) {
+    case "absent":
+      return mine === 0;
+    case "present":
+      return mine > 0;
+    case "at":
+      return mine === tablet.hint.position! + 1;
+    case "not-at":
+      return mine !== tablet.hint.position! + 1;
+    case "right-after":
+      return both && mine - theirs === 1;
+    case "right-before":
+      return both && theirs - mine === 1;
+    case "after":
+      return both && mine > theirs;
+    case "before":
+      return both && mine < theirs;
+    default:
+      throw new Error(`unknown relation ${String(tablet.hint.relation)}`);
+  }
+}
+
+function triplesFitting(clue: Extract<RuinClue, { kind: "sequence" }>): Triple[] {
+  return everyTriple().filter((triple) => clue.tablets.every((tablet) => tabletTrue(tablet, triple)));
+}
+
+const DELTA: Record<RuinMove, readonly [number, number]> = { N: [0, -1], S: [0, 1], E: [1, 0], W: [-1, 0] };
+
+/** A grid of booleans (true = open) from a navigation clue. */
+function openGrid(clue: Extract<RuinClue, { kind: "navigation" }>): boolean[][] {
+  const grid = Array.from({ length: clue.size }, () => Array.from({ length: clue.size }, () => true));
+  for (const { x, y } of clue.blocked) grid[y]![x] = false;
+  return grid;
+}
+
+/** Breadth-first search over the clue's grid: the shortest move list from start to goal, or null. */
+function shortestRoute(clue: Extract<RuinClue, { kind: "navigation" }>): RuinMove[] | null {
+  const grid = openGrid(clue);
+  const key = (x: number, y: number) => `${x},${y}`;
+  const came = new Map<string, { from: string; move: RuinMove } | null>([[key(clue.start.x, clue.start.y), null]]);
+  let frontier: [number, number][] = [[clue.start.x, clue.start.y]];
+  while (frontier.length > 0) {
+    const next: [number, number][] = [];
+    for (const [x, y] of frontier) {
+      if (x === clue.goal.x && y === clue.goal.y) {
+        const moves: RuinMove[] = [];
+        for (let at = came.get(key(x, y)); at; at = came.get(at.from)) moves.unshift(at.move);
+        return moves;
+      }
+      for (const move of ["W", "S", "E", "N"] as const) {
+        const [nx, ny] = [x + DELTA[move][0], y + DELTA[move][1]];
+        if (grid[ny]?.[nx] !== true || came.has(key(nx, ny))) continue;
+        came.set(key(nx, ny), { from: key(x, y), move });
+        next.push([nx, ny]);
+      }
+    }
+    frontier = next;
+  }
+  return null;
+}
+
+/** Whether a move list walks from start to goal over open cells of the clue's grid. */
+function routeReachesGoal(clue: Extract<RuinClue, { kind: "navigation" }>, moves: readonly RuinMove[], grid = openGrid(clue)): boolean {
+  let [x, y] = [clue.start.x, clue.start.y];
+  for (const move of moves) {
+    [x, y] = [x + DELTA[move][0], y + DELTA[move][1]];
+    if (grid[y]?.[x] !== true) return false;
+  }
+  return x === clue.goal.x && y === clue.goal.y;
+}
+
+/** What a player who reads the site answers. */
+function readersAttempt(clue: RuinClue): RuinAttempt {
+  if (clue.kind === "sequence") {
+    const fits = triplesFitting(clue);
+    if (fits.length !== 1) throw new Error(`the clue admits ${fits.length} sequences`);
+    return { kind: "sequence", symbols: [...fits[0]!] };
+  }
+  const route = shortestRoute(clue);
+  if (!route) throw new Error("no route");
+  return { kind: "navigation", moves: route };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+
+function percentile(values: readonly number[], fraction: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(fraction * (sorted.length - 1))]!;
+}
+
+function mean(values: readonly number[]): number {
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+/** A state with just this ruin, the player moored at its island with the clue open at `tick`. */
+function openedAlone(ruin: Ruin, playerId: string, tick: number): { state: RuinsState; clue: RuinClue } {
+  const alone: RuinsState = { rules: ruinRules, tick: 0, ruins: { [String(ruin.island)]: ruin }, presence: [] };
+  const present = reportPresence(alone, { playerId, island: ruin.island, inDuel: false, tick });
+  const opened = openRuin(present.state, { playerId, island: ruin.island, tick });
+  expect(opened.result.ok).toBe(true);
+  return { state: opened.state, clue: opened.result.clue! };
+}
+
+/** Plays attempts in order, each as soon as the lockout allows, until one solves; the ticks from opening to solving. */
+function playUntilSolved(ruin: Ruin, attempts: Iterable<RuinAttempt>): { ticks: number; wrong: number } {
+  const openTick = 100;
+  let { state } = openedAlone(ruin, "guesser", openTick);
+  let tick = openTick;
+  let wrong = 0;
+  for (const attempt of attempts) {
+    const step = answerRuin(state, { playerId: "guesser", island: ruin.island, tick, attempt });
+    expect(step.result.ok).toBe(true);
+    if (step.result.outcome === "solved") return { ticks: tick - openTick, wrong };
+    wrong += 1;
+    state = step.state;
+    tick = step.result.lockedUntil;
+  }
+  throw new Error("the attempts ran out before solving");
+}
+
+describe("ruin generation (§3)", () => {
+  it("gives the same puzzles for the same seed and islands, in whatever order the islands come", () => {
+    for (const seed of [0, 1, 7, 123_456, 2 ** 31]) {
+      const once = createRuins({ seed, islands: ISLANDS });
+      expect(createRuins({ seed, islands: ISLANDS })).toEqual(once);
+      expect(hashState(createRuins({ seed, islands: [...ISLANDS].reverse() }))).toBe(hashState(once));
+    }
+    const hashes = new Set(ALL.map(({ state }) => hashState(state)));
+    expect(hashes.size).toBe(SEEDS);
+  });
+
+  it("deals both kinds across seeds, and one ruin per island guarding exactly its source ids", () => {
+    const total = SEQUENCE_RUINS.length + NAVIGATION_RUINS.length;
+    expect(total).toBe(SEEDS * ISLANDS.length);
+    expect(SEQUENCE_RUINS.length).toBeGreaterThan(total * 0.4);
+    expect(NAVIGATION_RUINS.length).toBeGreaterThan(total * 0.4);
+    for (const { state } of ALL.slice(0, 20)) {
+      expect(ruinIslands(state)).toEqual([0, 1, 2, 3]);
+      for (const ruin of ruinsOf(state)) {
+        expect(ruin.sourceIds).toEqual([`source-${ruin.island}-0`, `source-${ruin.island}-1`]);
+        expect([ruin.unlocked, ruin.solvedBy, ruin.lockouts, ruin.sessions]).toEqual([false, [], [], []]);
+      }
+    }
+  });
+
+  it("refuses bad islands and source ids", () => {
+    expect(() => createRuins({ seed: 1, islands: [ISLANDS[0]!, ISLANDS[0]!] })).toThrow(/appears twice/);
+    expect(() => createRuins({ seed: 1, islands: [{ island: 2, sourceIds: ["source-3-0"] }] })).toThrow(/not a source of island 2/);
+    expect(() => createRuins({ seed: 1, islands: [{ island: 2, sourceIds: [] }] })).toThrow(/needs its source ids/);
+    expect(() => createRuins({ seed: 1, islands: [{ island: 2, sourceIds: ["source-2-0", "source-2-0"] }] })).toThrow(/repeats/);
+    expect(() => createRuins({ seed: 1.5, islands: ISLANDS })).toThrow(/seed/);
+  });
+
+  it(`sequence clues admit exactly one of the 120 ordered triples, the answer, over ${SEEDS} seeds`, () => {
+    expect(everyTriple()).toHaveLength(120);
+    expect(SEQUENCE_RUINS.length).toBeGreaterThan(SEEDS);
+    for (const { ruin } of SEQUENCE_RUINS) {
+      const clue = clueFor(ruin);
+      if (clue.kind !== "sequence" || ruin.puzzle.kind !== "sequence") throw new Error("kind");
+      expect(clue.tablets.map((tablet) => tablet.symbol)).toEqual([...RUIN_SYMBOLS]);
+      expect(triplesFitting(clue)).toEqual([ruin.puzzle.answer]);
+    }
+  });
+
+  it(`navigation clues have open start and goal and a shortest path of 4–6 moves, over ${SEEDS} seeds`, () => {
+    expect(NAVIGATION_RUINS.length).toBeGreaterThan(SEEDS);
+    const lengths = new Set<number>();
+    for (const { ruin } of NAVIGATION_RUINS) {
+      const clue = clueFor(ruin);
+      if (clue.kind !== "navigation" || ruin.puzzle.kind !== "navigation") throw new Error("kind");
+      expect(clue.size).toBe(4);
+      const cells = [clue.start, clue.goal, ...clue.blocked].map(({ x, y }) => `${x},${y}`);
+      expect(new Set(cells).size).toBe(cells.length);
+      for (const { x, y } of [clue.start, clue.goal, ...clue.blocked]) expect([x >= 0 && x < 4, y >= 0 && y < 4]).toEqual([true, true]);
+      expect(clue.blocked.length).toBeGreaterThanOrEqual(3);
+      expect(clue.blocked.length).toBeLessThanOrEqual(5);
+      const route = shortestRoute(clue);
+      expect(route).not.toBeNull();
+      expect(route!.length).toBeGreaterThanOrEqual(4);
+      expect(route!.length).toBeLessThanOrEqual(6);
+      expect(routeReachesGoal(clue, route!)).toBe(true);
+      expect(ruin.puzzle.minMoves).toBe(route!.length);
+      lengths.add(route!.length);
+    }
+    expect([...lengths].sort()).toEqual([4, 5, 6]);
+  });
+
+  it("writes readable inscriptions", () => {
+    const tablet = (symbol: RuinSymbol, relation: SequenceTablet["hint"]["relation"], other: RuinSymbol | null, position: number | null) => ({
+      symbol,
+      hint: { relation, other, position },
+    });
+    expect(tabletText(tablet("tide", "right-after", "sun", null), 3)).toBe("Tide comes right after Sun");
+    expect(tabletText(tablet("storm", "absent", null, null), 3)).toBe("Storm is not in the sequence");
+    expect(tabletText(tablet("moon", "at", null, 0), 3)).toBe("Moon comes first");
+    expect(tabletText(tablet("moon", "not-at", null, 1), 3)).toBe("Moon does not come in the middle");
+    expect(tabletText(tablet("skull", "before", "anchor", null), 3)).toBe("Skull comes somewhere before Anchor");
+  });
+});
+
+describe("ruin clues do not leak the answer (§16)", () => {
+  const SEQUENCE_KEYS = ["hint", "kind", "length", "other", "position", "relation", "symbol", "tablets"];
+  const NAVIGATION_KEYS = ["blocked", "goal", "kind", "size", "start", "x", "y"];
+
+  function keysIn(value: unknown, into = new Set<string>()): Set<string> {
+    if (Array.isArray(value)) for (const item of value) keysIn(item, into);
+    else if (typeof value === "object" && value !== null) {
+      for (const [key, item] of Object.entries(value)) {
+        into.add(key);
+        keysIn(item, into);
+      }
+    }
+    return into;
+  }
+
+  it(`serialise to nothing but the site's content, over ${SEEDS} seeds`, () => {
+    for (const { ruin } of [...SEQUENCE_RUINS, ...NAVIGATION_RUINS]) {
+      const clue = clueFor(ruin);
+      const text = JSON.stringify(clue);
+      expect(JSON.parse(text)).toEqual(clue);
+      expect(text).not.toMatch(/answer|minMoves|solution|seed|rng/);
+      const keys = [...keysIn(clue)].sort();
+      if (ruin.puzzle.kind === "navigation") {
+        // The clue is exactly the grid.
+        expect(clue).toEqual({ kind: "navigation", size: ruin.puzzle.size, start: ruin.puzzle.start, goal: ruin.puzzle.goal, blocked: ruin.puzzle.blocked });
+        expect(keys.every((key) => NAVIGATION_KEYS.includes(key))).toBe(true);
+      } else {
+        expect(keys.every((key) => SEQUENCE_KEYS.includes(key))).toBe(true);
+        const answer = ruin.puzzle.answer;
+        for (const encoding of [answer.join(","), answer.join(""), JSON.stringify(answer), answer.map((symbol) => RUIN_SYMBOLS.indexOf(symbol)).join(",")]) {
+          expect(text).not.toContain(encoding);
+        }
+      }
+    }
+  });
+
+  it("show every sequence ruin the same tablets in the same order; only the inscriptions differ", () => {
+    const layouts = new Set(
+      SEQUENCE_RUINS.map(({ ruin }) => {
+        const clue = clueFor(ruin);
+        return clue.kind === "sequence" ? JSON.stringify([clue.length, clue.tablets.map((tablet) => tablet.symbol)]) : "";
+      }),
+    );
+    expect([...layouts]).toEqual([JSON.stringify([3, [...RUIN_SYMBOLS]])]);
+  });
+
+  it("lay the tablets out in the answer's order no more often than chance allows", () => {
+    const n = SEQUENCE_RUINS.length;
+    // A binomial count: at most its mean plus four standard deviations (integer arithmetic on squares).
+    const withinChance = (count: number, p: number, q: number) => {
+      const excess = count * q - n * p;
+      return excess <= 0 || excess * excess <= 16 * n * p * (q - p);
+    };
+    let inDisplayOrder = 0;
+    const firstTablet = new Map<number, number>();
+    for (const { ruin } of SEQUENCE_RUINS) {
+      if (ruin.puzzle.kind !== "sequence") continue;
+      const places = ruin.puzzle.answer.map((symbol) => RUIN_SYMBOLS.indexOf(symbol));
+      if (places[0]! < places[1]! && places[1]! < places[2]!) inDisplayOrder += 1;
+      firstTablet.set(places[0]!, (firstTablet.get(places[0]!) ?? 0) + 1);
+    }
+    // Chance: 1 in 6 for the three answer tablets appearing in answer order, 1 in 6 for any tablet leading the answer.
+    expect(withinChance(inDisplayOrder, 1, 6)).toBe(true);
+    for (let place = 0; place < RUIN_SYMBOLS.length; place++) expect(withinChance(firstTablet.get(place) ?? 0, 1, 6)).toBe(true);
+  });
+});
+
+describe("ruin timing (§3: a fresh ruin in 20–40 s, rubbing included)", () => {
+  it(`lets a reading player solve each kind within two ticks of opening, over ${SEEDS} seeds`, () => {
+    const solvedKinds = new Set<string>();
+    for (const { ruin } of [...SEQUENCE_RUINS, ...NAVIGATION_RUINS]) {
+      const { state, clue } = openedAlone(ruin, "reader", 50);
+      const step = answerRuin(state, { playerId: "reader", island: ruin.island, tick: 51, attempt: readersAttempt(clue) });
+      expect(step.result.outcome).toBe("solved");
+      expect(step.state.tick - 50).toBeLessThanOrEqual(2);
+      solvedKinds.add(ruin.puzzle.kind);
+    }
+    expect([...solvedKinds].sort()).toEqual(["navigation", "sequence"]);
+  });
+
+  it("uses the three-second lockout of the content constants", () => {
+    expect(ruinRules.lockoutTicks).toBe(LOCKOUT_TICKS);
+  });
+
+  /** Guessers that ignore the inscriptions; each may use everything else the site shows (the six tablet symbols). */
+  function sequenceGuessers(): { name: string; order: (clue: RuinClue) => Triple[] }[] {
+    const lexicographic = everyTriple();
+    // A guesser that knows how answers fell over 500 other seeds tries the most frequent first.
+    const frequency = new Map<string, number>();
+    for (let seed = 100_000; seed < 100_000 + SEEDS; seed++) {
+      for (const ruin of ruinsOf(createRuins({ seed, islands: ISLANDS }))) {
+        if (ruin.puzzle.kind === "sequence") frequency.set(ruin.puzzle.answer.join(), (frequency.get(ruin.puzzle.answer.join()) ?? 0) + 1);
+      }
+    }
+    const byFrequency = [...lexicographic].sort((a, b) => (frequency.get(b.join()) ?? 0) - (frequency.get(a.join()) ?? 0));
+    const fromDisplay = (clue: RuinClue, reverse: boolean) => {
+      if (clue.kind !== "sequence") throw new Error("kind");
+      const shown = clue.tablets.map((tablet) => tablet.symbol);
+      if (reverse) shown.reverse();
+      return lexicographic.map((triple) => triple.map((symbol) => shown[RUIN_SYMBOLS.indexOf(symbol)]!) as unknown as Triple);
+    };
+    return [
+      { name: "display order", order: (clue) => fromDisplay(clue, false) },
+      { name: "reverse display order", order: (clue) => fromDisplay(clue, true) },
+      { name: "most frequent answers first", order: () => byFrequency },
+    ];
+  }
+
+  it(`makes the best guesser that ignores the hints average 100 s or more, and 20 s or more at the 10th percentile, on sequence ruins over ${SEEDS} seeds`, () => {
+    const summaries = sequenceGuessers().map(({ name, order }) => {
+      const seconds = SEQUENCE_RUINS.map(({ ruin }) => {
+        const played = playUntilSolved(
+          ruin,
+          order(clueFor(ruin)).map((symbols): RuinAttempt => ({ kind: "sequence", symbols: [...symbols] })),
+        );
+        expect(played.ticks).toBe(played.wrong * ruinRules.lockoutTicks);
+        return played.ticks / WORLD_STEPS_PER_SECOND;
+      });
+      return { name, mean: mean(seconds), p10: percentile(seconds, 0.1) };
+    });
+    const best = summaries.reduce((a, b) => (b.mean < a.mean ? b : a));
+    expect(best.mean, JSON.stringify(summaries)).toBeGreaterThanOrEqual(100);
+    for (const summary of summaries) {
+      expect(summary.mean, summary.name).toBeGreaterThanOrEqual(100);
+      expect(summary.p10, summary.name).toBeGreaterThanOrEqual(20);
+    }
+  }, 60_000);
+
+  /** Every move string of 1, 2, 3, … moves, in N E S W order: a guesser that ignores the grid. */
+  function* shortestFirst(): Generator<RuinMove[]> {
+    for (let length = 1; ; length++) {
+      const counter = Array.from({ length }, () => 0);
+      for (;;) {
+        yield counter.map((digit) => RUIN_MOVES[digit]!);
+        let place = length - 1;
+        while (place >= 0 && counter[place] === RUIN_MOVES.length - 1) counter[place--] = 0;
+        if (place < 0) break;
+        counter[place]! += 1;
+      }
+    }
+  }
+
+  function* navigationGuesses(): Generator<RuinAttempt> {
+    for (const moves of shortestFirst()) yield { kind: "navigation", moves };
+  }
+
+  it(`makes a guesser enumerating move strings shortest-first average 100 s or more, and 20 s or more at the 10th percentile, over ${SEEDS} seeds`, () => {
+    const seconds = NAVIGATION_RUINS.map(({ ruin }, index) => {
+      const clue = clueFor(ruin);
+      if (clue.kind !== "navigation" || ruin.puzzle.kind !== "navigation") throw new Error("kind");
+      // Wrong guesses before the first minimum-length route, counted with the independent evaluator…
+      const grid = openGrid(clue);
+      let wrong = 0;
+      for (const moves of shortestFirst()) {
+        if (moves.length === ruin.puzzle.minMoves && routeReachesGoal(clue, moves, grid)) break;
+        wrong += 1;
+      }
+      // …and, for the first ruins, played through the real operations, where each costs one lockout.
+      if (index < 40) {
+        const played = playUntilSolved(ruin, navigationGuesses());
+        expect(played.wrong).toBe(wrong);
+        expect(played.ticks).toBe(wrong * ruinRules.lockoutTicks);
+      }
+      return (wrong * ruinRules.lockoutTicks) / WORLD_STEPS_PER_SECOND;
+    });
+    expect(mean(seconds)).toBeGreaterThanOrEqual(100);
+    expect(percentile(seconds, 0.1)).toBeGreaterThanOrEqual(20);
+  }, 60_000);
+
+  it("keeps a lockout when the player leaves and reopens the ruin", () => {
+    const { ruin } = SEQUENCE_RUINS[0]!;
+    let { state, clue } = openedAlone(ruin, "p1", 10);
+    const right = readersAttempt(clue);
+    const wrong: RuinAttempt = { kind: "sequence", symbols: right.kind === "sequence" ? [right.symbols[1]!, right.symbols[0]!, right.symbols[2]!] : [] };
+    const failed = answerRuin(state, { playerId: "p1", island: ruin.island, tick: 11, attempt: wrong });
+    expect([failed.result.outcome, failed.result.lockedUntil]).toEqual(["wrong", 11 + LOCKOUT_TICKS]);
+    state = reportPresence(failed.state, { playerId: "p1", island: null, inDuel: false, tick: 12 }).state;
+    state = reportPresence(state, { playerId: "p1", island: ruin.island, inDuel: false, tick: 13 }).state;
+    const reopened = openRuin(state, { playerId: "p1", island: ruin.island, tick: 14 });
+    expect([reopened.result.ok, reopened.result.lockedUntil]).toEqual([true, 11 + LOCKOUT_TICKS]);
+    const early = answerRuin(reopened.state, { playerId: "p1", island: ruin.island, tick: 10 + LOCKOUT_TICKS, attempt: right });
+    expect(early.result.rejection).toBe("locked-out");
+    expect(early.state).toBe(reopened.state);
+    const onTime = answerRuin(reopened.state, { playerId: "p1", island: ruin.island, tick: 11 + LOCKOUT_TICKS, attempt: right });
+    expect(onTime.result.outcome).toBe("solved");
+  });
+});

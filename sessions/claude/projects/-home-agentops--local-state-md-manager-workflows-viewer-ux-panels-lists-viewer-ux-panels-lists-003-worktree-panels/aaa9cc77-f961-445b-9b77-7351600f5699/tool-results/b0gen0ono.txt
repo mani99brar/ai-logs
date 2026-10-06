@@ -1,0 +1,650 @@
+import { useCallback, useMemo, useState, type ReactNode } from 'react'
+import { attemptResultUris, type Now, type Timeline } from '../../contracts/projects/triage.ts'
+import { scopedResultPath, type RunDetail, type RunInputs, type ReviewResult, type RunScope, type WorkerResult, type WorkflowEvent } from './api.ts'
+import { ChallengeSections } from './node/ChallengeSections.tsx'
+import { AwaitingNotice, ControllerSections } from './node/ControllerSections.tsx'
+import { launchSectionEntries } from './node/launch.ts'
+import { attemptStrip, causeOf, nodeTiming, resultRole, revisionAttempt, verifiedSections, type SectionEntry } from './node/model.ts'
+import { ReviewSections } from './node/ReviewSections.tsx'
+import { CandidateLanes, VerifiedEvidence, WorkerReportLink, type LaneEntry } from './node/VerifySections.tsx'
+import { WorkerSections } from './node/WorkerSections.tsx'
+import { NodeHeader } from './NodeHeader.tsx'
+import { AppLink, ErrorPanel, LoadingPanel, StatusBadge } from './panels.tsx'
+import { attemptPathname, runPathname } from './routes.ts'
+import { NodeSection, SectionIndex } from './SectionIndex.tsx'
+import { isChallengeNode } from './status.ts'
+import { Time } from './Time.tsx'
+import type { Resource } from './useResource.ts'
+import { useRunResult, useRunResults } from './useRunData.ts'
+import './node.css'
+
+type DefinitionNode = RunDetail['definition']['nodes'][number]
+type SnapshotNode = RunDetail['snapshot']['nodes'][number]
+type ReviewTransport = ReviewResult['reviewer']['transport']
+
+type Props = {
+  scope: RunScope
+  detail: RunDetail
+  definition: DefinitionNode
+  node: SnapshotNode
+  /** The attempt the path names (`/attempts/<k>`); null shows the latest. */
+  attempt: number | null
+  events: Resource<WorkflowEvent[]>
+  onRetryEvents: () => void
+  /** The run's inputs (null once loaded when the export predates them), shared by every node of the run. */
+  inputs: Resource<RunInputs | null>
+  onRetryInputs: () => void
+  /** The run's timeline, once its events loaded: the header's times, attempts and markers. */
+  timeline: Timeline | null
+  /** The run's situation, once derived: its next step is repeated on the focus node. */
+  now: Now | null
+  clock: number
+  refreshToken: number
+  onNavigate: (pathname: string) => void
+  /** A requirement quote to highlight in this node's task, handed over by a review finding link. */
+  highlight: string | null
+  onHighlightApplied: () => void
+  onOpenRequirement: (nodeId: string, quote: string) => void
+  /** A captured file to scroll to on this launch node, handed over by a review finding's file link. */
+  fileFocus: string | null
+  onFileFocusApplied: () => void
+  onOpenFile: (nodeId: string, path: string) => void
+}
+
+/**
+ * One node of a run (docs/PRD_VIEWER_UX.md 4.4-4.9): the header (status by cause, timing, attempts, next step), a section
+ * index with counts, then the sections of its kind (worker, verification, candidate, review, challenge or the controller's
+ * own steps) and History, always last. Empty sections are absent; a result the launch and verify nodes share is said once.
+ * An earlier attempt's page shows that attempt's own result under a banner that leads back to the latest.
+ */
+export function NodeDetail({ scope, detail, definition, node, attempt, events, onRetryEvents, inputs, onRetryInputs, timeline, now, clock, refreshToken, onNavigate, highlight, onHighlightApplied, onOpenRequirement, fileFocus, onFileFocusApplied, onOpenFile }: Props) {
+  const definitionNodes = detail.definition.nodes
+  const snapshotNodes = detail.snapshot.nodes
+  // A review's executor wording depends on the transport its served result records, known once the review panel loads it.
+  const [reviewTransport, setReviewTransport] = useState<ReviewTransport | undefined>(undefined)
+
+  const isWorker = definition.kind === 'worker'
+  const isChallenge = isChallengeNode(definition)
+  const isReview = definition.kind === 'review' && !isChallenge
+  const isCandidate = node.node_id === 'candidate'
+  const isVerify = definition.kind === 'verification' && !isCandidate
+  const isController = definition.kind === 'prepare' || definition.kind === 'integration'
+  const latest = node.attempt
+  const isLatest = attempt === null || attempt === latest
+  const shownAttempt = attempt ?? latest
+  const recorded = shownAttempt >= 1 && shownAttempt <= latest
+
+  // What this view reads: the latest attempt's result as served, or the viewed attempt's own (`results/<lane>/<k>`).
+  const attemptUris = useMemo(() => attemptResultUris(detail, node.node_id), [detail, node.node_id])
+  const resultUri = definition.kind === 'review' ? null
+    : isLatest || !isVerify ? node.result_uri
+      : attemptUris.find(item => item.attempt === attempt)?.uri ?? null
+  const lanes: LaneEntry[] = isLatest || !isCandidate ? node.lane_results
+    : attemptUris.filter(item => item.attempt === attempt).map(item => ({ worker: item.lane, attempt: item.attempt, result_uri: item.uri }))
+  const resultPath = resultUri === null ? null : scopedResultPath(scope, resultUri)
+  const stamp = String(refreshToken)
+  const { state: result, reload: reloadResult } = useRunResult(scope, resultPath, stamp)
+  const resultData = result.status === 'ready' ? result.data : null
+
+  // The attempt strip: a chip shows once one of its results loaded (read through the run's cache, asked again on new events).
+  const strip = useMemo(() => (timeline ? attemptStrip(detail, timeline, node.node_id) : []), [detail, timeline, node.node_id])
+  const chipUris = useMemo(() => strip.flatMap(item => (item.kind === 'attempt' ? item.chip.uris : [])), [strip])
+  const { results: chipResults } = useRunResults(scope, chipUris, `${refreshToken}:${detail.snapshot.last_sequence}`)
+  const loaded = useCallback((uri: string) => chipResults.has(uri), [chipResults])
+  const viewedChip = strip.flatMap(item => (item.kind === 'attempt' && item.chip.attempt === shownAttempt ? [item.chip] : []))[0]
+
+  // The candidate's own verdict is its lanes': a failing lane's gate reasons are the cause its header names.
+  const { results: laneResults } = useRunResults(scope, useMemo(() => lanes.map(entry => entry.result_uri), [lanes]), stamp)
+  const failure = lanes.flatMap(entry => {
+    const error = laneResults.get(entry.result_uri)?.error
+    return error ? [`${entry.worker}: ${error.message}`] : []
+  }).join('; ') || null
+
+  const nodeEvents = events.status === 'ready' ? events.data.filter(event => event.node_id === node.node_id) : []
+  const reuse = nodeEvents.filter(event => event.type === 'result_reused')
+  const approvals = nodeEvents.filter(event => event.type === 'approval_requested')
+
+  const recordedInputs = inputs.status === 'ready' ? inputs.data : null
+  const worker = isWorker && recordedInputs !== null ? recordedInputs.workers.find(candidate => candidate.launch_node_id === node.node_id) ?? null : null
+  // The design challenge is also of kind review; the independent review is the other one.
+  const reviewNode = snapshotNodes.find(candidate => candidate.kind === 'review' && !isChallengeNode(candidate)) ?? null
+  const hasNode = (nodeId: string) => definitionNodes.some(candidate => candidate.node_id === nodeId)
+  const nodeLink = (nodeId: string) => ({ node_id: nodeId, href: runPathname(scope.projectId, scope.workflowId, scope.runId, nodeId), label: definitionNodes.find(candidate => candidate.node_id === nodeId)!.label })
+  const launchNodeOf = (lane: string) => {
+    const launched = recordedInputs?.workers.find(candidate => candidate.node_id === lane)?.launch_node_id
+    const id = launched && hasNode(launched) ? launched : hasNode(`launch_${lane}`) ? `launch_${lane}` : null
+    return id === null ? null : nodeLink(id)
+  }
+  const lane = isWorker ? worker?.node_id ?? node.node_id.replace(/^launch_/, '') : null
+  // A verification reads its lane's declared checks (they name the executed ones and key the gate's reasons) and requirements.
+  const declaredOf = (id: string) => recordedInputs?.workers.find(candidate => candidate.node_id === id)?.checks ?? null
+  const verifiedWorker = isVerify ? recordedInputs?.workers.find(candidate => candidate.node_id === node.node_id.replace(/^verify_/, '')) ?? null : null
+  const verifyId = lane !== null && hasNode(`verify_${lane}`) ? `verify_${lane}` : null
+  const verifyState = verifyId === null ? null : snapshotNodes.find(candidate => candidate.node_id === verifyId) ?? null
+  const verifyNode = verifyId === null ? null : { ...nodeLink(verifyId), status: verifyState?.status ?? 'pending' as const, attempt: verifyState?.attempt ?? 0 }
+  // What the worker handed over: the verification's first attempt ran on the snapshot frozen at handoff (a repair makes a new one).
+  const frozenUri = verifyId === null ? null : attemptResultUris(detail, verifyId).find(item => item.attempt === 1)?.uri ?? null
+  const { results: frozenResults } = useRunResults(scope, useMemo(() => (frozenUri === null ? [] : [frozenUri]), [frozenUri]), stamp)
+  const frozen = frozenUri === null ? null : frozenResults.get(frozenUri) ?? null
+  const frozenCommit = frozen?.output_commit ?? null
+  const role = resultRole(detail, node.node_id)
+  const reportNode = isVerify && !role.narrative && role.partner !== null ? nodeLink(role.partner) : null
+  const repairs = (timeline?.markers ?? []).filter(marker => marker.kind === 'repair' && verifyNode !== null && marker.node_id === verifyNode.node_id)
+  const repairLabel = repairs.length ? `repair ${repairs.map(marker => marker.repair?.n ?? '').filter(n => n !== '').join(', ')}`.trim() : ''
+  const repairNote = repairLabel ? `after operator ${repairLabel}` : ''
+
+  const timing = timeline && recorded ? nodeTiming(timeline, node.node_id, isLatest ? null : attempt, isVerify ? resultData : null) : null
+  const headerStatus = isLatest ? node.status : viewedChip?.status ?? resultData?.status ?? 'pending'
+  const cause = causeOf({
+    timeline, nodeId: node.node_id, attempt: isLatest ? null : shownAttempt, events: nodeEvents, latest,
+    error: headerStatus === 'failed' ? resultData?.error?.message ?? failure : null,
+  })
+  // A live or failed verification counts its attempts against the cap, which a repair restarts (5.3).
+  const cap = recordedInputs?.max_verification_attempts ?? null
+  const revision = (isVerify || isCandidate) && recorded && timeline !== null && cap !== null && (headerStatus === 'running' || headerStatus === 'failed')
+    ? { attempt: revisionAttempt(timeline, node.node_id, shownAttempt), of: cap }
+    : null
+  // A failed verification also says what happens next when nothing is to be typed (it replaces the old retry note, 8).
+  const failedCheck = (isVerify || isCandidate) && node.status === 'failed'
+  // A launch node's waiting question carries its answer commands in its own first section; the header does not repeat them.
+  const answered = isWorker && now?.situation === 'question' && now.lane === lane && (worker?.questions.some(question => question.answer === null) ?? false)
+  const next = isLatest && !answered && now?.focus?.node_id === node.node_id && (now.next.steps.length > 0 || now.next.action === 'required' || failedCheck) ? now.next : null
+  const attemptHref = (value: number) => attemptPathname(scope.projectId, scope.workflowId, scope.runId, node.node_id, value)
+  const nodeHref = runPathname(scope.projectId, scope.workflowId, scope.runId, node.node_id)
+
+  const renderResult = (evidence: (data: WorkerResult) => ReactNode) => (
+    <>
+      {resultUri === null && lanes.length === 0 && <p className="projects-muted" data-testid="result-none">No result has been published for this node{node.attempt === 0 ? ' (it has not started)' : ''}.</p>}
+      {resultUri !== null && resultPath === null && (
+        <p className="projects-error-inline" role="alert" data-testid="result-unscoped">
+          The result link <code>{resultUri}</code> is outside this run's results route and was not fetched.
+        </p>
+      )}
+      {resultPath !== null && result.status === 'loading' && <LoadingPanel>Loading the result…</LoadingPanel>}
+      {resultPath !== null && result.status === 'error' && <ErrorPanel error={result.error} what="The node result" onRetry={reloadResult} />}
+      {resultPath !== null && result.status === 'ready' && evidence(result.data)}
+    </>
+  )
+
+  // The section index: what the kind lists, only when it lists something, then reuse (only with reuse events) and History.
+  const sections: SectionEntry[] = [
+    ...(isWorker ? launchSectionEntries(worker, frozen, resultData) : []),
+    ...(isCandidate && lanes.length > 0 ? [{ key: 'lanes', label: 'Lanes', count: lanes.length }] : []),
+    ...((isVerify || isCandidate) && resultData !== null ? verifiedSections(resultData, { requirements: verifiedWorker !== null }) : []),
+    // A review or challenge that recorded nothing keeps only its honesty line, with no chip.
+    ...(isReview && reviewTransport !== undefined ? [{ key: 'review', label: 'Review' }] : []),
+    ...(isChallenge && recordedInputs?.challenge ? [{ key: 'challenge', label: 'Challenge' }] : []),
+    ...(reuse.length > 0 ? [{ key: 'reuse', label: 'Reuse', count: reuse.length }] : []),
+    { key: 'history', label: 'History', ...(events.status === 'ready' ? { count: nodeEvents.length } : {}) },
+  ]
+  // An earlier attempt keeps only a verification's own result; any other step's earlier attempt shows its times and History.
+  const evidence = isLatest || (recorded && (isVerify || isCandidate))
+
+  return (
+    <section className="node-detail" aria-labelledby="node-detail-title" data-testid="node-detail" data-node-id={node.node_id} data-attempt={isLatest ? undefined : shownAttempt}>
+      <NodeHeader
+        definition={definition}
+        status={headerStatus}
+        attempt={shownAttempt}
+        timing={timing}
+        clock={clock}
+        cause={cause}
+        revision={revision}
+        timeline={timeline}
+        reviewTransport={reviewTransport}
+        verifyNode={verifyNode}
+        strip={strip}
+        loaded={loaded}
+        attemptHref={attemptHref}
+        next={next}
+        onNavigate={onNavigate}
+      />
+
+      {!isLatest && (
+        <p className="projects-notice attempt-banner" role="note" data-testid="attempt-banner">
+          {recorded ? `You are viewing attempt ${attempt} of ${latest}. ` : `Attempt ${attempt} of this step was not recorded. `}
+          <AppLink href={nodeHref} onNavigate={onNavigate}>{latest === 0 ? 'Open the step ›' : `The latest is attempt ${latest} ›`}</AppLink>
+        </p>
+      )}
+
+      {isLatest && node.status === 'awaiting_approval' && <AwaitingNotice approvals={approvals} />}
+
+      {!isController && (isLatest || recorded) && (
+        <SectionIndex label={definition.label} sections={evidence ? sections : sections.filter(section => section.key === 'history')}>
+          {reportNode && <WorkerReportLink href={reportNode.href} label={reportNode.label} onNavigate={onNavigate} />}
+        </SectionIndex>
+      )}
+
+      {!evidence && recorded && <p className="projects-muted" data-testid="attempt-latest-only">Only the latest attempt's evidence is kept for this step; the times above are this attempt's.</p>}
+
+      {evidence && (
+        isWorker ? (
+          <WorkerSections
+            scope={scope}
+            renderResult={renderResult}
+            result={result}
+            role={role}
+            checksNode={verifyNode}
+            frozen={frozen}
+            frozenCommit={frozenCommit}
+            repairNote={repairNote}
+            repairLabel={repairLabel}
+            answer={answered ? now.next : null}
+            inputs={inputs}
+            onRetryInputs={onRetryInputs}
+            worker={worker}
+            reviewNode={reviewNode}
+            refreshToken={refreshToken}
+            onNavigate={onNavigate}
+            highlight={highlight}
+            onHighlightApplied={onHighlightApplied}
+            fileFocus={fileFocus}
+            onFileFocusApplied={onFileFocusApplied}
+          />
+        ) : isChallenge ? (
+          <ChallengeSections inputs={inputs} onRetryInputs={onRetryInputs} />
+        ) : isReview ? (
+          <ReviewSections
+            scope={scope}
+            node={node}
+            definitionNodes={definitionNodes}
+            snapshotNodes={snapshotNodes}
+            inputs={inputs}
+            refreshToken={refreshToken}
+            onNavigate={onNavigate}
+            onOpenRequirement={onOpenRequirement}
+            onOpenFile={onOpenFile}
+            onTransport={setReviewTransport}
+          />
+        ) : isController ? (
+          <ControllerSections scope={scope} renderResult={renderResult} />
+        ) : (
+          <>
+            {lanes.length > 0 && (
+              <CandidateLanes
+                scope={scope} lanes={lanes} launchNodeOf={launchNodeOf} declaredOf={declaredOf} timeline={timeline} cap={cap}
+                repairLanes={isLatest && now?.situation === 'blocked_identical' && now.lane ? now.lane.split(',') : []}
+                stamp={stamp} onNavigate={onNavigate}
+              />
+            )}
+            {renderResult(data => (
+              <VerifiedEvidence
+                scope={scope} result={data} phase="worker" anchored
+                declared={verifiedWorker?.checks ?? null}
+                attemptStart={timing?.start?.at ?? null}
+                requirements={verifiedWorker && { worker: verifiedWorker, cap: recordedInputs?.max_verification_attempts ?? null }}
+              />
+            ))}
+          </>
+        )
+      )}
+
+      {reuse.length > 0 && (
+        <NodeSection sectionKey="reuse" title="Reuse evidence">
+          <ul className="evidence-list" data-testid="reuse-list">
+            {reuse.map(event => (
+              <li key={event.event_id}>
+                Attempt {event.attempt} reused the result of attempt {event.reused_from_attempt ?? 'unknown'} (event {event.sequence}, <Time iso={event.occurred_at} seconds />): {event.message}
+              </li>
+            ))}
+          </ul>
+        </NodeSection>
+      )}
+
+      <NodeSection sectionKey="history" title="History">
+        {events.status === 'loading' && <LoadingPanel>Loading events…</LoadingPanel>}
+        {events.status === 'error' && <ErrorPanel error={events.error} what="The run events" onRetry={onRetryEvents} />}
+        {events.status === 'ready' && (nodeEvents.length === 0 ? (
+          <p className="projects-muted" data-testid="events-none">No events reference this node.</p>
+        ) : (
+          <ol className="event-list" data-testid="node-events">
+            {nodeEvents.map(event => (
+              <li key={event.event_id} data-attempt={event.attempt}>
+                <span className="event-seq">#{event.sequence}</span> <span className="projects-muted"><Time iso={event.occurred_at} seconds /></span>{' '}
+                <span className="event-type">{event.type.replace(/_/g, ' ')}</span>
+                {event.status && <> · <StatusBadge status={event.status} /></>}
+                {event.attempt > 0 && <> · attempt {event.attempt}</>}
+                {event.message && <> — {event.message}</>}
+                {event.artifact && <> · artifact <code>{event.artifact.artifact_id}</code> ({event.artifact.kind})</>}
+              </li>
+            ))}
+          </ol>
+        ))}
+      </NodeSection>
+    </section>
+  )
+}
+/**
+ * The node view's header model (docs/PRD_VIEWER_UX.md 4.4, 5.3, 7): the attempt word, the timing line with its source, the
+ * attempt strip with the controller's diagnosis and the operator's repairs, and which of two nodes that share one result
+ * shows its facts and which its worker narrative. Pure, so the header and the unit tests read the same values.
+ */
+import { attemptResultUris, humanizeEvent, type Instant, type Span, type SpanStatus, type Timeline } from '../../../contracts/projects/triage.ts'
+import type { RunDetail, WorkerResult, WorkflowEvent } from '../api.ts'
+
+/** `reason`: a failed attempt's reasons in a few words ("unit, integration"), "same" when they repeat the attempt before; empty otherwise. */
+export type AttemptChip = { attempt: number; status: SpanStatus; start: Instant | null; ms: number | null; outcome: string; reason: string; uris: string[] }
+export type StripItem =
+  | { kind: 'attempt'; at: string; chip: AttemptChip }
+  | { kind: 'diagnosis' | 'repair'; at: string; label: string; message: string }
+
+export type Timing = {
+  attempt: number
+  start: Instant | null
+  end: Instant | null
+  ms: number | null
+  live: boolean
+  setupMs: number | null
+  checksMs: number | null
+  /** Where the times come from when that is not an event, e.g. "from the launch and stop receipts"; null for events. */
+  source: string | null
+  inferred: boolean
+}
+
+export type ResultRole = { facts: boolean; narrative: boolean; partner: string | null }
+
+/** A node's attempt as the header says it: "not started" for a step that never ran, never "attempt 0" (5.3). */
+export function attemptWord(attempt: number): string {
+  return attempt === 0 ? 'not started' : String(attempt)
+}
+
+const ms = (instant: Instant) => Date.parse(instant.at)
+const earliest = (instants: (Instant | null)[]) => instants.reduce<Instant | null>((first, instant) => instant && (first === null || ms(instant) < ms(first)) ? instant : first, null)
+const latest = (instants: (Instant | null)[]) => instants.reduce<Instant | null>((last, instant) => instant && (last === null || ms(instant) >= ms(last)) ? instant : last, null)
+
+/** The spans of one node grouped by attempt, oldest first; the candidate runs one span per lane in the same attempt. */
+function attemptsOf(timeline: Timeline, nodeId: string): Map<number, Span[]> {
+  const groups = new Map<number, Span[]>()
+  for (const span of timeline.byNode.get(nodeId) ?? []) groups.set(span.attempt, [...(groups.get(span.attempt) ?? []), span])
+  return new Map([...groups.entries()].sort(([a], [b]) => a - b))
+}
+
+/** Which lane's verdict an attempt shows when its lanes disagree: the one that needs a look first (as the Steps marks). */
+const RANK: SpanStatus[] = ['failed', 'no_record', 'awaiting_approval', 'paused', 'cancelled', 'running', 'pending', 'succeeded']
+
+function attemptStatus(spans: Span[]): SpanStatus {
+  if (spans.some(span => span.live)) return 'running'
+  return RANK.find(rank => spans.some(span => span.status === rank)) ?? spans[0].status
+}
+
+/** Where a time comes from, said in the timing line: the receipts, check times and the review as nouns, inferences as their note. */
+function sourceText(instants: (Instant | null)[]): string | null {
+  const nouns: string[] = []
+  const notes: string[] = []
+  for (const instant of instants) {
+    if (!instant || instant.source === 'event') continue
+    if (instant.source === 'inferred') notes.push(instant.note ?? 'inferred')
+    else nouns.push(`the ${instant.note ?? (instant.source === 'check' ? 'check times' : instant.source)}`)
+  }
+  const unique = [...new Set(nouns)]
+  const parts = [...(unique.length ? [`from ${unique.join(' and ')}`] : []), ...new Set(notes)]
+  return parts.length ? parts.join('; ') : null
+}
+
+/**
+ * The timing line of one attempt (the latest when `attempt` is null): its start and end, how long it took, and, once its
+ * result is read, the setup before the first check and the checks themselves (5.2 rule 8). Null when nothing recorded it.
+ */
+export function nodeTiming(timeline: Timeline, nodeId: string, attempt: number | null, result?: WorkerResult | null): Timing | null {
+  const groups = attemptsOf(timeline, nodeId)
+  const shown = attempt ?? Math.max(0, ...groups.keys())
+  const spans = groups.get(shown)
+  if (!spans?.length) return null
+  const live = spans.some(span => span.live)
+  const start = earliest(spans.map(span => span.start))
+  const end = live || spans.some(span => span.end === null) ? null : latest(spans.map(span => span.end))
+  const checks = result?.checks ?? []
+  let setupMs: number | null = null
+  let checksMs: number | null = null
+  if (checks.length > 0 && start) {
+    const first = Math.min(...checks.map(check => Date.parse(check.started_at)))
+    const last = Math.max(...checks.map(check => Date.parse(check.finished_at)))
+    // Only when the checks ran inside the attempt: a span recorded by its verdict alone has no start to measure from.
+    if (first >= ms(start) && (end === null || last <= ms(end) + 1000)) {
+      setupMs = first - ms(start)
+      checksMs = Math.max(0, last - first)
+    }
+  }
+  return {
+    attempt: shown, start, end, ms: start && end ? Math.max(0, ms(end) - ms(start)) : null, live, setupMs, checksMs,
+    source: sourceText([start, end]),
+    inferred: start?.source === 'inferred' || end?.source === 'inferred',
+  }
+}
+
+/**
+ * The attempt strip (4.4): one chip per attempt, in time order, with the controller's diagnosis (⚑) and the operator's
+ * repairs (⚒) where they happened. Each chip carries the result URIs of its attempt (per lane for the candidate), so the
+ * header links it only once one of them loads. Empty for a step with one attempt or none.
+ */
+export function attemptStrip(detail: RunDetail, timeline: Timeline, nodeId: string): StripItem[] {
+  const groups = attemptsOf(timeline, nodeId)
+  if (groups.size < 2) return []
+  const uris = attemptResultUris(detail, nodeId)
+  const items: StripItem[] = [...groups.entries()].map(([attempt, spans]) => {
+    const start = earliest(spans.map(span => span.start))
+    const live = spans.some(span => span.live)
+    const end = live ? null : latest(spans.map(span => span.end))
+    const chip: AttemptChip = {
+      attempt, status: attemptStatus(spans), start, ms: start && end ? Math.max(0, ms(end) - ms(start)) : null,
+      outcome: spans.map(span => span.outcome).filter(Boolean).join('; '),
+      reason: '',
+      uris: uris.filter(item => item.attempt === attempt).map(item => item.uri),
+    }
+    return { kind: 'attempt', at: (start ?? end)?.at ?? '', chip }
+  })
+  let previous: AttemptChip | null = null
+  for (const item of items) {
+    if (item.kind !== 'attempt') continue
+    const { chip } = item
+    if (chip.status === 'failed' && chip.outcome) {
+      chip.reason = previous?.status === 'failed' && previous.outcome === chip.outcome ? 'same' : reasonWords(chip.outcome)
+    }
+    previous = chip
+  }
+  for (const marker of timeline.markers) {
+    if (marker.node_id !== nodeId || (marker.kind !== 'diagnosis' && marker.kind !== 'repair')) continue
+    items.push({ kind: marker.kind, at: marker.at, label: marker.kind === 'repair' ? `repair ${marker.repair?.n ?? ''}`.trim() : 'diagnosis', message: marker.message })
+  }
+  return items.sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0))
+}
+
+/**
+ * The cause a header names after its status (8): a failure's own error first; on an earlier attempt's page, that attempt's
+ * outcome as the timeline re-read it (served events may all carry one attempt number, 5.2 rule 1); otherwise the latest
+ * status message of the attempt, humanized. Null when nothing recorded one.
+ */
+export function causeOf({ timeline, nodeId, attempt, events, latest, error }: {
+  timeline: Timeline | null
+  nodeId: string
+  /** The viewed earlier attempt; null for the latest. */
+  attempt: number | null
+  /** The node's events; the latest attempt's are those of `latest`. */
+  events: WorkflowEvent[]
+  latest: number
+  error: string | null
+}): string | null {
+  if (error) return error
+  if (attempt !== null && timeline !== null) {
+    const outcome = (attemptsOf(timeline, nodeId).get(attempt) ?? []).map(span => span.outcome).filter(Boolean).join('; ')
+    if (outcome) return outcome
+  }
+  const shown = attempt ?? latest
+  const own = events.filter(event => event.status !== null && (event.attempt === shown || shown === 0))
+  // Only the latest attempt falls back to the node's last status message; an earlier one never quotes a later attempt.
+  const last = own.at(-1) ?? (attempt === null ? events.findLast(event => event.status !== null) : undefined)
+  return last ? humanizeEvent(last) : null
+}
+
+/** A failure's reasons in a few words: the checks its keyed gate reasons name ("unit, integration"), else the outcome itself. */
+function reasonWords(outcome: string): string {
+  const segments = outcome.split(';').map(segment => segment.trim()).filter(Boolean)
+  const keys = segments.map(segment => /^([\w.-]+):\s/.exec(segment)?.[1] ?? null)
+  return keys.length > 0 && keys.every(key => key !== null) ? [...new Set(keys)].join(', ') : outcome
+}
+
+/**
+ * Which attempt of a verification this is on its revision (5.3): counted from the operator's latest repair before it, since
+ * a repair restarts the attempt cap. Without a repair it is the attempt itself.
+ */
+export function revisionAttempt(timeline: Timeline, nodeId: string, attempt: number): number {
+  const groups = attemptsOf(timeline, nodeId)
+  const at = (value: number) => {
+    const spans = groups.get(value) ?? []
+    const instant = earliest(spans.map(span => span.start)) ?? earliest(spans.map(span => span.end))
+    return instant ? ms(instant) : null
+  }
+  const shown = at(attempt)
+  if (shown === null) return attempt
+  const repaired = timeline.markers
+    .filter(marker => marker.kind === 'repair' && marker.node_id === nodeId && Date.parse(marker.at) <= shown)
+    .reduce((last, marker) => Math.max(last, Date.parse(marker.at)), -Infinity)
+  if (repaired === -Infinity) return attempt
+  return [...groups.keys()].filter(value => value <= attempt && (at(value) ?? shown) >= repaired).length
+}
+
+/**
+ * Dedup by `result_uri` (7): when a launch node and a verify node link the same result, the verify node shows its facts
+ * (status, session, commits, the gate's error) and the launch node the worker's narrative (summary, assumptions). A result
+ * no other node links keeps both.
+ */
+export function resultRole(detail: RunDetail, nodeId: string): ResultRole {
+  const nodes = detail.snapshot.nodes
+  const node = nodes.find(candidate => candidate.node_id === nodeId)
+  const uri = node?.result_uri ?? null
+  const kind = detail.definition.nodes.find(candidate => candidate.node_id === nodeId)?.kind
+  if (uri === null || (kind !== 'worker' && kind !== 'verification')) return { facts: true, narrative: true, partner: null }
+  const partnerKind = kind === 'worker' ? 'verification' : 'worker'
+  const partner = nodes.find(candidate => candidate.node_id !== nodeId && candidate.result_uri === uri && candidate.kind === partnerKind)?.node_id ?? null
+  if (partner === null) return { facts: true, narrative: true, partner: null }
+  return kind === 'worker' ? { facts: false, narrative: true, partner } : { facts: true, narrative: false, partner }
+}
+
+// ---- The section index (4.4, 7) ----------------------------------------------------------------------------------
+
+/** One section of a node page: its anchor key, its name in the index and, when it lists items, how many. */
+export type SectionEntry = { key: string; label: string; count?: number }
+
+export const sectionId = (key: string) => `node-section-${key}`
+
+/** What one verified result holds, sorted the way its sections show it. */
+export function evidenceOf(result: WorkerResult) {
+  const artifactsById = new Map(result.artifacts.map(artifact => [artifact.artifact_id, artifact]))
+  const checkLogs = new Set(result.checks.map(check => check.log_artifact_id))
+  const screenshots = result.artifacts.filter(artifact => artifact.kind === 'screenshot')
+  // Check logs are shown with their check and captured files on the launch node; everything else that is not a screenshot is listed here.
+  const others = result.artifacts.filter(artifact => artifact.kind !== 'screenshot' && artifact.kind !== 'file' && !checkLogs.has(artifact.artifact_id))
+  // Checks the gate recorded on this isolated snapshot but gates only at the combined candidate (build, browser).
+  const deferred = new Map((result.deferred_checks ?? []).map(entry => [entry.check_index, entry.id]))
+  const passed = result.status === 'succeeded' && result.error === null
+  return { artifactsById, screenshots, others, deferred, passed }
+}
+
+/**
+ * The index entries of a verified result's sections: only those with something in them. A verify node whose lane the run's
+ * inputs name lists its Requirements before the Result.
+ */
+export function verifiedSections(result: WorkerResult, options: { requirements?: boolean } = {}): SectionEntry[] {
+  const { screenshots, others, deferred } = evidenceOf(result)
+  return [
+    { key: 'gate', label: 'Gate' },
+    ...(result.checks.length > 0 ? [{ key: 'checks', label: 'Checks', count: result.checks.length }] : []),
+    ...(screenshots.length > 0 || deferred.size > 0 ? [{ key: 'screenshots', label: 'Screenshots', count: screenshots.length }] : []),
+    ...(others.length > 0 ? [{ key: 'artifacts', label: 'Artifacts', count: others.length }] : []),
+    ...(options.requirements ? [{ key: 'requirements', label: 'Requirements' }] : []),
+    { key: 'result', label: 'Result' },
+  ]
+}
+import type { RunDetail, RunInputs, ReviewResult, RunScope } from '../api.ts'
+import { ReviewPanel } from '../ReviewDetail.tsx'
+import { NodeSection } from '../SectionIndex.tsx'
+import type { Resource } from '../useResource.ts'
+import './review.css'
+
+type DefinitionNode = RunDetail['definition']['nodes'][number]
+type SnapshotNode = RunDetail['snapshot']['nodes'][number]
+
+/** The independent review's section: the recorded verdict, its reviewers and their findings (docs/PRD_VIEWER_UX.md 4.7). */
+export function ReviewSections({ scope, node, definitionNodes, snapshotNodes, inputs, refreshToken, onNavigate, onOpenRequirement, onOpenFile, onTransport }: {
+  scope: RunScope
+  node: SnapshotNode
+  definitionNodes: DefinitionNode[]
+  snapshotNodes: SnapshotNode[]
+  inputs: Resource<RunInputs | null>
+  refreshToken: number
+  onNavigate: (pathname: string) => void
+  onOpenRequirement: (nodeId: string, quote: string) => void
+  onOpenFile: (nodeId: string, path: string) => void
+  /** Called with the served review's transport, which decides the executor wording ("one print job per reviewer"). */
+  onTransport: (transport: ReviewResult['reviewer']['transport']) => void
+}) {
+  return (
+    <NodeSection sectionKey="review" title="Review result">
+      <ReviewPanel
+        scope={scope}
+        node={node}
+        definitionNodes={definitionNodes}
+        snapshotNodes={snapshotNodes}
+        inputs={inputs}
+        refreshToken={refreshToken}
+        onNavigate={onNavigate}
+        onOpenRequirement={onOpenRequirement}
+        onOpenFile={onOpenFile}
+        onTransport={onTransport}
+      />
+    </NodeSection>
+  )
+}
+import type { RunInputs } from '../api.ts'
+import { ChallengePanel } from '../Challenge.tsx'
+import { NodeSection } from '../SectionIndex.tsx'
+import type { Resource } from '../useResource.ts'
+
+/** The design challenge's section: its outcome, concerns, alternative and experiment, from the run inputs (docs/PRD_VIEWER_UX.md 4.8). */
+export function ChallengeSections({ inputs, onRetryInputs }: { inputs: Resource<RunInputs | null>; onRetryInputs: () => void }) {
+  return (
+    <NodeSection sectionKey="challenge" title="Design challenge">
+      <ChallengePanel inputs={inputs} onRetry={onRetryInputs} />
+    </NodeSection>
+  )
+}
+import type { ReactNode } from 'react'
+import type { RunScope, WorkerResult, WorkflowEvent } from '../api.ts'
+import { Time } from '../Time.tsx'
+import { VerifiedEvidence } from './VerifySections.tsx'
+import './controller.css'
+
+/**
+ * A step stopped at a decision nobody recorded yet: the approval requests of its events. Viewing approves nothing; the
+ * decision is made in the workflow CLI.
+ */
+export function AwaitingNotice({ approvals }: { approvals: WorkflowEvent[] }) {
+  return (
+    <div className="projects-notice" role="status" data-testid="awaiting-notice">
+      <p><strong>Awaiting approval.</strong> This node is stopped at a decision that has not been recorded. Viewing does not approve it; decisions are made through the workflow CLI.</p>
+      {approvals.length > 0 && (
+        <ul className="evidence-list">
+          {approvals.map(event => <li key={event.event_id}>Requested at <Time iso={event.occurred_at} />: {event.message}</li>)}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The controller's own steps (docs/PRD_VIEWER_UX.md 4.9): the freeze of the handoffs, the approval and the integration. One
+ * panel with no index: what they recorded, which is usually no result of their own, and their History inline.
+ */
+export function ControllerSections({ scope, renderResult }: { scope: RunScope; renderResult: (evidence: (data: WorkerResult) => ReactNode) => ReactNode }) {
+  return (
+    <div className="controller-panel">
+      {renderResult(data => <VerifiedEvidence scope={scope} result={data} phase="worker" />)}
+    </div>
+  )
+}
+/* ---- Review section (docs/PRD_VIEWER_UX.md 4.7); the review panel's own rules stay in App.css until S4c moves them. ---- */
+
+.node-section .review-result { margin-top: 0; }
+/* ---- The controller's steps: handoff, approval, integrate (docs/PRD_VIEWER_UX.md 4.9): one panel, no index ---- */
+
+.controller-panel { margin-top: 8px; }

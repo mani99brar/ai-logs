@@ -1,0 +1,190 @@
+import { randomInt } from "node:crypto";
+import { ErrorCode, matchMaker, Room, ServerError, type AuthContext, type Client } from "colyseus";
+import {
+  createDuelOptionsSchema,
+  DUEL_CODE_REQUIRED_MESSAGE,
+  DUEL_RECONNECT_SECONDS,
+  DUEL_ROOM,
+  DUEL_UNAVAILABLE_MESSAGE,
+  duelFullMessage,
+  DuelMessageType,
+  duelPracticeMessageSchema,
+  joinDuelOptionsSchema,
+  JoinRefusal,
+  MAX_INPUT_MESSAGES_PER_SECOND,
+  NO_SUCH_DUEL_MESSAGE,
+  PROTOCOL_VERSION,
+  type DummyBehaviour,
+} from "@pirate-sea-race/protocol";
+import { defaultDuelConfig, duelInput, type DuelState, type PlayerIndex } from "@pirate-sea-race/simulation/duel";
+import type { DuelAuthority } from "@pirate-sea-race/simulation/netcode";
+import { admitSeat, authorizePrivateEntry, type AdmissionRules } from "./admission.js";
+import { DuelMachine, type DuelDiagnostics } from "./duelMachine.js";
+import type { DuelInputGate } from "./duelInputGate.js";
+import type { MatchMetadata } from "./MatchRoom.js";
+import { generateMatchCode } from "./matchCode.js";
+import { DuelRoomStateSchema } from "./schema.js";
+
+const STEPS_PER_SECOND = 60;
+/** The lobby state goes out at 20 Hz; the duel's frames travel as messages. */
+const PATCH_INTERVAL_MS = 1000 / 20;
+
+/** A duel's admission: the `duel` listing, the duel option schemas and the duel refusal messages. */
+const DUEL_ADMISSION: AdmissionRules = {
+  roomName: DUEL_ROOM,
+  createSchema: createDuelOptionsSchema,
+  joinSchema: joinDuelOptionsSchema,
+  noSuchMessage: NO_SUCH_DUEL_MESSAGE,
+  codeRequiredMessage: DUEL_CODE_REQUIRED_MESSAGE,
+  fullMessage: duelFullMessage,
+};
+
+/** Checks a create or join request for a duel before matchmaking places it (see `authorizePrivateEntry`). */
+export function authorizeDuelEntry(options: unknown): Promise<true> {
+  return authorizePrivateEntry(options, DUEL_ADMISSION);
+}
+
+/**
+ * One standalone duel (the combat spike, §18 stage 1), privately admitted like a match: created with a one-time token,
+ * joined by its code, two players (or one against the server's dummy in practice). The duel itself is a `DuelMachine`,
+ * the same one a match room runs for a duel at sea: the countdown starts once every seat is taken; during it the
+ * machine probes both round trips and, DELAY_DECISION_FRAMES before the end, chooses the shared input delay. It then
+ * steps `stepDuel` at 60 Hz through `DuelAuthority` (first copy of each frame's input wins, late input never rewrites
+ * a frame, the held input repeats for 250 ms and then neutral) and sends a frame bundle every third frame. The step's
+ * result ends the duel, and so does a forfeit (a player who quits, or stays absent past DUEL_RECONNECT_SECONDS),
+ * decided at the next frame boundary together with any other forfeit on that frame. The room keeps admission, the
+ * seats' reconnection windows and the practice dummy.
+ */
+export class DuelRoom extends Room<{ state: DuelRoomStateSchema; metadata: MatchMetadata }> {
+  override maxClients = 2;
+  /** A flood ceiling: past it Colyseus disconnects the client. Excess input is dropped well below it, in the gate. */
+  override maxMessagesPerSecond = MAX_INPUT_MESSAGES_PER_SECOND * 4;
+  override patchRate = PATCH_INTERVAL_MS;
+  override state = new DuelRoomStateSchema();
+
+  private readonly config = defaultDuelConfig;
+  private machine!: DuelMachine;
+  private createToken: string | undefined;
+
+  static override async onAuth(_token: string, options: unknown, _context: AuthContext): Promise<true> {
+    return authorizeDuelEntry(options);
+  }
+
+  override async onCreate(options: unknown): Promise<void> {
+    const parsed = createDuelOptionsSchema.safeParse(options);
+    if (!parsed.success) throw new ServerError(ErrorCode.MATCHMAKE_INVALID_CRITERIA, DUEL_UNAVAILABLE_MESSAGE);
+    this.createToken = parsed.data.createToken;
+    const practice = parsed.data.practice === true;
+    this.maxClients = practice ? 1 : 2;
+    const code = await this.allocateCode();
+    const seed = randomInt(0, 2 ** 32);
+    this.machine = new DuelMachine({
+      lobby: this.state,
+      seed,
+      start: "countdown",
+      config: this.config,
+      send: (sessionId, type, message) => this.clients.get(sessionId)?.send(type, message),
+    });
+    this.state.code = code;
+    this.state.protocolVersion = PROTOCOL_VERSION;
+    this.state.practice = practice;
+    this.state.dummy = practice ? "idle" : "";
+    if (practice) this.machine.script(1, (state) => this.dummyInput(state));
+    // As for matches: the create request's token was copied into the listing; replacing the metadata drops it.
+    await this.setMatchmaking({ metadata: { code, custom: true } });
+
+    this.onMessage(DuelMessageType.Input, (client, message: unknown) =>
+      this.machine.receiveInput(client.sessionId, message, (slot) => !this.state.practice || slot === 0),
+    );
+    this.onMessage(DuelMessageType.Probe, (client, message: unknown) => this.machine.receiveProbeReply(client.sessionId, message));
+    this.onMessage(DuelMessageType.Practice, (_client, message: unknown) => {
+      const request = duelPracticeMessageSchema.safeParse(message);
+      if (this.state.practice && request.success) this.state.dummy = request.data.dummy;
+    });
+    // Unknown message types are dropped, not answered: Colyseus would otherwise disconnect the sender.
+    this.onMessage("*", () => undefined);
+    this.setFixedTimestep(() => this.machine.advance(), STEPS_PER_SECOND);
+  }
+
+  override onJoin(client: Client, options: unknown): void {
+    this.createToken = admitSeat(options, { code: this.state.code, createToken: this.createToken }, DUEL_ADMISSION);
+    const slot: PlayerIndex = this.machine.sessionOf(0) === undefined ? 0 : 1;
+    this.machine.addSeat(client.sessionId, slot);
+    if (this.state.phase === "waiting" && this.state.seats.length === this.maxClients) {
+      this.machine.beginCountdown();
+      void this.lock();
+    }
+  }
+
+  /**
+   * The seconds a dropped player's seat is kept (§12: DUEL_RECONNECT_SECONDS). The server's test-only timing setting
+   * shortens it in a subclass (`startGameServer`); the production entry never does.
+   */
+  protected reconnectSeconds(): number {
+    return DUEL_RECONNECT_SECONDS;
+  }
+
+  /** A player dropped without leaving: their seat is kept for DUEL_RECONNECT_SECONDS, then they forfeit (§12). */
+  override onDrop(client: Client): void {
+    if (this.machine.slotOf(client.sessionId) === undefined || this.state.phase === "over") return;
+    this.machine.drop(client.sessionId);
+    void this.allowReconnection(client, this.reconnectSeconds()).catch(() => undefined);
+  }
+
+  /** The same player is back: they continue from the authoritative state, which a snapshot bundle gives them. */
+  override onReconnect(client: Client): void {
+    this.machine.reconnect(client.sessionId);
+  }
+
+  /** A player left for good (quit, or absent past the reconnection window): before the countdown their seat frees up. */
+  override onLeave(client: Client): void {
+    if (this.machine.slotOf(client.sessionId) === undefined) return;
+    if (this.state.phase === "waiting") {
+      this.machine.removeSeat(client.sessionId);
+      return;
+    }
+    this.machine.leave(client.sessionId);
+  }
+
+  /** Inputs dropped per client and reason, for tests and diagnostics. */
+  droppedInputs(sessionId: string): DuelInputGate["dropped"] | undefined {
+    return this.machine.droppedInputs(sessionId);
+  }
+
+  /** The duel's counters, for tests and the harness. */
+  diagnostics(): DuelDiagnostics {
+    return this.machine.diagnostics();
+  }
+
+  /** The authoritative duel state, for tests. */
+  get duelState(): DuelState {
+    return this.machine.state;
+  }
+
+  /** Every input pair applied so far as a replayable log, for tests. */
+  inputLog(): ReturnType<DuelAuthority["inputLog"]> {
+    return this.machine.authority.inputLog();
+  }
+
+  /**
+   * The practice dummy (§13's idle or defensive opponent): idle, or guarding. A guarding dummy holds back (away from
+   * player one) while player one strikes and while it is in blockstun, and stands still otherwise, so it neither
+   * backs out of range nor escapes a throw (throws beat guard).
+   */
+  private dummyInput(state: DuelState): number {
+    if ((this.state.dummy as DummyBehaviour) !== "guard") return 0;
+    const [player, dummy] = state.fighters;
+    const striking = player.action === "attack" && player.moveId !== this.config.moveset.commands.throw;
+    if (!striking && dummy.action !== "blockstun") return 0;
+    return duelInput(dummy.x >= player.x ? "right" : "left");
+  }
+
+  private async allocateCode(): Promise<string> {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const code = generateMatchCode();
+      const taken = await matchMaker.query({ name: this.roomName, code });
+      if (taken.length === 0) return code;
+    }
+    throw new ServerError(JoinRefusal.BadRequest, "Could not allocate a duel code");
+  }
+}

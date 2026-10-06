@@ -1,0 +1,179 @@
+import React, { Fragment, useEffect, useMemo } from "react";
+import styled from "styled-components";
+
+import { useTranslation } from "react-i18next";
+
+import { Card } from "@kleros/ui-components-library";
+
+import { useNewDisputeContext } from "context/NewDisputeContext";
+
+import { useSupportedDisputeKits } from "queries/useSupportedDisputeKits";
+
+import {
+  ensureValidSmart,
+  findMatchingKits,
+  getDisabledOptions,
+  getDisputeKitsForDeployment,
+  getFeatureGroupsForDeployment,
+  getVisibleFeaturesForCourt,
+  resolveInitialFeatureSet,
+  toggleFeature,
+} from "src/dispute-kits/disputeFeature";
+import { Features, Group } from "src/dispute-kits/types";
+import { isUndefined } from "src/utils";
+
+import { FeatureUIs } from "components/DisputeFeatures/Features";
+import { GroupsUI } from "components/DisputeFeatures/GroupsUI";
+
+const Container = styled(Card)`
+  width: 100%;
+  height: auto;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  margin-top: 16px;
+`;
+
+const SubTitle = styled.p`
+  font-size: 18px;
+  color: ${({ theme }) => theme.secondaryBlue};
+  padding: 0;
+  margin: 0;
+`;
+
+const Separator = styled.hr`
+  width: 100%;
+`;
+const FeatureSelection: React.FC = () => {
+  const { t } = useTranslation();
+  const {
+    disputeData,
+    setDisputeData,
+    selectedFeatures: selected,
+    setSelectedFeatures: setSelected,
+  } = useNewDisputeContext();
+  const { data: supportedDisputeKits } = useSupportedDisputeKits(disputeData.courtId);
+
+  const disputeKitsForDeployment = useMemo(() => getDisputeKitsForDeployment(), []);
+  const featureGroupsForDeployment = useMemo(() => getFeatureGroupsForDeployment(), []);
+
+  // DEV: initial feature selection logic
+  useEffect(() => {
+    if (!isUndefined(disputeData?.disputeKitId)) {
+      const defaultKit = disputeKitsForDeployment.find((dk) => dk.id === disputeData.disputeKitId);
+      if (!defaultKit) return;
+
+      const initialFeature = resolveInitialFeatureSet(defaultKit, disputeData?.disputeKitData);
+      setSelected(initialFeature);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const allowedDisputeKits = useMemo(() => {
+    if (!supportedDisputeKits?.court?.supportedDisputeKits) return [];
+    const allowedIds = supportedDisputeKits.court.supportedDisputeKits.map((dk) => Number(dk.id));
+    return disputeKitsForDeployment.filter((kit) => allowedIds.includes(kit.id));
+  }, [supportedDisputeKits, disputeKitsForDeployment]);
+
+  // Court specific groups
+  const courtGroups = useMemo(() => {
+    const courtKits = supportedDisputeKits?.court?.supportedDisputeKits.map((dk) => Number(dk.id));
+    if (isUndefined(courtKits) || allowedDisputeKits.length === 0) {
+      return { [Group.Voting]: [], [Group.Eligibility]: [] };
+    }
+    return getVisibleFeaturesForCourt(courtKits, allowedDisputeKits, featureGroupsForDeployment);
+  }, [supportedDisputeKits, allowedDisputeKits, featureGroupsForDeployment]);
+
+  const disabled = useMemo(
+    () => getDisabledOptions(selected, courtGroups, allowedDisputeKits),
+    [selected, courtGroups, allowedDisputeKits]
+  );
+
+  const matchingKits = useMemo(() => findMatchingKits(selected, allowedDisputeKits), [selected, allowedDisputeKits]);
+
+  const handleToggle = (feature: Features) => {
+    setSelected((prev) => {
+      const toggled = toggleFeature(prev, feature, courtGroups);
+      // we don't necessarily need ensureValidSmart here,
+      // but in case a bug allows picking a disabled option, this will correct that
+      return ensureValidSmart(toggled, courtGroups, allowedDisputeKits);
+    });
+  };
+
+  const handleGroupDisable = (group: Group) => {
+    const groupFeatures = courtGroups[group];
+    // we have a feature selected from this group
+    for (const feature of groupFeatures) {
+      if (selected.includes(feature)) {
+        // turn off this feature
+        handleToggle(feature);
+      }
+    }
+  };
+
+  // if each group only has one feature, select them by default
+  // This should not clash with the initial selection logic,
+  // as it only runs when there's one disputeKit and featureSet to pick
+  useEffect(() => {
+    // if only one disputeKit is found, and that dk has only one featureSEt to pick, then select by default
+    if (allowedDisputeKits.length === 1 && allowedDisputeKits[0].featureSets.length === 1) {
+      setSelected(allowedDisputeKits[0].featureSets[0]);
+    }
+  }, [allowedDisputeKits, setSelected]);
+
+  useEffect(() => {
+    // work of feature selection ends here by giving us the disputeKitId,
+    // any further checks we do separately, like for NextButton
+    // right now we don't have kits that can have same features, so we assume it will be 1 length array
+    if (matchingKits.length === 1) {
+      const selectedKit = matchingKits[0];
+
+      setDisputeData({
+        ...disputeData,
+        disputeKitId: selectedKit.id,
+        ...(disputeData?.disputeKitData ? { disputeKitData: disputeData.disputeKitData } : undefined),
+      });
+    } else if (matchingKits.length === 0) {
+      setDisputeData({ ...disputeData, disputeKitId: undefined });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchingKits]);
+
+  if (!supportedDisputeKits || Object.entries(courtGroups).length === 0) {
+    return null;
+  }
+
+  return (
+    <Container>
+      <SubTitle>{t("resolver.features_in_this_court")}</SubTitle>
+
+      {Object.entries(courtGroups).map(([groupName, features], index) => {
+        const GroupComponent = GroupsUI[groupName as Group];
+        return (
+          <Fragment key={groupName}>
+            <GroupComponent clearAll={() => handleGroupDisable(groupName as Group)}>
+              <Fragment>
+                {features.map((feature) => {
+                  const FeatureComponent = FeatureUIs[feature];
+                  return (
+                    <FeatureComponent
+                      key={feature}
+                      name={groupName}
+                      checked={selected.includes(feature)}
+                      disabled={disabled.has(feature)}
+                      onClick={() => handleToggle(feature)}
+                      value={feature}
+                    />
+                  );
+                })}
+              </Fragment>
+            </GroupComponent>
+            {index !== Object.entries(courtGroups).length - 1 ? <Separator /> : null}
+          </Fragment>
+        );
+      })}
+    </Container>
+  );
+};
+
+export default FeatureSelection;

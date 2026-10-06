@@ -1,0 +1,814 @@
+import { expect, type APIRequestContext, type Locator, type Page } from '@playwright/test'
+
+export const COMMITTED_ENTRIES = [
+  { source: 'Pi', path: 'skills', kind: 'directory' },
+  { source: 'Pi', path: 'skills/review.md', kind: 'file' },
+  { source: 'Pi', path: 'workflow.md', kind: 'file' },
+  { source: 'Claude', path: 'empty.md', kind: 'file' },
+  { source: 'Claude', path: 'subagents', kind: 'directory' },
+  { source: 'Claude', path: 'subagents/implementer.md', kind: 'file' },
+  { source: 'Claude', path: 'workflow.md', kind: 'file' },
+]
+
+/** The API starts alongside Vite; wait until the proxy reaches it before loading the page. */
+export async function waitForApi(request: APIRequestContext) {
+  await expect.poll(async () => (await request.get('/api/entries')).status(), { timeout: 30_000 }).toBe(200)
+}
+
+export async function openGraph(page: Page, path = '/') {
+  await page.goto(path)
+  await expect(page.locator('.graph-canvas')).toBeVisible()
+  await expect(node(page, 'Pi')).toBeVisible()
+}
+
+/** A graph node wrapper by id ("Pi", "Pi/skills", "Claude/workflow.md"). */
+export function node(page: Page, id: string): Locator {
+  return page.locator(`.graph-canvas [data-node-id="${id}"]`)
+}
+
+export function nodeBody(page: Page, id: string): Locator {
+  return node(page, id).locator('.node-body')
+}
+
+export function edge(page: Page, parentId: string, childId: string): Locator {
+  return page.locator(`.graph-canvas line[data-edge-parent="${parentId}"][data-edge-child="${childId}"]`)
+}
+
+export function expandButton(page: Page, name: string): Locator {
+  return page.getByRole('button', { name: `Expand ${name}`, exact: true })
+}
+
+export function collapseButton(page: Page, name: string): Locator {
+  return page.getByRole('button', { name: `Collapse ${name}`, exact: true })
+}
+
+export function currentCrumb(page: Page): Locator {
+  return page.getByRole('navigation', { name: 'Breadcrumb' }).locator('[aria-current="page"]')
+}
+
+export function folderInfo(page: Page): Locator {
+  return page.getByTestId('folder-info')
+}
+
+export function visibleNodeIds(page: Page): Promise<string[]> {
+  return page.locator('.graph-canvas .node').evaluateAll(elements => elements.map(element => element.getAttribute('data-node-id') ?? ''))
+}
+
+/** Drags a node body by a screen offset using real pointer events. */
+export async function dragNode(page: Page, id: string, dx: number, dy: number) {
+  const box = await nodeBody(page, id).locator('.shape').first().boundingBox()
+  if (!box) throw new Error(`Node ${id} has no bounding box`)
+  const startX = box.x + box.width / 2
+  const startY = box.y + box.height / 2
+  await page.mouse.move(startX, startY)
+  await page.mouse.down()
+  await page.mouse.move(startX + dx / 2, startY + dy / 2, { steps: 5 })
+  await page.mouse.move(startX + dx, startY + dy, { steps: 5 })
+  await page.mouse.up()
+}
+
+export async function nodeCenter(page: Page, id: string) {
+  const box = await nodeBody(page, id).locator('.shape').first().boundingBox()
+  if (!box) throw new Error(`Node ${id} has no bounding box`)
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+}
+
+export async function viewTransform(page: Page): Promise<{ x: number; y: number; k: number }> {
+  const transform = await page.locator('.graph-canvas > g').getAttribute('transform')
+  const match = /translate\(([-\d.e]+) ([-\d.e]+)\) scale\(([-\d.e]+)\)/.exec(transform ?? '')
+  if (!match) throw new Error(`Unexpected transform ${transform}`)
+  return { x: Number(match[1]), y: Number(match[2]), k: Number(match[3]) }
+}
+import { test, expect } from '@playwright/test'
+import {
+  COMMITTED_ENTRIES,
+  collapseButton,
+  currentCrumb,
+  dragNode,
+  edge,
+  expandButton,
+  folderInfo,
+  node,
+  nodeBody,
+  nodeCenter,
+  openGraph,
+  visibleNodeIds,
+  viewTransform,
+  waitForApi,
+} from './helpers.ts'
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+
+test('initial view shows only the two source nodes, fitted and unconnected', async ({ page, request }) => {
+  expect((await (await request.get('/api/entries')).json()).entries).toEqual(COMMITTED_ENTRIES)
+  await openGraph(page)
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude'])
+  await expect(page.locator('.graph-canvas line')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /^Pi, source folder, 1 folder, 1 Markdown file/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^Claude, source folder, 1 folder, 2 Markdown files/ })).toBeVisible()
+  await expect(currentCrumb(page)).toHaveText('Home')
+  await expect(folderInfo(page)).toContainText('Two sources')
+  await expect(page.getByRole('status')).toContainText('Loaded 2 folders and 5 Markdown files.')
+  await expect(page.getByRole('contentinfo')).toContainText('Contains (parent → child)')
+  // No document contents are ever requested.
+  const requests: string[] = []
+  page.on('request', request => requests.push(request.url()))
+  await expandButton(page, 'Pi').click()
+  await expandButton(page, 'skills').click()
+  expect(requests.filter(url => url.includes('/api/'))).toEqual([])
+})
+
+test('expansion reveals immediate children with containment edges; collapse hides descendants', async ({ page }) => {
+  await openGraph(page)
+  await expandButton(page, 'Pi').click()
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Pi/skills', 'Pi/workflow.md', 'Claude'])
+  await expect(edge(page, 'Pi', 'Pi/skills')).toBeVisible()
+  await expect(edge(page, 'Pi', 'Pi/workflow.md')).toBeVisible()
+  await expect(page.locator('.graph-canvas line')).toHaveCount(2)
+  await expect(page.getByRole('status')).toHaveText('Expanded Pi: 1 folder, 1 Markdown file')
+  await expect(node(page, 'Pi/skills/review.md')).toHaveCount(0)
+
+  await expandButton(page, 'skills').click()
+  await expect(node(page, 'Pi/skills/review.md')).toBeVisible()
+  await expect(edge(page, 'Pi/skills', 'Pi/skills/review.md')).toBeVisible()
+  await expect(page.getByRole('group', { name: 'review.md, Markdown file' })).toBeVisible()
+  // File nodes are not buttons and never select a document.
+  await nodeBody(page, 'Pi/skills/review.md').click()
+  await expect(page).toHaveURL('/')
+
+  // Pi and Claude are never connected to each other.
+  await expandButton(page, 'Claude').click()
+  const parents = await page.locator('.graph-canvas line').evaluateAll(lines => lines.map(line => [line.getAttribute('data-edge-parent'), line.getAttribute('data-edge-child')]))
+  for (const [parent, child] of parents) expect(child!.startsWith(`${parent}/`)).toBe(true)
+
+  await collapseButton(page, 'Pi').click()
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude', 'Claude/subagents', 'Claude/empty.md', 'Claude/workflow.md'])
+  await expect(page.getByRole('status')).toHaveText('Collapsed Pi.')
+  // Collapsing cleared the nested expansion state.
+  await expandButton(page, 'Pi').click()
+  await expect(node(page, 'Pi/skills')).toBeVisible()
+  await expect(node(page, 'Pi/skills/review.md')).toHaveCount(0)
+  await expect(expandButton(page, 'skills')).toBeVisible()
+})
+
+test('selecting folders updates breadcrumb, counts, highlight and URL; history works', async ({ page }) => {
+  await openGraph(page)
+  await nodeBody(page, 'Pi').click()
+  await expect(page).toHaveURL('/Pi')
+  await expect(currentCrumb(page)).toHaveText('Pi')
+  await expect(folderInfo(page)).toHaveText('1 folder, 1 Markdown file')
+  await expect(node(page, 'Pi')).toHaveClass(/is-selected/)
+  // Selection does not expand.
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude'])
+
+  await expandButton(page, 'Pi').click()
+  await nodeBody(page, 'Pi/skills').click()
+  await expect(page).toHaveURL('/Pi/skills')
+  await expect(currentCrumb(page)).toHaveText('skills')
+  await expect(folderInfo(page)).toHaveText('0 folders, 1 Markdown file')
+  await expect(edge(page, 'Pi', 'Pi/skills')).toHaveClass(/edge-highlight/)
+  await expect(edge(page, 'Pi', 'Pi/workflow.md')).not.toHaveClass(/edge-highlight/)
+  await expect(page.getByRole('button', { name: /^skills, folder/ })).toHaveAttribute('aria-pressed', 'true')
+
+  await page.goBack()
+  await expect(page).toHaveURL('/Pi')
+  await expect(currentCrumb(page)).toHaveText('Pi')
+  await page.goForward()
+  await expect(page).toHaveURL('/Pi/skills')
+  await expect(currentCrumb(page)).toHaveText('skills')
+
+  // Breadcrumb navigation selects the ancestor without collapsing anything.
+  await page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'Pi' }).click()
+  await expect(page).toHaveURL('/Pi')
+  await expect(node(page, 'Pi/skills')).toBeVisible()
+  await page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'Home' }).click()
+  await expect(page).toHaveURL('/')
+  await expect(currentCrumb(page)).toHaveText('Home')
+  await expect(node(page, 'Pi/skills')).toBeVisible()
+})
+
+test('direct links reveal the ancestor chain, expand the folder and survive reload', async ({ page }) => {
+  await openGraph(page, '/Claude/subagents')
+  await expect(currentCrumb(page)).toHaveText('subagents')
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude', 'Claude/subagents', 'Claude/subagents/implementer.md', 'Claude/empty.md', 'Claude/workflow.md'])
+  await expect(node(page, 'Claude/subagents')).toHaveClass(/is-selected/)
+  await expect(node(page, 'Claude/subagents')).toBeInViewport()
+  await expect(collapseButton(page, 'subagents')).toBeVisible()
+  await page.reload()
+  await expect(currentCrumb(page)).toHaveText('subagents')
+  await expect(node(page, 'Claude/subagents/implementer.md')).toBeVisible()
+})
+
+test('collapsing an ancestor of the selected folder selects the collapsing node', async ({ page }) => {
+  await openGraph(page, '/Pi/skills')
+  await collapseButton(page, 'Pi').click()
+  await expect(page).toHaveURL('/Pi')
+  await expect(currentCrumb(page)).toHaveText('Pi')
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude'])
+})
+
+test('missing folders and unknown sources explain themselves and link to a root', async ({ page }) => {
+  await openGraph(page, '/Pi/does-not-exist')
+  await expect(page.getByRole('alert')).toContainText('Folder “does-not-exist” was not found in Pi')
+  await expect(currentCrumb(page)).toHaveText('does-not-exist')
+  await page.getByRole('link', { name: 'Go to the Pi root' }).click()
+  await expect(page).toHaveURL('/Pi')
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  await expect(folderInfo(page)).toHaveText('1 folder, 1 Markdown file')
+
+  await openGraph(page, '/Nope/anything')
+  await expect(page.getByRole('alert')).toContainText('Source “Nope” does not exist')
+  await page.getByRole('link', { name: 'Go to the Claude root' }).click()
+  await expect(page).toHaveURL('/Claude')
+})
+
+test('dragging pins a node without selecting it; unpin and reset clear pins', async ({ page }) => {
+  await openGraph(page)
+  await expandButton(page, 'Pi').click()
+  const before = await nodeCenter(page, 'Pi/skills')
+  await dragNode(page, 'Pi/skills', 140, 90)
+  const after = await nodeCenter(page, 'Pi/skills')
+  expect(Math.hypot(after.x - before.x, after.y - before.y)).toBeGreaterThan(100)
+  await expect(page).toHaveURL('/')
+  await expect(node(page, 'Pi/skills')).toHaveClass(/is-pinned/)
+  await expect(page.getByRole('button', { name: /^skills, folder.*pinned$/ })).toBeVisible()
+
+  // Pins survive selection changes and stay where they were put.
+  await nodeBody(page, 'Pi').click()
+  await expect(page).toHaveURL('/Pi')
+  const afterSelect = await nodeCenter(page, 'Pi/skills')
+  expect(Math.abs(afterSelect.x - after.x)).toBeLessThan(1)
+  expect(Math.abs(afterSelect.y - after.y)).toBeLessThan(1)
+
+  await page.getByRole('button', { name: 'Unpin skills' }).click()
+  await expect(node(page, 'Pi/skills')).not.toHaveClass(/is-pinned/)
+  await expect(page.getByRole('status')).toHaveText('Unpinned skills.')
+
+  await dragNode(page, 'Pi', -120, 60)
+  await expect(node(page, 'Pi')).toHaveClass(/is-pinned/)
+  await page.getByRole('button', { name: 'Reset' }).click()
+  await expect(page).toHaveURL('/')
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude'])
+  await expect(page.locator('.graph-canvas .is-pinned')).toHaveCount(0)
+  await expect(currentCrumb(page)).toHaveText('Home')
+})
+
+test('keyboard: outline-order tabbing, Enter selects, arrows expand/collapse, P pins', async ({ page }) => {
+  await openGraph(page)
+  await nodeBody(page, 'Pi').focus()
+  await page.keyboard.press('ArrowRight')
+  await expect(node(page, 'Pi/skills')).toBeVisible()
+  await page.keyboard.press('Enter')
+  await expect(page).toHaveURL('/Pi')
+  await page.keyboard.press('p')
+  await expect(node(page, 'Pi')).toHaveClass(/is-pinned/)
+  await page.keyboard.press('p')
+  await expect(node(page, 'Pi')).not.toHaveClass(/is-pinned/)
+
+  // Tab order follows the outline: Pi body, Pi toggle, skills body, skills toggle, workflow.md, Claude…
+  await page.keyboard.press('Tab')
+  await expect(collapseButton(page, 'Pi')).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(nodeBody(page, 'Pi/skills')).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(expandButton(page, 'skills')).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(nodeBody(page, 'Pi/workflow.md')).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(nodeBody(page, 'Claude')).toBeFocused()
+
+  await nodeBody(page, 'Pi/skills').focus()
+  await page.keyboard.press('ArrowRight')
+  await expect(node(page, 'Pi/skills/review.md')).toBeVisible()
+  await page.keyboard.press('Space')
+  await expect(page).toHaveURL('/Pi/skills')
+  await page.keyboard.press('ArrowLeft')
+  await expect(node(page, 'Pi/skills/review.md')).toHaveCount(0)
+  // Toggles are keyboard operable too.
+  await collapseButton(page, 'Pi').focus()
+  await page.keyboard.press('Enter')
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude'])
+  await expect(page).toHaveURL('/Pi')
+})
+
+test('keyboard focus reveals off-screen node bodies, expand controls and pin controls', async ({ page }) => {
+  await openGraph(page)
+  await nodeBody(page, 'Pi').focus()
+  await page.keyboard.press('p')
+
+  const canvas = page.locator('.graph-canvas')
+  const bounds = await canvas.boundingBox()
+  if (!bounds) throw new Error('Graph canvas has no bounding box')
+  const panAway = async () => {
+    await page.mouse.move(bounds.x + 10, bounds.y + 10)
+    await page.mouse.down()
+    await page.mouse.move(bounds.x + bounds.width + 500, bounds.y + 10)
+    await page.mouse.up()
+    await expect(nodeBody(page, 'Pi')).not.toBeInViewport()
+  }
+
+  await panAway()
+  // Outline is the last toolbar button before the graph in DOM order.
+  await page.getByRole('button', { name: 'Outline', exact: true }).focus()
+  await page.keyboard.press('Tab')
+  await expect(nodeBody(page, 'Pi')).toBeFocused()
+  await expect(nodeBody(page, 'Pi')).toBeInViewport({ ratio: 1 })
+
+  await panAway()
+  await expandButton(page, 'Pi').focus()
+  await expect(expandButton(page, 'Pi')).toBeFocused()
+  await expect(expandButton(page, 'Pi')).toBeInViewport({ ratio: 1 })
+
+  await panAway()
+  const unpin = page.getByRole('button', { name: 'Unpin Pi', exact: true })
+  await unpin.focus()
+  await expect(unpin).toBeFocused()
+  await expect(unpin).toBeInViewport({ ratio: 1 })
+  await expect(page).toHaveURL('/')
+  expect(await visibleNodeIds(page)).toEqual(['Pi', 'Claude'])
+})
+
+test('outline mode replaces the graph and shares selection, expansion, breadcrumbs and refresh', async ({ page }) => {
+  await openGraph(page)
+  await expandButton(page, 'Pi').click()
+  await page.getByRole('button', { name: 'Outline' }).click()
+  await expect(page.locator('.graph-canvas')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Outline' })).toHaveAttribute('aria-pressed', 'true')
+  const outline = page.getByRole('navigation', { name: 'Directory outline' })
+  await expect(outline.locator('[data-node-id="Pi/skills"]')).toBeVisible()
+  await expect(outline.locator('[data-node-id="Claude/subagents"]')).toHaveCount(0)
+  await expect(outline.locator('[data-node-id="Pi/skills/review.md"]')).toHaveCount(0)
+
+  await outline.getByRole('button', { name: 'Expand skills' }).click()
+  await expect(outline.locator('[data-node-id="Pi/skills/review.md"]')).toContainText('review.md')
+  await expect(outline.locator('[data-node-id="Pi/skills/review.md"]')).toContainText('Markdown file')
+  await outline.getByRole('button', { name: /^skills\s*, folder$/ }).click()
+  await expect(page).toHaveURL('/Pi/skills')
+  await expect(currentCrumb(page)).toHaveText('skills')
+  await expect(outline.getByRole('button', { name: /^skills\s*, folder$/ })).toHaveAttribute('aria-current', 'true')
+  await expect(page.getByRole('button', { name: 'Zoom in' })).toBeDisabled()
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByRole('status')).toContainText('Refreshed')
+
+  // Back to the graph: the same expansion and selection are shown.
+  await page.getByRole('button', { name: 'Outline' }).click()
+  await expect(node(page, 'Pi/skills/review.md')).toBeVisible()
+  await expect(node(page, 'Pi/skills')).toHaveClass(/is-selected/)
+})
+
+test('zoom, fit and empty-folder display', async ({ page }) => {
+  await openGraph(page)
+  const initial = await viewTransform(page)
+  await page.getByRole('button', { name: 'Zoom in' }).click()
+  expect((await viewTransform(page)).k).toBeGreaterThan(initial.k)
+  await page.getByRole('button', { name: 'Zoom out' }).click()
+  await page.getByRole('button', { name: 'Zoom out' }).click()
+  expect((await viewTransform(page)).k).toBeLessThan(initial.k)
+  await page.getByRole('button', { name: 'Fit' }).click()
+  expect(Math.abs((await viewTransform(page)).k - initial.k)).toBeLessThan(0.001)
+
+  await page.route('**/api/entries', route => route.fulfill({ json: { entries: [{ source: 'Claude', path: 'nothing-here', kind: 'directory' }] } }))
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expandButton(page, 'Pi').click()
+  await expect(page.getByRole('button', { name: 'Pi, source folder, This folder is empty.' })).toBeVisible()
+  await expect(node(page, 'Pi').locator('.empty-tag')).toHaveText('empty')
+  await nodeBody(page, 'Pi').click()
+  await expect(folderInfo(page)).toHaveText('This folder is empty.')
+  await expandButton(page, 'Claude').click()
+  await expect(node(page, 'Claude/nothing-here')).toBeVisible()
+  await nodeBody(page, 'Claude/nothing-here').click()
+  await expect(folderInfo(page)).toHaveText('This folder is empty.')
+})
+
+test('loading state, initial failure with retry, and network failure', async ({ page }) => {
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let mode: 'gated-failure' | 'network-failure' | 'ok' = 'gated-failure'
+  await page.route('**/api/entries', async route => {
+    try {
+      if (mode === 'gated-failure') {
+        await gate
+        await route.fulfill({ status: 500, json: { error: 'Unable to read the Claude fixture folder. Check that both fixture folders exist and are readable, then refresh.' } })
+      } else if (mode === 'network-failure') {
+        await route.abort()
+      } else {
+        await route.continue()
+      }
+    } catch {
+      // The page may have cancelled the request (React strict mode aborts the first effect run).
+    }
+  })
+  await page.goto('/')
+  await expect(page.getByText('Loading the Pi and Claude fixture folders…')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Refresh' })).toBeDisabled()
+  release()
+  await expect(page.getByRole('alert')).toContainText('Unable to read the Claude fixture folder')
+  await expect(page.locator('.graph-canvas')).toHaveCount(0)
+  mode = 'network-failure'
+  await page.getByRole('button', { name: 'Retry' }).click()
+  await expect(page.getByRole('alert')).toContainText('The API could not be reached')
+  mode = 'ok'
+  await page.getByRole('button', { name: 'Retry' }).click()
+  await expect(node(page, 'Claude')).toBeVisible()
+})
+
+test('refresh keeps the previous graph and warns when the API fails', async ({ page }) => {
+  await openGraph(page, '/Pi/skills')
+  await page.route('**/api/entries', route => route.fulfill({ status: 500, json: { error: 'Unable to read the Pi fixture folder. Check that both fixture folders exist and are readable, then refresh.' } }))
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByRole('alert')).toContainText('may be outdated')
+  await expect(page.getByRole('alert')).toContainText('Unable to read the Pi fixture folder')
+  await expect(node(page, 'Pi/skills/review.md')).toBeVisible()
+  await expect(currentCrumb(page)).toHaveText('skills')
+  await expect(page.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+  await page.unroute('**/api/entries')
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByRole('alert')).toHaveCount(0)
+})
+
+test('narrow screens keep controls reachable without horizontal scrolling', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 640 })
+  await openGraph(page, '/Claude/subagents')
+  for (const name of ['Refresh', 'Zoom in', 'Zoom out', 'Fit', 'Reset', 'Outline']) {
+    await expect(page.getByRole('button', { name })).toBeInViewport()
+  }
+  const overflow = await page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+  expect(overflow).toBeLessThanOrEqual(0)
+  await expect(node(page, 'Claude/subagents')).toBeInViewport()
+})
+import { test, expect } from '@playwright/test'
+import { mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { currentCrumb, expandButton, folderInfo, node, nodeBody, openGraph, waitForApi } from './helpers.ts'
+
+/**
+ * These tests add uniquely named scratch artifacts under fixtures/ and remove them again in afterEach,
+ * even when an assertion fails. Committed sample files are never touched.
+ */
+const fixtureRoot = fileURLToPath(new URL('../fixtures/', import.meta.url))
+const created: string[] = []
+
+async function scratchDirectory(source: 'pi' | 'claude', name: string) {
+  const path = join(fixtureRoot, source, name)
+  created.push(path)
+  await mkdir(path, { recursive: true })
+  return path
+}
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+
+test.afterEach(async () => {
+  for (const path of created.splice(0)) await rm(path, { recursive: true, force: true })
+})
+
+test('refresh adds and removes entries, handles awkward names and only shows children of expanded parents', async ({ page }) => {
+  await openGraph(page)
+  await nodeBody(page, 'Claude').click()
+
+  const name = `scratch-${randomUUID().slice(0, 8)} a#b?c 100%`
+  const directory = await scratchDirectory('claude', name)
+  await mkdir(join(directory, 'nested', 'deeper'), { recursive: true })
+  await writeFile(join(directory, 'nested', 'deeper', 'NOTE.MD'), '# hidden contents are never read')
+  await writeFile(join(directory, 'ignored.txt'), 'not markdown')
+  await writeFile(join(directory, 'visible.md'), '')
+  await symlink(join(fixtureRoot, 'claude', 'workflow.md'), join(directory, 'linked.md'))
+  await mkdir(join(directory, 'empty-folder'))
+
+  // Nothing appears until Refresh is pressed; after that, only when the parent is expanded.
+  await expect(node(page, `Claude/${name}`)).toHaveCount(0)
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByRole('status')).toContainText('Refreshed: 6 folders and 7 Markdown files.')
+  await expect(node(page, `Claude/${name}`)).toHaveCount(0)
+  await expect(folderInfo(page)).toHaveText('2 folders, 2 Markdown files')
+  await expandButton(page, 'Claude').click()
+  await expect(node(page, `Claude/${name}`)).toBeVisible()
+
+  await expandButton(page, name).click()
+  await expect(node(page, `Claude/${name}/nested`)).toBeVisible()
+  await expect(node(page, `Claude/${name}/empty-folder`)).toBeVisible()
+  await expect(node(page, `Claude/${name}/visible.md`)).toBeVisible()
+  await expect(node(page, `Claude/${name}/ignored.txt`)).toHaveCount(0)
+  await expect(node(page, `Claude/${name}/linked.md`)).toHaveCount(0)
+
+  // Awkward names survive the URL, reloads and history.
+  await nodeBody(page, `Claude/${name}`).click()
+  const encoded = `/Claude/${encodeURIComponent(name)}`
+  await expect(page).toHaveURL(encoded)
+  await expect(currentCrumb(page)).toHaveText(name)
+  await expect(folderInfo(page)).toHaveText('2 folders, 1 Markdown file')
+  await page.reload()
+  await expect(currentCrumb(page)).toHaveText(name)
+  await expect(node(page, `Claude/${name}/visible.md`)).toBeVisible()
+  await page.goBack()
+  await expect(page).toHaveURL('/Claude')
+  await page.goForward()
+  await expect(page).toHaveURL(encoded)
+
+  // Deep paths: the breadcrumb collapses the middle behind an expandable control.
+  await expandButton(page, 'nested').click()
+  await nodeBody(page, `Claude/${name}/nested/deeper`).click()
+  await expect(page).toHaveURL(`${encoded}/nested/deeper`)
+  const breadcrumb = page.getByRole('navigation', { name: 'Breadcrumb' })
+  await expect(breadcrumb.getByRole('link', { name: 'Claude' })).toHaveCount(0)
+  await breadcrumb.getByRole('button', { name: /hidden breadcrumb/ }).click()
+  await expect(breadcrumb.getByRole('link', { name: 'Claude' })).toBeVisible()
+  await expect(breadcrumb.getByRole('link', { name: name })).toBeVisible()
+  // Selection and expansion are separate actions: the uppercase .MD file only appears once deeper is expanded.
+  await expect(node(page, `Claude/${name}/nested/deeper/NOTE.MD`)).toHaveCount(0)
+  await expandButton(page, 'deeper').click()
+  await expect(node(page, `Claude/${name}/nested/deeper/NOTE.MD`)).toBeVisible()
+
+  // Removing the folder on disk: refresh shows the missing-folder state and drops the nodes.
+  await rm(directory, { recursive: true, force: true })
+  await page.getByRole('button', { name: 'Refresh' }).click()
+  await expect(page.getByRole('alert')).toContainText('was not found in Claude')
+  await expect(node(page, `Claude/${name}`)).toHaveCount(0)
+  await expect(page.getByRole('status')).toContainText('The selected folder no longer exists.')
+  await page.getByRole('link', { name: 'Go to the Claude root' }).click()
+  await expect(page).toHaveURL('/Claude')
+  await expect(folderInfo(page)).toHaveText('1 folder, 2 Markdown files')
+})
+
+test('a scratch tree with several hundred files loads and expands without visible delay', async ({ page }) => {
+  const name = `scratch-large-${randomUUID().slice(0, 8)}`
+  const directory = await scratchDirectory('pi', name)
+  const writes: Promise<void>[] = []
+  for (let folder = 0; folder < 5; folder += 1) {
+    const sub = join(directory, `part-${folder}`)
+    await mkdir(sub)
+    for (let file = 0; file < 60; file += 1) writes.push(writeFile(join(sub, `note-${String(file).padStart(3, '0')}.md`), ''))
+  }
+  for (let file = 0; file < 40; file += 1) writes.push(writeFile(join(directory, `top-${String(file).padStart(3, '0')}.md`), ''))
+  await Promise.all(writes)
+
+  const started = Date.now()
+  await openGraph(page, `/Pi/${name}`)
+  await expect(node(page, `Pi/${name}/top-039.md`)).toBeVisible()
+  expect(Date.now() - started).toBeLessThan(5_000)
+
+  const expandStart = Date.now()
+  for (let folder = 0; folder < 5; folder += 1) await expandButton(page, `part-${folder}`).click()
+  await expect(node(page, `Pi/${name}/part-4/note-059.md`)).toBeVisible()
+  await expect(page.locator('.graph-canvas .node-file')).toHaveCount(341)
+  expect(Date.now() - expandStart).toBeLessThan(8_000)
+
+  // The canvas stays navigable and collapse/reset remain available.
+  await page.getByRole('button', { name: 'Fit' }).click()
+  await page.getByRole('button', { name: 'Zoom out' }).click()
+  await page.getByRole('button', { name: `Collapse ${name}` }).click()
+  await expect(page.locator('.graph-canvas .node-file')).toHaveCount(1)
+  await page.getByRole('button', { name: 'Reset' }).click()
+  await expect(page).toHaveURL('/')
+})
+import { test, expect } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
+// Runs last (files execute alphabetically on the single worker): the suite must leave fixtures/ untouched.
+test('the suite leaves no modified or untracked files under fixtures/', () => {
+  const repo = fileURLToPath(new URL('..', import.meta.url))
+  const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all', '--', 'fixtures'], { cwd: repo, encoding: 'utf8' })
+  expect(status.trim()).toBe('')
+})
+import { defineConfig } from '@playwright/test'
+
+export default defineConfig({
+  testDir: './tests',
+  testMatch: '**/*.spec.ts',
+  // Browser tests mutate (and then clean) the shared fixture tree, so they must never run concurrently.
+  workers: 1,
+  fullyParallel: false,
+  use: {
+    baseURL: 'http://127.0.0.1:5173',
+    browserName: 'chromium',
+    // Reduced motion makes the force layout settle synchronously, so nothing waits on animation.
+    reducedMotion: 'reduce',
+  },
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://127.0.0.1:5173',
+    reuseExistingServer: false,
+    timeout: 30_000,
+  },
+})
+=====
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import {
+  ancestorIds,
+  breadcrumbsFor,
+  buildIndex,
+  childCounts,
+  collapseNode,
+  describeCounts,
+  folderExists,
+  folderToPathname,
+  parsePathname,
+  pruneIds,
+  revealFolder,
+  visibleGraph,
+  type Entry,
+} from '../../src/graph/model.ts'
+import { wrapLabel } from '../../src/graph/labels.ts'
+
+const entries: Entry[] = [
+  { source: 'Pi', path: 'skills', kind: 'directory' },
+  { source: 'Pi', path: 'skills/review.md', kind: 'file' },
+  { source: 'Pi', path: 'skills/empty', kind: 'directory' },
+  { source: 'Pi', path: 'workflow.md', kind: 'file' },
+  { source: 'Pi', path: 'archive.md', kind: 'file' },
+  { source: 'Claude', path: 'workflow.md', kind: 'file' },
+  { source: 'Claude', path: 'orphan/deeper/note.md', kind: 'file' }, // parents omitted on purpose
+]
+
+test('buildIndex creates source roots, implicit parents and ordered children (folders first)', () => {
+  const index = buildIndex(entries)
+  assert.deepEqual([...index.nodes.keys()].slice(0, 2), ['Pi', 'Claude'])
+  assert.deepEqual(index.children.get('Pi')!.map(node => node.name), ['skills', 'archive.md', 'workflow.md'])
+  assert.deepEqual(index.children.get('Pi/skills')!.map(node => node.id), ['Pi/skills/empty', 'Pi/skills/review.md'])
+  assert.equal(index.nodes.get('Claude/orphan')?.kind, 'directory')
+  assert.equal(index.nodes.get('Claude/orphan/deeper/note.md')?.parentId, 'Claude/orphan/deeper')
+  assert.equal(index.nodes.get('Claude/orphan/deeper/note.md')?.depth, 3)
+  // Same filename in both sources stays distinct.
+  assert.notEqual(index.nodes.get('Pi/workflow.md'), index.nodes.get('Claude/workflow.md'))
+})
+
+test('visibleGraph reveals immediate children only, with one containment edge per child', () => {
+  const index = buildIndex(entries)
+  const initial = visibleGraph(index, new Set())
+  assert.deepEqual(initial.nodes.map(node => node.id), ['Pi', 'Claude'])
+  assert.deepEqual(initial.edges, [])
+
+  const piOpen = visibleGraph(index, new Set(['Pi']))
+  assert.deepEqual(piOpen.nodes.map(node => node.id), ['Pi', 'Pi/skills', 'Pi/archive.md', 'Pi/workflow.md', 'Claude'])
+  assert.ok(piOpen.edges.every(edge => index.nodes.get(edge.childId)!.parentId === edge.parentId))
+  assert.ok(!piOpen.nodes.some(node => node.id === 'Pi/skills/review.md'))
+
+  const deep = visibleGraph(index, new Set(['Pi', 'Pi/skills']))
+  assert.ok(deep.nodes.some(node => node.id === 'Pi/skills/review.md'))
+  // Expansion state of hidden nodes is ignored until they are visible again.
+  const hiddenChild = visibleGraph(index, new Set(['Pi/skills']))
+  assert.deepEqual(hiddenChild.nodes.map(node => node.id), ['Pi', 'Claude'])
+})
+
+test('collapseNode clears descendants, revealFolder expands the ancestor chain, pruneIds drops stale ids', () => {
+  const index = buildIndex(entries)
+  const expanded = new Set(['Pi', 'Pi/skills', 'Pi/skills/empty', 'Claude'])
+  const collapsed = collapseNode(index, expanded, 'Pi')
+  assert.deepEqual([...collapsed], ['Claude'])
+
+  const revealed = revealFolder(index, new Set(['Claude']), { source: 'Pi', path: 'skills/empty' })
+  assert.deepEqual([...revealed].sort(), ['Claude', 'Pi', 'Pi/skills', 'Pi/skills/empty'])
+  assert.deepEqual(ancestorIds(index.nodes.get('Pi/skills/empty')!), ['Pi', 'Pi/skills'])
+  // Files are never expandable.
+  assert.deepEqual([...revealFolder(index, new Set(), { source: 'Pi', path: 'workflow.md' })], [])
+
+  const smaller = buildIndex(entries.filter(entry => !entry.path.startsWith('skills')))
+  assert.deepEqual([...pruneIds(smaller, expanded)], ['Pi', 'Claude'])
+  assert.equal(folderExists(smaller, { source: 'Pi', path: 'skills' }), false)
+  assert.equal(folderExists(index, { source: 'Pi', path: 'skills' }), true)
+  assert.equal(folderExists(index, { source: 'Pi', path: 'workflow.md' }), false)
+  assert.equal(folderExists(index, null), true)
+})
+
+test('childCounts and describeCounts', () => {
+  const index = buildIndex(entries)
+  assert.deepEqual(childCounts(index, 'Pi'), { directories: 1, files: 2 })
+  assert.equal(describeCounts(childCounts(index, 'Pi')), '1 folder, 2 Markdown files')
+  assert.equal(describeCounts(childCounts(index, 'Pi/skills/empty')), 'This folder is empty.')
+})
+
+test('folder URLs encode every segment and round-trip awkward names', () => {
+  const awkward = { source: 'Claude' as const, path: 'a b/c#d/e?f/g%h/100%' }
+  const pathname = folderToPathname(awkward)
+  assert.equal(pathname, '/Claude/a%20b/c%23d/e%3Ff/g%25h/100%25')
+  assert.deepEqual(parsePathname(pathname), { kind: 'folder', ref: awkward })
+  assert.deepEqual(parsePathname('/'), { kind: 'home' })
+  assert.deepEqual(parsePathname('/Pi/'), { kind: 'folder', ref: { source: 'Pi', path: '' } })
+  assert.deepEqual(parsePathname('/Nope/x'), { kind: 'unknown-source', name: 'Nope' })
+  assert.deepEqual(parsePathname('/Pi/%E0%A4%A'), { kind: 'malformed' })
+  assert.equal(folderToPathname(null), '/')
+})
+
+test('breadcrumbs start at Home and follow the source and directory segments', () => {
+  assert.deepEqual(breadcrumbsFor(null).map(crumb => crumb.label), ['Home'])
+  const crumbs = breadcrumbsFor({ source: 'Pi', path: 'skills/deep' })
+  assert.deepEqual(crumbs.map(crumb => crumb.label), ['Home', 'Pi', 'skills', 'deep'])
+  assert.deepEqual(crumbs.map(crumb => crumb.ref), [null, { source: 'Pi', path: '' }, { source: 'Pi', path: 'skills' }, { source: 'Pi', path: 'skills/deep' }])
+})
+
+test('wrapLabel breaks long names at separators and truncates with an ellipsis', () => {
+  assert.deepEqual(wrapLabel('review.md'), ['review.md'])
+  assert.deepEqual(wrapLabel('release-notes-2026.md'), ['release-notes-', '2026.md'])
+  const lines = wrapLabel('a'.repeat(60))
+  assert.equal(lines.length, 3)
+  assert.ok(lines[2].endsWith('…'))
+})
+=====
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { createApp, defaultFixtureRoot, resolveFixtureRoot } from './app.ts'
+
+const expected = [
+  { source: 'Pi', path: 'skills', kind: 'directory' },
+  { source: 'Pi', path: 'skills/review.md', kind: 'file' },
+  { source: 'Pi', path: 'workflow.md', kind: 'file' },
+  { source: 'Claude', path: 'empty.md', kind: 'file' },
+  { source: 'Claude', path: 'subagents', kind: 'directory' },
+  { source: 'Claude', path: 'subagents/implementer.md', kind: 'file' },
+  { source: 'Claude', path: 'workflow.md', kind: 'file' },
+]
+
+async function withTempRoot(run: (root: string) => Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), 'md-manager-test-'))
+  try {
+    await mkdir(join(root, 'pi'))
+    await mkdir(join(root, 'claude'))
+    await run(root)
+  } finally {
+    await chmod(join(root, 'pi'), 0o755).catch(() => undefined)
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+test('lists the committed fixtures as a flat, ordered list of directories and Markdown files', async () => {
+  const app = createApp(defaultFixtureRoot)
+  try {
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 200)
+    assert.deepEqual(response.json(), { entries: expected })
+    // Query parameters cannot select a different root or path.
+    assert.equal((await app.inject('/api/entries?root=/tmp&path=..')).body, response.body)
+    // The previous endpoint is gone.
+    assert.equal((await app.inject('/api/files')).statusCode, 404)
+  } finally { await app.close() }
+})
+
+test('fixture root comes from MD_MANAGER_FIXTURE_ROOT or the repository default', () => {
+  assert.equal(resolveFixtureRoot({}), defaultFixtureRoot)
+  assert.equal(resolveFixtureRoot({ MD_MANAGER_FIXTURE_ROOT: '   ' }), defaultFixtureRoot)
+  assert.equal(resolveFixtureRoot({ MD_MANAGER_FIXTURE_ROOT: 'scratch/root' }), resolve('scratch/root'))
+})
+
+test('includes nested and empty directories and uppercase .MD, excludes other files and symlinks', async () => {
+  await withTempRoot(async root => {
+    await mkdir(join(root, 'pi', 'b-empty'))
+    await mkdir(join(root, 'pi', 'a-nested', 'deeper'), { recursive: true })
+    await writeFile(join(root, 'pi', 'a-nested', 'deeper', 'NOTE.MD'), '')
+    await writeFile(join(root, 'pi', 'a-nested', 'ignored.txt'), 'nope')
+    await writeFile(join(root, 'pi', 'a-nested', 'archive.md.bak'), 'nope')
+    await writeFile(join(root, 'pi', 'zeta.md'), '')
+    await writeFile(join(root, 'outside.md'), 'Not in a source folder')
+    await symlink(join(root, 'outside.md'), join(root, 'pi', 'linked.md'))
+    await symlink(root, join(root, 'claude', 'linked-directory'))
+    await symlink(join(root, 'pi'), join(root, 'claude', 'linked-source'))
+    const app = createApp(root)
+    try {
+      const response = await app.inject('/api/entries')
+      assert.equal(response.statusCode, 200)
+      assert.deepEqual(response.json(), {
+        entries: [
+          { source: 'Pi', path: 'a-nested', kind: 'directory' },
+          { source: 'Pi', path: 'a-nested/deeper', kind: 'directory' },
+          { source: 'Pi', path: 'a-nested/deeper/NOTE.MD', kind: 'file' },
+          { source: 'Pi', path: 'b-empty', kind: 'directory' },
+          { source: 'Pi', path: 'zeta.md', kind: 'file' },
+        ],
+      })
+    } finally { await app.close() }
+  })
+})
+
+test('missing, unreadable or symlinked sources fail the whole listing without exposing paths', async () => {
+  await withTempRoot(async root => {
+    await writeFile(join(root, 'pi', 'keep.md'), '')
+    const app = createApp(root)
+    try {
+      await rm(join(root, 'claude'), { recursive: true })
+      const missing = await app.inject('/api/entries')
+      assert.equal(missing.statusCode, 500)
+      assert.match(missing.json().error, /Unable to read the Claude fixture folder/)
+      assert.ok(!missing.body.includes(root))
+
+      await symlink(join(root, 'pi'), join(root, 'claude'))
+      const linked = await app.inject('/api/entries')
+      assert.equal(linked.statusCode, 500)
+      assert.match(linked.json().error, /Claude fixture folder/)
+
+      await rm(join(root, 'claude'))
+      await mkdir(join(root, 'claude'))
+      if (process.getuid?.() !== 0) {
+        await chmod(join(root, 'pi'), 0o000)
+        const unreadable = await app.inject('/api/entries')
+        assert.equal(unreadable.statusCode, 500)
+        assert.match(unreadable.json().error, /Unable to read the Pi fixture folder/)
+        assert.ok(!unreadable.body.includes(root))
+      }
+    } finally { await app.close() }
+  })
+})

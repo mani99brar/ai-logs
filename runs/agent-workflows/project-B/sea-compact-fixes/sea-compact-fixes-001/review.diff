@@ -1,0 +1,1224 @@
+diff --git a/README.md b/README.md
+index 9307930..4f1e245 100644
+--- a/README.md
++++ b/README.md
+@@ -2,7 +2,7 @@
+ 
+ A browser multiplayer pirate treasure race. The game is specified in [`docs/spec.md`](docs/spec.md) (the text of `docs/spec.docx`); [`docs/architecture.md`](docs/architecture.md) maps this repository onto it.
+ 
+-Browsers create or join a private match by a six-character code and sail placeholder ships around the slice sea: a compact map with four small islands with docks, reefs and shoal walls that funnel every route between islands through one central crossing, and eight outer-sea spawn slots. Up (or W) sails ahead, down (S) brakes and then reverses, left and right (A, D) turn, and E docks a slow ship beside a dock. The authoritative server decides every position and sends each browser only the ships within its sight radius; the minimap's fog clears where the player has sailed.
++Browsers create or join a private match by a six-character code and sail placeholder ships around the slice sea: a compact map with four small islands with docks, reefs and shoal walls that funnel every route between islands through one central crossing, and eight outer-sea spawn slots. Up (or W) sails ahead, down (S) brakes and then reverses, left and right (A, D) turn, and E docks a ship beside a dock, at any speed. The authoritative server decides every position and sends each browser only the ships within its sight radius; the minimap's fog clears where the player has sailed.
+ 
+ The combat spike (§18 stage 1) runs beside it: "Create duel" makes a 1v1 duel whose code the second browser enters under "Join duel", and "Practice" fights a server-side dummy (idle or guarding). After a three-second countdown both browsers predict the fight with the shared duel simulation and roll back to the server's inputs (`docs/duel.md`). Keys (§8): WASD or the arrows move (hold back to guard), J light, K heavy, U and I specials, Shift dash, J and K together throw. The HUD shows both health bars, stamina, the round clock, the connection line (round trip, input delay, corrections) and the result; "Show hitboxes" draws hurtboxes and active hitboxes.
+ 
+@@ -31,7 +31,7 @@ Set `VITE_SERVER_URL` when the web client should reach a server other than port
+ 
+ **Simulated latency for duel playtests (development only).** With `npm run dev`, add `?rtt=80&jitter=20` to the page's address (for example `http://localhost:5393/?rtt=80&jitter=20`) before creating or joining a duel: that browser's duel socket is then delayed by half the round trip each way, plus a uniform ±jitter/2, in order, round-trip probes included, so the HUD's round trip and the chosen input delay reflect it. Give both browsers the setting to test §19's 30, 80 or 150 ms. It is read only when `import.meta.env.DEV` is true and is absent from the production build (`npm run build` checks). Loss is simulated only by the test harness (`ImpairmentProxy` in `packages/test-tools`).
+ 
+-The map is generated from an ASCII sketch of one quarter, `assets/source/maps/sketch.ts`: edit it, run `node assets/source/maps/sketch.ts`, then `npm run map:build` (details in `assets/source/maps/README.md`). The `.tmj` stays within the Tiled subset documented in `packages/content/src/tiledMap.ts`, so [Tiled](https://www.mapeditor.org/) opens it.
++The map is generated from an ASCII sketch of one quarter, `assets/source/maps/sliceSeaSketch.ts`: edit it, run `node assets/source/maps/sketch.ts`, then `npm run map:build` (details in `assets/source/maps/README.md`). The `.tmj` stays within the Tiled subset documented in `packages/content/src/tiledMap.ts`, so [Tiled](https://www.mapeditor.org/) opens it.
+ 
+ `PIRATE_SEA_RACE_TEST_PLACEMENT=1` is a test-only setting, off by default: the dev and test entry point (`npm run dev`, and the server the browser tests start) then serves `POST /__test/place`, which puts a player's ship on a chosen tile. The production entry (`npm start`) never reads it.
+ 
+diff --git a/apps/server/src/MatchRoom.ts b/apps/server/src/MatchRoom.ts
+index f12b709..a3fca7f 100644
+--- a/apps/server/src/MatchRoom.ts
++++ b/apps/server/src/MatchRoom.ts
+@@ -159,7 +159,8 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   private advance(): void {
+     const frame = this.simulation.frame + 1;
+     const inputs: Record<string, PlayerInput> = {};
+-    for (const [sessionId, gate] of this.gates) inputs[sessionId] = gate.inputAt(frame);
++    // A lapsed client gets no entry: its ship sails as neutral, but keeps its mooring throttle until real input.
++    for (const [sessionId, gate] of this.gates) if (!gate.lapsedAt(frame)) inputs[sessionId] = gate.inputAt(frame);
+     this.simulation = step(this.config, this.simulation, inputs);
+     if (!isWorldStep(this.simulation.frame)) return;
+     for (const gate of this.gates.values()) gate.worldStepTaken();
+diff --git a/apps/server/src/inputGate.test.ts b/apps/server/src/inputGate.test.ts
+index b1efef8..613d16e 100644
+--- a/apps/server/src/inputGate.test.ts
++++ b/apps/server/src/inputGate.test.ts
+@@ -41,6 +41,18 @@ describe("InputGate", () => {
+     expect(gate.inputAt(10 + INPUT_HOLD_FRAMES + 1)).toEqual(NEUTRAL_INPUT);
+   });
+ 
++  it("reports a lapse only when the held input has expired and no button is latched", () => {
++    const gate = new InputGate();
++    gate.receive({ ...input(1, 10), buttons: Buttons.Interact }, 10);
++    expect(gate.lapsedAt(10 + INPUT_HOLD_FRAMES)).toBe(false);
++    // A button pressed in the last message is latched until the world step reads it, so that frame is not a lapse.
++    expect(gate.lapsedAt(10 + INPUT_HOLD_FRAMES + 1)).toBe(false);
++    gate.worldStepTaken();
++    expect(gate.lapsedAt(10 + INPUT_HOLD_FRAMES + 1)).toBe(true);
++    gate.receive(input(2, 40), 40);
++    expect(gate.lapsedAt(41)).toBe(false);
++  });
++
+   it("drops out-of-sequence input and keeps the accepted one", () => {
+     const gate = new InputGate();
+     gate.receive(input(5, 10, 1), 10);
+diff --git a/apps/server/src/inputGate.ts b/apps/server/src/inputGate.ts
+index a7d874d..760b6a4 100644
+--- a/apps/server/src/inputGate.ts
++++ b/apps/server/src/inputGate.ts
+@@ -90,6 +90,15 @@ export class InputGate {
+     return undefined;
+   }
+ 
++  /**
++   * Whether the client has sent nothing the simulation could use at `frame`: its held input has lapsed and no button
++   * is latched. The match room then gives the simulation no input for the ship at all, rather than neutral input, so a
++   * stall cannot release the throttle a moored ship keeps (see `StepInputs`).
++   */
++  lapsedAt(frame: number): boolean {
++    return frame - this.heldAtFrame > INPUT_HOLD_FRAMES && this.latchedButtons === 0;
++  }
++
+   /** The intent the simulation uses for `frame`: the held input, plus any button latched since the last world step. */
+   inputAt(frame: number): PlayerInput {
+     const held = frame - this.heldAtFrame > INPUT_HOLD_FRAMES ? NEUTRAL_INPUT : this.held;
+diff --git a/apps/web/src/hud.ts b/apps/web/src/hud.ts
+index bf139a6..139c896 100644
+--- a/apps/web/src/hud.ts
++++ b/apps/web/src/hud.ts
+@@ -28,16 +28,14 @@ export function dockText(dock: number): string {
+ }
+ 
+ /**
+- * What the player can do about docking right now, by the simulation's own rule (`dockInReach` and the dock speed
+- * limit): nothing to say when moored or far from any dock; otherwise either press E or slow down first.
++ * What the player can do about docking right now, by the simulation's own rule (`dockInReach`; speed does not matter):
++ * nothing to say when moored or far from any dock; otherwise press E.
+  */
+-export function dockHint(ship: Pick<ShipSnapshot, "x" | "y" | "speed" | "dock">): string {
++export function dockHint(ship: Pick<ShipSnapshot, "x" | "y" | "dock">): string {
+   if (ship.dock !== NOT_DOCKED) return "";
+   const config = defaultSimulationConfig;
+   const berth = dockInReach(config, ship.x, ship.y);
+-  if (berth === undefined) return "";
+-  const where = dockLabel(config.map, berth.id);
+-  return Math.abs(ship.speed) <= config.ship.dockMaxSpeed ? `Press E to dock at ${where}` : `Slow down to dock at ${where}`;
++  return berth === undefined ? "" : `Press E to dock at ${dockLabel(config.map, berth.id)}`;
+ }
+ 
+ /** Writes the match status and the latest authoritative (not interpolated) state of the visible ships. */
+diff --git a/apps/web/src/keyboard.ts b/apps/web/src/keyboard.ts
+index dac0550..42eb30a 100644
+--- a/apps/web/src/keyboard.ts
++++ b/apps/web/src/keyboard.ts
+@@ -26,8 +26,8 @@ export function axis(negative: boolean, positive: boolean): number {
+ 
+ /**
+  * The keyboard input adapter (§8 defaults): up is throttle, down brakes (and reverses slowly from a stop), left and
+- * right turn, E interacts (docks). It tracks held keys and releases them all when the window loses focus, so a ship
+- * never keeps sailing on a key-up the page missed. The page reads it on a timer, so a tap of E that goes down and up
++ * right turn, E interacts (docks). It tracks held keys and releases them all (and forgets a tap) when the window loses
++ * focus, so a ship never keeps sailing, or docks, on a key the page missed. The page reads it on a timer, so a tap of E that goes down and up
+  * between two reads is kept until the next read, as the duel keyboard keeps its taps: it counts once.
+  */
+ export class KeyboardHelm {
+@@ -41,7 +41,10 @@ export class KeyboardHelm {
+       this.press(event.code);
+     });
+     target.addEventListener("keyup", (event) => this.release(event.code));
+-    target.addEventListener("blur", () => this.held.clear());
++    target.addEventListener("blur", () => {
++      this.held.clear();
++      this.tapped = 0;
++    });
+   }
+ 
+   press(code: string): void {
+@@ -67,6 +70,10 @@ export class KeyboardHelm {
+   }
+ }
+ 
++/** Whether a key went to a text field. Outside a browser (unit tests in Node) there are no text fields. */
+ function isTyping(target: EventTarget | null): boolean {
+-  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
++  return (
++    (typeof HTMLInputElement !== "undefined" && target instanceof HTMLInputElement) ||
++    (typeof HTMLTextAreaElement !== "undefined" && target instanceof HTMLTextAreaElement)
++  );
+ }
+diff --git a/apps/web/src/web.test.ts b/apps/web/src/web.test.ts
+index 96513e3..b8e4df7 100644
+--- a/apps/web/src/web.test.ts
++++ b/apps/web/src/web.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from "vitest";
++import { afterEach, describe, expect, it, vi } from "vitest";
+ import { Buttons, MessageType, PROTOCOL_VERSION, type InputMessage } from "@pirate-sea-race/protocol";
+ import { SIGHT_RADIUS_TILES, SUB_UNITS_PER_TILE, WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+ import { defaultSimulationConfig, NOT_DOCKED, quantizeAxis, sail, tileCentre, type ShipState } from "@pirate-sea-race/simulation";
+@@ -77,22 +77,37 @@ describe("keyboard axes", () => {
+ });
+ 
+ describe("sea keyboard", () => {
++  /** A key event as the browser dispatches it on the window: Node has no KeyboardEvent, so an Event with a code. */
++  const key = (target: EventTarget, type: "keydown" | "keyup", code: string): Event => {
++    const event = Object.assign(new Event(type, { cancelable: true }), { code });
++    target.dispatchEvent(event);
++    return event;
++  };
++
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
+   it("keeps a tap of E that goes down and up between two reads, reports it once, and that tap docks", () => {
+-    const keyboard = new KeyboardHelm(new EventTarget() as unknown as Window);
++    const page = new EventTarget();
++    const keyboard = new KeyboardHelm(page as unknown as Window);
+     expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
+-    // Down and up before the page's next read (every 16.7 ms).
+-    keyboard.press("KeyE");
+-    keyboard.release("KeyE");
++    // Down and up before the page's next read (every 16.7 ms), as real key events: the page keeps them from scrolling.
++    expect(key(page, "keydown", "KeyE").defaultPrevented).toBe(true);
++    key(page, "keyup", "KeyE");
+     const tapped = keyboard.helm();
+     expect(tapped).toEqual({ moveX: 0, moveY: 0, buttons: Buttons.Interact });
+     expect(keyboard.helm().buttons).toBe(0);
+     // A held E stays in on every read until it is released; arrows are only what is held.
+-    keyboard.press("KeyE");
+-    keyboard.press("ArrowUp");
++    key(page, "keydown", "KeyE");
++    key(page, "keydown", "ArrowUp");
+     expect(keyboard.helm()).toEqual({ moveX: 0, moveY: -1, buttons: Buttons.Interact });
+     expect(keyboard.helm()).toEqual({ moveX: 0, moveY: -1, buttons: Buttons.Interact });
+-    keyboard.release("KeyE");
+-    keyboard.release("ArrowUp");
++    key(page, "keyup", "KeyE");
++    key(page, "keyup", "ArrowUp");
++    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
++    // Keys that are not the helm's pass through to the page untouched.
++    expect(key(page, "keydown", "KeyQ").defaultPrevented).toBe(false);
+     expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
+ 
+     // The tap goes out as one input message, and the server's step moors a slow ship beside a dock with it.
+@@ -109,6 +124,29 @@ describe("sea keyboard", () => {
+     const moored = sail(config, ship, { buttons: message!.buttons, moveX: quantizeAxis(message!.moveX), moveY: quantizeAxis(message!.moveY) });
+     expect(moored).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+   });
++
++  it("forgets held keys and a tap of E when the window loses focus", () => {
++    const page = new EventTarget();
++    const keyboard = new KeyboardHelm(page as unknown as Window);
++    key(page, "keydown", "ArrowUp");
++    key(page, "keydown", "KeyE");
++    key(page, "keyup", "KeyE");
++    page.dispatchEvent(new Event("blur"));
++    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
++  });
++
++  it("ignores keys typed into a text field", () => {
++    // The page's text fields, as the browser would type them; the keys go to the field and bubble up unhandled.
++    class TextField extends EventTarget {}
++    vi.stubGlobal("HTMLInputElement", TextField);
++    vi.stubGlobal("HTMLTextAreaElement", class extends EventTarget {});
++    const field = new TextField();
++    const keyboard = new KeyboardHelm(field as unknown as Window);
++    const typed = key(field, "keydown", "KeyE");
++    key(field, "keyup", "KeyE");
++    expect(typed.defaultPrevented).toBe(false);
++    expect(keyboard.helm()).toEqual({ moveX: 0, moveY: 0, buttons: 0 });
++  });
+ });
+ 
+ describe("frame estimate", () => {
+@@ -173,17 +211,19 @@ describe("HUD dock state", () => {
+     expect(dockText(0)).toMatch(/^[A-Z][a-z]+ [A-Z][a-z]+, (north|east|south|west) dock$/);
+   });
+ 
+-  it("tells the player to press E within reach of a dock when slow enough, and to slow down otherwise", () => {
++  it("tells the player to press E within reach of a dock, at any speed", () => {
+     const { map, ship } = defaultSimulationConfig;
+     const berth = tileCentre(defaultSimulationConfig, map.docks[0]!.tileX, map.docks[0]!.tileY);
+     const label = dockText(0);
+-    expect(dockHint({ ...berth, speed: 0, dock: NOT_DOCKED })).toBe(`Press E to dock at ${label}`);
+-    expect(dockHint({ ...berth, speed: ship.dockMaxSpeed, dock: NOT_DOCKED })).toBe(`Press E to dock at ${label}`);
+-    expect(dockHint({ ...berth, speed: ship.dockMaxSpeed + 1, dock: NOT_DOCKED })).toBe(`Slow down to dock at ${label}`);
++    // The HUD's own ship snapshots carry a speed; it no longer changes the hint.
++    const near = (speed: number) => ({ ...berth, speed, dock: NOT_DOCKED });
++    for (const speed of [0, ship.dockMaxSpeed, ship.dockMaxSpeed + 1, ship.maxSpeed, -ship.maxReverseSpeed]) {
++      expect(dockHint(near(speed))).toBe(`Press E to dock at ${label}`);
++    }
+     // Moored already, or far from every dock: nothing to say.
+-    expect(dockHint({ ...berth, speed: 0, dock: 0 })).toBe("");
++    expect(dockHint({ ...berth, dock: 0 })).toBe("");
+     const spawn = tileCentre(defaultSimulationConfig, map.spawnSlots[0]!.tileX, map.spawnSlots[0]!.tileY);
+-    expect(dockHint({ ...spawn, speed: 0, dock: NOT_DOCKED })).toBe("");
++    expect(dockHint({ ...spawn, dock: NOT_DOCKED })).toBe("");
+   });
+ });
+ 
+diff --git a/assets/source/maps/README.md b/assets/source/maps/README.md
+index 9d79572..470c4b4 100644
+--- a/assets/source/maps/README.md
++++ b/assets/source/maps/README.md
+@@ -7,7 +7,7 @@
+ - a tile layer named `terrain`, stored as a plain array of tile ids, every cell filled;
+ - an object layer named `objects` with an `island` rectangle per island (on tile boundaries, named, string property `theme`: `tropical`, `volcanic`, `ruin` or `mist`), a `spawn` point per spawn slot (int property `slot` from 0, string property `facing`: `E`, `SE`, `S`, `SW`, `W`, `NW`, `N` or `NE`), and one `hub` point without properties: the crossing near the centre that every route between islands passes.
+ 
+-The map is generated: `sketch.ts` draws its north-west quarter in ASCII (`.` sea, `#` land, `%` shoal, `D` dock) and mirrors it into the other three, with the islands, spawn slots and hub. Shoal walls on the midlines open only near the hub, so ships sailing between islands meet there; reefs keep every stretch of open water within sight of an obstacle. The row three tiles south of the hub stays clear for 20 tiles either side of it, for the tests. To change the map, edit the sketch and run, from the repository root:
++The map is generated: `sliceSeaSketch.ts` draws its north-west quarter in ASCII (`.` sea, `#` land, `%` shoal, `D` dock) and mirrors it into the other three, with the islands, spawn slots and hub. Shoal walls on the midlines open only near the hub, so ships sailing between islands meet there; reefs keep every stretch of open water within sight of an obstacle. The row three tiles south of the hub stays clear for 20 tiles either side of it, for the tests. `sketch.ts` writes it, and a unit test fails while the committed `.tmj` differs from what the sketch draws. To change the map, edit the sketch and run, from the repository root:
+ 
+ ```
+ node assets/source/maps/sketch.ts
+diff --git a/assets/source/maps/sketch.ts b/assets/source/maps/sketch.ts
+index 1e87a04..b2dc14c 100644
+--- a/assets/source/maps/sketch.ts
++++ b/assets/source/maps/sketch.ts
+@@ -1,215 +1,13 @@
+ /**
+- * The sketch the slice sea is drawn from: one quarter of the map as ASCII, mirrored into all four quarters, so every
+- * island, spawn slot and route has a twin in each corner (§2's spawn fairness). It writes `slice-sea.tmj` in the
+- * Tiled subset `packages/content/src/tiledMap.ts` documents; that file stays the committed source `npm run map:build`
+- * reads. Regenerate after editing this sketch, from the repository root:
++ * Writes `slice-sea.tmj` from the sketch in `sliceSeaSketch.ts`. From the repository root:
+  *
+  *   node assets/source/maps/sketch.ts && npm run map:build
+- *
+- * Node runs it directly (type stripping), so it uses only erasable TypeScript and imports nothing from the workspace.
+  */
+ import { writeFileSync } from "node:fs";
++import { sliceSeaTmj } from "./sliceSeaSketch.ts";
+ 
+-/** Tiled's tile size for sea maps: `TILE_PIXELS` in `packages/content/src/tiledMap.ts`. */
+-const TILE_PIXELS = 24;
+-
+-/**
+- * The north-west quarter, 56 × 56 tiles: `.` sea, `#` land, `%` shoal, `D` dock. Its last column and row are the map's
+- * midlines, shared with the mirrored quarters: shoal walls that stop five tiles short of the centre, so the only way
+- * from one quarter to another is through the open crossing around the hub (the map's centre tile). Row 52 here, and
+- * so the row three tiles south of the hub too, is kept clear from 20 tiles west of the hub to 20 east of it: the
+- * browser and integration tests put ships on it.
+- */
+-const QUARTER = [
+-  ".......................................................%", // 0
+-  ".......................................................%", // 1
+-  ".......................................................%", // 2
+-  ".......................................................%", // 3
+-  ".......................................................%", // 4
+-  ".....%%...............%%...............................%", // 5
+-  "....%%%%.............%%%%...............%%.............%", // 6
+-  ".....%%...............%%...............%%%%............%", // 7
+-  "........................................%%.............%", // 8
+-  ".......................................................%", // 9
+-  ".......................................................%", // 10
+-  ".......................................................%", // 11
+-  ".................................%%....................%", // 12
+-  "............%%...................%%....................%", // 13
+-  "............%%.........................................%", // 14
+-  ".......................................................%", // 15
+-  ".......................................................%", // 16
+-  "....................########...........................%", // 17
+-  "...................###########.........................%", // 18
+-  "..................#############........................%", // 19
+-  "..................#############........................%", // 20
+-  ".................D#############........................%", // 21
+-  "..................#############..............%%........%", // 22
+-  ".....%%...........#############.............%%%%.......%", // 23
+-  "....%%%%..........#############..............%%........%", // 24
+-  ".....%%...........#############........................%", // 25
+-  "..................#############........................%", // 26
+-  "...................####D...............................%", // 27
+-  "....................##.................................%", // 28
+-  ".......................................................%", // 29
+-  ".......................................................%", // 30
+-  ".......................................................%", // 31
+-  ".......................................................%", // 32
+-  "...........%%..................................%%......%", // 33
+-  "...........%%......%%%%%%%%....................%%......%", // 34
+-  "...................%%%%%%%%............................%", // 35
+-  "........................................%..............%", // 36
+-  ".......................................%%%.............%", // 37
+-  "......................................%%%%%............%", // 38
+-  ".......................................%%%.............%", // 39
+-  "........................................%..............%", // 40
+-  ".....%%................................................%", // 41
+-  "....%%%%...............................................%", // 42
+-  ".....%%................................................%", // 43
+-  ".......................................................%", // 44
+-  ".......................%%..............................%", // 45
+-  "......................%%%%.......%%....................%", // 46
+-  ".......................%%........%%....................%", // 47
+-  ".......................................................%", // 48
+-  ".......................................................%", // 49
+-  ".......................................................%", // 50
+-  "........................................................", // 51
+-  "........................................................", // 52
+-  "........................................................", // 53
+-  "........................................................", // 54
+-  "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%.....", // 55
+-];
+-
+-const QUARTER_SIZE = QUARTER.length;
+-const SIZE = 2 * QUARTER_SIZE - 1;
+-const GID: Readonly<Record<string, number>> = { ".": 1, "#": 2, "%": 3, D: 4 };
+-
+-interface Mirror {
+-  readonly x: boolean;
+-  readonly y: boolean;
+-}
+-
+-/** The island in the sketched quarter: its rectangle holds its land and docks. */
+-const ISLAND = { tileX: 17, tileY: 17, widthTiles: 14, heightTiles: 12 };
+-const ISLANDS: readonly { name: string; theme: string; mirror: Mirror }[] = [
+-  { name: "Palm Key", theme: "tropical", mirror: { x: false, y: false } },
+-  { name: "Ember Rock", theme: "volcanic", mirror: { x: true, y: false } },
+-  { name: "Old Stones", theme: "ruin", mirror: { x: false, y: true } },
+-  { name: "Mist Cay", theme: "mist", mirror: { x: true, y: true } },
+-];
+-
+-/** The two spawn positions in the sketched quarter, facing its island; slots run clockwise from the north. */
+-const NORTH_SPAWN = { tileX: 31, tileY: 5, facing: "SW" };
+-const WEST_SPAWN = { tileX: 5, tileY: 32, facing: "NE" };
+-const SPAWNS: readonly { spawn: typeof NORTH_SPAWN; mirror: Mirror }[] = [
+-  { spawn: NORTH_SPAWN, mirror: { x: false, y: false } },
+-  { spawn: NORTH_SPAWN, mirror: { x: true, y: false } },
+-  { spawn: WEST_SPAWN, mirror: { x: true, y: false } },
+-  { spawn: WEST_SPAWN, mirror: { x: true, y: true } },
+-  { spawn: NORTH_SPAWN, mirror: { x: true, y: true } },
+-  { spawn: NORTH_SPAWN, mirror: { x: false, y: true } },
+-  { spawn: WEST_SPAWN, mirror: { x: false, y: true } },
+-  { spawn: WEST_SPAWN, mirror: { x: false, y: false } },
+-];
+-
+-for (const [index, row] of QUARTER.entries()) {
+-  if (row.length !== QUARTER_SIZE) throw new Error(`sketch row ${index} has ${row.length} tiles, not ${QUARTER_SIZE}`);
+-}
+-
+-const flip = (tile: number, mirrored: boolean) => (mirrored ? SIZE - 1 - tile : tile);
+-const flipFacing = (facing: string, mirror: Mirror) =>
+-  [...facing].map((letter) => (mirror.x && letter === "E" ? "W" : mirror.x && letter === "W" ? "E" : mirror.y && letter === "N" ? "S" : mirror.y && letter === "S" ? "N" : letter)).join("");
+-
+-const data: number[] = [];
+-for (let tileY = 0; tileY < SIZE; tileY++) {
+-  for (let tileX = 0; tileX < SIZE; tileX++) {
+-    const char = QUARTER[Math.min(tileY, SIZE - 1 - tileY)]![Math.min(tileX, SIZE - 1 - tileX)]!;
+-    const gid = GID[char];
+-    if (gid === undefined) throw new Error(`unknown sketch character "${char}"`);
+-    data.push(gid);
+-  }
+-}
+-
+-let nextId = 1;
+-const objects: object[] = [];
+-for (const island of ISLANDS) {
+-  const tileX = island.mirror.x ? SIZE - ISLAND.tileX - ISLAND.widthTiles : ISLAND.tileX;
+-  const tileY = island.mirror.y ? SIZE - ISLAND.tileY - ISLAND.heightTiles : ISLAND.tileY;
+-  objects.push({
+-    id: nextId++,
+-    name: island.name,
+-    type: "island",
+-    x: tileX * TILE_PIXELS,
+-    y: tileY * TILE_PIXELS,
+-    width: ISLAND.widthTiles * TILE_PIXELS,
+-    height: ISLAND.heightTiles * TILE_PIXELS,
+-    rotation: 0,
+-    visible: true,
+-    properties: [{ name: "theme", type: "string", value: island.theme }],
+-  });
+-}
+-const point = (tileX: number, tileY: number) => ({ x: tileX * TILE_PIXELS + TILE_PIXELS / 2, y: tileY * TILE_PIXELS + TILE_PIXELS / 2 });
+-for (const [slot, { spawn, mirror }] of SPAWNS.entries()) {
+-  objects.push({
+-    id: nextId++,
+-    name: `spawn ${slot}`,
+-    type: "spawn",
+-    point: true,
+-    ...point(flip(spawn.tileX, mirror.x), flip(spawn.tileY, mirror.y)),
+-    width: 0,
+-    height: 0,
+-    rotation: 0,
+-    visible: true,
+-    properties: [
+-      { name: "facing", type: "string", value: flipFacing(spawn.facing, mirror) },
+-      { name: "slot", type: "int", value: slot },
+-    ],
+-  });
+-}
+-const centre = QUARTER_SIZE - 1;
+-objects.push({ id: nextId++, name: "hub", type: "hub", point: true, ...point(centre, centre), width: 0, height: 0, rotation: 0, visible: true });
+-
+-const map = {
+-  compressionlevel: -1,
+-  height: SIZE,
+-  infinite: false,
+-  layers: [
+-    { data: "DATA", height: SIZE, id: 1, name: "terrain", opacity: 1, type: "tilelayer", visible: true, width: SIZE, x: 0, y: 0 },
+-    { draworder: "topdown", id: 2, name: "objects", objects, opacity: 1, type: "objectgroup", visible: true, x: 0, y: 0 },
+-  ],
+-  nextlayerid: 3,
+-  nextobjectid: nextId,
+-  orientation: "orthogonal",
+-  renderorder: "right-down",
+-  tiledversion: "1.11.2",
+-  tileheight: TILE_PIXELS,
+-  tilesets: [
+-    {
+-      columns: 0,
+-      firstgid: 1,
+-      grid: { height: TILE_PIXELS, orientation: "orthogonal", width: TILE_PIXELS },
+-      margin: 0,
+-      name: "terrain",
+-      spacing: 0,
+-      tilecount: 4,
+-      tileheight: TILE_PIXELS,
+-      tilewidth: TILE_PIXELS,
+-      tiles: [
+-        { id: 0, type: "sea" },
+-        { id: 1, type: "land" },
+-        { id: 2, type: "shoal" },
+-        { id: 3, type: "dock" },
+-      ],
+-    },
+-  ],
+-  tilewidth: TILE_PIXELS,
+-  type: "map",
+-  version: "1.10",
+-  width: SIZE,
+-};
+-
+-// Tiled's own layout: one space of indent per level, and the terrain as one CSV line per row.
+-const rows = Array.from({ length: SIZE }, (_, tileY) => data.slice(tileY * SIZE, (tileY + 1) * SIZE).join(","));
+-const text = JSON.stringify(map, null, 1).replace('"DATA"', `[\n${rows.join(",\n")}]`);
+ const target = new URL("slice-sea.tmj", import.meta.url);
+-writeFileSync(target, `${text}\n`);
+-console.log(`wrote ${target.pathname}: ${SIZE} × ${SIZE} tiles`);
++const text = sliceSeaTmj();
++writeFileSync(target, text);
++const size = JSON.parse(text) as { width: number; height: number };
++console.log(`wrote ${target.pathname}: ${size.width} × ${size.height} tiles`);
+diff --git a/assets/source/maps/sliceSeaSketch.ts b/assets/source/maps/sliceSeaSketch.ts
+new file mode 100644
+index 0000000..759a775
+--- /dev/null
++++ b/assets/source/maps/sliceSeaSketch.ts
+@@ -0,0 +1,217 @@
++/**
++ * The sketch the slice sea is drawn from: one quarter of the map as ASCII, mirrored into all four quarters, so every
++ * island, spawn slot and route has a twin in each corner (§2's spawn fairness). `sliceSeaTmj` returns the text of
++ * `slice-sea.tmj` in the Tiled subset `packages/content/src/tiledMap.ts` documents; that file stays the committed
++ * source `npm run map:build` reads. `sketch.ts` writes it; a unit test (`maps.test.ts`) fails while the committed file
++ * differs from what this sketch draws. Regenerate after editing this sketch, from the repository root:
++ *
++ *   node assets/source/maps/sketch.ts && npm run map:build
++ *
++ * Node runs it directly (type stripping), so it uses only erasable TypeScript and imports nothing: no workspace
++ * package and no Node API, and it does nothing when imported.
++ */
++
++/** Tiled's tile size for sea maps: `TILE_PIXELS` in `packages/content/src/tiledMap.ts`. */
++const TILE_PIXELS = 24;
++
++/**
++ * The north-west quarter, 56 × 56 tiles: `.` sea, `#` land, `%` shoal, `D` dock. Its last column and row are the map's
++ * midlines, shared with the mirrored quarters: shoal walls that stop five tiles short of the centre, so the only way
++ * from one quarter to another is through the open crossing around the hub (the map's centre tile). Row 52 here, and
++ * so the row three tiles south of the hub too, is kept clear from 20 tiles west of the hub to 20 east of it: the
++ * browser and integration tests put ships on it.
++ */
++const QUARTER = [
++  ".......................................................%", // 0
++  ".......................................................%", // 1
++  ".......................................................%", // 2
++  ".......................................................%", // 3
++  ".......................................................%", // 4
++  ".....%%...............%%...............................%", // 5
++  "....%%%%.............%%%%...............%%.............%", // 6
++  ".....%%...............%%...............%%%%............%", // 7
++  "........................................%%.............%", // 8
++  ".......................................................%", // 9
++  ".......................................................%", // 10
++  ".......................................................%", // 11
++  ".................................%%....................%", // 12
++  "............%%...................%%....................%", // 13
++  "............%%.........................................%", // 14
++  ".......................................................%", // 15
++  ".......................................................%", // 16
++  "....................########...........................%", // 17
++  "...................###########.........................%", // 18
++  "..................#############........................%", // 19
++  "..................#############........................%", // 20
++  ".................D#############........................%", // 21
++  "..................#############..............%%........%", // 22
++  ".....%%...........#############.............%%%%.......%", // 23
++  "....%%%%..........#############..............%%........%", // 24
++  ".....%%...........#############........................%", // 25
++  "..................#############........................%", // 26
++  "...................####D...............................%", // 27
++  "....................##.................................%", // 28
++  ".......................................................%", // 29
++  ".......................................................%", // 30
++  ".......................................................%", // 31
++  ".......................................................%", // 32
++  "...........%%..................................%%......%", // 33
++  "...........%%......%%%%%%%%....................%%......%", // 34
++  "...................%%%%%%%%............................%", // 35
++  "........................................%..............%", // 36
++  ".......................................%%%.............%", // 37
++  "......................................%%%%%............%", // 38
++  ".......................................%%%.............%", // 39
++  "........................................%..............%", // 40
++  ".....%%................................................%", // 41
++  "....%%%%...............................................%", // 42
++  ".....%%................................................%", // 43
++  ".......................................................%", // 44
++  ".......................%%..............................%", // 45
++  "......................%%%%.......%%....................%", // 46
++  ".......................%%........%%....................%", // 47
++  ".......................................................%", // 48
++  ".......................................................%", // 49
++  ".......................................................%", // 50
++  "........................................................", // 51
++  "........................................................", // 52
++  "........................................................", // 53
++  "........................................................", // 54
++  "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%.....", // 55
++];
++
++const QUARTER_SIZE = QUARTER.length;
++const SIZE = 2 * QUARTER_SIZE - 1;
++const GID: Readonly<Record<string, number>> = { ".": 1, "#": 2, "%": 3, D: 4 };
++
++interface Mirror {
++  readonly x: boolean;
++  readonly y: boolean;
++}
++
++/** The island in the sketched quarter: its rectangle holds its land and docks. */
++const ISLAND = { tileX: 17, tileY: 17, widthTiles: 14, heightTiles: 12 };
++const ISLANDS: readonly { name: string; theme: string; mirror: Mirror }[] = [
++  { name: "Palm Key", theme: "tropical", mirror: { x: false, y: false } },
++  { name: "Ember Rock", theme: "volcanic", mirror: { x: true, y: false } },
++  { name: "Old Stones", theme: "ruin", mirror: { x: false, y: true } },
++  { name: "Mist Cay", theme: "mist", mirror: { x: true, y: true } },
++];
++
++/** The two spawn positions in the sketched quarter, facing its island; slots run clockwise from the north. */
++const NORTH_SPAWN = { tileX: 31, tileY: 5, facing: "SW" };
++const WEST_SPAWN = { tileX: 5, tileY: 32, facing: "NE" };
++const SPAWNS: readonly { spawn: typeof NORTH_SPAWN; mirror: Mirror }[] = [
++  { spawn: NORTH_SPAWN, mirror: { x: false, y: false } },
++  { spawn: NORTH_SPAWN, mirror: { x: true, y: false } },
++  { spawn: WEST_SPAWN, mirror: { x: true, y: false } },
++  { spawn: WEST_SPAWN, mirror: { x: true, y: true } },
++  { spawn: NORTH_SPAWN, mirror: { x: true, y: true } },
++  { spawn: NORTH_SPAWN, mirror: { x: false, y: true } },
++  { spawn: WEST_SPAWN, mirror: { x: false, y: true } },
++  { spawn: WEST_SPAWN, mirror: { x: false, y: false } },
++];
++
++/** The Tiled JSON text of the slice sea, as `slice-sea.tmj` holds it (ending with a newline). */
++export function sliceSeaTmj(): string {
++  for (const [index, row] of QUARTER.entries()) {
++    if (row.length !== QUARTER_SIZE) throw new Error(`sketch row ${index} has ${row.length} tiles, not ${QUARTER_SIZE}`);
++  }
++
++  const flip = (tile: number, mirrored: boolean) => (mirrored ? SIZE - 1 - tile : tile);
++  const flipFacing = (facing: string, mirror: Mirror) =>
++    [...facing].map((letter) => (mirror.x && letter === "E" ? "W" : mirror.x && letter === "W" ? "E" : mirror.y && letter === "N" ? "S" : mirror.y && letter === "S" ? "N" : letter)).join("");
++
++  const data: number[] = [];
++  for (let tileY = 0; tileY < SIZE; tileY++) {
++    for (let tileX = 0; tileX < SIZE; tileX++) {
++      const char = QUARTER[Math.min(tileY, SIZE - 1 - tileY)]![Math.min(tileX, SIZE - 1 - tileX)]!;
++      const gid = GID[char];
++      if (gid === undefined) throw new Error(`unknown sketch character "${char}"`);
++      data.push(gid);
++    }
++  }
++
++  let nextId = 1;
++  const objects: object[] = [];
++  for (const island of ISLANDS) {
++    const tileX = island.mirror.x ? SIZE - ISLAND.tileX - ISLAND.widthTiles : ISLAND.tileX;
++    const tileY = island.mirror.y ? SIZE - ISLAND.tileY - ISLAND.heightTiles : ISLAND.tileY;
++    objects.push({
++      id: nextId++,
++      name: island.name,
++      type: "island",
++      x: tileX * TILE_PIXELS,
++      y: tileY * TILE_PIXELS,
++      width: ISLAND.widthTiles * TILE_PIXELS,
++      height: ISLAND.heightTiles * TILE_PIXELS,
++      rotation: 0,
++      visible: true,
++      properties: [{ name: "theme", type: "string", value: island.theme }],
++    });
++  }
++  const point = (tileX: number, tileY: number) => ({ x: tileX * TILE_PIXELS + TILE_PIXELS / 2, y: tileY * TILE_PIXELS + TILE_PIXELS / 2 });
++  for (const [slot, { spawn, mirror }] of SPAWNS.entries()) {
++    objects.push({
++      id: nextId++,
++      name: `spawn ${slot}`,
++      type: "spawn",
++      point: true,
++      ...point(flip(spawn.tileX, mirror.x), flip(spawn.tileY, mirror.y)),
++      width: 0,
++      height: 0,
++      rotation: 0,
++      visible: true,
++      properties: [
++        { name: "facing", type: "string", value: flipFacing(spawn.facing, mirror) },
++        { name: "slot", type: "int", value: slot },
++      ],
++    });
++  }
++  const centre = QUARTER_SIZE - 1;
++  objects.push({ id: nextId++, name: "hub", type: "hub", point: true, ...point(centre, centre), width: 0, height: 0, rotation: 0, visible: true });
++
++  const map = {
++    compressionlevel: -1,
++    height: SIZE,
++    infinite: false,
++    layers: [
++      { data: "DATA", height: SIZE, id: 1, name: "terrain", opacity: 1, type: "tilelayer", visible: true, width: SIZE, x: 0, y: 0 },
++      { draworder: "topdown", id: 2, name: "objects", objects, opacity: 1, type: "objectgroup", visible: true, x: 0, y: 0 },
++    ],
++    nextlayerid: 3,
++    nextobjectid: nextId,
++    orientation: "orthogonal",
++    renderorder: "right-down",
++    tiledversion: "1.11.2",
++    tileheight: TILE_PIXELS,
++    tilesets: [
++      {
++        columns: 0,
++        firstgid: 1,
++        grid: { height: TILE_PIXELS, orientation: "orthogonal", width: TILE_PIXELS },
++        margin: 0,
++        name: "terrain",
++        spacing: 0,
++        tilecount: 4,
++        tileheight: TILE_PIXELS,
++        tilewidth: TILE_PIXELS,
++        tiles: [
++          { id: 0, type: "sea" },
++          { id: 1, type: "land" },
++          { id: 2, type: "shoal" },
++          { id: 3, type: "dock" },
++        ],
++      },
++    ],
++    tilewidth: TILE_PIXELS,
++    type: "map",
++    version: "1.10",
++    width: SIZE,
++  };
++
++  // Tiled's own layout: one space of indent per level, and the terrain as one CSV line per row.
++  const rows = Array.from({ length: SIZE }, (_, tileY) => data.slice(tileY * SIZE, (tileY + 1) * SIZE).join(","));
++  const text = JSON.stringify(map, null, 1).replace('"DATA"', `[\n${rows.join(",\n")}]`);
++  return `${text}\n`;
++}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 8f5cc49..c4d3392 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -15,10 +15,10 @@ The HTTP service, PostgreSQL, static hosting and monitoring are not built yet (`
+ 
+ ## The sea
+ 
+-- **Map format and pipeline.** The map is `assets/source/maps/slice-sea.tmj`, in a documented subset of Tiled's JSON format (`packages/content/src/tiledMap.ts`): orthogonal, finite, 24 px tiles (`TILE_PIXELS`, as drawn); one imageless tileset whose tiles carry a `type` of `sea`, `land`, `shoal` or `dock`; a `terrain` layer as a plain gid array; an `objects` layer with a named `island` rectangle per island (property `theme`), a `spawn` point per slot (properties `slot` and `facing`) and one `hub` point. Nothing else is accepted. `assets/source/maps/sketch.ts` writes it from one mirrored ASCII quarter. `npm run map:build` (`scripts/build-map.ts`) converts it into `packages/content/src/maps/sliceSea.ts` (terrain rows and objects) if it passes the validators; a unit test fails when that module is stale (it reads the `.tmj` as a Vite `?raw` import).
+-- **Validators.** `validateSeaMap` checks §2 and §3: four small islands, each land tile inside one island rectangle, each island with a dock beside its land and open sea; shoals; eight spawn slots on open sea outside the islands' bounding box and pairwise beyond `ENGAGEMENT_RANGE_TILES` (6); every dock and slot reachable by sea; and, by eight-way shortest paths (no cut corners) at full speed: each island's nearest neighbour 20–40 s away, no dock-or-slot crossing over 90 s, a dock within 40 s of every slot. No empty stretches: every navigable tile is within the sight radius of land, a shoal or a dock (not the edge). Routes meet: closing the disc around the hub (open sea near the centre; radius half the sight radius, so ships in it see each other) lengthens or cuts every shortest path between docks of different islands. The slice sea (111 × 111 tiles, midline shoal walls open only in the hub's disc): neighbours 26 s apart, longest crossing 39 s, water within 9.9 tiles of an obstacle, 91 % open sea.
++- **Map format and pipeline.** The map is `assets/source/maps/slice-sea.tmj`, in a documented subset of Tiled's JSON format (`packages/content/src/tiledMap.ts`): orthogonal, finite, 24 px tiles (`TILE_PIXELS`, as drawn); one imageless tileset whose tiles carry a `type` of `sea`, `land`, `shoal` or `dock`; a `terrain` layer as a plain gid array; an `objects` layer with a named `island` rectangle per island (property `theme`), a `spawn` point per slot (properties `slot` and `facing`) and one `hub` point. Nothing else is accepted. `assets/source/maps/sketch.ts` writes it from one mirrored ASCII quarter (`sliceSeaSketch.ts`; a unit test fails when they differ). `npm run map:build` (`scripts/build-map.ts`) converts it into `packages/content/src/maps/sliceSea.ts` (terrain rows and objects) if it passes the validators; a unit test fails when that module is stale (it reads the `.tmj` as a Vite `?raw` import).
++- **Validators.** `validateSeaMap` checks §2 and §3: four small islands, each land tile inside one island rectangle, each island with a dock beside its land and open sea; shoals; eight spawn slots on open sea outside the islands' bounding box and pairwise beyond `ENGAGEMENT_RANGE_TILES` (6); every dock and slot reachable by sea; and, by eight-way shortest paths (no cut corners) at full speed: each island's nearest neighbour 20–40 s away, no dock-or-slot crossing over 90 s, a dock within 40 s of every slot. No empty stretches: every navigable tile is within the sight radius of land, a shoal or a dock (not the edge). Routes meet: closing the disc around the hub (open sea near the centre; radius half the sight radius, so ships in it see each other) lengthens or cuts every shortest path between docks of different islands. At most 112 tiles a side. The slice sea (111 × 111 tiles, midline shoal walls open only in the hub's disc): neighbours 26 s apart, longest crossing 39 s, water within 9.9 tiles of an obstacle, 91 % open sea.
+ - **Sailing.** Positions are integer sub-units (256 a tile); headings are 64 directions, 0 east, clockwise (y grows down), unit vectors from a literal cosine table. Each world step the throttle (`-moveY`) accelerates towards 39 sub-units a step (3.05 tiles a second), brakes, or reverses slowly from a stop; `moveX` turns a heading a step (3.2 s a circle); none coasts to a stop. On 24 px tiles that handles like the old five tiles a second on 16 px (unit tests hold it within 25 %). The hull is a square of half-size 80. A move sweeps each axis in turn through the tile columns or rows its leading edge enters and stops flush at the first land, shoal or map edge: a ship slides along an obstacle met at an angle, runs aground head-on, and never tunnels.
+-- **Docking.** Interact (E) at speed 15 or less, whatever the throttle (a ship driven ashore at its dock docks once stopped), with the ship's centre within 1.5 tiles of a dock tile's centre and a clear hull along the straight run to it (checked sub-unit by sub-unit) moors it: it moves to the dock's centre, stops, and records the dock; turning does nothing. It stays moored while E or the throttle it moored with (`mooredThrottle`) is held; pressing a throttle after releasing that one, or the other direction, casts off at once. The page's keyboard keeps a tap until its next read, the server a button until its next step, so no quick tap of E is lost; the HUD's Harbour line says "Press E to dock" or "Slow down to dock" by the same rule.
++- **Docking.** Hold E near a dock to brake and moor, at any speed and throttle: with the ship's centre within 1.5 tiles of a dock tile's centre and a clear hull along the straight run to it (checked sub-unit by sub-unit), it moves to the dock's centre, stops and records the dock, so an angled arrival moors, not slides past. It stays moored while E or the throttle it moored with (`mooredThrottle`) is held; pressing a throttle after releasing that one, or the other direction, casts off. An input stall does not: the server gives a lapsed client no input, keeping the latch. The keyboard keeps a tap of E until its next read (not past a blur), the server until its next step; within reach the HUD says "Press E to dock".
+ - **Visibility boundary (§16).** The room's `ships` map is tagged `.view()`. Each client gets a `StateView`; after every mirror the room puts into it the client's own ship and each ship within `SIGHT_RADIUS_TILES` (10, `visibleShipIds`) and takes out the rest, so Colyseus encodes no other ship into that client's patches (an integration test checks the decoded state and the raw frames). `players` in the state is the public player count. Terrain is static content every client bundles, never synced; the minimap fog is client-side presentation, not a security boundary.
+ - **Test placement.** Tests place ships through `POST /__test/place` (code, session id, tile, heading); its tile bounds come from the map. Only the dev and test entry (`apps/server/src/dev.ts`) offers it, when `PIRATE_SEA_RACE_TEST_PLACEMENT=1`; the production entry (`main.ts`) never reads that, which the build smoke test checks. It only moves a ship: admission and views are unchanged.
+ 
+diff --git a/packages/content/src/maps.test.ts b/packages/content/src/maps.test.ts
+index 04b66d2..173c575 100644
+--- a/packages/content/src/maps.test.ts
++++ b/packages/content/src/maps.test.ts
+@@ -1,12 +1,13 @@
+ import { describe, expect, it } from "vitest";
+ import tiledSource from "../../../assets/source/maps/slice-sea.tmj?raw";
++import { sliceSeaTmj } from "../../../assets/source/maps/sliceSeaSketch.js";
+ import generatedModule from "./maps/sliceSea.ts?raw";
+ import { sliceSeaSource } from "./maps/sliceSea.js";
+ import { privateMatch, rulesPresets } from "./rules.js";
+ import { ENGAGEMENT_RANGE_TILES, shipTuning, SIGHT_RADIUS_TILES, travelTargets } from "./sailing.js";
+ import { seaMap, spawnSlots } from "./sea.js";
+ import { createSeaMap, dockLabel, insideIsland, Terrain, terrainAt, type SeaMapSource } from "./seaMap.js";
+-import { inHubDisc, obstacleDistancesSquared, octileStepCosts, seaPathCosts, validateSeaMap, type SeaMapReport } from "./seaValidation.js";
++import { inHubDisc, MAX_SEA_SIDE_TILES, obstacleDistancesSquared, octileStepCosts, seaPathCosts, validateSeaMap, type SeaMapReport } from "./seaValidation.js";
+ import { convertTiledMap, formatSeaMapModule, type TiledMap } from "./tiledMap.js";
+ 
+ const SOURCE_PATH = "assets/source/maps/slice-sea.tmj";
+@@ -19,6 +20,10 @@ describe("map pipeline", () => {
+     expect(formatSeaMapModule(converted.value, "sliceSeaSource", SOURCE_PATH)).toBe(generatedModule);
+   });
+ 
++  it("keeps the Tiled source map in step with the sketch it is drawn from (run `node assets/source/maps/sketch.ts`)", () => {
++    expect(sliceSeaTmj()).toBe(tiledSource);
++  });
++
+   const tiled = (): TiledMap => JSON.parse(tiledSource) as TiledMap;
+   const issuesOf = (candidate: unknown) => {
+     const result = convertTiledMap("broken", candidate);
+@@ -206,6 +211,22 @@ describe("map validators fail on a broken map", () => {
+   const palm = seaMap.islands[0]!;
+   const palmDocks = seaMap.docks.filter((dock) => dock.island === 0);
+ 
++  it("a sea larger than 112 × 112 tiles", () => {
++    expect(MAX_SEA_SIDE_TILES).toBe(112);
++    expect(Math.max(seaMap.widthTiles, seaMap.heightTiles)).toBeLessThanOrEqual(MAX_SEA_SIDE_TILES);
++    // Open sea added along the east edge: 112 tiles wide is still compact, 113 is not.
++    const widened = (widthTiles: number) => ({
++      ...sliceSeaSource,
++      widthTiles,
++      rows: sliceSeaSource.rows.map((row) => row.padEnd(widthTiles, ".")),
++    });
++    const tooLarge = `113 × ${seaMap.heightTiles} tiles is larger than 112 × 112`;
++    expect(issuesFor(widened(113))).toContain(tooLarge);
++    expect(issuesFor(widened(112)).some((issue) => /larger than 112 × 112/.test(issue))).toBe(false);
++    const tall = { ...sliceSeaSource, heightTiles: 113, rows: [...sliceSeaSource.rows, ".".repeat(seaMap.widthTiles), ".".repeat(seaMap.widthTiles)] };
++    expect(issuesFor(tall)).toContain(`${seaMap.widthTiles} × 113 tiles is larger than 112 × 112`);
++  });
++
+   it("an island without a dock", () => {
+     const edits = Object.fromEntries(palmDocks.map((dock) => [`${dock.tileX},${dock.tileY}`, "."]));
+     expect(issuesFor(editedMap(edits))).toContain(`${palm.name}: no dock`);
+diff --git a/packages/content/src/sailing.ts b/packages/content/src/sailing.ts
+index 3b214f1..d9fca09 100644
+--- a/packages/content/src/sailing.ts
++++ b/packages/content/src/sailing.ts
+@@ -21,9 +21,9 @@ export interface ShipTuning {
+   readonly turnRate: number;
+   /** Ships collide as a square of this half-size around their position; it must fit inside one tile. */
+   readonly hullHalfSize: number;
+-  /** A ship docks with interact when its centre is this close to a dock tile's centre... */
++  /** A ship docks with interact, at any speed, when its centre is this close to a dock tile's centre. */
+   readonly dockRadius: number;
+-  /** ...and its speed is at most this. */
++  /** A slow approach to a dock (the old mooring speed limit, kept at its share of full speed). Mooring ignores it. */
+   readonly dockMaxSpeed: number;
+ }
+ 
+diff --git a/packages/content/src/seaValidation.ts b/packages/content/src/seaValidation.ts
+index 7c61a4e..3234340 100644
+--- a/packages/content/src/seaValidation.ts
++++ b/packages/content/src/seaValidation.ts
+@@ -13,6 +13,9 @@ const UNREACHABLE = Number.MAX_SAFE_INTEGER;
+ /** No island rectangle may be larger than this many tiles on a side: the slice's islands are small (§18). */
+ export const MAX_ISLAND_SIDE_TILES = 16;
+ 
++/** The slice sea is compact (§3's travel times at three tiles a second): at most this many tiles on a side. */
++export const MAX_SEA_SIDE_TILES = 112;
++
+ /**
+  * Octile path costs for one tile step, in sub-units: straight is a tile's side, diagonal its side times √2, rounded to
+  * the nearest integer by an integer square root (no floating-point `Math.sqrt` in the pure packages). For 256
+@@ -142,9 +145,10 @@ export function inHubDisc(map: SeaMapDefinition, tileX: number, tileY: number):
+ }
+ 
+ /**
+- * Checks a map against §2 and §3: four small islands, each with a dock; shoals; eight outer-sea spawn slots out of
+- * each other's engagement range; every dock and slot reachable by sea; neighbouring islands 20–40 s apart and no
+- * useful crossing over 90 s at full speed; and a dock within 40 s of every slot. No empty stretches: every navigable
++ * Checks a map against §2 and §3: a compact sea, at most MAX_SEA_SIDE_TILES on a side; four small islands, each with
++ * a dock; shoals; eight outer-sea spawn slots out of each other's engagement range; every dock and slot reachable by
++ * sea; neighbouring islands 20–40 s apart and no useful crossing over 90 s at full speed; and a dock within 40 s of
++ * every slot. No empty stretches: every navigable
+  * tile lies within the sight radius of land, a shoal or a dock. Routes meet: the hub is open sea near the centre, and
+  * every shortest route between docks on different islands crosses its disc (closing the disc lengthens or cuts
+  * every one of them).
+@@ -157,6 +161,9 @@ export function validateSeaMap(map: SeaMapDefinition, tuning: ShipTuning, rules:
+   if (tuning.hullHalfSize >= tileCentre) issues.push(`ship hull half-size ${tuning.hullHalfSize} does not fit inside one tile`);
+   if (SIGHT_RADIUS_TILES <= ENGAGEMENT_RANGE_TILES) issues.push("the sight radius must be larger than the engagement range");
+ 
++  if (map.widthTiles > MAX_SEA_SIDE_TILES || map.heightTiles > MAX_SEA_SIDE_TILES) {
++    issues.push(`${map.widthTiles} × ${map.heightTiles} tiles is larger than ${MAX_SEA_SIDE_TILES} × ${MAX_SEA_SIDE_TILES}`);
++  }
+   if (islands.length !== rules.islands) issues.push(`${islands.length} islands, not ${rules.islands}`);
+   islands.forEach((island, index) => {
+     if (island.widthTiles > MAX_ISLAND_SIDE_TILES || island.heightTiles > MAX_ISLAND_SIDE_TILES) {
+diff --git a/packages/simulation/src/simulation.test.ts b/packages/simulation/src/simulation.test.ts
+index fc76d5c..6979d39 100644
+--- a/packages/simulation/src/simulation.test.ts
++++ b/packages/simulation/src/simulation.test.ts
+@@ -19,6 +19,8 @@ import {
+   canSee,
+   createMatchState,
+   defaultSimulationConfig as config,
++  divTrunc,
++  dockInReach,
+   HEADING_DX,
+   HEADING_DY,
+   HEADING_SCALE,
+@@ -283,9 +285,21 @@ describe("sailing", () => {
+ });
+ 
+ describe("handling on screen", () => {
+-  // The feel before the sea was made compact (§3): five tiles a second on 16 px tiles. The compact sea sails at about
+-  // three tiles a second on TILE_PIXELS tiles, so on screen a ship should handle much as it did.
+-  const BEFORE: ShipTuning = { ...config.ship, maxSpeed: 64, maxReverseSpeed: 16, acceleration: 4, reverseAcceleration: 2, braking: 8, drag: 2, dockMaxSpeed: 24 };
++  // The feel before the sea was made compact (§3): five tiles a second on 16 px tiles, every field as it was then
++  // (`git show e2a80af:packages/content/src/sailing.ts`), so the comparisons below fail if today's tuning drifts. The
++  // compact sea sails at about three tiles a second on TILE_PIXELS tiles, so on screen a ship should handle much as it did.
++  const BEFORE: ShipTuning = {
++    maxSpeed: 64,
++    maxReverseSpeed: 16,
++    acceleration: 4,
++    reverseAcceleration: 2,
++    braking: 8,
++    drag: 2,
++    turnRate: 1,
++    hullHalfSize: 80,
++    dockRadius: 384,
++    dockMaxSpeed: 24,
++  };
+   const BEFORE_TILE_PIXELS = 16;
+   const open = testConfig(Array.from({ length: 60 }, () => ".".repeat(200)));
+ 
+@@ -337,6 +351,9 @@ describe("handling on screen", () => {
+ 
+   it("docks within the same reach, which does not depend on speed", () => {
+     expect(config.ship.dockRadius).toBeGreaterThanOrEqual(BEFORE.dockRadius);
++    expect(config.ship.dockRadius).toBeGreaterThanOrEqual(384);
++    expect(config.ship.hullHalfSize).toBe(BEFORE.hullHalfSize);
++    expect(config.ship.turnRate).toBe(BEFORE.turnRate);
+     // The dock speed keeps its share of full speed, rounded up.
+     expect(config.ship.dockMaxSpeed * BEFORE.maxSpeed).toBeGreaterThanOrEqual(BEFORE.dockMaxSpeed * config.ship.maxSpeed);
+     expect((config.ship.dockMaxSpeed - 1) * BEFORE.maxSpeed).toBeLessThan(BEFORE.dockMaxSpeed * config.ship.maxSpeed);
+@@ -452,25 +469,29 @@ describe("docking", () => {
+     }
+   });
+ 
+-  it("does not dock too fast, too far, or without interact", () => {
+-    expect(sail(harbour, { ...nearby, speed: harbour.ship.dockMaxSpeed + 1 }, INTERACT).dock).toBe(NOT_DOCKED);
++  it("docks at any speed, but not too far or without interact", () => {
++    expect(sail(harbour, { ...nearby, speed: harbour.ship.maxSpeed }, INTERACT)).toMatchObject({ ...berth, speed: 0, dock: dock.id });
++    expect(sail(harbour, { ...nearby, speed: -harbour.ship.maxReverseSpeed }, INTERACT)).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+     expect(sail(harbour, { ...nearby, y: berth.y + 2 * tile }, INTERACT).dock).toBe(NOT_DOCKED);
+     expect(sail(harbour, nearby, helm(0, 0)).dock).toBe(NOT_DOCKED);
+     expect(sail(harbour, nearby, FULL_AHEAD).dock).toBe(NOT_DOCKED);
+   });
+ 
+-  it("docks with the throttle held, ahead or astern, when slow enough", () => {
++  it("docks with the throttle held, ahead or astern, at any speed", () => {
+     expect(sail(harbour, nearby, helm(0, -1, INTERACT_BUTTON))).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+     expect(sail(harbour, nearby, helm(0, 1, INTERACT_BUTTON))).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+-    expect(sail(harbour, { ...nearby, speed: harbour.ship.dockMaxSpeed + 1 }, helm(0, 1, INTERACT_BUTTON)).dock).toBe(NOT_DOCKED);
++    expect(sail(harbour, { ...nearby, speed: harbour.ship.maxSpeed }, helm(0, 1, INTERACT_BUTTON))).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+   });
+ 
+-  it("docks a ship driven into its dock with ahead held, once the shore has stopped it", () => {
+-    // Heading north (48) from two tiles south of the dock, full ahead and interact held throughout, as a player
+-    // drives in: too fast at first, it runs up to the shore, stops, and then moors.
+-    const approach = { ...shipAt(dock.tileX, dock.tileY + 2, 48, harbour), speed: harbour.ship.maxSpeed };
++  it("docks a ship driven at its dock with ahead held as soon as it is within reach, still at full speed", () => {
++    // Heading north (48) from three tiles south of the dock at full speed, full ahead and interact held throughout, as
++    // a player drives in: it moors on the first step it starts within the dock's reach, without slowing down first.
++    const approach = { ...shipAt(dock.tileX, dock.tileY + 3, 48, harbour), speed: harbour.ship.maxSpeed };
+     const course = sailFor(approach, helm(0, 1, INTERACT_BUTTON), 40, harbour);
+-    expect(course.some((ship) => ship.dock === NOT_DOCKED && ship.speed > harbour.ship.dockMaxSpeed)).toBe(true);
++    const moored = course.findIndex((ship) => ship.dock !== NOT_DOCKED);
++    expect(course[moored - 1]!.speed).toBe(harbour.ship.maxSpeed);
++    expect(dockInReach(harbour, course[moored - 2]!.x, course[moored - 2]!.y)).toBeUndefined();
++    expect(dockInReach(harbour, course[moored - 1]!.x, course[moored - 1]!.y)).toBe(dock);
+     expect(course.at(-1)).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+   });
+ 
+@@ -518,6 +539,23 @@ describe("docking", () => {
+     expect(sail(harbour, released, FULL_AHEAD)).toMatchObject({ dock: NOT_DOCKED, mooredThrottle: 0 });
+   });
+ 
++  it("keeps a moored ship's throttle latch when its input entry is missing, as the server leaves it after a lapse", () => {
++    const realDock = config.map.docks[0]!;
++    const moored = sail(config, shipAt(realDock.tileX, realDock.tileY, 0), helm(0, 1, INTERACT_BUTTON));
++    expect(moored).toMatchObject({ dock: realDock.id, mooredThrottle: 1 });
++    const stalled = run({ ...createMatchState(1), ships: [moored] }, [], 10 * WORLD_STEP_INTERVAL);
++    expect(stalled.ships[0]).toEqual(moored);
++    // Unchanged ahead held on resuming does not cast off; neutral input releases the latch, and ahead then casts off.
++    const resumed = run(stalled, [{ frame: stalled.frame + 1, shipId: moored.id, input: FULL_AHEAD }], 10 * WORLD_STEP_INTERVAL);
++    expect(resumed.ships[0]).toEqual(moored);
++    const neutral = run(stalled, [{ frame: stalled.frame + 1, shipId: moored.id, input: helm(0, 0) }], WORLD_STEP_INTERVAL);
++    expect(neutral.ships[0]).toMatchObject({ dock: realDock.id, mooredThrottle: 0 });
++    // A ship at sea with no entry still sails as neutral: it coasts.
++    const slot = config.spawnSlots[0]!;
++    const underWay = run({ ...createMatchState(1), ships: [{ ...shipAt(slot.tileX, slot.tileY, compassHeading(slot.facing)), speed: 10 }] }, [], WORLD_STEP_INTERVAL);
++    expect(underWay.ships[0]!.speed).toBe(10 - config.ship.drag);
++  });
++
+   it("moors from any lateral offset when driven into the corner of the shore beside a dock, tilted toward the land", () => {
+     // A south dock with land beside it to the west in its row, open sea to the east, and the coast running on east of it
+     // one row further north: an inside corner of the shore.
+@@ -532,8 +570,8 @@ describe("docking", () => {
+     }
+     // The approach the browser test sails: from 1–3 tiles east and 2–4 tiles south of the dock, at a heading one or two
+     // units west of north, ahead and interact held together from a slow start. Every lateral offset across those tiles,
+-    // 16 sub-units apart, grounds on the coast past the dock or slides along it into the land beside the dock, stops in
+-    // the dock tile, and moors.
++    // 16 sub-units apart, moors on the first step it starts within the dock's reach with a clear run to the berth,
++    // never touching the shore.
+     const north = compassHeading("N");
+     let approaches = 0;
+     for (const heading of [north - 1, north - 2]) {
+@@ -544,9 +582,10 @@ describe("docking", () => {
+           const moored = course.findIndex((ship) => ship.dock !== NOT_DOCKED);
+           expect(moored, `heading ${heading}, x ${x}, speed ${speed}`).toBeGreaterThan(0);
+           expect(course[moored]).toMatchObject({ ...berth, speed: 0, dock: corner.id, mooredThrottle: 1 });
+-          // It stopped against the shore inside the dock tile just before.
+-          expect(course[moored - 1]!.speed).toBe(0);
+-          expect(toTilePosition(config, course[moored - 1]!.x, course[moored - 1]!.y)).toMatchObject({ tileX: corner.tileX, tileY: corner.tileY });
++          const before = [start, ...course.slice(0, moored)];
++          expect(dockInReach(config, before.at(-1)!.x, before.at(-1)!.y)).toBe(corner);
++          for (const ship of before.slice(0, -1)) expect(dockInReach(config, ship.x, ship.y)).toBeUndefined();
++          for (const ship of before.slice(1)) expect(ship.speed).toBeGreaterThan(0);
+           for (const ship of course) expect(hullIsClear(config, ship.x, ship.y)).toBe(true);
+           approaches++;
+         }
+@@ -555,6 +594,70 @@ describe("docking", () => {
+     expect(approaches).toBe(2 * 3 * (tile / 16) * 4);
+   });
+ 
++  it("moors from any approach into the berth's open sides, at any speed, on the first step within reach", () => {
++    // A dock on the corner of an island, as the slice sea's docks are: land to its west and north, open sea to its east
++    // and south, with room to run up to it.
++    const island = testConfig([
++      "................",
++      "................",
++      "................",
++      "................",
++      "....######......",
++      "....######......",
++      "....######......",
++      "....#####D......",
++      "................",
++      "................",
++      "................",
++      "................",
++      "................",
++      "................",
++    ]);
++    const berthDock = island.map.docks[0]!;
++    const centre = tileCentre(island, berthDock.tileX, berthDock.tileY);
++    const reach = island.ship.dockRadius;
++    const outward = { E: { dx: 1, dy: 0 }, S: { dx: 0, dy: 1 }, W: { dx: -1, dy: 0 }, N: { dx: 0, dy: -1 } } as const;
++    const divide = (value: number) => divTrunc(value, HEADING_SCALE);
++    const openSides = (["E", "S", "W", "N"] as const)
++      .map((side) => ({ side, ...outward[side] }))
++      .filter(({ dx, dy }) => isNavigable(island.map, berthDock.tileX + dx, berthDock.tileY + dy));
++    expect(openSides.map(({ side }) => side)).toEqual(["E", "S"]);
++    const headings: number[] = [];
++    for (let heading = 0; heading < HEADING_COUNT; heading += 8) {
++      // Pointing into an open side: sailing against that side's outward direction.
++      if (openSides.some(({ dx, dy }) => dx * HEADING_DX[heading]! + dy * HEADING_DY[heading]! < 0)) headings.push(heading);
++    }
++    expect(headings).toEqual([24, 32, 40, 48, 56]);
++    let approaches = 0;
++    for (const heading of headings) {
++      const along = { x: HEADING_DX[heading]!, y: HEADING_DY[heading]! };
++      for (let offset = 16 - reach; offset < reach; offset += 32) {
++        // The lane passes the berth `offset` sub-units to its side. Lanes whose closest point to the berth has no clear
++        // run to it pass over the land beside the dock rather than into an open side.
++        const closest = { x: centre.x + divide(-along.y * offset), y: centre.y + divide(along.x * offset) };
++        if (!hullPathIsClear(island, closest.x, closest.y, centre.x, centre.y)) continue;
++        const runUp = reach + 2 * tile;
++        for (const speed of [0, divTrunc(island.ship.maxSpeed, 2), island.ship.maxSpeed]) {
++          const start = { ...shipAt(0, 0, heading, island), x: closest.x - divide(along.x * runUp), y: closest.y - divide(along.y * runUp), speed };
++          expect(hullIsClear(island, start.x, start.y)).toBe(true);
++          const course = sailFor(start, helm(0, 1, INTERACT_BUTTON), 100, island);
++          const moored = course.findIndex((ship) => ship.dock !== NOT_DOCKED);
++          const label = `heading ${heading}, offset ${offset}, speed ${speed}`;
++          expect(moored, label).toBeGreaterThanOrEqual(0);
++          expect(course[moored], label).toMatchObject({ ...centre, speed: 0, dock: berthDock.id, mooredThrottle: 1 });
++          // Every step before it started outside the reach or without a clear run, and none ran aground on the way.
++          const before = [start, ...course.slice(0, moored)];
++          expect(dockInReach(island, before.at(-1)!.x, before.at(-1)!.y), label).toBe(berthDock);
++          for (const ship of before.slice(0, -1)) expect(dockInReach(island, ship.x, ship.y), label).toBeUndefined();
++          for (const ship of before.slice(1)) expect(ship.speed, label).toBeGreaterThan(0);
++          approaches++;
++        }
++      }
++    }
++    // Each heading keeps most of its lanes: the ones it loses run over the island beside the dock.
++    expect(approaches).toBeGreaterThanOrEqual(headings.length * 3 * 12);
++  });
++
+   it("docks on the real map at every dock", () => {
+     for (const each of config.map.docks) {
+       const centre = tileCentre(config, each.tileX, each.tileY);
+diff --git a/packages/simulation/src/step.ts b/packages/simulation/src/step.ts
+index 9445fd9..c742250 100644
+--- a/packages/simulation/src/step.ts
++++ b/packages/simulation/src/step.ts
+@@ -5,7 +5,11 @@ import { HEADING_DX, HEADING_DY, HEADING_SCALE, normalizeHeading } from "./headi
+ import { AXIS_SCALE, INTERACT_BUTTON, sanitizeInput, type PlayerInput } from "./input.js";
+ import { NOT_DOCKED, tileCentre, WORLD_STEP_INTERVAL, type MatchState, type ShipState } from "./state.js";
+ 
+-/** Held inputs by ship id; a ship without an entry is neutral. */
++/**
++ * Held inputs by ship id. A ship without an entry sails as neutral input, except that a moored ship keeps the throttle
++ * it moored with (`mooredThrottle`): a missing entry is no input at all (the server leaves it out when a player's input
++ * lapsed), so it cannot release that throttle, and the player's unchanged held keys do not cast off when they resume.
++ */
+ export type StepInputs = Readonly<Record<string, PlayerInput>>;
+ 
+ export function isWorldStep(frame: number): boolean {
+@@ -23,7 +27,10 @@ export function step(config: SimulationConfig, state: MatchState, inputs: StepIn
+     ...state,
+     frame,
+     worldTick: state.worldTick + 1,
+-    ships: state.ships.map((ship) => sail(config, ship, sanitizeInput(inputs[ship.id]))),
++    ships: state.ships.map((ship) => {
++      const input = inputs[ship.id];
++      return input === undefined && ship.dock !== NOT_DOCKED ? ship : sail(config, ship, sanitizeInput(input));
++    }),
+   };
+ }
+ 
+@@ -31,11 +38,11 @@ export function step(config: SimulationConfig, state: MatchState, inputs: StepIn
+  * One world step of one ship (§3). The throttle (`-moveY`) accelerates, brakes or reverses; `moveX` turns the
+  * heading; the ship then moves along its heading and stops or slides against land, shoals and the map edge.
+  *
+- * Docking: interact at low speed near a dock moors the ship there (at the dock tile's centre, speed 0), if its hull
+- * could sail straight there. The throttle does not matter, so a ship driven into its dock with ahead still held (and
+- * stopped against the shore) docks too. A moored ship stays put while interact is held, without throttle, or while
+- * the throttle it moored with is still held; releasing that throttle and then any throttle (or the other direction)
+- * casts off and sails in the same step.
++ * Docking: interact near a dock moors the ship there (at the dock tile's centre, speed 0) at any speed, if its hull
++ * could sail straight there. Neither speed nor throttle matters, so a ship driven at its dock with ahead and interact
++ * held moors on the first step it starts within reach, from any angle. A moored ship stays put while interact is held,
++ * without throttle, or while the throttle it moored with is still held; releasing that throttle and then any throttle
++ * (or the other direction) casts off and sails in the same step.
+  */
+ export function sail(config: SimulationConfig, ship: ShipState, input: PlayerInput): ShipState {
+   const tuning = config.ship;
+@@ -49,7 +56,7 @@ export function sail(config: SimulationConfig, ship: ShipState, input: PlayerInp
+       return ship.speed === 0 && ship.mooredThrottle === mooredThrottle ? ship : { ...ship, speed: 0, mooredThrottle };
+     }
+     dock = NOT_DOCKED;
+-  } else if (interact && Math.abs(ship.speed) <= tuning.dockMaxSpeed) {
++  } else if (interact) {
+     const berth = dockInReach(config, ship.x, ship.y);
+     if (berth !== undefined) {
+       return { ...ship, ...tileCentre(config, berth.tileX, berth.tileY), speed: 0, dock: berth.id, mooredThrottle: direction };
+diff --git a/tests/e2e/sea.spec.ts b/tests/e2e/sea.spec.ts
+index 2cd2482..4155957 100644
+--- a/tests/e2e/sea.spec.ts
++++ b/tests/e2e/sea.spec.ts
+@@ -100,8 +100,8 @@ test("sail around a shoal to an island dock and dock there [scenario:sail-and-do
+   const berth = centre(dock.tileX, dock.tileY);
+ 
+   // The run in: at rest, turn to a fixed heading one or two units west of north, toward the land beside the dock, then
+-  // hold ahead and E together. The ship grounds on the coast past the dock and slides along it into the corner, stops in
+-  // the dock tile and moors; nothing is timed and no key is released on the way.
++  // hold ahead and E together. The ship moors, at whatever speed, on the first step it is within the dock's reach with
++  // a clear run to the berth; nothing is timed and no key is released on the way.
+   const runStart = await turnTo(page, [compassHeading("N") - 2, compassHeading("N") - 1]);
+   // It starts the run 1–3 tiles east of the dock and 2–4 tiles out, where the simulation's sweep shows it moors.
+   expect(Math.floor(runStart.x / TILE) - dock.tileX).toBeGreaterThanOrEqual(1);
+@@ -115,8 +115,12 @@ test("sail around a shoal to an island dock and dock there [scenario:sail-and-do
+   await page.keyboard.up("ArrowUp");
+   await page.keyboard.up("KeyE");
+   expect(dockLabel(seaMap, dock.id)).toBe("Palm Key, south dock");
+-  // On the way in, beside the dock, the HUD said how to dock there; moored, it says nothing.
+-  expect(await dockHintsSeen(page)).toContainEqual(expect.stringMatching(new RegExp(`to dock at ${dockLabel(seaMap, dock.id)}$`)));
++  // The HUD shows the dock the ship is moored at.
++  await expect(page.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(dock.id));
++  // On the way in the HUD only ever offered to dock (the ship moors the step it comes within reach, so the offer may be
++  // too brief to draw); it never asked to slow down. Moored, it says nothing.
++  const pressE = `Press E to dock at ${dockLabel(seaMap, dock.id)}`;
++  for (const hint of await dockHintsSeen(page)) expect(["", pressE]).toContain(hint);
+   await expect(page.getByTestId("hud-dock-hint")).toHaveText("");
+ 
+   // The ship stops at the dock and stays there.
+@@ -157,9 +161,10 @@ test("sail around a shoal to an island dock and dock there [scenario:sail-and-do
+ 
+   await attachScreenshot(page, testInfo, "sail-and-dock");
+ 
+-  // Any throttle casts off.
++  // Any throttle casts off. Backing slowly away, still within reach, the HUD offers to dock again.
+   await page.keyboard.down("ArrowDown");
+   await expect(page.getByTestId("hud-dock")).toHaveText("at sea");
++  await expect(page.getByTestId("hud-dock-hint")).toHaveText(pressE);
+   await page.keyboard.up("ArrowDown");
+ });
+ 
+diff --git a/tests/integration/match.test.ts b/tests/integration/match.test.ts
+index 5d7154c..0d96f3f 100644
+--- a/tests/integration/match.test.ts
++++ b/tests/integration/match.test.ts
+@@ -163,6 +163,52 @@ describe("sailing and docking on the server", () => {
+     expect(host.ship()).toMatchObject({ x: dock.tileX * 256 + 128, y: dock.tileY * 256 + 128, speed: 0, dock: dock.id });
+   });
+ 
++  it("keeps a ship moored through an input stall, however long, until the player releases or reverses the throttle", async () => {
++    const host = await track(HeadlessClient.create(endpoint));
++    const dock = seaMap.docks.find((each) => each.side === "S")!;
++    const berth = tileCentre(defaultSimulationConfig, dock.tileX, dock.tileY);
++    /** Sends a movement every 50 ms for `durationMs` (without releasing it after), checking the ship after each. */
++    const keepSending = async (movement: Parameters<HeadlessClient["sendInput"]>[0], durationMs: number, check: () => void = () => {}) => {
++      const until = Date.now() + durationMs;
++      while (Date.now() < until) {
++        host.sendInput(movement);
++        await sleep(50);
++        check();
++      }
++    };
++    const stayMoored = () => expect(host.ship()).toMatchObject({ ...berth, speed: 0, dock: dock.id });
++    /** Docks with ahead and E held, as a player drives in, then stalls with both still held and resumes with E released. */
++    const dockThenStall = async () => {
++      await host.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY + 2, heading: 48 });
++      const deadline = Date.now() + 5000;
++      while (host.ship()!.dock !== dock.id) {
++        if (Date.now() > deadline) throw new Error("did not dock");
++        host.sendInput({ ...AHEAD, buttons: Buttons.Interact });
++        await sleep(50);
++      }
++      await keepSending({ ...AHEAD, buttons: Buttons.Interact }, 200, stayMoored);
++      // Nothing from the client for 400 ms: the server's held input lapses after 250 ms (INPUT_HOLD_FRAMES).
++      await sleep(400);
++      stayMoored();
++      // The player's ahead key never went up, so resuming with it held (and E released) is not a fresh press.
++      await keepSending(AHEAD, 600, stayMoored);
++    };
++
++    await dockThenStall();
++    // Astern casts off at once.
++    await keepSending({ moveX: 0, moveY: 1 }, 600);
++    expect(host.ship()!.dock).toBe(-1);
++    // Let go, and let the ship come to rest before placing it again.
++    host.sendInput({ moveX: 0, moveY: 0 });
++    await host.waitFor(() => host.ship()!.speed === 0);
++
++    await dockThenStall();
++    // Releasing ahead keeps it moored; pressing ahead again casts off.
++    await keepSending({ moveX: 0, moveY: 0 }, 200, stayMoored);
++    await keepSending(AHEAD, 600);
++    expect(host.ship()!.dock).toBe(-1);
++  });
++
+   it("stops a ship against land without entering it", async () => {
+     const host = await track(HeadlessClient.create(endpoint));
+     const island = seaMap.islands[0]!;
+diff --git a/tests/integration/visibility.test.ts b/tests/integration/visibility.test.ts
+index 0d98cb6..be2442e 100644
+--- a/tests/integration/visibility.test.ts
++++ b/tests/integration/visibility.test.ts
+@@ -1,6 +1,6 @@
+ import { matchMaker } from "colyseus";
+ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+-import { seaMap, SIGHT_RADIUS_TILES, SUB_UNITS_PER_TILE } from "@pirate-sea-race/content";
++import { seaMap, shipTuning, SIGHT_RADIUS_TILES, SUB_UNITS_PER_TILE } from "@pirate-sea-race/content";
+ import { defaultSimulationConfig, hullPathIsClear, tileCentre } from "@pirate-sea-race/simulation";
+ import { MatchRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+ import { AHEAD, HeadlessClient, sleep, type ShipView } from "@pirate-sea-race/test-tools";
+@@ -80,7 +80,7 @@ describe("sight radius", () => {
+       const ownShip = guest.ship()!;
+       const seen = guest.ship(host.sessionId);
+       if (seen === undefined) {
+-        expect(distance(ownShip, hostShip)).toBeGreaterThan(SIGHT - 3 * 64);
++        expect(distance(ownShip, hostShip)).toBeGreaterThan(SIGHT - 3 * shipTuning.maxSpeed);
+         wasHidden = true;
+         return false;
+       }

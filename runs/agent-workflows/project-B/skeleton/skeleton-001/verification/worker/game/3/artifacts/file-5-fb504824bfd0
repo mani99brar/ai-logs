@@ -1,0 +1,150 @@
+import { randomInt } from "node:crypto";
+import { matchMaker, Room, ServerError, type AuthContext, type Client } from "colyseus";
+import { privateMatch } from "@pirate-sea-race/content";
+import {
+  createMatchOptionsSchema,
+  JoinRefusal,
+  joinMatchOptionsSchema,
+  MATCH_ROOM,
+  matchFullMessage,
+  MAX_INPUT_MESSAGES_PER_SECOND,
+  MessageType,
+  NO_SUCH_MATCH_MESSAGE,
+  PROTOCOL_VERSION,
+  protocolMismatchMessage,
+} from "@pirate-sea-race/protocol";
+import {
+  addShip,
+  createMatchState,
+  defaultSimulationConfig,
+  isWorldStep,
+  removeShip,
+  step,
+  STEPS_PER_SECOND,
+  type MatchState,
+  type PlayerInput,
+} from "@pirate-sea-race/simulation";
+import { InputGate } from "./inputGate.js";
+import { generateMatchCode } from "./matchCode.js";
+import { MatchStateSchema, ShipSchema } from "./schema.js";
+
+/** The room's matchmaking listing: private matches are found by `code` (Colyseus `filterBy`). */
+export interface MatchMetadata {
+  code: string;
+  custom: boolean;
+}
+
+/** World updates go out at 20 Hz, the world simulation rate (§15). */
+const PATCH_INTERVAL_MS = 1000 / 20;
+
+/**
+ * Checks a create or join request before matchmaking places it (Colyseus calls this for every seat request).
+ * Refusals carry a readable message the client shows.
+ */
+export async function authorizeEntry(options: unknown): Promise<true> {
+  const version = (options as { protocolVersion?: unknown } | undefined)?.protocolVersion;
+  if (version !== PROTOCOL_VERSION) throw new ServerError(JoinRefusal.ProtocolMismatch, protocolMismatchMessage(version));
+  if ((options as { code?: unknown }).code === undefined) {
+    if (!createMatchOptionsSchema.safeParse(options).success) throw new ServerError(JoinRefusal.BadRequest, "Malformed match request");
+    return true;
+  }
+  const parsed = joinMatchOptionsSchema.safeParse(options);
+  if (!parsed.success) throw new ServerError(JoinRefusal.NoSuchMatch, NO_SUCH_MATCH_MESSAGE);
+  const [listing] = await matchMaker.query({ name: MATCH_ROOM, code: parsed.data.code });
+  if (listing === undefined) throw new ServerError(JoinRefusal.NoSuchMatch, NO_SUCH_MATCH_MESSAGE);
+  if (listing.locked || listing.clients >= listing.maxClients) {
+    throw new ServerError(JoinRefusal.MatchFull, matchFullMessage(listing.maxClients));
+  }
+  return true;
+}
+
+/**
+ * One private match (§14): the only writer of its state. It runs the shared simulation on a 60 Hz fixed step,
+ * applies validated client intent, and mirrors the simulation into the synced schema after every world step.
+ */
+export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMetadata }> {
+  override maxClients = privateMatch.maxPlayers;
+  /** A flood ceiling: past it Colyseus disconnects the client. Excess input is dropped well below it, in InputGate. */
+  override maxMessagesPerSecond = MAX_INPUT_MESSAGES_PER_SECOND * 4;
+  override patchRate = PATCH_INTERVAL_MS;
+  override state = new MatchStateSchema();
+
+  private readonly config = defaultSimulationConfig;
+  private simulation: MatchState = createMatchState(0);
+  private readonly gates = new Map<string, InputGate>();
+
+  static override async onAuth(_token: string, options: unknown, _context: AuthContext): Promise<true> {
+    return authorizeEntry(options);
+  }
+
+  override async onCreate(): Promise<void> {
+    const code = await this.allocateCode();
+    this.simulation = createMatchState(randomInt(0, 2 ** 32));
+    this.state.code = code;
+    this.state.protocolVersion = PROTOCOL_VERSION;
+    this.state.custom = privateMatch.custom;
+    await this.setMatchmaking({ metadata: { code, custom: privateMatch.custom } });
+
+    this.onMessage(MessageType.Input, (client, message: unknown) => {
+      this.gates.get(client.sessionId)?.receive(message, this.simulation.frame);
+    });
+    // Unknown message types are dropped, not answered: Colyseus would otherwise disconnect the sender.
+    this.onMessage("*", () => undefined);
+    this.setFixedTimestep(() => this.advance(), STEPS_PER_SECOND);
+  }
+
+  override onJoin(client: Client): void {
+    this.simulation = addShip(this.config, this.simulation, client.sessionId);
+    this.gates.set(client.sessionId, new InputGate());
+    this.mirror();
+  }
+
+  override onLeave(client: Client): void {
+    this.simulation = removeShip(this.simulation, client.sessionId);
+    this.gates.delete(client.sessionId);
+    this.mirror();
+  }
+
+  /** Inputs dropped per client and reason, for tests and diagnostics. */
+  droppedInputs(sessionId: string): InputGate["dropped"] | undefined {
+    return this.gates.get(sessionId)?.dropped;
+  }
+
+  private advance(): void {
+    const frame = this.simulation.frame + 1;
+    const inputs: Record<string, PlayerInput> = {};
+    for (const [sessionId, gate] of this.gates) inputs[sessionId] = gate.inputAt(frame);
+    this.simulation = step(this.config, this.simulation, inputs);
+    if (isWorldStep(this.simulation.frame)) this.mirror();
+  }
+
+  /** Copies the plain simulation state into the synced schema. */
+  private mirror(): void {
+    this.state.frame = this.simulation.frame;
+    this.state.worldTick = this.simulation.worldTick;
+    const present = new Set<string>();
+    for (const ship of this.simulation.ships) {
+      present.add(ship.id);
+      let synced = this.state.ships.get(ship.id);
+      if (synced === undefined) {
+        synced = new ShipSchema();
+        synced.id = ship.id;
+        synced.slot = ship.slot;
+        this.state.ships.set(ship.id, synced);
+      }
+      synced.x = ship.x;
+      synced.y = ship.y;
+      synced.heading = ship.heading;
+    }
+    for (const id of [...this.state.ships.keys()]) if (!present.has(id)) this.state.ships.delete(id);
+  }
+
+  private async allocateCode(): Promise<string> {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const code = generateMatchCode();
+      const taken = await matchMaker.query({ name: this.roomName, code });
+      if (taken.length === 0) return code;
+    }
+    throw new ServerError(JoinRefusal.BadRequest, "Could not allocate a match code");
+  }
+}

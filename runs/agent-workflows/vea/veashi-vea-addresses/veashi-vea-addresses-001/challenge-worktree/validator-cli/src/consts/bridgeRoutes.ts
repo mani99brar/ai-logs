@@ -1,0 +1,113 @@
+require("dotenv").config();
+
+import veaInboxArbToEthDevnet from "../../../contracts/deployments/arbitrumSepolia/VeaInboxArbToEthDevnet.json";
+import veaOutboxArbToEthDevnet from "../../../contracts/deployments/sepolia/VeaOutboxArbToEthDevnet.json";
+import veaInboxArbToEthTestnet from "../../../contracts/deployments/arbitrumSepolia/VeaInboxArbToEthTestnet.json";
+import veaOutboxArbToEthTestnet from "../../../contracts/deployments/sepolia/VeaOutboxArbToEthTestnet.json";
+
+import veaInboxArbToGnosisDevnet from "../../../contracts/deployments/arbitrumSepolia/VeaInboxArbToGnosisDevnet.json";
+import veaOutboxArbToGnosisDevnet from "../../../contracts/deployments/chiado/VeaOutboxArbToGnosisDevnet.json";
+
+import veaInboxArbToGnosisTestnet from "../../../contracts/deployments/arbitrumSepolia/VeaInboxArbToGnosisTestnet.json";
+import veaOutboxArbToGnosisTestnet from "../../../contracts/deployments/chiado/VeaOutboxArbToGnosisTestnet.json";
+import veaRouterArbToGnosisTestnet from "../../../contracts/deployments/sepolia/RouterArbToGnosisTestnet.json";
+export interface Bridge {
+  chain: string;
+  minChallengePeriod: number;
+  sequencerDelayLimit: number;
+  // RPC endpoints are stored as ordered lists; the first is primary and the rest are fallbacks.
+  inboxRPC: string[];
+  outboxRPC: string[];
+  routerRPC?: string[];
+  routeConfig: { [key in Network]: RouteConfigs };
+  depositToken?: string;
+}
+
+/**
+ * Parse a comma-separated list of RPC URLs from an environment variable into an ordered array.
+ * Returns an empty array when the variable is unset so optional RPCs (e.g. router) stay optional.
+ */
+const splitRpcUrls = (value?: string): string[] =>
+  (value ?? "")
+    .split(",")
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+
+type RouteConfigs = {
+  veaInbox: any;
+  veaOutbox: any;
+  veaRouter?: any;
+  epochPeriod: number;
+  deposit: bigint;
+};
+
+enum Network {
+  DEVNET = "devnet",
+  TESTNET = "testnet",
+}
+
+const arbToEthConfigs: { [key in Network]: RouteConfigs } = {
+  [Network.DEVNET]: {
+    veaInbox: veaInboxArbToEthDevnet,
+    veaOutbox: veaOutboxArbToEthDevnet,
+    epochPeriod: 300,
+    deposit: BigInt("1000000000000000000"),
+  },
+  [Network.TESTNET]: {
+    veaInbox: veaInboxArbToEthTestnet,
+    veaOutbox: veaOutboxArbToEthTestnet,
+    epochPeriod: 7200,
+    deposit: BigInt("1000000000000000000"),
+  },
+};
+
+const arbToGnosisConfigs: { [key in Network]: RouteConfigs } = {
+  [Network.DEVNET]: {
+    veaInbox: veaInboxArbToGnosisDevnet,
+    veaOutbox: veaOutboxArbToGnosisDevnet,
+    epochPeriod: 300,
+    deposit: BigInt("100000000000000000"),
+  },
+  [Network.TESTNET]: {
+    veaInbox: veaInboxArbToGnosisTestnet,
+    veaOutbox: veaOutboxArbToGnosisTestnet,
+    veaRouter: veaRouterArbToGnosisTestnet,
+    epochPeriod: 3600,
+    deposit: BigInt("200000000000000000"),
+  },
+};
+
+const bridges: { [chainId: number]: Bridge } = {
+  11155111: {
+    chain: "sepolia",
+    minChallengePeriod: 10800,
+    sequencerDelayLimit: 86400,
+    inboxRPC: splitRpcUrls(process.env.RPC_ARB),
+    outboxRPC: splitRpcUrls(process.env.RPC_ETH),
+    routeConfig: arbToEthConfigs,
+  },
+  10200: {
+    chain: "chiado",
+    minChallengePeriod: 10800,
+    sequencerDelayLimit: 86400,
+    inboxRPC: splitRpcUrls(process.env.RPC_ARB),
+    outboxRPC: splitRpcUrls(process.env.RPC_GNOSIS),
+    routerRPC: splitRpcUrls(process.env.RPC_ETH),
+    routeConfig: arbToGnosisConfigs,
+    depositToken: process.env.GNOSIS_WETH,
+  },
+};
+
+// For the remaining time in an epoch the bot should save snapshots
+const snapshotSavingPeriod = {
+  [Network.DEVNET]: 90, // 1m 30s
+  [Network.TESTNET]: 600, // 10 mins
+};
+
+const getBridgeConfig = (chainId: number): Bridge => {
+  const bridge = bridges[chainId];
+  if (!bridge) throw new Error(`Bridge not found for chain`);
+  return bridges[chainId];
+};
+
+export { bridges, getBridgeConfig, Network, snapshotSavingPeriod };

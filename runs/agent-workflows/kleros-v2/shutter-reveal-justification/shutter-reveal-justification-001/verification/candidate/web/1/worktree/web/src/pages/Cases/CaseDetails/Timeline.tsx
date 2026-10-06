@@ -1,0 +1,176 @@
+import React, { useMemo } from "react";
+import styled, { css } from "styled-components";
+
+import { useTranslation } from "react-i18next";
+
+import { Box, StepItem, Steps } from "@kleros/ui-components-library";
+
+import HourglassIcon from "svgs/icons/hourglass.svg";
+
+import { Periods } from "consts/periods";
+import { useCountdownContext, useFundingContext } from "hooks/useClassicAppealContext";
+import { useCountdown } from "hooks/useCountdown";
+import useIsDesktop from "hooks/useIsDesktop";
+import { secondsToDayHourMinute } from "utils/date";
+
+import { DisputeDetailsQuery } from "queries/useDisputeDetailsQuery";
+
+import { isUndefined } from "src/utils";
+
+import { landscapeStyle } from "styles/landscapeStyle";
+import { responsiveSize } from "styles/responsiveSize";
+
+import { StyledSkeleton } from "components/StyledSkeleton";
+
+const TimeLineContainer = styled(Box)`
+  width: 100%;
+  height: auto;
+  border-radius: 0px;
+  background-color: transparent;
+`;
+
+const StyledSteps = styled(Steps)`
+  display: flex;
+  justify-content: space-between;
+  width: 89%;
+  margin: auto;
+
+  h2 {
+    font-size: ${responsiveSize(12, 14)};
+  }
+
+  [class*="horizontal-bullet__TextWrapper"] {
+    margin-top: 2px;
+  }
+
+  ${landscapeStyle(
+    () => css`
+      width: 98%;
+    `
+  )}
+`;
+
+const AppealBannerContainer = styled.div`
+  background-color: ${({ theme }) => theme.whiteBackground};
+  border-radius: 3px;
+  margin-top: 16px;
+  padding: 12px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  & > svg {
+    width: 14px;
+    fill: ${({ theme }) => theme.secondaryPurple};
+  }
+`;
+
+const Timeline: React.FC<{
+  dispute: DisputeDetailsQuery["dispute"];
+  currentPeriodIndex: number;
+}> = ({ currentPeriodIndex, dispute }) => {
+  const currentItemIndex = currentPeriodToCurrentItem(currentPeriodIndex, dispute?.currentRound.hiddenVotes);
+  const items = useTimeline(dispute, currentPeriodIndex);
+
+  return (
+    <TimeLineContainer>
+      <StyledSteps horizontal items={items as StepItem[]} currentItemIndex={currentItemIndex} />
+      {currentPeriodIndex === Periods.appeal ? <AppealBanner /> : null}
+    </TimeLineContainer>
+  );
+};
+
+const AppealBanner: React.FC = () => {
+  const { loserSideCountdown, winnerSideCountdown } = useCountdownContext();
+  const { fundedChoices } = useFundingContext();
+
+  const { t } = useTranslation();
+  const text = useMemo(() => {
+    if (loserSideCountdown)
+      return t("appeal.time_remaining_to_fund_losing", { time: secondsToDayHourMinute(loserSideCountdown) });
+    // only show if loosing option was funded and winner needs funding, else no action is needed from user
+    if (winnerSideCountdown && !isUndefined(fundedChoices) && fundedChoices.length > 0)
+      return t("appeal.time_remaining_to_fund_winning", { time: secondsToDayHourMinute(winnerSideCountdown) });
+    return;
+  }, [loserSideCountdown, winnerSideCountdown, fundedChoices, t]);
+
+  return text ? (
+    <AppealBannerContainer>
+      <HourglassIcon /> <small>{text}</small>
+    </AppealBannerContainer>
+  ) : null;
+};
+
+const currentPeriodToCurrentItem = (currentPeriodIndex: number, hiddenVotes?: boolean): number => {
+  if (hiddenVotes) return currentPeriodIndex;
+  if (currentPeriodIndex <= Periods.commit) return currentPeriodIndex;
+  else return currentPeriodIndex - 1;
+};
+
+const useTimeline = (dispute: DisputeDetailsQuery["dispute"], currentPeriodIndex: number) => {
+  const { t } = useTranslation();
+  const isDesktop = useIsDesktop();
+  const titles = [
+    t("timeline.evidence"),
+    t("timeline.commit"),
+    t("timeline.voting"),
+    t("timeline.appeal"),
+    t("timeline.executed"),
+  ];
+  const periodTitles = [
+    t("timeline.evidence_period"),
+    t("timeline.commit_period"),
+    t("timeline.voting_period"),
+    t("timeline.appeal_period"),
+    t("timeline.executed"),
+  ];
+
+  const deadlineCurrentPeriod = getDeadline(
+    currentPeriodIndex,
+    dispute?.lastPeriodChange,
+    dispute?.currentRound.timesPerPeriod
+  );
+
+  const countdown = useCountdown(deadlineCurrentPeriod);
+  const getSubitems = (index: number): string[] | React.ReactNode[] => {
+    if (typeof countdown !== "undefined" && dispute) {
+      if (index === titles.length - 1) {
+        return [];
+      } else if (index === currentPeriodIndex && countdown === 0) {
+        return [t("voting.times_up")];
+      } else if (index < currentPeriodIndex) {
+        return [];
+      } else if (index === currentPeriodIndex) {
+        return [secondsToDayHourMinute(countdown)];
+      } else {
+        return [secondsToDayHourMinute(Number(dispute?.currentRound.timesPerPeriod[index]))];
+      }
+    }
+    return [<StyledSkeleton key={index} width={60} />];
+  };
+  return titles.flatMap((title, i) => {
+    // if not hidden votes, skip commit index
+    if (!dispute?.currentRound.hiddenVotes && i === Periods.commit) return [];
+    return [
+      {
+        title: i + 1 < titles.length && isDesktop ? periodTitles[i] : title,
+        subitems: getSubitems(i),
+      },
+    ];
+  });
+};
+
+export const getDeadline = (
+  currentPeriodIndex: number,
+  lastPeriodChange?: string,
+  timesPerPeriod?: string[]
+): number | undefined => {
+  if (lastPeriodChange && timesPerPeriod && currentPeriodIndex < timesPerPeriod.length) {
+    const parsedLastPeriodChange = parseInt(lastPeriodChange, 10);
+    const parsedTimeCurrentPeriod = parseInt(timesPerPeriod[currentPeriodIndex]);
+    return parsedLastPeriodChange + parsedTimeCurrentPeriod;
+  }
+  return 0;
+};
+
+export default Timeline;

@@ -1,0 +1,419 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { clueFor, findRuin, sessionOf } from "@pirate-sea-race/simulation/ruins";
+import { checkLedger } from "@pirate-sea-race/simulation/objectives";
+import { MAX_RUIN_MESSAGES_PER_SECOND, parseRuinResultMessage, RuinMessageType, TEST_NEXT_MATCH_RUINS_PATH } from "@pirate-sea-race/protocol";
+import { startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { HeadlessClient, ImpairmentProxy, readClue, sleep, wrongAnswer, type ReadClue } from "@pirate-sea-race/test-tools";
+import { containsText, EAST, HOLD_E, openWater, playersAt, quickStart, roomOf, startThroughLobby, tracker, until, type Seat } from "./seaDuelSetup.js";
+import { layout, quickEncounters } from "./rubbingsSetup.js";
+
+/**
+ * The ruins in the match room (§3, §11, §16): every island's sources start locked behind its ruin; a player moored
+ * there opens it, reads the clue and answers; the first solve unlocks the island for everyone, and every solver earns
+ * 40 gold once. The server pins Palm Key's ruin to a sequence and Ember Rock's to a grid (test-only), leaves Old Stones
+ * dealt from the ruins' own seed, locked, and opens Mist Cay from the start. Answers are worked out from the clue the client
+ * received, as a reader would (`readClue`). Every test's rooms check `checkLedger` and the room's invariant after
+ * every world tick, and that the ledger refused nothing the room asked (`tracker`).
+ */
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  const matchTuning = quickStart({
+    sourceLayout: layout,
+    objectives: { ...objectiveRules, collectTicks: 20 },
+    encounters: quickEncounters,
+    testRuins: { "0": "sequence", "1": "navigation", "3": "open" },
+    // The room's test-only fault, to end a match.
+    testHooks: true,
+  });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+const docksOf = (island: number) => seaMap.docks.filter((dock) => dock.island === island);
+const PALM = docksOf(0);
+const EMBER = docksOf(1);
+const LOCKOUT_TICKS = 60;
+/** Somewhere at sea off Palm Key's west dock, in sight of it. */
+const OFF_PALM: Seat = { tileX: PALM[0]!.tileX - 4, tileY: PALM[0]!.tileY, heading: EAST };
+
+/** Moors a player at a dock: placed on it, then E held until the ship is moored (a locked island gives E nothing more). */
+async function moor(client: HeadlessClient, dock: { id: number; tileX: number; tileY: number }): Promise<void> {
+  await client.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+  await client.holdUntil(HOLD_E, () => client.ship()?.dock === dock.id, 5000);
+}
+
+/** Opens the ruin where the player is moored and resolves with the clue it received. */
+async function open(client: HeadlessClient): Promise<ReadClue> {
+  const before = client.clues.length;
+  client.openRuin();
+  await client.waitFor(() => client.clues.length > before && client.ruinView()?.ruinOpen === true, 3000);
+  return client.clues.at(-1)!.clue;
+}
+
+/** Answers and resolves with the verdict. */
+async function answer(client: HeadlessClient, attempt: Parameters<HeadlessClient["answerRuin"]>[0], requestId?: string) {
+  const after = client.ruinResults.length;
+  const id = client.answerRuin(attempt, requestId);
+  return client.ruinResult(id, 3000, after);
+}
+
+async function pairAt(track: (client: HeadlessClient) => void, seats: readonly Seat[] = [OFF_PALM, { ...OFF_PALM, tileY: OFF_PALM.tileY - 2 }]) {
+  const [host, guest] = (await playersAt(endpoint, seats, track)) as [HeadlessClient, HeadlessClient];
+  return { host, guest, room: roomOf(host) };
+}
+
+describe.concurrent("the ruins in the match room (§3, §11)", () => {
+  it("locks every source at the start, refuses collection until the island's ruin is solved, and the first solve unlocks it for everyone, once", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest, room } = await pairAt(track);
+    // Every source is locked but Mist Cay's, which this server opens from the start (test-only).
+    expect(room.ledgerState.sources.filter((source) => source.unlocked).map((source) => source.island)).toEqual([3, 3]);
+    await moor(host, PALM[0]!);
+    await moor(guest, PALM[1]!);
+    // Holding E at a locked island collects nothing: no target, no hold, however long.
+    await host.holdUntil(HOLD_E, () => false, 1500).catch(() => undefined);
+    expect(host.rubbings()).toEqual([]);
+    expect(host.objectives()).toMatchObject({ target: "", channel: "", islandTypes: ["sun", "sun"] });
+    expect(room.ledgerState.players.every((player) => player.channel === null)).toBe(true);
+    expect(host.ruinView()).toEqual({ ruin: "locked", ruinOpen: false, ruinLockedUntil: 0 });
+    expect(guest.ruinMarkers().find((marker) => marker.island === 0)?.unlocked).toBe(false);
+
+    const clue = await open(host);
+    expect(clue.kind).toBe("sequence");
+    const solved = await answer(host, readClue(clue));
+    expect(solved).toMatchObject({ outcome: "solved", island: 0, gold: 40, unlocked: true, reason: null });
+    // The island's two sources, and only those, are open, for everyone.
+    expect(room.ledgerState.sources.filter((source) => source.unlocked).map((source) => source.id)).toEqual(["source-0-0", "source-0-1", "source-3-0", "source-3-1"]);
+    await guest.waitFor(() => guest.ruinView()?.ruin === "unlocked" && guest.ruinMarkers().find((marker) => marker.island === 0)?.unlocked === true);
+    await host.waitFor(() => host.ruinView()?.ruin === "solved");
+    expect(guest.objectives()?.target).toBe("collect:sun");
+    // The guest, who solved nothing, collects; so does the host.
+    await guest.holdUntil(HOLD_E, () => guest.rubbings().includes("sun"), 8000);
+    await host.holdUntil(HOLD_E, () => host.rubbings().includes("sun"), 8000);
+    // Once: a second solve (the guest's) unlocks nothing more.
+    const second = await answer(guest, readClue(await open(guest)));
+    expect(second).toMatchObject({ outcome: "solved", gold: 40, unlocked: false });
+    expect(room.ledgerState.sources.filter((source) => source.unlocked)).toHaveLength(4);
+    expect(checkLedger(room.ledgerState)).toEqual([]);
+  }, 30_000);
+
+  it("notes in each player's journal the islands it has had in sight or moored at, each ruin as last seen and whether it solved it (§13)", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host: solver, guest: seer } = await pairAt(track);
+    // Both start in sight of Palm Key, locked; neither knows Ember Rock, far out of sight.
+    await seer.waitFor(() => seer.knownIslands().some((known) => known.island === 0));
+    expect(seer.knownIslands().find((known) => known.island === 0)).toEqual({ island: 0, unlocked: false, solved: false });
+    expect(seer.knownIslands().some((known) => known.island === 1)).toBe(false);
+    // The seer sails off to Mist Cay, open from the start (test-only); then the solver solves Palm Key.
+    await moor(seer, docksOf(3)[0]!);
+    await seer.waitFor(() => seer.knownIslands().some((known) => known.island === 3));
+    expect(seer.knownIslands().find((known) => known.island === 3)).toEqual({ island: 3, unlocked: true, solved: false });
+    await moor(solver, PALM[0]!);
+    expect(await answer(solver, readClue(await open(solver)))).toMatchObject({ outcome: "solved", unlocked: true });
+    await solver.waitFor(() => solver.knownIslands().find((known) => known.island === 0)?.solved === true);
+    expect(solver.knownIslands().find((known) => known.island === 0)).toEqual({ island: 0, unlocked: true, solved: true });
+    // Out of sight, the seer's journal keeps Palm Key as it last saw it: locked.
+    await sleep(300);
+    expect(seer.knownIslands().find((known) => known.island === 0)).toEqual({ island: 0, unlocked: false, solved: false });
+    // Back in sight, it is unlocked (by someone else).
+    await seer.placeShip(endpoint, OFF_PALM);
+    await seer.waitFor(() => seer.knownIslands().find((known) => known.island === 0)?.unlocked === true);
+    expect(seer.knownIslands().find((known) => known.island === 0)).toEqual({ island: 0, unlocked: true, solved: false });
+  }, 30_000);
+
+  it("pays every solver 40 once, through the ledger's grant: a second solver their own, a repeat nothing, and a retried request its first verdict", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest, room } = await pairAt(track);
+    await moor(host, PALM[0]!);
+    await moor(guest, PALM[1]!);
+    const [hostGold, guestGold] = [host.gold(), guest.gold()];
+    const clue = await open(host);
+    const first = await answer(host, readClue(clue), "first");
+    expect(first).toMatchObject({ outcome: "solved", gold: 40 });
+    await host.waitFor(() => host.gold() === hostGold + 40);
+    // The same request again: the first verdict, judged once, paid once.
+    const retried = await answer(host, readClue(clue), "first");
+    expect(retried).toEqual(first);
+    // A new request after solving: refused, nothing paid.
+    const repeat = await answer(host, readClue(clue));
+    expect(repeat).toMatchObject({ outcome: "refused", reason: "already-solved", gold: 0, unlocked: false });
+    const own = await answer(guest, readClue(await open(guest)));
+    expect(own).toMatchObject({ outcome: "solved", gold: 40, unlocked: false });
+    await guest.waitFor(() => guest.gold() === guestGold + 40);
+    await sleep(200);
+    expect(host.gold()).toBe(hostGold + 40);
+    const grants = room.ledgerState.grants.map(({ reason, sourceKey, playerId, amount }) => ({ reason, sourceKey, playerId, amount }));
+    expect(grants).toEqual([
+      { reason: "ruin", sourceKey: "0", playerId: host.sessionId, amount: 40 },
+      { reason: "ruin", sourceKey: "0", playerId: guest.sessionId, amount: 40 },
+    ]);
+    expect(checkLedger(room.ledgerState)).toEqual([]);
+  }, 30_000);
+
+  it("locks a wrong answer out for 3 s, that player only; leaving and reopening keeps the lockout", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest, room } = await pairAt(track);
+    await moor(host, EMBER[0]!);
+    await moor(guest, EMBER[1]!);
+    const clue = await open(host);
+    expect(clue.kind).toBe("navigation");
+    const wrong = await answer(host, wrongAnswer(clue));
+    expect(wrong.outcome).toBe("wrong");
+    expect(wrong.gold).toBe(0);
+    const until = wrong.lockedUntil;
+    expect(until).toBeGreaterThanOrEqual(LOCKOUT_TICKS);
+    await host.waitFor(() => host.ruinView()?.ruinLockedUntil === until);
+    // The right answer during the lockout is refused, and does not extend it.
+    expect(await answer(host, readClue(clue))).toMatchObject({ outcome: "refused", reason: "locked-out", lockedUntil: until });
+    // The guest is not locked out.
+    const guestClue = await open(guest);
+    expect(await answer(guest, readClue(guestClue))).toMatchObject({ outcome: "solved", gold: 40 });
+    // The host casts off (the session closes), comes back and reopens: still locked out, until the same tick.
+    await host.placeShip(endpoint, { tileX: EMBER[0]!.tileX + 4, tileY: EMBER[0]!.tileY, heading: 32 });
+    await host.waitFor(() => host.ruinView()?.ruinOpen !== true && host.ship()?.dock === -1);
+    await moor(host, EMBER[0]!);
+    const reopened = host.clues.length;
+    await open(host);
+    expect(host.clues[reopened]).toMatchObject({ island: 1, lockedUntil: until, solved: false });
+    if (host.worldTick < until - 5) expect(await answer(host, readClue(clue))).toMatchObject({ outcome: "refused", reason: "locked-out" });
+    await host.waitFor(() => host.worldTick >= until, 5000);
+    expect(await answer(host, readClue(clue))).toMatchObject({ outcome: "solved", gold: 40 });
+    expect(room.ledgerState.grants.map((grant) => grant.playerId)).toEqual([guest.sessionId, host.sessionId]);
+  }, 30_000);
+
+  it("closes a player's session when they cast off, enter a duel or disconnect", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    expect(openWater(OFF_PALM, { tileX: PALM[0]!.tileX - 1, tileY: PALM[0]!.tileY, heading: EAST })).toBe(true);
+    // The guest never readies its arena: it loses the duel by forfeit and waits to respawn.
+    const [host, guest, dropper] = (await playersAt(endpoint, [OFF_PALM, { ...OFF_PALM, tileY: OFF_PALM.tileY - 2 }, { ...OFF_PALM, tileY: OFF_PALM.tileY + 2 }], track, {
+      endpoints: [endpoint, endpoint, proxy.endpoint],
+      clients: [{}, { autoReady: false }, {}],
+    })) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const room = roomOf(host);
+    const session = (id: string, island: number) => sessionOf(findRuin(room.ruinsState, island)!, id);
+
+    // Casting off.
+    await moor(host, EMBER[0]!);
+    await open(host);
+    expect(session(host.sessionId, 1)).toBeDefined();
+    await host.placeShip(endpoint, { tileX: EMBER[0]!.tileX + 4, tileY: EMBER[0]!.tileY, heading: 32 });
+    await host.waitFor(() => host.ship()?.dock === -1 && host.ruinView()?.ruinOpen === false);
+    await until(() => session(host.sessionId, 1) === undefined, 2000, "casting off closing the session");
+    // An answer with no open ruin is refused.
+    // (The verdict names no island, -1, which the client's parser accepts.)
+    const atSea = await answer(host, { kind: "navigation", moves: ["N"] });
+    expect(atSea).toMatchObject({ outcome: "refused", reason: "not-at-ruin", island: -1 });
+    expect(parseRuinResultMessage(atSea)).toEqual(atSea);
+
+    // A duel: the guest, moored at Palm Key's west dock with the ruin open, is grappled from the sea.
+    await moor(guest, PALM[0]!);
+    await open(guest);
+    expect(session(guest.sessionId, 0)).toBeDefined();
+    await host.placeShip(endpoint, OFF_PALM);
+    await host.waitFor(() => host.ship(guest.sessionId) !== undefined);
+    host.tapGrapple();
+    await until(() => room.encounterState.duels.some((duel) => duel.players.includes(guest.sessionId)), 5000, "the duel");
+    await until(() => session(guest.sessionId, 0) === undefined, 2000, "the duel closing the session");
+    await guest.waitFor(() => guest.ruinView()?.ruin === "");
+    // Opening in a duel gives nothing, and a fighter sees no island's ruin.
+    const clues = guest.clues.length;
+    guest.openRuin();
+    await guest.waitFor(() => guest.ruinMarkers().length === 0);
+    await sleep(300);
+    expect(guest.clues).toHaveLength(clues);
+    // Still moored at the island while it waits to respawn (out of the world): no ruin, no clue.
+    await guest.waitFor(() => guest.status()?.mode === "respawning", 8000);
+    expect(room.matchState.ships.find((ship) => ship.id === guest.sessionId)?.dock).toBe(PALM[0]!.id);
+    guest.openRuin();
+    await sleep(300);
+    expect(guest.clues).toHaveLength(clues);
+    expect(room.ruinsState.presence.find((entry) => entry.playerId === guest.sessionId)).toBeUndefined();
+
+    // A disconnect.
+    await moor(dropper, PALM[1]!);
+    await open(dropper);
+    expect(session(dropper.sessionId, 0)).toBeDefined();
+    proxy.sever({ refuse: true });
+    await until(() => room.ledgerState.players.find((player) => player.id === dropper.sessionId)?.status === "disconnected", 3000, "the disconnect");
+    await until(() => session(dropper.sessionId, 0) === undefined, 1000, "the disconnect closing the session");
+
+    // A player who leaves: their session and presence go with them.
+    await moor(host, EMBER[1]!);
+    await open(host);
+    expect(session(host.sessionId, 1)).toBeDefined();
+    await host.leave();
+    await until(() => room.ruinsState.presence.every((entry) => entry.playerId !== host.sessionId), 3000, "the leave closing the session");
+    expect(session(host.sessionId, 1)).toBeUndefined();
+  }, 45_000);
+
+  it("pays a solver at an island a test opened from the start, without unlocking its sources twice", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const mist = docksOf(3)[0]!;
+    const { host, room } = await pairAt(track, [
+      { tileX: mist.tileX, tileY: mist.tileY, heading: 48 },
+      { ...OFF_PALM, tileY: OFF_PALM.tileY - 2 },
+    ]);
+    expect(room.ledgerState.sources.filter((source) => source.unlocked).map((source) => source.id)).toEqual(["source-3-0", "source-3-1"]);
+    await moor(host, mist);
+    expect(host.ruinView()?.ruin).toBe("unlocked");
+    expect(host.objectives()?.target).toBe("collect:moon");
+    const gold = host.gold();
+    const solved = await answer(host, readClue(await open(host)));
+    expect(solved).toMatchObject({ outcome: "solved", gold: 40 });
+    await host.waitFor(() => host.gold() === gold + 40 && host.ruinView()?.ruin === "solved");
+    // The tracker checks the ledger refused nothing: no source was unlocked a second time.
+    expect(room.ledgerRefusals).toEqual([]);
+  }, 30_000);
+
+  it("locks a wrong answer out for exactly LOCKOUT_TICKS from the tick it was judged on", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, room } = await pairAt(track);
+    await moor(host, EMBER[0]!);
+    const clue = await open(host);
+    // The world held after a tick, so the answer is judged on that very tick.
+    room.pauseAfterTick(room.matchState.worldTick + 1);
+    await until(() => room.worldPaused, 2000, "the pause");
+    const judgedOn = room.matchState.worldTick;
+    const wrong = await answer(host, wrongAnswer(clue));
+    room.resumeWorld();
+    expect(wrong.outcome).toBe("wrong");
+    expect(wrong.lockedUntil).toBe(judgedOn + LOCKOUT_TICKS);
+    await host.waitFor(() => host.ruinView()?.ruinLockedUntil === judgedOn + LOCKOUT_TICKS);
+  }, 30_000);
+
+  it("sends no clue for an open from open water", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, room } = await pairAt(track);
+    expect(host.ship()?.dock).toBe(-1);
+    host.openRuin();
+    await sleep(500);
+    expect(host.clues).toEqual([]);
+    expect(host.ruinView()).toEqual({ ruin: "", ruinOpen: false, ruinLockedUntil: 0 });
+    expect(Object.values(room.ruinsState.ruins).every((ruin) => sessionOf(ruin, host.sessionId) === undefined)).toBe(true);
+  });
+
+  it("reads no ruin message once the match has ended", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, room } = await pairAt(track);
+    await moor(host, PALM[0]!);
+    const clue = await open(host);
+    room.injectFault();
+    await host.waitFor(() => host.phase === "ended");
+    const [clues, results] = [host.clues.length, host.ruinResults.length];
+    host.openRuin();
+    host.answerRuin(readClue(clue));
+    await sleep(500);
+    expect(host.clues).toHaveLength(clues);
+    expect(host.ruinResults).toHaveLength(results);
+    expect(room.ledgerState.grants).toEqual([]);
+  });
+
+  it("gives the next match only the test-only ruins posted for it, and refuses malformed ones", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const post = (body: unknown) =>
+      fetch(`${endpoint}${TEST_NEXT_MATCH_RUINS_PATH}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect((await post({ "0": "riddle" })).status).toBe(400);
+    expect((await post("0=open")).status).toBe(400);
+    expect((await post({ "0": "open" })).status).toBe(200);
+    const next = await HeadlessClient.create(endpoint);
+    track(next);
+    const after = await HeadlessClient.create(endpoint);
+    track(after);
+    const unlocked = (client: HeadlessClient) => roomOf(client).ledgerState.sources.filter((source) => source.unlocked).map((source) => source.island);
+    // The posted ruins replace the server's own for that match (island 0 open, nothing else), then the server's return.
+    expect(unlocked(next)).toEqual([0, 0]);
+    expect(unlocked(after)).toEqual([3, 3]);
+    expect(roomOf(after).ruinsState.ruins["0"]!.puzzle.kind).toBe("sequence");
+  });
+
+  it("sends the clue only to its opener and never the answer; others get only whether the island is unlocked, in sight or moored there (§16)", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The onlooker sits off Palm Key, in sight of it; the far player at Old Stones' dock sees neither Palm Key nor Ember Rock.
+    const stones = docksOf(2)[0]!;
+    const [opener, onlooker, far] = (await playersAt(endpoint, [OFF_PALM, { ...OFF_PALM, tileY: OFF_PALM.tileY - 2 }, { tileX: stones.tileX, tileY: stones.tileY, heading: 48 }], track)) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const room = roomOf(opener);
+    await moor(far, stones);
+    await moor(opener, PALM[0]!);
+    await onlooker.waitFor(() => onlooker.ship(opener.sessionId) !== undefined);
+    const marks = { opener: opener.frameCount, onlooker: onlooker.frameCount, far: far.frameCount };
+    const clue = await open(opener);
+    const ruin = findRuin(room.ruinsState, 0)!;
+    // Exactly the site's clue, field by field: no answer, no path length.
+    expect(opener.clues.at(-1)).toEqual({ island: 0, clue: clueFor(ruin), lockedUntil: 0, solved: false });
+    expect(Object.keys(clue).sort()).toEqual(["kind", "length", "tablets"]);
+    const wrong = await answer(opener, wrongAnswer(clue));
+    expect(wrong.outcome).toBe("wrong");
+    expect(Object.keys(wrong).sort()).toEqual(["gold", "island", "lockedUntil", "outcome", "reason", "requestId", "unlocked"]);
+    await opener.waitFor(() => opener.worldTick >= wrong.lockedUntil, 5000);
+    expect((await answer(opener, readClue(clue))).outcome).toBe("solved");
+    await onlooker.waitFor(() => onlooker.ruinMarkers().find((marker) => marker.island === 0)?.unlocked === true);
+    await sleep(200);
+    const openerFrames = opener.framesSince(marks.opener);
+    expect(openerFrames.some((frame) => containsText(frame, RuinMessageType.Clue))).toBe(true);
+    for (const secret of ["answer", "minMoves", "puzzle", "solvedBy"]) expect(openerFrames.some((frame) => containsText(frame, secret)), secret).toBe(false);
+    for (const [name, frames] of [
+      ["onlooker", onlooker.framesSince(marks.onlooker)],
+      ["far", far.framesSince(marks.far)],
+    ] as const) {
+      for (const text of [RuinMessageType.Clue, RuinMessageType.Result, "tablets", "relation", "right-", "absent", "present", "not-at"]) {
+        expect(frames.some((frame) => containsText(frame, text)), `${name}: ${text}`).toBe(false);
+      }
+    }
+    // What the others hold of the ruins: markers (island, place, unlocked) for islands in sight or where moored, and
+    // their own status at their own island.
+    expect(onlooker.ruinMarkers().map((marker) => marker.island)).toContain(0);
+    expect(onlooker.ruinMarkers().map((marker) => marker.island)).not.toContain(3);
+    expect(onlooker.ruinView()?.ruin).toBe("");
+    expect(far.ruinMarkers().map((marker) => marker.island)).toEqual([2]);
+    expect(far.ruinMarkers()[0]!.unlocked).toBe(false);
+    expect(far.ruinView()).toEqual({ ruin: "locked", ruinOpen: false, ruinLockedUntil: 0 });
+  }, 30_000);
+
+  it("drops malformed and excess ruin messages, and opens nothing before the match starts", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    // In the lobby: no clue.
+    host.openRuin();
+    await sleep(300);
+    expect(host.clues).toEqual([]);
+    const bench = await startThroughLobby(endpoint, [host]);
+    track(bench!);
+    await host.placeShip(endpoint, OFF_PALM);
+    await moor(host, PALM[0]!);
+    // Malformed answers get no verdict at all.
+    for (const payload of [{ requestId: "x" }, { requestId: "bad id", attempt: { kind: "sequence", symbols: ["sun"] } }, "sun,moon,tide", { requestId: "y", attempt: { kind: "sequence", symbols: ["gold"] } }]) {
+      host.sendRaw(RuinMessageType.Answer, payload);
+    }
+    host.sendRaw(RuinMessageType.Open, { island: 2 });
+    await sleep(1100);
+    expect(host.ruinResults).toEqual([]);
+    expect(host.clues).toEqual([]);
+    // A burst: at most MAX_RUIN_MESSAGES_PER_SECOND (8) are read in a second.
+    for (let index = 0; index < 20; index++) host.answerRuin({ kind: "sequence", symbols: ["sun", "moon", "tide"] }, `burst${index}`);
+    await sleep(500);
+    expect(host.ruinResults.length).toBeLessThanOrEqual(MAX_RUIN_MESSAGES_PER_SECOND);
+    expect(host.ruinResults.length).toBeGreaterThan(0);
+    expect(host.ruinResults.every((result) => result.outcome === "refused" && result.reason === "no-session")).toBe(true);
+    // Opens count against the same cap: after a burst of opens, an answer in that second is not read.
+    await sleep(1100);
+    const heard = host.ruinResults.length;
+    for (let index = 0; index < 12; index++) host.openRuin();
+    host.answerRuin({ kind: "sequence", symbols: ["sun", "moon", "tide"] }, "after-opens");
+    await sleep(500);
+    expect(host.ruinResults).toHaveLength(heard);
+    // And a real open after the second has passed still works.
+    await sleep(1100);
+    expect((await open(host)).kind).toBe("sequence");
+  }, 30_000);
+});

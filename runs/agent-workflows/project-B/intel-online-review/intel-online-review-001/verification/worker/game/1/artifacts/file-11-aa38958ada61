@@ -1,0 +1,474 @@
+import { WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import {
+  JournalMessageType,
+  parseJournal,
+  parseJournalMessage,
+  parseKnownIslands,
+  parseRumorOffers,
+  parseRumorResultMessage,
+  type BuyRumorMessage,
+  type JournalEntry,
+  type JournalMessage,
+  type KnownIsland,
+  type RumorOfferName,
+  type RumorRefusalName,
+  type RumorResultMessage,
+} from "@pirate-sea-race/protocol";
+import { kitDescriptions } from "@pirate-sea-race/simulation/fruits";
+import { createIntelConfig, sectorOf, type IntelConfig } from "@pirate-sea-race/simulation/intel";
+import { typeName } from "./hud.js";
+
+/**
+ * §3, §11 and §13's journal in the browser: M opens and closes it (Escape closes it too), and it lists this player's
+ * leads (the type, the island or sector, why they got it, stale ones greyed with what replaced them), the islands they
+ * know, their collected types and their kit with its description. Moored at a dock, it sells a targeted rumor about each
+ * missing type. A toast announces each new lead, and the sea shows its sector borders while the journal is open or a
+ * sector lead is active. Everything down to `JournalPanel` is plain data, for unit tests; `JournalPanel` and
+ * `applyJournal` touch the page. The helm stays live while the journal is open.
+ */
+
+/** A targeted rumor's price (§11), as the server charges it (`objectiveRules.rumorPrice`). */
+export const RUMOR_PRICE = 25;
+
+/** This player's journal fields, from its private status and its ship. */
+export interface JournalStatus {
+  readonly journal: readonly JournalEntry[];
+  readonly knownIslands: readonly KnownIsland[];
+  readonly offers: readonly { readonly type: string; readonly offer: RumorOfferName }[];
+  readonly rubbings: readonly string[];
+  readonly gold: number;
+  readonly kit: string;
+  /** The ship is moored at a dock and in the world (not in a duel, not waiting to respawn). */
+  readonly moored: boolean;
+}
+
+export interface Line {
+  readonly text: string;
+  readonly state: string;
+}
+
+/** The journal's fields of this player's private status, as decoded. */
+export interface JournalStatusFields {
+  readonly journal: string;
+  readonly knownIslands: string;
+  readonly rumorOffers: string;
+  readonly rubbings: string;
+  readonly gold: number;
+  readonly kit: string;
+  readonly mode: string;
+}
+
+/**
+ * The journal's status from the decoded private status and the dock this player's ship is moored at (-1 at sea):
+ * it is moored for buying only at a dock and in the world (not in a duel, not waiting to respawn).
+ */
+export function journalStatusOf(fields: JournalStatusFields | undefined, dock: number | undefined): JournalStatus | undefined {
+  if (fields === undefined) return undefined;
+  return {
+    journal: parseJournal(fields.journal),
+    knownIslands: parseKnownIslands(fields.knownIslands),
+    offers: parseRumorOffers(fields.rumorOffers),
+    rubbings: fields.rubbings === "" ? [] : fields.rubbings.split(","),
+    gold: fields.gold,
+    kit: fields.kit,
+    moored: dock !== undefined && dock !== -1 && fields.mode === "sea",
+  };
+}
+
+/** One journal entry as the journal lists it. */
+export interface RumorLine {
+  readonly n: number;
+  readonly type: string;
+  /** "Sun: Old Stones (island)", "Moon: a cache in Central Waters", "Sun: a carrier seen in Central Waters 45 s before", "Moon: no lead". */
+  readonly text: string;
+  /** Why the player got it: "start", "fresh", "targeted", "replacement", or "sighting". */
+  readonly reason: string;
+  /** "active", "stale" or "resolved". */
+  readonly status: string;
+  /** " stale" or " resolved", or "" while active. */
+  readonly statusText: string;
+  /** For a stale entry: what replaced it ("Replaced by #3: …"), or that no lead followed yet. */
+  readonly replaced: string;
+}
+
+/** A Buy button: one per missing type. */
+export interface BuyButton {
+  readonly type: string;
+  readonly label: string;
+  /** "available", "covered", "no-lead", "not-at-dock", "gold" or "pending". */
+  readonly state: string;
+  readonly disabled: boolean;
+}
+
+export interface JournalView {
+  readonly hidden: boolean;
+  /** Newest first, or one "No leads yet" line (state "empty"). */
+  readonly rumors: readonly RumorLine[];
+  /** Or one line saying none are known yet (state "empty"). */
+  readonly islands: readonly Line[];
+  readonly collected: string;
+  readonly kit: { readonly name: string; readonly specials: readonly string[]; readonly advantage: string; readonly vulnerability: string };
+  readonly buys: readonly BuyButton[];
+  /** The last purchase's answer. */
+  readonly message: Line;
+}
+
+/** An entry's line: the type and where it points. */
+export function entryText(entry: JournalEntry): string {
+  const type = typeName(entry.type);
+  switch (entry.kind) {
+    case "island":
+      return `${type}: ${entry.target} (island)`;
+    case "sector":
+      return `${type}: a recovery cache in ${entry.target}`;
+    case "sighting":
+      return `${type}: a carrier seen in ${entry.target} ${Math.round((entry.tick - entry.seenTick) / WORLD_STEPS_PER_SECOND)} s before`;
+    case "no-lead":
+      return `${type}: no lead`;
+  }
+}
+
+/** Every entry, newest first, with the reason, the status and a stale entry's replacement. */
+export function rumorLines(entries: readonly JournalEntry[]): RumorLine[] {
+  return [...entries].reverse().map((entry) => {
+    const next = entries.find((each) => each.n === entry.replacedBy);
+    const replaced = entry.status !== "stale" ? "" : next !== undefined ? `Replaced by #${next.n}: ${entryText(next)}` : "Stale: its target no longer holds it";
+    return {
+      n: entry.n,
+      type: entry.type,
+      text: `#${entry.n} ${entryText(entry)}`,
+      reason: entry.kind === "sighting" ? "sighting" : entry.reason,
+      status: entry.status,
+      statusText: entry.status === "active" ? "" : ` ${entry.status}`,
+      replaced,
+    };
+  });
+}
+
+/** The known islands (§13): name, the ruin as last seen, and whether this player solved it. */
+export function islandLines(known: readonly KnownIsland[], islandName: (island: number) => string): Line[] {
+  return known.map((island) => {
+    const state = island.solved ? "solved" : island.unlocked ? "unlocked" : "locked";
+    const ruin = island.solved ? "ruin solved by you" : island.unlocked ? "ruin unlocked" : "ruin locked";
+    return { text: `${islandName(island.island)}: ${ruin}`, state };
+  });
+}
+
+/**
+ * The Buy buttons: one per missing type the server offers. A type whose lead is free coverage is `covered`, one with
+ * nothing to sell `no-lead`; otherwise the ship must be moored at a dock and the player hold the price. While a request
+ * waits for its answer every button is disabled.
+ */
+export function buyButtons(status: JournalStatus | undefined, pending: string | undefined): BuyButton[] {
+  if (status === undefined) return [];
+  return status.offers.map(({ type, offer }) => {
+    const name = typeName(type);
+    const button = (state: string, text: string, disabled = true): BuyButton => ({ type, label: `${name}: ${text}`, state, disabled });
+    if (pending !== undefined) return button("pending", pending === type ? "asking…" : `Buy a rumor (${RUMOR_PRICE} gold)`);
+    if (offer === "covered") return button("covered", "covered (a free lead is coming)");
+    if (offer === "none") return button("no-lead", "no lead to sell now");
+    if (!status.moored) return button("not-at-dock", "moor at a dock to buy a rumor");
+    if (status.gold < RUMOR_PRICE) return button("gold", `not enough gold (${RUMOR_PRICE})`);
+    return button("available", `Buy a rumor (${RUMOR_PRICE} gold)`, false);
+  });
+}
+
+const REFUSALS: Readonly<Record<RumorRefusalName, string>> = {
+  busy: "Two requests are already waiting",
+  "not-in-play": "Rumors are sold only during the match",
+  "not-at-dock": "Moor at a dock to buy a rumor",
+  "player-in-duel": "Not during a duel",
+  "player-disconnected": "Not while disconnected",
+  "insufficient-gold": "Not enough gold",
+  covered: "Nothing to pay for: a free lead covers it",
+  capped: "No fresher sighting to sell yet",
+  none: "No lead to sell",
+  duplicate: "That request was already answered",
+};
+
+/** The answer to the last purchase, as the journal says it. */
+export function resultLine(result: RumorResultMessage | undefined): Line {
+  if (result === undefined) return { text: "", state: "none" };
+  if (result.outcome === "bought") return { text: `Bought a rumor about ${typeName(result.type)} (−${result.price} gold)`, state: "bought" };
+  return { text: `${typeName(result.type)}: ${REFUSALS[result.reason]}, nothing charged`, state: result.reason };
+}
+
+/** The whole journal. */
+export function journalView(open: boolean, status: JournalStatus | undefined, pending: string | undefined, last: RumorResultMessage | undefined, islandName: (island: number) => string): JournalView {
+  const kit = kitDescriptions[(status?.kit ?? "duelist") as keyof typeof kitDescriptions] ?? kitDescriptions.duelist;
+  const rumors = rumorLines(status?.journal ?? []);
+  const islands = islandLines(status?.knownIslands ?? [], islandName);
+  return {
+    hidden: !open,
+    rumors: rumors.length > 0 ? rumors : [{ n: 0, type: "", text: "No leads yet", reason: "", status: "empty", statusText: "", replaced: "" }],
+    islands: islands.length > 0 ? islands : [{ text: "None yet: islands you sight are noted here", state: "empty" }],
+    collected: (status?.rubbings.length ?? 0) === 0 ? "none yet" : status!.rubbings.map(typeName).join(", "),
+    kit: { name: kit.name, specials: [`U: ${kit.specials[0]}`, `I: ${kit.specials[1]}`], advantage: kit.advantage, vulnerability: kit.vulnerability },
+    buys: buyButtons(status, pending),
+    message: resultLine(last),
+  };
+}
+
+/** A toast: a new lead, said briefly over the sea. */
+export interface Toast {
+  readonly title: string;
+  readonly detail: string;
+}
+
+/** The toast for a lead, or undefined for a notice that is not one (a rumor resolved quietly). */
+export function toastOf(lead: JournalMessage): Toast | undefined {
+  switch (lead.kind) {
+    case "rumor": {
+      const where = lead.target.kind === "island" ? lead.target.name : `a recovery cache in ${lead.target.name}`;
+      return { title: `New lead (${lead.reason}): ${typeName(lead.type)}`, detail: `Try ${where}.` };
+    }
+    case "carrier-sighting":
+      return {
+        title: `Carrier sighting: ${lead.sightings.map((sighting) => typeName(sighting.type)).join(", ")}`,
+        detail: `${lead.sightings.map((sighting) => `${typeName(sighting.type)} seen in ${sighting.name}`).join("; ")}, ${Math.round((lead.tick - lead.seenTick) / WORLD_STEPS_PER_SECOND)} s ago.`,
+      };
+    case "no-lead":
+      return { title: `No lead: ${typeName(lead.type)}`, detail: "Every copy is out of reach for now." };
+    case "rumor-stale":
+      return { title: `Stale rumor: ${typeName(lead.type)}`, detail: "Its target no longer holds it." };
+    case "rumor-resolved":
+      return undefined;
+  }
+}
+
+/** Where focus goes on Tab inside the open journal: the next of `count` buttons (Shift: the previous), wrapping. */
+export function nextFocus(count: number, current: number, backwards: boolean): number {
+  if (count === 0) return -1;
+  if (current < 0) return backwards ? count - 1 : 0;
+  return (current + (backwards ? count - 1 : 1)) % count;
+}
+
+/** The sea's sector grid (§3), as the intel rules cut it. */
+const intelConfig: IntelConfig = createIntelConfig({ preset: "slice", finalIsland: { x: 0, y: 0 } });
+
+/** The first tile of each band after the first: where `sectorOfTile` changes from one band to the next. */
+export function bandStarts(tiles: number, bands: number): number[] {
+  return Array.from({ length: bands - 1 }, (_, index) => Math.ceil(((index + 1) * tiles) / bands));
+}
+
+/** How long a sector's name shows after the ship enters it, in milliseconds. */
+export const SECTOR_NAME_MS = 4000;
+
+export interface SectorOverlay {
+  /** Only while the journal is open or a sector lead is active, so the sea stays clean. */
+  readonly visible: boolean;
+  /** The border lines' tiles, the columns' and rows' starts: none while hidden. */
+  readonly columns: readonly number[];
+  readonly rows: readonly number[];
+  /** The ship's sector, or -1. */
+  readonly sector: number;
+  /** The sector's name for a moment after entering it (while visible), else "". */
+  readonly label: string;
+}
+
+/**
+ * The sector borders over the sea: shown while the journal is open or the player holds an active sector lead, with
+ * the name of the sector the ship is in for `SECTOR_NAME_MS` after it enters it. `entered` is the scene's memory of
+ * the last sector and when it was entered; the new memory comes back with the overlay.
+ */
+export function sectorOverlay(input: {
+  readonly journalOpen: boolean;
+  readonly entries: readonly JournalEntry[];
+  readonly own: { readonly x: number; readonly y: number } | undefined;
+  readonly entered: { readonly sector: number; readonly at: number } | undefined;
+  readonly now: number;
+}): { readonly overlay: SectorOverlay; readonly entered: { readonly sector: number; readonly at: number } | undefined } {
+  const visible = input.journalOpen || input.entries.some((entry) => entry.kind === "sector" && entry.status === "active");
+  const sector = input.own === undefined ? -1 : sectorOf(intelConfig, input.own);
+  const entered = sector < 0 ? input.entered : input.entered?.sector === sector ? input.entered : { sector, at: input.now };
+  const showing = visible && sector >= 0 && entered !== undefined && input.now - entered.at < SECTOR_NAME_MS;
+  return {
+    overlay: {
+      visible,
+      columns: visible ? bandStarts(intelConfig.widthTiles, intelConfig.sectorColumns) : [],
+      rows: visible ? bandStarts(intelConfig.heightTiles, intelConfig.sectorRows) : [],
+      sector,
+      label: showing ? intelConfig.sectorNames[sector]! : "",
+    },
+    entered,
+  };
+}
+
+/** A world tick count after which a request with no answer (dropped by the rate cap) no longer holds the buttons. */
+const PENDING_TIMEOUT_TICKS = 5 * WORLD_STEPS_PER_SECOND;
+
+/**
+ * The journal's behaviour, as `main.ts` wires it: M toggles it, Escape closes it, Tab and Shift+Tab move focus among
+ * its buttons while it is open (`focus`), a Buy button sends `buy-rumor` with a fresh request id and disables the
+ * buttons until the answer, and each new lead raises a toast (a lead seen before, resent by a replay, raises none).
+ */
+export class JournalPanel {
+  private open = false;
+  private status: JournalStatus | undefined;
+  private pending: { readonly type: string; readonly requestId: string; readonly since: number } | undefined;
+  private last: RumorResultMessage | undefined;
+  private readonly seen = new Set<string>();
+  private requests = 0;
+  private worldTick = 0;
+
+  constructor(
+    private readonly send: (type: string, message: unknown) => void,
+    private readonly render: (view: JournalView) => void,
+    private readonly toast: (toast: Toast) => void,
+    private readonly focus: (backwards: boolean) => void,
+    private readonly islandName: (island: number) => string,
+  ) {}
+
+  get isOpen(): boolean {
+    return this.open;
+  }
+
+  /** The journal's entries, for the sea's sector overlay. */
+  entries(): readonly JournalEntry[] {
+    return this.status?.journal ?? [];
+  }
+
+  keydown(event: Pick<KeyboardEvent, "code" | "repeat"> & { readonly shiftKey?: boolean }): boolean {
+    if (event.code === "KeyM") {
+      if (!event.repeat) this.toggle();
+      return true;
+    }
+    if (!this.open) return false;
+    if (event.code === "Escape") {
+      this.toggle();
+      return true;
+    }
+    if (event.code === "Tab") {
+      this.focus(event.shiftKey === true);
+      return true;
+    }
+    return false;
+  }
+
+  toggle(): void {
+    this.open = !this.open;
+    this.draw();
+    if (this.open) this.focus(false);
+  }
+
+  update(status: JournalStatus | undefined, worldTick: number): void {
+    this.status = status;
+    this.worldTick = worldTick;
+    if (this.pending !== undefined && worldTick - this.pending.since > PENDING_TIMEOUT_TICKS) this.pending = undefined;
+    this.draw();
+  }
+
+  /** A lead from the server: a toast the first time it is seen. */
+  lead(message: unknown): void {
+    const lead = parseJournalMessage(message);
+    if (lead === undefined) return;
+    const key = JSON.stringify(lead);
+    if (this.seen.has(key)) return;
+    this.seen.add(key);
+    const toast = toastOf(lead);
+    if (toast !== undefined) this.toast(toast);
+  }
+
+  /** The answer to a purchase: the pending request (if this is its answer) is over. */
+  result(message: unknown): void {
+    const result = parseRumorResultMessage(message);
+    if (result === undefined) return;
+    if (this.pending?.requestId === result.requestId) this.pending = undefined;
+    this.last = result;
+    this.draw();
+  }
+
+  /** A Buy button: only an available one sends. */
+  buy(type: string): void {
+    const button = buyButtons(this.status, this.pending?.type).find((each) => each.type === type);
+    if (button === undefined || button.disabled) return;
+    const requestId = `j${++this.requests}`;
+    this.pending = { type, requestId, since: this.worldTick };
+    this.send(JournalMessageType.BuyRumor, { requestId, type: type as BuyRumorMessage["type"] } satisfies BuyRumorMessage);
+    this.draw();
+  }
+
+  private draw(): void {
+    this.render(journalView(this.open, this.status, this.pending?.type, this.last, this.islandName));
+  }
+}
+
+function field(root: ParentNode, id: string): HTMLElement {
+  const element = root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  if (element === null) throw new Error(`missing journal field ${id}`);
+  return element;
+}
+
+function item(text: string, state: string): HTMLLIElement {
+  const li = document.createElement("li");
+  li.textContent = text;
+  li.dataset["state"] = state;
+  return li;
+}
+
+/**
+ * Whether the page's Buy buttons (their types, in page order) are already the view's: then the same elements stay,
+ * and so does the focus on one of them. Otherwise (a type bought or collected, the first draw) they are replaced.
+ */
+export function sameButtons(current: readonly string[], wanted: readonly string[]): boolean {
+  return current.length === wanted.length && current.every((type, index) => type === wanted[index]);
+}
+
+/** Writes the journal into the page as readable text, and its Buy buttons. */
+export function applyJournal(root: ParentNode, view: JournalView): void {
+  field(root, "journal").hidden = view.hidden;
+  field(root, "journal-rumors").replaceChildren(
+    ...view.rumors.map((rumor) => {
+      const li = item("", rumor.status);
+      li.dataset["reason"] = rumor.reason;
+      li.dataset["type"] = rumor.type;
+      li.dataset["n"] = String(rumor.n);
+      const text = document.createElement("span");
+      text.textContent = rumor.text;
+      const reason = document.createElement("em");
+      reason.className = "reason";
+      reason.textContent = rumor.reason;
+      const status = document.createElement("span");
+      status.className = "status";
+      status.textContent = rumor.statusText;
+      const replaced = document.createElement("small");
+      replaced.textContent = rumor.replaced;
+      li.append(text, " ", reason, status, replaced);
+      return li;
+    }),
+  );
+  field(root, "journal-islands").replaceChildren(...view.islands.map((line) => item(line.text, line.state)));
+  field(root, "journal-collected").textContent = view.collected;
+  field(root, "journal-kit").textContent = view.kit.name;
+  field(root, "journal-kit-specials").textContent = view.kit.specials.join(" · ");
+  field(root, "journal-kit-description").textContent = `Advantage: ${view.kit.advantage}. Vulnerability: ${view.kit.vulnerability}.`;
+  const buys = field(root, "journal-buys");
+  const existing = new Map([...buys.querySelectorAll<HTMLButtonElement>("button[data-type]")].map((button) => [button.dataset["type"]!, button]));
+  const buttons = view.buys.map((buy) => {
+    const button = existing.get(buy.type) ?? document.createElement("button");
+    button.type = "button";
+    button.dataset["type"] = buy.type;
+    button.dataset["state"] = buy.state;
+    button.textContent = buy.label;
+    button.disabled = buy.disabled;
+    return button;
+  });
+  // The same button elements stay, so focus stays where it is across redraws (20 a second).
+  if (!sameButtons([...existing.keys()], view.buys.map((buy) => buy.type))) buys.replaceChildren(...buttons);
+  const message = field(root, "journal-message");
+  message.textContent = view.message.text;
+  message.dataset["state"] = view.message.state;
+}
+
+/** How long a toast stays up, in milliseconds. */
+export const TOAST_MS = 4000;
+
+/** Shows a toast over the sea for `TOAST_MS`; a newer one replaces it. */
+export function showToast(root: ParentNode, toast: Toast, timers: { hide?: number }): void {
+  const element = field(root, "toast");
+  field(root, "toast-title").textContent = toast.title;
+  field(root, "toast-detail").textContent = toast.detail;
+  element.hidden = false;
+  window.clearTimeout(timers.hide);
+  timers.hide = window.setTimeout(() => (element.hidden = true), TOAST_MS);
+}

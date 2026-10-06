@@ -1,0 +1,352 @@
+import { describe, expect, it } from "vitest";
+import {
+  claimRules,
+  createClaimConfig,
+  createClaimState,
+  hashState,
+  replayClaim,
+  stepClaim,
+  type ClaimConfig,
+  type ClaimEncounter,
+  type ClaimEvent,
+  type ClaimPlayer,
+  type ClaimState,
+  type ClaimTickInput,
+} from "./index.js";
+
+const POINT = { x: 20_000, y: 30_000 };
+const config = createClaimConfig({ claimPoint: POINT });
+const CHANNEL = config.channelTicks;
+const RADIUS = config.circleRadius;
+
+/** A player who could claim: at the claim point, stopped, holding everything, connected, unprotected. */
+function player(id: string, change: Partial<ClaimPlayer> = {}): ClaimPlayer {
+  return { id, x: POINT.x, y: POINT.y, speed: 0, holdsAllTypes: true, interact: true, connected: true, protected: false, ...change };
+}
+
+function duel(id: string, a: string, b: string): ClaimEncounter {
+  return { id, playerIds: [a, b] };
+}
+
+/** Recursively frozen, so a step that mutated its input would throw. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+type Tick = { players: ClaimPlayer[]; encounters?: ClaimEncounter[] };
+
+/** Steps one tick with frozen input and state, checking neither is changed. */
+function step(state: ClaimState, tick: Tick, cfg: ClaimConfig = config) {
+  const input: ClaimTickInput = deepFreeze({ tick: state.tick + 1, players: tick.players, encounters: tick.encounters ?? [] });
+  const before = hashState(deepFreeze(state));
+  const stepped = stepClaim(cfg, state, input);
+  expect(hashState(state)).toBe(before);
+  return stepped;
+}
+
+/** Steps `count` identical ticks and returns the final state and every event. */
+function hold(state: ClaimState, tick: Tick, count: number, cfg: ClaimConfig = config) {
+  const events: ClaimEvent[] = [];
+  let current = state;
+  for (let index = 0; index < count; index++) {
+    const stepped = step(current, tick, cfg);
+    current = stepped.state;
+    events.push(...stepped.events);
+  }
+  return { state: current, events };
+}
+
+const kinds = (events: readonly ClaimEvent[]) => events.map((event) => event.kind);
+
+describe("claim config", () => {
+  it("uses the content rules: a 200-tick channel, the treasure circle in sub-units and the minute-35 deadline", () => {
+    expect(config).toEqual({ claimPoint: POINT, circleRadius: claimRules.circleRadiusTiles * 256, channelTicks: 200, deadlineTick: 42_000 });
+    expect(createClaimConfig({ claimPoint: POINT, controlStartTick: 60 }).deadlineTick).toBe(42_060);
+    expect(() => createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: -1 } })).toThrow(/invalid claim rules/);
+    expect(() => createClaimConfig({ claimPoint: { x: 0.5, y: 0 } })).toThrow(RangeError);
+    expect(() => createClaimState(config, config.deadlineTick)).toThrow(RangeError);
+    expect(createClaimState(config)).toEqual({ tick: 0, channel: null, result: null });
+  });
+});
+
+describe("eligibility (§5)", () => {
+  const start = createClaimState(config);
+
+  it("lets a player start who holds all four types inside the circle, stopped, connected and holding interact", () => {
+    const { state, events } = step(start, { players: [player("a")] });
+    expect(events).toEqual([{ kind: "claim-started", tick: 1, playerId: "a" }]);
+    expect(state.channel).toEqual({ playerId: "a", startTick: 1, x: POINT.x, y: POINT.y, progress: 0 });
+  });
+
+  it("counts the circle's edge as inside and one sub-unit beyond it as outside", () => {
+    expect(step(start, { players: [player("a", { x: POINT.x + RADIUS })] }).state.channel?.playerId).toBe("a");
+    expect(step(start, { players: [player("a", { y: POINT.y - RADIUS })] }).state.channel?.playerId).toBe("a");
+    expect(step(start, { players: [player("a", { x: POINT.x + RADIUS + 1 })] }).state.channel).toBeNull();
+    // (3r/5, 4r/5) lies exactly on the circle when r is a multiple of 5; one sub-unit further does not.
+    const r = RADIUS - (RADIUS % 5);
+    const edge = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, circleRadiusTiles: 5 }, subUnitsPerTile: r / 5 });
+    expect(step(start, { players: [player("a", { x: POINT.x + (3 * r) / 5, y: POINT.y + (4 * r) / 5 })] }, edge).state.channel).not.toBeNull();
+    expect(step(start, { players: [player("a", { x: POINT.x + (3 * r) / 5 + 1, y: POINT.y + (4 * r) / 5 })] }, edge).state.channel).toBeNull();
+  });
+
+  it.each<[string, Partial<ClaimPlayer>]>([
+    ["missing a rubbing type", { holdsAllTypes: false }],
+    ["moving", { speed: 1 }],
+    ["reversing", { speed: -1 }],
+    ["disconnected", { connected: false }],
+    ["not holding interact", { interact: false }],
+    ["outside the circle", { x: POINT.x - RADIUS - 1 }],
+  ])("refuses a player %s", (_, change) => {
+    const { state, events } = step(start, { players: [player("a", change)] });
+    expect(state.channel).toBeNull();
+    expect(events).toEqual([]);
+  });
+
+  it("refuses a player reserved for a duel", () => {
+    const { state, events } = step(start, { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "a", "b")] });
+    expect(state.channel).toBeNull();
+    expect(events).toEqual([]);
+  });
+
+  it("ends a protected player's protection first, then starts the claim (§6)", () => {
+    const { state, events } = step(start, { players: [player("a", { protected: true })] });
+    expect(events).toEqual([
+      { kind: "protection-ended", tick: 1, playerId: "a" },
+      { kind: "claim-started", tick: 1, playerId: "a" },
+    ]);
+    expect(state.channel?.playerId).toBe("a");
+  });
+
+  it("keeps the protection of a protected player who must wait", () => {
+    const first = step(start, { players: [player("a")] }).state;
+    const { events } = step(first, { players: [player("a"), player("b", { protected: true })] });
+    expect(events).toEqual([]);
+  });
+});
+
+describe("the channel (§5)", () => {
+  const start = createClaimState(config);
+
+  it("completes after ten seconds of held interact: 200 ticks after the tick it starts", () => {
+    const almost = hold(start, { players: [player("a")] }, CHANNEL);
+    expect(almost.state.channel).toMatchObject({ playerId: "a", startTick: 1, progress: CHANNEL - 1 });
+    expect(almost.state.result).toBeNull();
+    const done = step(almost.state, { players: [player("a")] });
+    expect(done.state).toEqual({ tick: CHANNEL + 1, channel: null, result: { reason: "claim", winner: "a", tick: CHANNEL + 1 } });
+    expect(done.events).toEqual([
+      { kind: "claim-completed", tick: CHANNEL + 1, playerId: "a" },
+      { kind: "match-ended", tick: CHANNEL + 1, reason: "claim", winner: "a" },
+    ]);
+  });
+
+  it("runs one channel at a time: a second eligible player waits, then starts from zero when the first breaks", () => {
+    const both = { players: [player("a"), player("b", { x: POINT.x + 1 })] };
+    const first = hold(start, both, 50);
+    expect(first.state.channel).toMatchObject({ playerId: "a", progress: 49 });
+    expect(kinds(first.events)).toEqual(["claim-started"]);
+    const broken = step(first.state, { players: [player("a", { interact: false }), player("b", { x: POINT.x + 1 })] });
+    expect(broken.events).toEqual([
+      { kind: "claim-interrupted", tick: 51, playerId: "a", reason: "released", progress: 49 },
+      { kind: "claim-started", tick: 51, playerId: "b" },
+    ]);
+    // a holds interact again but b now owns the channel, which completes 200 ticks after it started.
+    const rest = hold(broken.state, both, CHANNEL);
+    expect(rest.state.result).toEqual({ reason: "claim", winner: "b", tick: 51 + CHANNEL });
+  });
+
+  const breaks: [string, (id: string) => ClaimPlayer | null, string][] = [
+    ["moving", (id) => player(id, { speed: 2 }), "moved"],
+    ["drifting to a new position at speed 0", (id) => player(id, { x: POINT.x + 1 }), "moved"],
+    ["losing a rubbing type", (id) => player(id, { holdsAllTypes: false }), "ineligible"],
+    ["disconnecting", (id) => player(id, { connected: false }), "disconnected"],
+    ["leaving the snapshot", () => null, "disconnected"],
+    ["releasing interact", (id) => player(id, { interact: false }), "released"],
+  ];
+
+  it.each(breaks)("resets progress to zero on %s", (_, broken, reason) => {
+    const channelled = hold(start, { players: [player("a")] }, 120).state;
+    const brokenPlayer = broken("a");
+    const interrupted = step(channelled, { players: brokenPlayer === null ? [] : [brokenPlayer] });
+    // A player who drifted but is still eligible where they stopped starts again at once, from zero.
+    expect(interrupted.state.channel === null || interrupted.state.channel.progress === 0).toBe(true);
+    expect(interrupted.events[0]).toEqual({ kind: "claim-interrupted", tick: 121, playerId: "a", reason, progress: 119 });
+    // Restarting counts from zero: the full channel again.
+    const restarted = hold(interrupted.state, { players: [player("a")] }, CHANNEL + 1);
+    expect(restarted.state.result).toEqual({ reason: "claim", winner: "a", tick: 122 + CHANNEL });
+  });
+
+  it("resets progress to zero when the channeller enters a duel", () => {
+    const channelled = hold(start, { players: [player("a"), player("b", { interact: false })] }, 120).state;
+    const reserved = step(channelled, { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "b", "a")] });
+    expect(reserved.state.channel).toBeNull();
+    expect(reserved.events).toEqual([{ kind: "claim-interrupted", tick: 121, playerId: "a", reason: "duel", progress: 119 }]);
+    // Still reserved: no claim. Released from the duel: a fresh channel.
+    const during = hold(reserved.state, { players: [player("a")], encounters: [duel("e1", "a", "b")] }, 30);
+    expect(during.state.channel).toBeNull();
+    expect(step(during.state, { players: [player("a")] }).state.channel).toMatchObject({ playerId: "a", startTick: 152, progress: 0 });
+  });
+
+  it("does not let a duel between two other players touch the channel", () => {
+    const tick = { players: [player("a"), player("b"), player("c")], encounters: [duel("e1", "b", "c")] };
+    expect(hold(start, tick, CHANNEL + 1).state.result).toMatchObject({ winner: "a" });
+  });
+
+  it("reads protection only when a claim starts: the channel has already ended it", () => {
+    const channelled = step(start, { players: [player("a", { protected: true })] }).state;
+    expect(hold(channelled, { players: [player("a", { protected: true })] }, CHANNEL).state.result).toMatchObject({ winner: "a" });
+  });
+});
+
+describe("completion (§5)", () => {
+  const start = createClaimState(config);
+  const won = hold(start, { players: [player("a")] }, CHANNEL + 1);
+
+  it("commits the winner once and freezes the state against every later input", () => {
+    expect(won.events.filter((event) => event.kind === "claim-completed")).toHaveLength(1);
+    const later: ClaimTickInput[] = [
+      { tick: CHANNEL + 2, players: [player("a", { holdsAllTypes: false, connected: false })], encounters: [duel("e1", "a", "b")] },
+      { tick: CHANNEL + 3, players: [player("b")], encounters: [] },
+      { tick: 1, players: [player("b"), player("b")], encounters: [] },
+      { tick: config.deadlineTick, players: [], encounters: [] },
+    ];
+    for (const input of later) {
+      const stepped = stepClaim(config, won.state, deepFreeze(input));
+      expect(stepped.state).toBe(won.state);
+      expect(stepped.events).toEqual([]);
+    }
+    expect(replayClaim(config, won.state, later).hash).toBe(hashState(won.state));
+  });
+
+  it("ends every duel still reserved or running without theft when the claim completes", () => {
+    const almost = hold(start, { players: [player("a")] }, CHANNEL).state;
+    const done = step(almost, { players: [player("a")], encounters: [duel("z", "e", "f"), duel("m", "c", "d")] });
+    expect(done.events).toEqual([
+      { kind: "claim-completed", tick: CHANNEL + 1, playerId: "a" },
+      { kind: "duel-ended-without-theft", tick: CHANNEL + 1, encounterId: "m", playerIds: ["c", "d"] },
+      { kind: "duel-ended-without-theft", tick: CHANNEL + 1, encounterId: "z", playerIds: ["e", "f"] },
+      { kind: "match-ended", tick: CHANNEL + 1, reason: "claim", winner: "a" },
+    ]);
+  });
+
+  it("with a zero-tick channel, wins on arrival (§5's alternative)", () => {
+    const instant = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: 0 } });
+    const { state, events } = step(createClaimState(instant), { players: [player("a", { protected: true })] }, instant);
+    expect(kinds(events)).toEqual(["protection-ended", "claim-started", "claim-completed", "match-ended"]);
+    expect(state.result).toEqual({ reason: "claim", winner: "a", tick: 1 });
+  });
+});
+
+describe("same-tick ordering (§5)", () => {
+  const start = createClaimState(config);
+
+  it("processes a reservation accepted on the completing tick before the channel: the duel wins", () => {
+    const almost = hold(start, { players: [player("a"), player("b", { interact: false })] }, CHANNEL).state;
+    const tick = { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "a", "b")] };
+    const { state, events } = step(almost, tick);
+    expect(state.result).toBeNull();
+    expect(events).toEqual([{ kind: "claim-interrupted", tick: CHANNEL + 1, playerId: "a", reason: "duel", progress: CHANNEL - 1 }]);
+  });
+
+  it("lets a waiting player start on the tick a reservation stops the channeller", () => {
+    const tick = { players: [player("a"), player("b", { x: POINT.x + 100 }), player("c", { interact: false })] };
+    const channelled = hold(start, tick, 10).state;
+    const { events } = step(channelled, { ...tick, encounters: [duel("e1", "c", "a")] });
+    expect(kinds(events)).toEqual(["claim-interrupted", "claim-started"]);
+    expect(events[1]).toMatchObject({ playerId: "b" });
+  });
+
+  it("starts the closest of several simultaneous starters", () => {
+    const players = [player("a", { x: POINT.x + 300 }), player("b", { y: POINT.y - 200 }), player("c", { x: POINT.x - 250 })];
+    expect(step(start, { players }).state.channel?.playerId).toBe("b");
+    expect(step(start, { players: [...players].reverse() }).state.channel?.playerId).toBe("b");
+  });
+
+  it("breaks a distance tie on the lowest stable id, by code units", () => {
+    const players = [player("p9", { x: POINT.x + 300 }), player("p10", { y: POINT.y + 300 }), player("q", { x: POINT.x - 300 })];
+    expect(step(start, { players }).state.channel?.playerId).toBe("p10");
+    const cased = [player("b", { x: POINT.x + 5 }), player("B", { x: POINT.x - 5 })];
+    expect(step(start, { players: cased }).state.channel?.playerId).toBe("B");
+  });
+
+  it("skips an ineligible closer player", () => {
+    const players = [player("a", { holdsAllTypes: false }), player("b", { x: POINT.x + 10, protected: true }), player("c", { x: POINT.x + 20 })];
+    const { state, events } = step(start, { players, encounters: [] });
+    expect(state.channel?.playerId).toBe("b");
+    expect(events).toEqual([
+      { kind: "protection-ended", tick: 1, playerId: "b" },
+      { kind: "claim-started", tick: 1, playerId: "b" },
+    ]);
+  });
+});
+
+describe("the deadline (§2)", () => {
+  const deadline = config.deadlineTick;
+  const late = createClaimState(config, deadline - CHANNEL - 10);
+
+  it("processes a claim completing on the deadline tick before the timeout", () => {
+    const channelled = hold(late, { players: [player("a", { interact: false })] }, 9).state;
+    const done = hold(channelled, { players: [player("a")] }, CHANNEL + 1);
+    expect(done.state.tick).toBe(deadline);
+    expect(done.state.result).toEqual({ reason: "claim", winner: "a", tick: deadline });
+    expect(done.events.at(-1)).toEqual({ kind: "match-ended", tick: deadline, reason: "claim", winner: "a" });
+  });
+
+  it("ends a match with no winner when a channel is one tick short at the deadline", () => {
+    const channelled = hold(late, { players: [player("a", { interact: false })] }, 10).state;
+    const done = hold(channelled, { players: [player("a")] }, CHANNEL);
+    expect(done.state).toEqual({ tick: deadline, channel: null, result: { reason: "deadline", winner: null, tick: deadline } });
+    expect(done.events.slice(-2)).toEqual([
+      { kind: "claim-interrupted", tick: deadline, playerId: "a", reason: "deadline", progress: CHANNEL - 1 },
+      { kind: "match-ended", tick: deadline, reason: "deadline", winner: null },
+    ]);
+  });
+
+  it("ends a match nobody claimed with no winner, and every running duel without theft", () => {
+    const quiet = hold(late, { players: [player("a", { interact: false })] }, CHANNEL + 9).state;
+    const { state, events } = step(quiet, { players: [], encounters: [duel("e2", "c", "d"), duel("e1", "a", "b")] });
+    expect(state.result).toEqual({ reason: "deadline", winner: null, tick: deadline });
+    expect(events).toEqual([
+      { kind: "duel-ended-without-theft", tick: deadline, encounterId: "e1", playerIds: ["a", "b"] },
+      { kind: "duel-ended-without-theft", tick: deadline, encounterId: "e2", playerIds: ["c", "d"] },
+      { kind: "match-ended", tick: deadline, reason: "deadline", winner: null },
+    ]);
+    expect(stepClaim(config, state, { tick: deadline + 1, players: [player("a")], encounters: [] })).toEqual({ state, events: [] });
+  });
+
+  it("lets a reservation on the deadline tick stop a claim that would have completed on it", () => {
+    const channelled = hold(late, { players: [player("a", { interact: false }), player("b", { interact: false })] }, 9).state;
+    const almost = hold(channelled, { players: [player("a"), player("b", { interact: false })] }, CHANNEL).state;
+    const { state, events } = step(almost, { players: [player("a"), player("b", { interact: false })], encounters: [duel("e1", "b", "a")] });
+    expect(state.result).toEqual({ reason: "deadline", winner: null, tick: deadline });
+    expect(kinds(events)).toEqual(["claim-interrupted", "duel-ended-without-theft", "match-ended"]);
+  });
+
+  it("wins with a zero-tick channel started on the deadline tick", () => {
+    const instant = createClaimConfig({ claimPoint: POINT, rules: { ...claimRules, channelTicks: 0 } });
+    const state = createClaimState(instant, instant.deadlineTick - 1);
+    expect(step(state, { players: [player("a")] }, instant).state.result).toEqual({ reason: "claim", winner: "a", tick: instant.deadlineTick });
+  });
+});
+
+describe("malformed ticks", () => {
+  const start = createClaimState(config);
+  const input = (change: Partial<ClaimTickInput>): ClaimTickInput => ({ tick: 1, players: [player("a")], encounters: [], ...change });
+
+  it("are refused", () => {
+    expect(() => stepClaim(config, start, input({ tick: 2 }))).toThrow(/expected tick 1/);
+    expect(() => stepClaim(config, start, input({ tick: 0 }))).toThrow(/expected tick 1/);
+    expect(() => stepClaim(config, start, input({ players: [player("a"), player("a")] }))).toThrow(/twice/);
+    expect(() => stepClaim(config, start, input({ players: [player("")] }))).toThrow(/non-empty/);
+    expect(() => stepClaim(config, start, input({ players: [player("a", { x: 1.5 })] }))).toThrow(/safe integer/);
+    expect(() => stepClaim(config, start, input({ players: [player("a", { speed: Number.NaN })] }))).toThrow(/safe integer/);
+    expect(() => stepClaim(config, start, input({ players: [{ ...player("a"), interact: 1 as unknown as boolean }] }))).toThrow(/boolean/);
+    expect(() => stepClaim(config, start, input({ encounters: [duel("e", "a", "a")] }))).toThrow(/twice/);
+    expect(() => stepClaim(config, start, input({ encounters: [duel("e", "a", "b"), duel("e", "c", "d")] }))).toThrow(/twice/);
+    expect(() => stepClaim(config, start, input({ encounters: [duel("e1", "a", "b"), duel("e2", "b", "c")] }))).toThrow(/two encounters/);
+    expect(() => stepClaim(config, start, input({ players: [player("a", { x: 2 ** 40 })] }))).toThrow(/too far/);
+  });
+});

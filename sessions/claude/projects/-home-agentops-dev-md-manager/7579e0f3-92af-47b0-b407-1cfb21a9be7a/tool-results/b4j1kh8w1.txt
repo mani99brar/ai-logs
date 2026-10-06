@@ -1,0 +1,279 @@
+commit 8cd355f2e2c5e5320ed798af49224405d2c55106
+Author: Mani Brar <mani99brar@gmail.com>
+Date:   Wed Sep 23 23:07:38 2026 +0000
+
+    Keep a question pause alive: finished lanes meet their deadline, blocked turns ask
+    
+    Three confirmed findings of the slice 2 review against PRD 4.6 (a worker
+    question pauses only that worker's deadline and the other lanes keep
+    running):
+    
+    - wait_handoffs checked every lane's deadline before its completion, so a
+      lane that finished long ago (valid completed file, idle) was still held
+      to launch + worker_timeout_seconds. In a multi-lane run a question pause
+      lasted only until the earliest finished lane's original deadline; then
+      drive() stopped every worker and blocked the run. The deadline runs from
+      launch to the completion signal: a completion accepted while idle or done
+      now skips the check. A question still meets the deadline check before it
+      is recorded, as before. The WorkerQuestion test hid this by giving the
+      finished lane a new launch time; it keeps the real one now, and a new
+      test replays the review's scenario (answered after the finished lane's
+      deadline, no raise, returns once the asking lane completes in time).
+    
+    - A session that turns `working` while its question waits was recorded as
+      an operator answer typed in the pane, but a session also wakes on its own
+      (a background command it started ends). The operator's `answer` was then
+      refused and never reached the worker. The check-then-write also ran
+      outside question_lock, so an `answer` landing in between raised
+      ValueError in the wait and drive() stopped every worker. The controller
+      now records a placeholder that claims no answer, checked and written
+      under one lock (record_pane_answer: a no-op once `answer` recorded one),
+      and `answer` may replace that placeholder and deliver the text; the
+      deadline keeps running.
+    
+    - A question completion was read only in native state idle or done. Real
+      sessions whose turn ends waiting on the operator report `blocked`
+      (~/.claude/jobs timelines: "awaiting user to test locally", "2 design
+      choices need your call"), so the question was never recorded, its
+      deadline never paused and `answer` was refused. The file is final once
+      the turn is over: a question is now recorded in idle, done or blocked,
+      and a blocked lane waiting on a recorded question gets no second
+      attention event. A completed or blocked file is still accepted only in
+      idle or done, as in slice 1.
+    
+    A TransientInfraError from the inventory still leaves the wait before any
+    of this and stops nothing (exit 75).
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/workflow/README.md b/workflow/README.md
+index 63e6438..1d6a12d 100644
+--- a/workflow/README.md
++++ b/workflow/README.md
+@@ -56,7 +56,7 @@ The target is `--repo`, else the current directory when it is a Git repository w
+ - **Decisions.** `features/<feature>/decisions.md` must exist and be non-empty; the `workflow-grill` skill writes it (`## Decisions`, `## Assumptions`, `## Deferred`). It is pinned into `plan.json` at prepare and every worker and reviewer prompt includes it after the task. An optional `prd` in `feature.json` (relative to the target, any format Claude can read, PDFs included) must exist; it is copied into the run for the challenge.
+ - **Design challenge.** It runs inside `start` and `resume`, not as a LangGraph node: it must decide before any worker session exists, and it pauses and resumes on its own. The exported graph shows it as the first node, `challenge` ("Design challenge"), and every launch depends on it. Before any worker session, one read-only `claude --print` job (Read, Glob and Grep only, a worktree at the base commit) reads the pinned PRD, tasks and decisions and returns concerns (severity P0, P1 or P2, each with its consequence), the strongest simpler alternative and one cheap experiment; the controller validates it against `contracts/workflow/challenge.schema.json` and writes `challenge.json`. Only P2 concerns: `passed`, the workers launch. A P0 or P1: `paused`, no worker is launched, the timeline records the pause and the launch exits 0 printing the concerns and the commands. Then either edit the task files, `decisions.md` or the PRD and run `$PY -m workflow resume "$RUN"` (re-reads them from the paths pinned at prepare, commits them on the run's branch, moves the run to that commit so the source checkout stays clean for integration, updates the plan's copies and reruns the challenge as the next attempt; earlier attempts stay as `challenge-<n>.json`; the policy is never re-pinned; any other change in the source checkout, or a run worktree that is not the clean base, is refused before anything is committed; until the move is pinned, `challenge-revision.json` makes `start` and the override refuse and a rerun continues it), or run `$PY -m workflow resume "$RUN" --accept-challenge "<reason>"` to record `accepted` with the reason and continue without rerunning (refused while a pinned feature file no longer holds the plan's copy, and when the paused attempt read other files than the plan now pins because a later rerun failed). Add `--herdr` to attach the worker panes. `"challenge": false` in `feature.json` records `disabled` and the graph has no challenge node.
+ - **Completion 1.1.0.** A worker's completion file adds `untested` (behaviours no executed check covers; may be empty), `falsifying_check` (the check id or command that would fail if the work were wrong) and `verify_yourself` (one assumption the operator should verify), plus `question` (null). A `completed` file without the evidence is refused, and a 2.2.0 run refuses a 1.0.0 file; runs prepared before keep reading 1.0.0. The commands actually executed remain the verifier's evidence, not the worker's claim.
+-- **Questions.** A worker may end its turn with `status: question` and the text in `question`. The controller keeps the file as `<lane>.question-<n>.json`, lists it in `<lane>.questions.json`, records an event and pauses only that lane's deadline (persisted in `<lane>.deadline.json` as `paused_seconds`, so a restarted controller computes the same deadline); the other lanes keep running. Answer with `$PY -m workflow answer "$RUN" <lane> "<text>"`: it records the answer, restarts the deadline and types it into the lane's Herdr pane (`herdr pane send-text`, then Enter); with `--no-herdr` it prints the `claude attach <id>` command to type it yourself. A failed delivery (no Herdr pane, a closed pane) keeps the answer recorded and the deadline running; rerun the same command, or with `--no-herdr`, to deliver it once. Typing the answer straight into the pane works too: the controller records it when the session works again. At most three questions per worker: the prompt says so from the start, and a fourth is treated as `blocked`.
++- **Questions.** A worker may end its turn with `status: question` and the text in `question`. The controller keeps the file as `<lane>.question-<n>.json`, lists it in `<lane>.questions.json`, records an event and pauses only that lane's deadline (persisted in `<lane>.deadline.json` as `paused_seconds`, so a restarted controller computes the same deadline); the other lanes keep running. Answer with `$PY -m workflow answer "$RUN" <lane> "<text>"`: it records the answer, restarts the deadline and types it into the lane's Herdr pane (`herdr pane send-text`, then Enter); with `--no-herdr` it prints the `claude attach <id>` command to type it yourself. A failed delivery (no Herdr pane, a closed pane) keeps the answer recorded and the deadline running; rerun the same command, or with `--no-herdr`, to deliver it once. Typing the answer straight into the pane works too: when the session works again the controller records a placeholder answer and restarts the deadline; `answer` can still replace it, since a session may also work again on its own. At most three questions per worker: the prompt says so from the start, and a fourth is treated as `blocked`.
+ 
+ The export (1.5.0) carries all of it for the viewer: `inputs.decisions`, `inputs.challenge` (the latest `challenge.json` without `run_id`/`version`, plus `attempts`), on `inputs.workers.<lane>.completion` its `version`, the three evidence fields (null for a 1.0.0 completion), the `question` status and `question` (the text of a question not recorded yet), and `inputs.workers.<lane>.questions` (`{n, question, asked_at, answer, answered_at}`, `[]` for older runs). A completion is exported only as the controller reads it: a file it refuses (another version, stale or foreign) is null, and a fourth question is exported as `blocked` with its text. The Projects API serves them as run inputs 1.4.0.
+ 
+diff --git a/workflow/RUNBOOK.md b/workflow/RUNBOOK.md
+index dd6f1db..f0751ef 100644
+--- a/workflow/RUNBOOK.md
++++ b/workflow/RUNBOOK.md
+@@ -47,13 +47,13 @@ The rules are in the README ("Guardrails"); these are the procedures.
+ - **Override:** `"$PY" -m workflow resume "$RUN" --accept-challenge "<reason>" [--herdr]` rewrites the paused attempt as `accepted` with the reason (the paused record stays as `challenge-<n>.json`), reruns nothing and launches the workers. The reason is shown in the viewer. It refuses while a pinned feature file no longer holds the plan's copy, edited or committed by hand (the workers would run without the edit: rerun without `--accept-challenge` to use it, or revert it), while an interrupted `resume` has not finished (`challenge-revision.json`, or a revision commit the run does not use yet), and when the paused attempt read other files than the plan now pins (a rerun failed after its re-pin; the digests in `challenge.json` `pinned` differ): rerun without `--accept-challenge` so a challenge reads them.
+ - `resume` refuses once any worker was launched, and for runs without a challenge. `"challenge": false` records `disabled` at `start` and runs no job.
+ 
+-**Worker questions.** A worker that cannot decide alone writes its completion file with `status: question`; the controller keeps it as `<lane>.question-<n>.json`, appends `{n, question, asked_at, answer: null, answered_at: null}` to `<lane>.questions.json`, records an `interactive` event with the question and the `answer` command, and pauses that lane's deadline (`<lane>.deadline.json`: `paused_at` while waiting, `paused_seconds` accumulated). The other lanes and their deadlines keep running; a controller restart reads the same pause. Answer with:
++**Worker questions.** A worker that cannot decide alone writes its completion file with `status: question`; once its turn is over (the session idle, done or `blocked`: a turn that ends waiting on the operator usually reports `blocked`, and needs no other attention event) the controller keeps it as `<lane>.question-<n>.json`, appends `{n, question, asked_at, answer: null, answered_at: null}` to `<lane>.questions.json`, records an `interactive` event with the question and the `answer` command, and pauses that lane's deadline (`<lane>.deadline.json`: `paused_at` while waiting, `paused_seconds` accumulated). The other lanes and their deadlines keep running; a controller restart reads the same pause. A deadline runs from launch to the completion signal: a lane whose completion file was accepted (its session idle or done) no longer has one, so a lane that finished early never ends the run while another lane waits on its answer. Answer with:
+ 
+ ```bash
+ "$PY" -m workflow answer "$RUN" <lane> "Use option B; record the trade-off as an open assumption."
+ ```
+ 
+-It refuses when the lane has no unanswered question, records the answer and its time (with `delivered: false`), restarts the deadline (the paused time is added to it) and types the text into the lane's pane from `terminals.json` (`herdr pane send-text <pane> <text>`, then `herdr pane send-keys <pane> Enter`; needs `HERDR_ENV=1`), then sets `delivered: true`. With `--no-herdr` it prints `claude attach <id>` so you can type the answer yourself; that counts as the delivery. If the delivery fails (outside a Herdr pane, a run started without `--herdr` so no pane is recorded, a closed pane), it exits 1 with the reason: the answer stays recorded and the deadline keeps running (a deadline paused until a delivery would never run again if you then typed the answer in the pane), but the worker has not received it. Rerun one of the two commands it prints (the same command from a Herdr pane, or with `--no-herdr`): it delivers the recorded answer once and records nothing again. A different text for that question is refused, and so is any rerun once the answer was delivered; if you type the answer in the pane after a failed delivery, do not rerun `answer` too. If you type into the pane directly instead, the controller records `(answered by typing in the worker's pane)` as soon as the session works again and restarts the deadline. A worker gets at most three answered questions; a fourth `question` blocks the run like `status: blocked` (the file stays as evidence): the `controller` event quotes the question, and the viewer shows that lane as blocked with its text.
++It refuses when the lane's latest question is answered, records the answer and its time (with `delivered: false`), restarts the deadline (the paused time is added to it) and types the text into the lane's pane from `terminals.json` (`herdr pane send-text <pane> <text>`, then `herdr pane send-keys <pane> Enter`; needs `HERDR_ENV=1`), then sets `delivered: true`. With `--no-herdr` it prints `claude attach <id>` so you can type the answer yourself; that counts as the delivery. If the delivery fails (outside a Herdr pane, a run started without `--herdr` so no pane is recorded, a closed pane), it exits 1 with the reason: the answer stays recorded and the deadline keeps running (a deadline paused until a delivery would never run again if you then typed the answer in the pane), but the worker has not received it. Rerun one of the two commands it prints (the same command from a Herdr pane, or with `--no-herdr`): it delivers the recorded answer once and records nothing again. A different text for that question is refused, and so is any rerun once the answer was delivered; if you type the answer in the pane after a failed delivery, do not rerun `answer` too. If you type into the pane directly instead, the controller records `(no answer recorded: the worker's session worked again in its pane)` as soon as the session works again, restarts the deadline and says so in an `interactive` event. A session can also work again with nobody answering (a background command it started ended): `answer` still records your text over that placeholder and types it, and the deadline keeps running. Once you typed the answer in the pane yourself, do not run `answer` too: it would type it again. A worker gets at most three answered questions; a fourth `question` blocks the run like `status: blocked` (the file stays as evidence): the `controller` event quotes the question, and the viewer shows that lane as blocked with its text.
+ 
+ **Completion evidence.** A 2.2.0 run pins completion `1.1.0` (`plan.completion_version`): `completed` needs `untested` (a list, may be empty), non-empty `falsifying_check` and `verify_yourself`, and `question: null`; a file without them, or a 1.0.0 file, blocks the run like any malformed completion. The export serves a completion only as the controller reads it, so the viewer shows a refused file as no completion signal; the `controller` event says why. Check `falsifying_check` against the verify node's evidence: the executed checks, not the worker's claim, are what passed.
+ 
+@@ -87,7 +87,7 @@ npm run test:contracts
+ 
+ `workflow.run_tests` runs each test class in its own process, as many at a time as there are CPUs (`--jobs N` or `WORKFLOW_TEST_JOBS` to change it), and prints one unittest summary the verifier parses like a plain run; on 4 cores it takes about 3.5 minutes instead of 9.5. Use it as a policy check's argv (`["<venv>/bin/python", "-m", "workflow.run_tests"]`) so the verifier runs the suite in parallel too. A failed class's output is echoed indented, stdout and stderr in the order they were written, with the captured output of a failed command (a `CalledProcessError`'s stderr, such as git's reason for exit 128) noted under its exception line; only the runner's own final summary is counted. Test classes must not share state outside their own temporary directories.
+ 
+-The tests use fake workers, a fake reviewer session and mocked native lifecycle controls. `workflow.test_lanes` covers lanes from configuration: a three-lane run, a one-lane run, a pinned subset, excluded-lane ownership, refused selections, required check kinds, reserved ids, retrying any lane, a skipped drill, finding attribution per lane, the refused 1.0.0 feature file and the export of a run recorded before configured lanes. `workflow.test_portable` covers targets other than md-manager (PRD_PORTABLE_WORKFLOW section 6): `--repo`, the cwd rule, feature scanning, a target without `contracts/`, md-manager's unchanged commands, the registry entry (plus concurrent launches, a symlinked registry, aliased runs roots and subset launches), `init`, placeholders, the bundled briefs and prompts free of md-manager wording. `workflow.test_guardrails` covers the slice 2 controller scenarios of the same section: outcome-brief headings, required decisions, a passing and a pausing design challenge with `resume` and `--accept-challenge`, every failing challenge job (exit status, error result, wrong session, missing or malformed output, deadline, missing CLI, changed worktree, a checkout that cannot be created), lanes named like run files (`plan`, `policy`), completion evidence, worker questions with `answer` through a fake Herdr, a failed `answer` delivery and its retry, and the 1.5.0 export seam. `workflow.test_browser_rules` covers `check-report` on synthetic Playwright reports, the worker-phase gate on scenario evidence (with a stand-in for `playwright test`) and the rules in the pinned and `init` task texts. The end-to-end test uses real temporary Git worktrees, Python unit tests, headless Chromium, screenshot files, review/approval interrupts and a fast-forward of a **temporary test repository**. It makes no Claude model calls. A second test injects a check failure, reopens checkpoints and verifies that only the failed verification attempt reruns. The automatic tests run once with the native reviewer protocol and once with the print-mode fallback, each with the single built-in reviewer and with two declared reviewers, including a controller interrupted while waiting for the reviewers and every rejected completion file; `ParallelReviewerScenarios` covers PRD_PARALLEL_REVIEWERS section 6 (two approve, one blocks, a P1 anywhere, one times out, a file naming the other reviewer, a shared session UUID, an interrupted second launch) and `test_lanes` the manual import per reviewer.
++The tests use fake workers, a fake reviewer session and mocked native lifecycle controls. `workflow.test_lanes` covers lanes from configuration: a three-lane run, a one-lane run, a pinned subset, excluded-lane ownership, refused selections, required check kinds, reserved ids, retrying any lane, a skipped drill, finding attribution per lane, the refused 1.0.0 feature file and the export of a run recorded before configured lanes. `workflow.test_portable` covers targets other than md-manager (PRD_PORTABLE_WORKFLOW section 6): `--repo`, the cwd rule, feature scanning, a target without `contracts/`, md-manager's unchanged commands, the registry entry (plus concurrent launches, a symlinked registry, aliased runs roots and subset launches), `init`, placeholders, the bundled briefs and prompts free of md-manager wording. `workflow.test_guardrails` covers the slice 2 controller scenarios of the same section: outcome-brief headings, required decisions, a passing and a pausing design challenge with `resume` and `--accept-challenge`, every failing challenge job (exit status, error result, wrong session, missing or malformed output, deadline, missing CLI, changed worktree, a checkout that cannot be created), lanes named like run files (`plan`, `policy`), completion evidence, worker questions with `answer` through a fake Herdr (in each native state a turn ends in, beside a lane that finished before its deadline, and a session that works again with nobody answering), a failed `answer` delivery and its retry, and the 1.5.0 export seam. `workflow.test_browser_rules` covers `check-report` on synthetic Playwright reports, the worker-phase gate on scenario evidence (with a stand-in for `playwright test`) and the rules in the pinned and `init` task texts. The end-to-end test uses real temporary Git worktrees, Python unit tests, headless Chromium, screenshot files, review/approval interrupts and a fast-forward of a **temporary test repository**. It makes no Claude model calls. A second test injects a check failure, reopens checkpoints and verifies that only the failed verification attempt reruns. The automatic tests run once with the native reviewer protocol and once with the print-mode fallback, each with the single built-in reviewer and with two declared reviewers, including a controller interrupted while waiting for the reviewers and every rejected completion file; `ParallelReviewerScenarios` covers PRD_PARALLEL_REVIEWERS section 6 (two approve, one blocks, a P1 anywhere, one times out, a file naming the other reviewer, a shared session UUID, an interrupted second launch) and `test_lanes` the manual import per reviewer.
+ 
+ ## 1. Define and commit the feature contract
+ 
+diff --git a/workflow/automatic.py b/workflow/automatic.py
+index 772f5bf..4a1560c 100644
+--- a/workflow/automatic.py
++++ b/workflow/automatic.py
+@@ -159,10 +159,11 @@ def lanes(runtime) -> list[str]:
+ def wait_handoffs(runtime, *, clock=time.time, sleep=time.sleep) -> None:
+     """Idle alone never means completion. Deadlines survive controller restart.
+ 
+-    A 1.1.0 `question` completion pauses only that lane's deadline (persisted in `<node>.deadline.json`) until the
+-    operator answers, with `workflow answer` or by typing in the pane; the other lanes keep running.
++    A lane's deadline runs from its launch to its completion signal: a lane that finished is not held to it while
++    others work. A 1.1.0 `question` completion pauses only that lane's deadline (persisted in `<node>.deadline.json`)
++    until the operator answers, with `workflow answer` or by typing in the pane; the other lanes keep running.
+     """
+-    from .guardrails import PANE_ANSWER, deadline_extension, load_questions, record_answer, record_question, waiting_question
++    from .guardrails import PANE_ANSWER, deadline_extension, load_questions, record_pane_answer, record_question, waiting_question
+     validate_automatic(runtime.plan)
+     workers = lanes(runtime)
+     if any((runtime.directory / f"{node}.stop.json").exists() for node in workers):
+@@ -178,37 +179,47 @@ def wait_handoffs(runtime, *, clock=time.time, sleep=time.sleep) -> None:
+         rows = runtime.sessions.inventory()
+         handoffs = {}
+         for node in workers:
++            row = runtime.sessions.locate(node, rows)
++            if row is None:
++                raise RuntimeError("Native worker missing; reconciliation required")
++            path = runtime.directory / f"{node}.completion.json"
++            # The turn is over, so the file is final. A turn that ends on a question reports idle, done or, waiting on
++            # the operator, blocked; a `completed` or `blocked` file is still accepted only once idle or done, as before.
++            item = read_signal(runtime, node) if row["state"] in {"idle", "done", "blocked"} and path.exists() else None
++            if item and item["status"] != "question" and row["state"] != "blocked":
++                handoffs[node] = read_completion(runtime, node)
++                continue  # Its completion signal met the deadline.
+             receipt = read_json(runtime.directory / f"{node}.interactive.json")
+             started = datetime.fromisoformat(receipt["launch_requested_at"]).timestamp()
+             extension = deadline_extension(runtime.directory, node)  # None while a question waits: that lane has no running deadline.
+             if extension is not None and clock() >= started + runtime.plan["automatic"]["worker_timeout_seconds"] + extension:
+                 raise RuntimeError(f"Worker {node} deadline exhausted; no automatic relaunch")
+-            row = runtime.sessions.locate(node, rows)
+-            if row is None:
+-                raise RuntimeError("Native worker missing; reconciliation required")
+-            if row["state"] == "working" and waiting_question(runtime.directory, node):
+-                # The operator typed the answer in the pane: the worker is working again, so its deadline runs again.
+-                record_answer(runtime.directory, node, PANE_ANSWER, clock)
++            if item and item["status"] == "question":
++                record_question(runtime, node, item, clock)
++                continue
++            waiting = waiting_question(runtime.directory, node)
++            if row["state"] == "working" and waiting:
++                # Working again while the question waits: its deadline runs again. `answer` may have landed meanwhile
++                # (then nothing is recorded), and it still records and delivers an answer after this.
++                record_pane_answer(runtime.directory, node, clock)
+             for entry in load_questions(runtime.directory, node):
+                 if entry["answer"] is not None and (node, entry["n"]) not in answered:
+                     answered.add((node, entry["n"]))
+-                    runtime.event(node, "interactive", f"Worker {node} question {entry['n']} answered; its deadline runs again")
+-            if row["state"] == "blocked" and node not in attention:
++                    runtime.event(node, "interactive", (f"Worker {node} is working again while question {entry['n']} waits (an answer typed "
++                                                        "in its pane, or a command of its own); its deadline runs again, and `answer` "
++                                                        "still records and delivers an answer") if entry["answer"] == PANE_ANSWER
++                                  else f"Worker {node} question {entry['n']} answered; its deadline runs again")
++            if row["state"] == "blocked" and not waiting and node not in attention:
+                 # A native session reports `blocked` when its turn ended needing a human: a question,
+                 # a permission prompt or a refusal the harness could not continue past. That is not a
+                 # failure of the lane, and the other lanes keep working. The operator may answer in the
+-                # pane; the worker deadline bounds the wait. No billing/provider fallback.
++                # pane; the worker deadline bounds the wait. No billing/provider fallback. A recorded
++                # question already said what it waits for, and its deadline is paused.
+                 attention.add(node)
+                 runtime.event(node, "interactive", f"Worker {node} needs attention in its pane (native state blocked); "
+                                                    "waiting until its deadline")
+             elif row["state"] != "blocked":
+                 attention.discard(node)
+-            path = runtime.directory / f"{node}.completion.json"
+-            if row["state"] in {"idle", "done"} and path.exists():
+-                if read_signal(runtime, node)["status"] == "question":
+-                    record_question(runtime, node, read_signal(runtime, node), clock)
+-                    continue
+-                handoffs[node] = read_completion(runtime, node)
+         if set(handoffs) == set(workers):
+             for node, value in handoffs.items():
+                 save_json(runtime.directory / f"{node}.handoff.json", value)
+diff --git a/workflow/guardrails.py b/workflow/guardrails.py
+index 7a266d1..6c04aff 100644
+--- a/workflow/guardrails.py
++++ b/workflow/guardrails.py
+@@ -726,17 +726,23 @@ def record_question(runtime, node: str, item: dict, clock=None) -> dict:
+     return entry
+ 
+ 
++# What the controller records when the session works again while its question waits: the operator typed in the pane,
++# or something else woke the session (a background command it started ending). It never claims an answer.
++PANE_ANSWER = "(no answer recorded: the worker's session worked again in its pane)"
++
++
+ def record_answer(directory: Path, node: str, text: str, clock=None, delivered: bool | None = None) -> dict:
+     """The latest question's answer; the deadline restarts now. Refused when no question waits.
+ 
+     `answer` records `delivered: false` and sets it once the text reached the worker, so a failed delivery can be
+-    retried; an answer typed in the pane (recorded by the controller) carries no flag.
++    retried. It also replaces PANE_ANSWER, which the controller records (without the flag) once the session works
++    again: that deadline already runs, and the text still reaches the worker.
+     """
+     if not text.strip():
+         raise ValueError("The answer is empty")
+     with question_lock(directory):
+         questions = load_questions(directory, node)
+-        if not questions or questions[-1]["answer"] is not None:
++        if not questions or questions[-1]["answer"] not in {None, PANE_ANSWER}:
+             raise ValueError(f"Worker {node} has no unanswered question")
+         at = (clock or time.time)()
+         questions[-1].update(answer=text, answered_at=iso(at))
+@@ -747,6 +753,22 @@ def record_answer(directory: Path, node: str, text: str, clock=None, delivered:
+     return questions[-1]
+ 
+ 
++def record_pane_answer(directory: Path, node: str, clock=None) -> dict | None:
++    """The session works again while its latest question waits: PANE_ANSWER, and the deadline runs again.
++
++    Checked and written under the lock: when `answer` recorded the answer meanwhile, nothing is recorded (None).
++    """
++    with question_lock(directory):
++        questions = load_questions(directory, node)
++        if not questions or questions[-1]["answer"] is not None:
++            return None
++        at = (clock or time.time)()
++        questions[-1].update(answer=PANE_ANSWER, answered_at=iso(at))
++        save_questions(directory, node, questions)
++        resume_deadline(directory, node, at)
++    return questions[-1]
++
++
+ def undelivered_answer(directory: Path, node: str, text: str) -> dict | None:
+     """The latest question when `answer` recorded this text but never delivered it: a rerun delivers it, recording nothing.
+ 
+@@ -769,9 +791,6 @@ def mark_delivered(directory: Path, node: str, number: int) -> None:
+         save_questions(directory, node, questions)
+ 
+ 
+-PANE_ANSWER = "(answered by typing in the worker's pane)"
+-
+-
+ def deliver_answer(directory: Path, node: str, text: str, use_herdr: bool = True) -> str:
+     """Type the answer into the worker's Herdr pane (send-text, then Enter), or say how to type it after `claude attach`."""
+     receipt = read_json(directory / f"{node}.interactive.json")
+Keep a question pause alive: finished lanes meet their deadline, blocked turns ask
+
+Three confirmed findings of the slice 2 review against PRD 4.6 (a worker
+question pauses only that worker's deadline and the other lanes keep
+running):
+
+- wait_handoffs checked every lane's deadline before its completion, so a
+  lane that finished long ago (valid completed file, idle) was still held
+  to launch + worker_timeout_seconds. In a multi-lane run a question pause
+  lasted only until the earliest finished lane's original deadline; then
+  drive() stopped every worker and blocked the run. The deadline runs from
+  launch to the completion signal: a completion accepted while idle or done
+  now skips the check. A question still meets the deadline check before it
+  is recorded, as before. The WorkerQuestion test hid this by giving the
+  finished lane a new launch time; it keeps the real one now, and a new
+  test replays the review's scenario (answered after the finished lane's
+  deadline, no raise, returns once the asking lane completes in time).
+
+- A session that turns `working` while its question waits was recorded as
+  an operator answer typed in the pane, but a session also wakes on its own
+  (a background command it started ends). The operator's `answer` was then
+  refused and never reached the worker. The check-then-write also ran
+  outside question_lock, so an `answer` landing in between raised
+  ValueError in the wait and drive() stopped every worker. The controller
+  now records a placeholder that claims no answer, checked and written
+  under one lock (record_pane_answer: a no-op once `answer` recorded one),
+  and `answer` may replace that placeholder and deliver the text; the
+  deadline keeps running.
+
+- A question completion was read only in native state idle or done. Real
+  sessions whose turn ends waiting on the operator report `blocked`
+  (~/.claude/jobs timelines: "awaiting user to test locally", "2 design
+  choices need your call"), so the question was never recorded, its
+  deadline never paused and `answer` was refused. The file is final once
+  the turn is over: a question is now recorded in idle, done or blocked,
+  and a blocked lane waiting on a recorded question gets no second
+  attention event. A completed or blocked file is still accepted only in
+  idle or done, as in slice 1.
+
+A TransientInfraError from the inventory still leaves the wait before any
+of this and stops nothing (exit 75).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+

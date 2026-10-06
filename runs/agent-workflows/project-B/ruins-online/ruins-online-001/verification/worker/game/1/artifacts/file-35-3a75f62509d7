@@ -1,0 +1,183 @@
+import { expect, test } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/index.js";
+import { readGrid, readSequence, type ReadTablet } from "../../packages/test-tools/src/ruinReader.js";
+import { attachScreenshot, createMatch, nextMatchRuins, place, readout, selfId, startWithCompanion } from "./helpers.js";
+
+/**
+ * §3's ruins in the browser. The browser server opens every island (test-only); these matches ask for locked ruins of
+ * a pinned kind instead (`nextMatchRuins`). The test reads the clue off the page, as a player reads it, works the
+ * answer out from what it read (`ruinReader`: never from the server's puzzle), enters it with the keyboard and clicks,
+ * and sees the gold, the unlock and then the collection.
+ */
+
+const PALM_WEST = seaMap.docks.find((dock) => dock.island === 0)!;
+const EMBER_EAST = seaMap.docks.find((dock) => dock.island === 1)!;
+const SYMBOLS = ["sun", "moon", "tide", "storm", "anchor", "skull"] as const;
+const PLACES: Readonly<Record<string, number>> = { first: 0, "in the middle": 1, last: 2 };
+
+/** An inscription as a hint, read the way a player reads "Tide comes right after Sun". */
+function readInscription(symbol: string, text: string): ReadTablet {
+  const name = (word: string) => word.toLowerCase();
+  const rules: [RegExp, (match: RegExpExecArray) => ReadTablet["hint"]][] = [
+    [/^\w+ is not in the sequence$/, () => ({ relation: "absent", other: null, position: null })],
+    [/^\w+ is in the sequence$/, () => ({ relation: "present", other: null, position: null })],
+    [/^\w+ does not come (first|last|in the middle)$/, (match) => ({ relation: "not-at", other: null, position: PLACES[match[1]!]! })],
+    [/^\w+ comes (first|last|in the middle)$/, (match) => ({ relation: "at", other: null, position: PLACES[match[1]!]! })],
+    [/^\w+ comes right (after|before) (\w+)$/, (match) => ({ relation: `right-${match[1]}`, other: name(match[2]!), position: null })],
+    [/^\w+ comes somewhere (after|before) (\w+)$/, (match) => ({ relation: match[1]!, other: name(match[2]!), position: null })],
+  ];
+  for (const [pattern, hint] of rules) {
+    const match = pattern.exec(text);
+    if (match !== null) return { symbol, hint: hint(match) };
+  }
+  throw new Error(`cannot read the inscription "${text}"`);
+}
+
+test("one browser moored at an island opens its ruin with R, reads the clue from the page, submits the answer it works out, sees +40 gold and the island unlocked, then holds E to collect [scenario:ruin-solve]", async ({ browser, page, request }, testInfo) => {
+  test.setTimeout(90_000);
+  await nextMatchRuins(request, { "0": "sequence" });
+  const code = await createMatch(page);
+  const companion = await startWithCompanion(browser, page, code);
+  try {
+    await place(request, page, code, PALM_WEST.tileX, PALM_WEST.tileY, 0);
+    await page.keyboard.press("e");
+    await expect(page.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(PALM_WEST.id));
+    // Locked: the HUD says so and offers R; E has nothing to collect.
+    await expect(page.getByTestId("hud-ruin")).toHaveAttribute("data-state", "locked");
+    await expect(page.getByTestId("hud-ruin")).toContainText("Press R");
+    await expect(page.getByTestId("hud-hold")).toHaveAttribute("data-state", "none");
+    await expect(page.getByTestId("hud-ruin-verdict")).toHaveAttribute("data-state", "none");
+    const gold = Number(await page.getByTestId("purse-gold").getAttribute("data-gold"));
+
+    await page.keyboard.press("r");
+    const panel = page.getByTestId("ruin-panel");
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveAttribute("data-kind", "sequence");
+    const tablets = panel.getByTestId("ruin-tablet");
+    await expect(tablets).toHaveCount(6);
+    // Read every tablet as the page shows it: its symbol's name on the button, its inscription beside it.
+    const read: ReadTablet[] = [];
+    for (let index = 0; index < 6; index++) {
+      const tablet = tablets.nth(index);
+      const label = (await tablet.getByRole("button").textContent())!;
+      const symbol = SYMBOLS.find((each) => label.toLowerCase().includes(each))!;
+      expect(label.startsWith(String(index + 1))).toBe(true);
+      read.push(readInscription(symbol, (await tablet.getByTestId("ruin-inscription").textContent())!));
+    }
+    // What the player sees, for the record (not the scenario's screenshot).
+    const panelShot = testInfo.outputPath("ruin-panel.png");
+    await page.screenshot({ path: panelShot });
+    await testInfo.attach("ruin-panel", { path: panelShot, contentType: "image/png" });
+    // While the panel is open the helm is neutral: the throttle held does not cast off (which would close the ruin).
+    await page.keyboard.down("ArrowUp");
+    await page.waitForTimeout(600);
+    await page.keyboard.up("ArrowUp");
+    await expect(page.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(PALM_WEST.id));
+    await expect(panel).toBeVisible();
+    const answers = readSequence(3, read);
+    expect(answers).toHaveLength(1);
+    const [first, second, third] = answers[0]!;
+    const key = (symbol: string) => `Digit${SYMBOLS.indexOf(symbol as (typeof SYMBOLS)[number]) + 1}`;
+    // A guess first: the first two swapped. The tablets mark the order chosen; the ruin locks the guesser out, and the
+    // panel counts it down.
+    await page.keyboard.press(key(second!));
+    await expect(tablets.nth(SYMBOLS.indexOf(second!))).toHaveAttribute("data-chosen", "1");
+    await page.keyboard.press(key(first!));
+    await page.keyboard.press(key(third!));
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("ruin-verdict")).toHaveAttribute("data-state", "wrong");
+    const lockout = page.getByTestId("ruin-lockout");
+    await expect(lockout).toHaveAttribute("data-state", "locked");
+    await expect(lockout).toContainText(/Locked out: try again in [123] s/);
+    await expect(lockout).toHaveAttribute("data-seconds", "1", { timeout: 4000 });
+    await expect(lockout).toHaveAttribute("data-state", "none", { timeout: 4000 });
+    await expect(lockout).not.toHaveAttribute("data-seconds");
+    await expect(page.getByTestId("ruin-entry")).toHaveAttribute("data-symbols", "");
+    // Keys 1–6 for the first two (the tablets' order), a click for the third; a slip undone with Backspace.
+    await page.keyboard.press(key(first!));
+    await page.keyboard.press(key(second!));
+    await expect(page.getByTestId("ruin-entry")).toHaveAttribute("data-symbols", `${first},${second}`);
+    await page.keyboard.press("Backspace");
+    await expect(page.getByTestId("ruin-entry")).toHaveAttribute("data-symbols", first!);
+    await page.keyboard.press(key(second!));
+    await panel.locator(`button[data-symbol="${third}"]`).click();
+    await expect(page.getByTestId("ruin-entry")).toHaveAttribute("data-symbols", `${first},${second},${third}`);
+    await page.keyboard.press("Enter");
+
+    await expect(page.getByTestId("hud-ruin-verdict")).toContainText("Ruin solved: +40 gold");
+    await expect(page.getByTestId("hud-ruin-verdict")).toContainText("The island's rubbings are unlocked");
+    await expect(page.getByTestId("hud-ruin-verdict")).toHaveAttribute("data-state", "solved,unlocked");
+    await expect(panel).toBeHidden();
+    await expect(page.getByTestId("purse-gold")).toHaveAttribute("data-gold", String(gold + 40));
+    await expect(page.getByTestId("hud-ruin")).toHaveAttribute("data-state", "solved");
+    await expect(page.getByTestId("hud-ruins-sighted")).toContainText("Palm Key: open");
+    await expect(page.getByTestId("hud-hold")).toHaveAttribute("data-state", "ready:collect:sun");
+    await attachScreenshot(page, testInfo, "ruin-solve");
+
+    // Then the rubbing, as ever: hold E for six seconds.
+    await page.keyboard.down("e");
+    try {
+      await expect(page.getByTestId("hud-hold")).toHaveAttribute("data-state", "collect:sun");
+      await expect(page.getByTestId("purse-rubbings")).toHaveAttribute("data-types", "sun", { timeout: 12_000 });
+    } finally {
+      await page.keyboard.up("e");
+    }
+    await expect(page.getByTestId("hud-result")).toHaveText("Collected the Sun rubbing");
+  } finally {
+    await companion.close();
+  }
+});
+
+test("a navigation ruin: the grid read off the page, walked with the arrow keys and WASD, the last step undone and retaken, and solved", async ({ browser, page, request }) => {
+  test.setTimeout(90_000);
+  await nextMatchRuins(request, { "1": "navigation" });
+  const code = await createMatch(page);
+  const companion = await startWithCompanion(browser, page, code);
+  try {
+    await place(request, page, code, EMBER_EAST.tileX, EMBER_EAST.tileY, 0);
+    await page.keyboard.press("e");
+    await expect(page.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(EMBER_EAST.id));
+    await expect(page.getByTestId("hud-ruin")).toHaveAttribute("data-state", "locked");
+    const id = await selfId(page);
+    const moored = await readout(page, id);
+    // R opens the panel, Close shuts it (the session stays open), R shows it again.
+    await page.keyboard.press("r");
+    const panel = page.getByTestId("ruin-panel");
+    await expect(panel).toHaveAttribute("data-kind", "navigation");
+    await page.getByTestId("ruin-close").click();
+    await expect(panel).toBeHidden();
+    await page.keyboard.press("r");
+    await expect(panel).toBeVisible();
+    await expect(panel.locator('[data-kind="start"]')).toHaveText("S");
+    await expect(panel.locator('[data-kind="goal"]')).toHaveText("G");
+    for (const blocked of await panel.locator('[data-kind="blocked"]').all()) await expect(blocked).toHaveText("▩");
+    const cells = await panel.getByTestId("ruin-grid").locator("[data-cell]").evaluateAll((squares) =>
+      squares.map((square) => ({ cell: (square as HTMLElement).dataset["cell"]!, kind: (square as HTMLElement).dataset["kind"]! })),
+    );
+    expect(cells).toHaveLength(16);
+    const at = (kind: string) => cells.filter((each) => each.kind === kind).map((each) => ({ x: Number(each.cell.split(",")[0]), y: Number(each.cell.split(",")[1]) }));
+    const moves = readGrid(4, at("start")[0]!, at("goal")[0]!, at("blocked"))!;
+    expect(moves.length).toBeGreaterThanOrEqual(4);
+    const keys: Readonly<Record<string, readonly [string, string]>> = { N: ["ArrowUp", "KeyW"], E: ["ArrowRight", "KeyD"], S: ["ArrowDown", "KeyS"], W: ["ArrowLeft", "KeyA"] };
+    // The whole walk, alternating arrows and WASD; then the last step undone, and taken again.
+    for (const [index, move] of moves.entries()) await page.keyboard.press(keys[move]![index % 2]!);
+    const walked = moves.length;
+    await expect(page.getByTestId("ruin-grid")).toHaveAttribute("data-path", new RegExp(`^(\\S+ ){${walked}}\\S+$`));
+    await expect(panel.locator('[data-path="true"]')).toHaveCount(new Set(await page.getByTestId("ruin-grid").getAttribute("data-path").then((path) => path!.split(" "))).size);
+    await page.getByTestId("ruin-undo").click();
+    await expect(page.getByTestId("ruin-submit")).toBeDisabled();
+    // The click gave the keys back to the page: Space does not press Undo again.
+    await page.keyboard.press("Space");
+    await expect(page.getByTestId("ruin-grid")).toHaveAttribute("data-path", new RegExp(`^(\\S+ ){${walked - 1}}\\S+$`));
+    await page.keyboard.press(keys[moves.at(-1)!]![1]);
+    await expect(page.getByTestId("ruin-entry")).toHaveText(moves.join(" "));
+    await page.getByTestId("ruin-submit").click();
+    await expect(page.getByTestId("hud-ruin-verdict")).toContainText("Ruin solved: +40 gold");
+    await expect(page.getByTestId("hud-ruin-verdict")).toContainText("The island's rubbings are unlocked");
+    // The arrows moved the path, never the ship.
+    expect(await readout(page, id)).toEqual(moored);
+    await expect(page.getByTestId("hud-hold")).toHaveAttribute("data-state", "ready:collect:moon");
+  } finally {
+    await companion.close();
+  }
+});

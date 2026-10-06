@@ -1,0 +1,149 @@
+import type { AddressInfo } from "node:net";
+import { createEndpoint, createRouter, defineRoom, defineServer, matchMaker, WebSocketTransport, type Server } from "colyseus";
+import { createTestPlacementSchema, DUEL_ROOM, MATCH_ROOM, TEST_NEXT_MATCH_TIMINGS_PATH, TEST_PLACEMENT_PATH, testTimingsSchema, type TestTimings } from "@pirate-sea-race/protocol";
+import { defaultSimulationConfig } from "@pirate-sea-race/simulation";
+import { DuelRoom } from "./DuelRoom.js";
+import { DEFAULT_MATCH_TUNING, MatchRoom, type MatchTuning } from "./MatchRoom.js";
+
+export const DEFAULT_PORT = 2593;
+
+/** The largest WebSocket frame the transport accepts; a larger one closes that connection. */
+export const MAX_FRAME_BYTES = 4096;
+
+export interface GameServerOptions {
+  /** 0 picks a free port. */
+  readonly port: number;
+  readonly host?: string;
+  /** Install SIGINT/SIGTERM handlers that drain rooms and exit. Off for in-process tests. */
+  readonly handleSignals?: boolean;
+  /**
+   * Test-only: serve TEST_PLACEMENT_PATH, which puts a player's ship on a chosen tile, and TEST_NEXT_MATCH_TIMINGS_PATH,
+   * which gives the next match created its own test timings. Off by default; only the dev and test entry point
+   * (`dev.ts`) and in-process tests turn it on.
+   */
+  readonly testPlacement?: boolean;
+  /**
+   * Test-only: a match's timings and settings instead of the rules' (`DEFAULT_MATCH_TUNING`), for example a short seat
+   * reservation or respawn delay, or a pinned source layout. Unset in production (`main.ts` never passes it).
+   */
+  readonly matchTuning?: Partial<MatchTuning>;
+  /** Test-only: a standalone duel's reconnection window in seconds instead of DUEL_RECONNECT_SECONDS. */
+  readonly duelReconnectSeconds?: number;
+  /**
+   * Check the ledger and the room's invariants after every world tick (on by default, for development and tests); the
+   * production entry turns it off.
+   */
+  readonly checkInvariants?: boolean;
+}
+
+export interface RunningGameServer {
+  readonly port: number;
+  readonly server: Server;
+  close(): Promise<void>;
+}
+
+/** Placements on the match's own sea map. */
+const testPlacementSchema = createTestPlacementSchema(defaultSimulationConfig.map);
+
+/**
+ * POST TEST_PLACEMENT_PATH with a TestPlacement body: 200 with the ship's new position, 400 for a malformed body, a
+ * tile off the map or a tile a ship cannot sit on, 404 when no match or player matches.
+ */
+const placeShipEndpoint = createEndpoint(TEST_PLACEMENT_PATH, { method: "POST" }, async (context) => {
+  const parsed = testPlacementSchema.safeParse(context.body);
+  if (!parsed.success) return Response.json({ error: "malformed placement" }, { status: 400 });
+  const { code, sessionId, tileX, tileY, heading } = parsed.data;
+  const [listing] = await matchMaker.query({ name: MATCH_ROOM, code });
+  const room = listing === undefined ? undefined : (matchMaker.getLocalRoomById(listing.roomId) as MatchRoom | undefined);
+  if (room === undefined || room.clients.get(sessionId) === undefined) return Response.json({ error: "no such player" }, { status: 404 });
+  try {
+    room.placeShip(sessionId, { tileX, tileY, heading });
+  } catch (error) {
+    return Response.json({ error: (error as Error).message }, { status: 400 });
+  }
+  const ship = room.state.ships.get(sessionId)!;
+  return Response.json({ x: ship.x, y: ship.y, heading: ship.heading });
+});
+
+/**
+ * Test-only timings (`TEST_TIMINGS_ENV`) as a match tuning: the ready countdown, the departure's spawn protection,
+ * the match's duration (the claim deadline, which is also the timer) and the two timed reveals, each only when given.
+ */
+export function testTimingsTuning(timings: TestTimings, base: MatchTuning = DEFAULT_MATCH_TUNING): Partial<MatchTuning> {
+  return {
+    match: { ...base.match, ...(timings.ready !== undefined ? { readyTicks: timings.ready } : {}) },
+    encounters: { ...base.encounters, ...(timings.protection !== undefined ? { spawnProtectionTicks: timings.protection } : {}) },
+    claim: { ...base.claim, ...(timings.match !== undefined ? { deadlineTicks: timings.match } : {}) },
+    intel: {
+      ...base.intel,
+      ...(timings.sectors !== undefined ? { sectorRevealTicks: timings.sectors } : {}),
+      ...(timings.carriers !== undefined ? { carrierRevealTicks: timings.carriers } : {}),
+    },
+  };
+}
+
+/** Test-only timings waiting for the next match a server creates (TEST_NEXT_MATCH_TIMINGS_PATH). */
+interface NextMatchTimings {
+  pending: TestTimings | undefined;
+}
+
+/**
+ * POST TEST_NEXT_MATCH_TIMINGS_PATH with test timings: 200, and the next match created takes them on top of the
+ * server's own; 400 for a malformed body.
+ */
+function nextMatchTimingsEndpoint(next: NextMatchTimings) {
+  return createEndpoint(TEST_NEXT_MATCH_TIMINGS_PATH, { method: "POST" }, async (context) => {
+    const parsed = testTimingsSchema.safeParse(context.body);
+    if (!parsed.success) return Response.json({ error: "malformed timings" }, { status: 400 });
+    next.pending = parsed.data;
+    return Response.json(parsed.data);
+  });
+}
+
+/** The room classes a server registers: the rules' own, or subclasses carrying the test-only settings. */
+function roomClasses(options: GameServerOptions, next: NextMatchTimings): { match: typeof MatchRoom; duel: typeof DuelRoom } {
+  const tuning: MatchTuning = { ...DEFAULT_MATCH_TUNING, ...options.matchTuning, checkInvariants: options.checkInvariants ?? options.matchTuning?.checkInvariants ?? true };
+  const match = class TunedMatchRoom extends MatchRoom {
+    protected override matchTuning(): MatchTuning {
+      // Test-only timings posted for the next match are this one's, once.
+      const timings = next.pending ?? {};
+      next.pending = undefined;
+      return { ...tuning, ...testTimingsTuning(timings, tuning) };
+    }
+  };
+  const seconds = options.duelReconnectSeconds;
+  const duel =
+    seconds === undefined
+      ? DuelRoom
+      : class TunedDuelRoom extends DuelRoom {
+          protected override reconnectSeconds(): number {
+            return seconds;
+          }
+        };
+  return { match, duel };
+}
+
+export async function startGameServer(options: GameServerOptions): Promise<RunningGameServer> {
+  const next: NextMatchTimings = { pending: undefined };
+  const rooms = roomClasses(options, next);
+  const server = defineServer({
+    greet: false,
+    gracefullyShutdown: options.handleSignals ?? true,
+    transport: new WebSocketTransport({ maxPayload: MAX_FRAME_BYTES }),
+    rooms: {
+      // Private matches are found by their code. A create's one-time token is a filter field too, and no listing
+      // holds it, so a request carrying one matches no existing match: `join` fails and `joinOrCreate` creates.
+      [MATCH_ROOM]: defineRoom(rooms.match).filterBy(["code", "createToken"]),
+      // Standalone duels (the combat spike) are admitted the same way, under their own name.
+      [DUEL_ROOM]: defineRoom(rooms.duel).filterBy(["code", "createToken"]),
+    },
+    ...(options.testPlacement === true ? { routes: createRouter({ placeShipEndpoint, nextMatchTimings: nextMatchTimingsEndpoint(next) }) } : {}),
+  });
+  await server.listen(options.port, options.host);
+  const address = server.transport.server?.address() as AddressInfo | null | undefined;
+  return {
+    port: address?.port ?? options.port,
+    server,
+    close: () => server.gracefullyShutdown(false),
+  };
+}

@@ -1,0 +1,111 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { TEST_NEXT_MATCH_TIMINGS_PATH } from "@pirate-sea-race/protocol";
+import { startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { HeadlessClient, type ResultLineView } from "@pirate-sea-race/test-tools";
+import type { MatchReport } from "@pirate-sea-race/simulation/match";
+import { GUEST_SEAT, HOST_SEAT } from "./rubbingsSetup.js";
+import { flowTuning } from "./matchFlowSetup.js";
+import { playersAt, roomOf, tracker, until } from "./seaDuelSetup.js";
+
+/**
+ * The room's reports to the match flow through the real room (§2): a report naming a player the flow does not know is
+ * dropped before `stepMatch` (which throws on one) while the known players' reports still count; and the test-only
+ * timings for the next match created. Test-only timings: a two-second channel and a 10 s match.
+ */
+const MATCH_TICKS = 200;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  const matchTuning = flowTuning({ claim: { ...claimRules, channelTicks: 40, deadlineTicks: MATCH_TICKS } });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+const line = (seat: number, change: Partial<ResultLineView> = {}): ResultLineView => ({
+  seat,
+  winner: false,
+  left: false,
+  rubbingsHeld: 0,
+  collected: 0,
+  thefts: 0,
+  lost: 0,
+  duelsWon: 0,
+  duelsLost: 0,
+  duelsDrawn: 0,
+  gold: 50,
+  cachesClaimed: 0,
+  islandsVisited: 0,
+  ...change,
+});
+
+function postTimings(body: unknown): Promise<Response> {
+  return fetch(`${endpoint}${TEST_NEXT_MATCH_TIMINGS_PATH}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+}
+
+// One after another: the posted timings go to whichever match is created next.
+describe("the room's reports to the match flow (§2)", () => {
+  it("drops a report naming a ghost player without throwing, and still counts the known players' reports of the same tick", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track)) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(host);
+    // The clock stops after a tick in play; the reports go in meanwhile, so the next tick's flow step takes them all.
+    const stopAt = room.matchState.worldTick + 2;
+    room.pauseAfterTick(stopAt);
+    await until(() => room.worldPaused, 5000, "the pause");
+    const ghosts: MatchReport[] = [
+      { kind: "collected", playerId: "ghost" },
+      { kind: "stole", playerId: "ghost" },
+      { kind: "lost", playerId: "ghost" },
+      { kind: "cache-claimed", playerId: "ghost" },
+      { kind: "gold", playerId: "ghost", gold: 99 },
+      { kind: "island-visited", playerId: "ghost", island: "3" },
+      { kind: "duel-ended", playerIds: ["ghost", guest.sessionId], winner: "ghost" },
+      // A claim won by a ghost on the very tick the flow steps: it would end the match with an unknown winner.
+      { kind: "match-ended", tick: stopAt + 1, reason: "claim", winner: "ghost" },
+    ];
+    const known: MatchReport[] = [
+      { kind: "collected", playerId: host.sessionId },
+      { kind: "duel-ended", playerIds: [host.sessionId, guest.sessionId], winner: host.sessionId },
+    ];
+    room.injectFlowReports([ghosts[0]!, known[0]!, ...ghosts.slice(1), known[1]!]);
+    room.resumeWorld();
+    await until(() => room.matchState.worldTick > stopAt + 1, 5000, "the next tick");
+    expect(room.droppedFlowReports).toEqual(ghosts);
+    // Nothing threw: the match was not aborted, and neither the ghost's claim nor anything else ended it.
+    expect(room.flowState.end).toBeNull();
+    expect(room.flowState.players.map((player) => player.id).sort()).toEqual([host.sessionId, guest.sessionId].sort());
+
+    for (const client of [host, guest]) await client.waitFor(() => client.results() !== undefined, 15_000);
+    const results = host.results()!;
+    expect(results).toMatchObject({ reason: "deadline", winnerSeat: 0 });
+    expect([...results.players].sort((a, b) => a.seat - b.seat)).toEqual([
+      line(host.seat, { rubbingsHeld: 1, collected: 1, duelsWon: 1 }),
+      line(guest.seat, { duelsLost: 1 }),
+    ]);
+  }, 25_000);
+
+  it("gives the next match created, and only it, the test timings posted for it", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    expect((await postTimings({ match: 120, ready: 10 })).status).toBe(200);
+    // A malformed body changes nothing.
+    expect((await postTimings({ match: 0 })).status).toBe(400);
+    const first = await HeadlessClient.create(endpoint);
+    track(first);
+    const second = await HeadlessClient.create(endpoint);
+    track(second);
+    await first.waitFor(() => first.room.state.durationTicks === 120);
+    expect(roomOf(first).timings.claim.deadlineTicks).toBe(120);
+    expect(first.room.state.readyTicks).toBe(10);
+    // The next match keeps the server's own.
+    await second.waitFor(() => second.room.state.durationTicks === MATCH_TICKS);
+    expect(roomOf(second).timings.claim.deadlineTicks).toBe(MATCH_TICKS);
+    expect(second.room.state.readyTicks).toBe(roomOf(second).timings.match.readyTicks);
+    expect(second.room.state.readyTicks).not.toBe(10);
+  });
+});

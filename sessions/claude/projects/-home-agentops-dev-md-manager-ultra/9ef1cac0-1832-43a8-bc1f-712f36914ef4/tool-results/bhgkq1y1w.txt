@@ -1,0 +1,791 @@
+import { useCallback, useState } from 'react'
+import {
+  fetchArtifactText,
+  fetchWorkerResult,
+  paths,
+  scopedResultPath,
+  type RunDetail,
+  type RunScope,
+  type WorkerResult,
+  type WorkflowEvent,
+} from './api.ts'
+import { ErrorPanel, LoadingPanel, StatusBadge } from './panels.tsx'
+import { formatTime, KIND_LABEL, nodeStatusMeaning, STATUS_LABEL } from './status.ts'
+import { useResource, type Resource } from './useResource.ts'
+
+type DefinitionNode = RunDetail['definition']['nodes'][number]
+type SnapshotNode = RunDetail['snapshot']['nodes'][number]
+
+type Props = {
+  scope: RunScope
+  definition: DefinitionNode
+  node: SnapshotNode
+  events: Resource<WorkflowEvent[]>
+  onRetryEvents: () => void
+  refreshToken: number
+}
+
+function shortSha(value: string | null): string {
+  return value === null ? 'none' : value.slice(0, 12)
+}
+
+/** Text-like artifact kinds are shown as plain text on demand; screenshots are images; anything else is only listed. */
+function TextArtifact({ scope, artifactId }: { scope: RunScope; artifactId: string }) {
+  const [open, setOpen] = useState(false)
+  const load = useCallback((signal: AbortSignal) => fetchArtifactText(scope, artifactId, signal), [scope, artifactId])
+  const { state, reload } = useResource(open ? `artifact:${artifactId}` : null, load)
+  return (
+    <div className="artifact-text">
+      <button type="button" className="button button-small" aria-expanded={open} onClick={() => setOpen(previous => !previous)}>
+        {open ? 'Hide contents' : 'Show contents'}
+      </button>
+      {open && state.status === 'loading' && <LoadingPanel>Loading artifact {artifactId}…</LoadingPanel>}
+      {open && state.status === 'error' && <ErrorPanel error={state.error} what={`Artifact ${artifactId}`} onRetry={reload} />}
+      {open && state.status === 'ready' && (
+        state.data.length === 0
+          ? <p className="projects-muted">This artifact is empty.</p>
+          : <pre className="artifact-log" data-testid={`artifact-text:${artifactId}`} tabIndex={0}>{state.data}</pre>
+      )}
+    </div>
+  )
+}
+
+function ScreenshotArtifact({ scope, artifactId }: { scope: RunScope; artifactId: string }) {
+  const [failed, setFailed] = useState(false)
+  if (failed) return <p className="projects-error-inline" role="alert">Screenshot {artifactId} could not be loaded from the artifact route.</p>
+  return (
+    <img
+      className="artifact-screenshot"
+      src={paths.artifact(scope, artifactId)}
+      alt={`Screenshot artifact ${artifactId}`}
+      data-testid={`artifact-screenshot:${artifactId}`}
+      onError={() => setFailed(true)}
+    />
+  )
+}
+
+function WorkerEvidence({ scope, result, node }: { scope: RunScope; result: WorkerResult; node: SnapshotNode }) {
+  const artifactsById = new Map(result.artifacts.map(artifact => [artifact.artifact_id, artifact]))
+  const checkLogs = new Set(result.checks.map(check => check.log_artifact_id))
+  const screenshots = result.artifacts.filter(artifact => artifact.kind === 'screenshot')
+  // Check logs are shown with their check; everything else that is not a screenshot is listed here.
+  const others = result.artifacts.filter(artifact => artifact.kind !== 'screenshot' && !checkLogs.has(artifact.artifact_id))
+  return (
+    <div className="worker-evidence" data-testid="worker-result">
+      <dl className="projects-facts">
+        <div><dt>Result status</dt><dd><StatusBadge status={result.status} /></dd></div>
+        <div><dt>Result attempt</dt><dd>{result.attempt}{result.attempt !== node.attempt ? ` (graph node attempt is ${node.attempt})` : ''}</dd></div>
+        <div><dt>Session</dt><dd><code>{result.session_id}</code></dd></div>
+        <div><dt>Base commit</dt><dd><code>{shortSha(result.base_commit)}</code></dd></div>
+        <div><dt>Output commit</dt><dd>{result.output_commit ? <code>{shortSha(result.output_commit)}</code> : 'None recorded (no durable output commit)'}</dd></div>
+      </dl>
+      <p className="worker-summary" data-testid="worker-summary">{result.summary}</p>
+      {result.error && (
+        <div className="projects-error" role="alert" data-testid="worker-error">
+          <p><strong>Error {result.error.code}:</strong> {result.error.message}</p>
+          <p>{result.error.retryable ? 'Marked retryable by the producer. Retrying is done through the workflow CLI, not this viewer.' : 'Marked not retryable by the producer.'}</p>
+        </div>
+      )}
+
+      <section className="evidence-section" aria-labelledby="evidence-checks">
+        <h4 id="evidence-checks">Checks actually executed</h4>
+        {result.checks.length === 0 ? (
+          <p className="projects-muted" data-testid="checks-empty">No checks were recorded for this result.</p>
+        ) : (
+          <ul className="evidence-list" data-testid="checks-list">
+            {result.checks.map((check, index) => {
+              const log = artifactsById.get(check.log_artifact_id)
+              return (
+                <li key={`${check.log_artifact_id}-${index}`} className={check.exit_code === 0 ? 'check check-passed' : 'check check-failed'} data-exit-code={check.exit_code}>
+                  <div className="check-head">
+                    <code className="check-command">{check.command}</code>
+                    <span className="check-exit">{check.exit_code === 0 ? 'exit 0' : `exit ${check.exit_code} (failed)`}</span>
+                  </div>
+                  <p className="projects-muted check-meta">
+                    {formatTime(check.started_at)} → {formatTime(check.finished_at)} · cwd <code>{check.cwd}</code>
+                  </p>
+                  <div className="check-log">
+                    <span>Log artifact <code>{check.log_artifact_id}</code>{log ? '' : ' (not listed among the result artifacts)'}</span>
+                    {log && <TextArtifact scope={scope} artifactId={log.artifact_id} />}
+                  </div>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </section>
+
+      <section className="evidence-section" aria-labelledby="evidence-files">
+        <h4 id="evidence-files">Changed files</h4>
+        {result.changed_files.length === 0 ? (
+          <p className="projects-muted" data-testid="changed-files-empty">No changed files were recorded.</p>
+        ) : (
+          <ul className="evidence-list evidence-files" data-testid="changed-files">
+            {result.changed_files.map(file => <li key={file}><code>{file}</code></li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="evidence-section" aria-labelledby="evidence-assumptions">
+        <h4 id="evidence-assumptions">Open assumptions</h4>
+        {result.open_assumptions.length === 0 ? (
+          <p className="projects-muted" data-testid="assumptions-empty">No open assumptions were recorded.</p>
+        ) : (
+          <ul className="evidence-list" data-testid="assumptions">
+            {result.open_assumptions.map((assumption, index) => <li key={index}>{assumption}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="evidence-section" aria-labelledby="evidence-screenshots">
+        <h4 id="evidence-screenshots">Screenshots</h4>
+        {screenshots.length === 0 ? (
+          <p className="projects-muted" data-testid="screenshots-empty">No screenshot artifacts were published.</p>
+        ) : (
+          <ul className="evidence-list evidence-screenshots" data-testid="screenshots">
+            {screenshots.map(artifact => (
+              <li key={artifact.artifact_id}>
+                <p><code>{artifact.artifact_id}</code> <span className="projects-muted">sha256 {artifact.sha256.slice(0, 12)}…</span></p>
+                <ScreenshotArtifact scope={scope} artifactId={artifact.artifact_id} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="evidence-section" aria-labelledby="evidence-artifacts">
+        <h4 id="evidence-artifacts">Other artifacts</h4>
+        {others.length === 0 ? (
+          <p className="projects-muted">No artifacts beyond the check logs and screenshots were published.</p>
+        ) : (
+          <ul className="evidence-list" data-testid="artifacts">
+            {others.map(artifact => (
+              <li key={artifact.artifact_id}>
+                <p><code>{artifact.artifact_id}</code> · {artifact.kind} · <span className="projects-muted">sha256 {artifact.sha256.slice(0, 12)}…</span></p>
+                {artifact.kind === 'other'
+                  ? <p className="projects-muted">Not rendered: only logs, reports, patches and screenshots are displayed.</p>
+                  : <TextArtifact scope={scope} artifactId={artifact.artifact_id} />}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  )
+}
+
+/** Everything known about one node of a run: state, reuse evidence, result and events. Absent evidence is stated. */
+export function NodeDetail({ scope, definition, node, events, onRetryEvents, refreshToken }: Props) {
+  const resultPath = node.result_uri === null ? null : scopedResultPath(scope, node.result_uri)
+  const loadResult = useCallback((signal: AbortSignal) => fetchWorkerResult(scope, resultPath!, signal), [scope, resultPath])
+  const { state: result, reload: reloadResult } = useResource(resultPath, loadResult, refreshToken)
+
+  const nodeEvents = events.status === 'ready' ? events.data.filter(event => event.node_id === node.node_id) : []
+  const reuse = nodeEvents.filter(event => event.type === 'result_reused')
+  const approvals = nodeEvents.filter(event => event.type === 'approval_requested')
+
+  return (
+    <section className="node-detail" aria-labelledby="node-detail-title" data-testid="node-detail" data-node-id={node.node_id}>
+      <h3 id="node-detail-title">{definition.label} <span className="projects-muted node-detail-id">({node.node_id})</span></h3>
+      <dl className="projects-facts">
+        <div><dt>Kind</dt><dd>{KIND_LABEL[definition.kind]}</dd></div>
+        <div><dt>Status</dt><dd><StatusBadge status={node.status} /> <span data-testid="node-status-meaning">{nodeStatusMeaning(definition.kind, node.status)}</span></dd></div>
+        <div><dt>Graph attempt</dt><dd data-testid="node-attempt">{node.attempt === 0 ? '0 (not started)' : node.attempt}</dd></div>
+        <div><dt>Session</dt><dd>{node.session_id ? <code>{node.session_id}</code> : 'No session recorded'}</dd></div>
+        <div><dt>Depends on</dt><dd>{definition.depends_on.length ? definition.depends_on.join(', ') : 'nothing'}</dd></div>
+      </dl>
+
+      {node.status === 'awaiting_approval' && (
+        <div className="projects-notice" role="status" data-testid="awaiting-notice">
+          <p><strong>Awaiting approval.</strong> This node is stopped at a decision that has not been recorded. Viewing does not approve it; decisions are made through the workflow CLI.</p>
+          {approvals.length > 0 && (
+            <ul className="evidence-list">
+              {approvals.map(event => <li key={event.event_id}>Requested at {formatTime(event.occurred_at)}: {event.message}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <section className="evidence-section" aria-labelledby="node-reuse">
+        <h4 id="node-reuse">Reuse evidence</h4>
+        {events.status === 'loading' && <LoadingPanel>Loading events…</LoadingPanel>}
+        {events.status === 'error' && <p className="projects-muted">Events could not be loaded, so reuse cannot be determined.</p>}
+        {events.status === 'ready' && (reuse.length === 0 ? (
+          <p className="projects-muted" data-testid="reuse-none">No reuse evidence recorded: the attempts shown are this node's own graph attempts, not reused results.</p>
+        ) : (
+          <ul className="evidence-list" data-testid="reuse-list">
+            {reuse.map(event => (
+              <li key={event.event_id}>
+                Attempt {event.attempt} reused the result of attempt {event.reused_from_attempt ?? 'unknown'} (event {event.sequence}, {formatTime(event.occurred_at)}): {event.message}
+              </li>
+            ))}
+          </ul>
+        ))}
+      </section>
+
+      <section className="evidence-section" aria-labelledby="node-result">
+        <h4 id="node-result">Result</h4>
+        {node.result_uri === null && <p className="projects-muted" data-testid="result-none">No result has been published for this node{node.attempt === 0 ? ' (it has not started)' : ''}.</p>}
+        {node.result_uri !== null && resultPath === null && (
+          <p className="projects-error-inline" role="alert" data-testid="result-unscoped">
+            The result link <code>{node.result_uri}</code> is outside this run's results route and was not fetched.
+          </p>
+        )}
+        {resultPath !== null && result.status === 'loading' && <LoadingPanel>Loading the result…</LoadingPanel>}
+        {resultPath !== null && result.status === 'error' && <ErrorPanel error={result.error} what="The node result" onRetry={reloadResult} />}
+        {resultPath !== null && result.status === 'ready' && <WorkerEvidence scope={scope} result={result.data} node={node} />}
+      </section>
+
+      <section className="evidence-section" aria-labelledby="node-timeline">
+        <h4 id="node-timeline">Events for this node</h4>
+        {events.status === 'loading' && <LoadingPanel>Loading events…</LoadingPanel>}
+        {events.status === 'error' && <ErrorPanel error={events.error} what="The run events" onRetry={onRetryEvents} />}
+        {events.status === 'ready' && (nodeEvents.length === 0 ? (
+          <p className="projects-muted" data-testid="events-none">No events reference this node.</p>
+        ) : (
+          <ol className="event-list" data-testid="node-events">
+            {nodeEvents.map(event => (
+              <li key={event.event_id}>
+                <span className="event-seq">#{event.sequence}</span> <span className="projects-muted">{formatTime(event.occurred_at)}</span>{' '}
+                <span className="event-type">{event.type.replace(/_/g, ' ')}</span>
+                {event.status && <> · <StatusBadge status={event.status} /></>}
+                {event.attempt > 0 && <> · attempt {event.attempt}</>}
+                {event.message && <> — {event.message}</>}
+                {event.artifact && <> · artifact <code>{event.artifact.artifact_id}</code> ({event.artifact.kind})</>}
+              </li>
+            ))}
+          </ol>
+        ))}
+      </section>
+      <p className="projects-muted node-detail-footnote">Status labels here are historical observations; “{STATUS_LABEL.succeeded}” on a worker node is not workflow completion.</p>
+    </section>
+  )
+}
+=== RunView.tsx ===
+import { useCallback } from 'react'
+import { fetchEvents, type RunDetail, type RunScope, type WorkflowDefinition } from './api.ts'
+import { NodeDetail } from './NodeDetail.tsx'
+import { AppLink, StatusBadge } from './panels.tsx'
+import { runPathname } from './routes.ts'
+import { formatTime, KIND_LABEL, RUN_STATUS_MEANING, shortRevision, STATUS_LABEL } from './status.ts'
+import { useResource } from './useResource.ts'
+import { WorkflowGraph, type GraphNodeView } from './WorkflowGraph.tsx'
+
+type Props = {
+  scope: RunScope
+  detail: RunDetail
+  /** The workflow's current definition, when the workflow list loaded; used only to say whether it changed. */
+  current: WorkflowDefinition | null
+  selectedNodeId: string | null
+  refreshToken: number
+  onNavigate: (pathname: string) => void
+}
+
+/** One run: its summary, its pinned definition graph coloured by actual node statuses, and the selected node. */
+export function RunView({ scope, detail, current, selectedNodeId, refreshToken, onNavigate }: Props) {
+  const { summary, definition, snapshot } = detail
+  const snapshotById = new Map(snapshot.nodes.map(node => [node.node_id, node]))
+  const graphNodes: GraphNodeView[] = definition.nodes.map(node => {
+    const state = snapshotById.get(node.node_id)!
+    return { node_id: node.node_id, label: node.label, kind: node.kind, depends_on: node.depends_on, status: state.status, attempt: state.attempt }
+  })
+  const selectedDefinition = selectedNodeId === null ? null : definition.nodes.find(node => node.node_id === selectedNodeId) ?? null
+  const selectedState = selectedNodeId === null ? null : snapshotById.get(selectedNodeId) ?? null
+
+  const loadEvents = useCallback((signal: AbortSignal) => fetchEvents(scope, signal), [scope])
+  const { state: events, reload: reloadEvents } = useResource(`events:${scope.projectId}/${scope.workflowId}/${scope.runId}`, loadEvents, refreshToken)
+
+  const selectNode = (nodeId: string) => onNavigate(runPathname(scope.projectId, scope.workflowId, scope.runId, nodeId))
+  const definitionChanged = current !== null && current.definition_revision !== definition.definition_revision
+
+  return (
+    <div className="run-view" data-testid="run-view" data-run-id={summary.run_id} data-run-status={summary.status}>
+      <section className="run-summary" aria-labelledby="run-summary-title">
+        <h2 id="run-summary-title">Run {summary.run_id}</h2>
+        <p className="run-status-line" data-testid="run-status">
+          <StatusBadge status={summary.status} /> <span data-testid="run-status-meaning">{RUN_STATUS_MEANING[summary.status]}</span>
+        </p>
+        <dl className="projects-facts">
+          <div><dt>Created</dt><dd>{formatTime(summary.created_at)}</dd></div>
+          <div><dt>Updated</dt><dd>{formatTime(summary.updated_at)}</dd></div>
+          <div><dt>Last event</dt><dd>{snapshot.last_sequence === 0 ? 'none' : `sequence ${snapshot.last_sequence}`}</dd></div>
+          <div>
+            <dt>Pinned definition</dt>
+            <dd data-testid="pinned-definition">
+              {definition.name} · revision <code>{shortRevision(definition.definition_revision)}</code>
+              {current === null
+                ? null
+                : definitionChanged
+                  ? <span className="projects-warning" data-testid="definition-changed"> — the current workflow definition (revision <code>{shortRevision(current.definition_revision)}</code>) differs; this run is shown against its own pinned graph.</span>
+                  : <span className="projects-muted" data-testid="definition-current"> — same as the current workflow definition.</span>}
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      <section className="run-graph" aria-labelledby="run-graph-title">
+        <h3 id="run-graph-title">Pinned graph</h3>
+        <WorkflowGraph title={`Pinned definition graph of run ${summary.run_id}`} nodes={graphNodes} selectedId={selectedNodeId} onSelect={selectNode} />
+        <p className="projects-muted">Keyboard: Tab or arrow keys move between nodes, Enter or Space opens a node. The list below is the same graph as text.</p>
+      </section>
+
+      <div className="run-columns">
+        <nav className="run-nodes" aria-labelledby="run-nodes-title">
+          <h3 id="run-nodes-title">Nodes</h3>
+          <ul className="run-node-list" data-testid="run-node-list">
+            {graphNodes.map(node => (
+              <li key={node.node_id} data-node-id={node.node_id} data-status={node.status}>
+                <AppLink href={runPathname(scope.projectId, scope.workflowId, scope.runId, node.node_id)} onNavigate={onNavigate} className="run-node-link" current={node.node_id === selectedNodeId}>
+                  <span className="run-node-label">{node.label}</span>
+                  <span className="run-node-meta">
+                    <StatusBadge status={node.status!} /> {KIND_LABEL[node.kind]} · attempt {node.attempt}
+                  </span>
+                </AppLink>
+              </li>
+            ))}
+          </ul>
+        </nav>
+
+        <div className="run-detail-panel">
+          {selectedNodeId === null && (
+            <p className="projects-muted" data-testid="node-hint">Select a node in the graph or the list to inspect its attempts, result, evidence and events.</p>
+          )}
+          {selectedNodeId !== null && (selectedDefinition === null || selectedState === null) && (
+            <div className="projects-error" role="alert" data-testid="node-missing">
+              <p>Node <code>{selectedNodeId}</code> is not part of this run's pinned definition.</p>
+              <p><AppLink href={runPathname(scope.projectId, scope.workflowId, scope.runId)} onNavigate={onNavigate}>Back to the run</AppLink></p>
+            </div>
+          )}
+          {selectedDefinition !== null && selectedState !== null && (
+            <NodeDetail scope={scope} definition={selectedDefinition} node={selectedState} events={events} onRetryEvents={reloadEvents} refreshToken={refreshToken} />
+          )}
+        </div>
+      </div>
+      <p className="projects-muted run-footnote">Statuses: {Object.entries(STATUS_LABEL).map(([key, label]) => `${label} (${key})`).join(', ')}. Only a succeeded run is a completed workflow.</p>
+    </div>
+  )
+}
+=== panels.tsx ===
+import type { ReactNode } from 'react'
+import { describeApiError, ProjectsApiError } from './api.ts'
+import { RUN_STATUS_MEANING, STATUS_LABEL, type RunStatus } from './status.ts'
+
+export function StatusBadge({ status, explain = false }: { status: RunStatus; explain?: boolean }) {
+  return (
+    <span className={`status-badge status-${status}`} data-status={status}>
+      <span>{STATUS_LABEL[status]}</span>
+      {explain && <span className="visually-hidden">. {RUN_STATUS_MEANING[status]}</span>}
+    </span>
+  )
+}
+
+export function LoadingPanel({ children }: { children: ReactNode }) {
+  return <p className="projects-loading" aria-busy="true">{children}</p>
+}
+
+/** A failed request: what failed, why, and what the reader can do. Never replaced by sample data. */
+export function ErrorPanel({ error, what, onRetry, children }: { error: unknown; what: string; onRetry?: () => void; children?: ReactNode }) {
+  const api = error instanceof ProjectsApiError ? error : null
+  return (
+    <div className="projects-error" role="alert" data-testid="projects-error" data-error-kind={api?.kind ?? 'unknown'}>
+      <p><strong>{what} could not be loaded.</strong> {describeApiError(error)}</p>
+      {api?.kind === 'http' && api.status !== null && api.status >= 500 && <p>The server reported a failure; nothing was substituted for the missing data. Retry once it has recovered.</p>}
+      {api?.kind === 'malformed' && <p>The response was rejected rather than rendered, because it might be incomplete or from an incompatible server version.</p>}
+      {api && <p className="projects-error-path">Request: <code>{api.path}</code></p>}
+      <div className="projects-actions">
+        {onRetry && <button type="button" className="button" onClick={onRetry}>Retry</button>}
+        {children}
+      </div>
+    </div>
+  )
+}
+
+export function EmptyPanel({ title, children, testId }: { title: string; children?: ReactNode; testId?: string }) {
+  return (
+    <div className="projects-empty" data-testid={testId}>
+      <p><strong>{title}</strong></p>
+      {children}
+    </div>
+  )
+}
+
+/** A link that navigates inside the app through history rather than reloading. */
+export function AppLink({ href, onNavigate, className, children, current = false }: { href: string; onNavigate: (pathname: string) => void; className?: string; children: ReactNode; current?: boolean }) {
+  return (
+    <a
+      href={href}
+      className={className}
+      aria-current={current ? 'page' : undefined}
+      onClick={event => {
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return
+        event.preventDefault()
+        onNavigate(href)
+      }}
+    >
+      {children}
+    </a>
+  )
+}
+=== api.ts ===
+/**
+ * Read-only client for the project workflow viewer API (`contracts/projects/README.md`).
+ *
+ * Every payload is validated against the committed contract schemas before it reaches a component. A
+ * response that fails validation is a malformed-payload error: nothing is patched up or substituted.
+ * Artifacts and results are only ever requested through the scoped routes of the run being viewed.
+ */
+import { z } from 'zod'
+import { schemas, validateRunDetail, type Project, type RunDetail, type RunSummary, type WorkflowDefinition } from '../../contracts/projects/v1.ts'
+import { eventSchema, validateWorkerResult, type WorkerResult, type WorkflowEvent } from '../../contracts/workflow/v1.ts'
+
+export type { Project, RunDetail, RunSummary, WorkflowDefinition, WorkerResult, WorkflowEvent }
+
+export type ApiErrorKind = 'network' | 'http' | 'malformed'
+
+/** A failed request. `status` is set for HTTP failures; `code` comes from the contract error body when present. */
+export class ProjectsApiError extends Error {
+  readonly kind: ApiErrorKind
+  readonly status: number | null
+  readonly code: string | null
+  readonly path: string
+
+  constructor(kind: ApiErrorKind, message: string, path: string, options: { status?: number | null; code?: string | null } = {}) {
+    super(message)
+    this.name = 'ProjectsApiError'
+    this.kind = kind
+    this.status = options.status ?? null
+    this.code = options.code ?? null
+    this.path = path
+  }
+
+  get notFound(): boolean {
+    return this.kind === 'http' && this.status === 404
+  }
+}
+
+export function describeApiError(error: unknown): string {
+  if (error instanceof ProjectsApiError) {
+    switch (error.kind) {
+      case 'network': return 'The API could not be reached. Check that the server is running, then retry.'
+      case 'malformed': return `The API returned data that does not match the projects contract: ${error.message}`
+      case 'http': return error.code ? `${error.message} (${error.code}, HTTP ${error.status})` : `${error.message} (HTTP ${error.status})`
+    }
+  }
+  return error instanceof Error && error.message ? error.message : 'An unexpected error occurred.'
+}
+
+const errorBodySchema = z.object({ error: z.object({ code: z.string(), message: z.string() }) })
+
+function encodeSegments(...segments: string[]): string {
+  return segments.map(encodeURIComponent).join('/')
+}
+
+export type RunScope = { projectId: string; workflowId: string; runId: string }
+
+export const paths = {
+  projects: () => '/api/projects',
+  workflows: (projectId: string) => `/api/projects/${encodeSegments(projectId)}/workflows`,
+  runs: (projectId: string, workflowId: string, options: { limit?: number; cursor?: string | null } = {}) => {
+    const query = new URLSearchParams()
+    if (options.limit !== undefined) query.set('limit', String(options.limit))
+    if (options.cursor) query.set('cursor', options.cursor)
+    const suffix = query.size ? `?${query}` : ''
+    return `/api/projects/${encodeSegments(projectId)}/workflows/${encodeSegments(workflowId)}/runs${suffix}`
+  },
+  run: (scope: RunScope) => `/api/projects/${encodeSegments(scope.projectId)}/workflows/${encodeSegments(scope.workflowId)}/runs/${encodeSegments(scope.runId)}`,
+  events: (scope: RunScope, after = 0) => `${paths.run(scope)}/events?after=${after}`,
+  result: (scope: RunScope, nodeId: string, attempt: number) => `${paths.run(scope)}/results/${encodeSegments(nodeId)}/${attempt}`,
+  artifact: (scope: RunScope, artifactId: string) => `${paths.run(scope)}/artifacts/${encodeSegments(artifactId)}`,
+}
+
+async function request(path: string, signal: AbortSignal | undefined, accept: string): Promise<Response> {
+  let response: Response
+  try {
+    response = await fetch(path, { signal, headers: { Accept: accept } })
+  } catch (error) {
+    if (signal?.aborted) throw error
+    throw new ProjectsApiError('network', error instanceof Error ? error.message : 'Network failure', path)
+  }
+  if (!response.ok) {
+    let body: unknown = null
+    try { body = await response.json() } catch { /* not JSON */ }
+    const parsed = errorBodySchema.safeParse(body)
+    const message = parsed.success ? parsed.data.error.message : `The API responded with status ${response.status}.`
+    throw new ProjectsApiError('http', message, path, { status: response.status, code: parsed.success ? parsed.data.error.code : null })
+  }
+  return response
+}
+
+async function requestJson<T>(path: string, validate: (input: unknown) => T, signal?: AbortSignal): Promise<T> {
+  const response = await request(path, signal, 'application/json')
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    throw new ProjectsApiError('malformed', 'the response body is not JSON.', path)
+  }
+  try {
+    return validate(body)
+  } catch (error) {
+    throw new ProjectsApiError('malformed', error instanceof z.ZodError ? z.prettifyError(error) : error instanceof Error ? error.message : 'invalid payload', path)
+  }
+}
+
+export function fetchProjects(signal?: AbortSignal): Promise<Project[]> {
+  return requestJson(paths.projects(), input => schemas.projectList.parse(input).projects, signal)
+}
+
+export function fetchWorkflows(projectId: string, signal?: AbortSignal): Promise<WorkflowDefinition[]> {
+  return requestJson(paths.workflows(projectId), input => schemas.workflowList.parse(input).workflows, signal)
+}
+
+export type RunPage = { runs: RunSummary[]; nextCursor: string | null }
+
+export function fetchRuns(projectId: string, workflowId: string, options: { cursor?: string | null } = {}, signal?: AbortSignal): Promise<RunPage> {
+  return requestJson(paths.runs(projectId, workflowId, options), input => {
+    const page = schemas.runList.parse(input)
+    for (const run of page.runs) {
+      if (run.project_id !== projectId || run.workflow_id !== workflowId) throw new Error(`run ${run.run_id} belongs to another scope.`)
+    }
+    return { runs: page.runs, nextCursor: page.next_cursor }
+  }, signal)
+}
+
+export function fetchRunDetail(scope: RunScope, signal?: AbortSignal): Promise<RunDetail> {
+  return requestJson(paths.run(scope), input => {
+    const detail = validateRunDetail(input)
+    if (detail.summary.project_id !== scope.projectId || detail.summary.workflow_id !== scope.workflowId || detail.summary.run_id !== scope.runId) {
+      throw new Error('the run detail belongs to a different project, workflow or run.')
+    }
+    return detail
+  }, signal)
+}
+
+const eventListSchema = z.strictObject({ events: z.array(eventSchema) })
+
+export function fetchEvents(scope: RunScope, signal?: AbortSignal): Promise<WorkflowEvent[]> {
+  return requestJson(paths.events(scope, 0), input => {
+    const events = eventListSchema.parse(input).events
+    // Deduplicate by sequence and keep the persisted order; the run ID must be this run's.
+    const seen = new Set<number>()
+    const unique: WorkflowEvent[] = []
+    for (const event of events) {
+      if (event.run_id !== scope.runId) throw new Error(`event ${event.event_id} belongs to run ${event.run_id}.`)
+      if (seen.has(event.sequence)) continue
+      seen.add(event.sequence)
+      unique.push(event)
+    }
+    return unique.sort((a, b) => a.sequence - b.sequence)
+  }, signal)
+}
+
+/** Only results published under this run's scoped `results/` route are fetched; anything else is refused. */
+export function scopedResultPath(scope: RunScope, resultUri: string): string | null {
+  const prefix = `${paths.run(scope)}/results/`
+  if (!resultUri.startsWith(prefix)) return null
+  const rest = resultUri.slice(prefix.length).split('/')
+  if (rest.length !== 2 || rest.some(segment => segment === '') || !/^[1-9][0-9]*$/.test(rest[1])) return null
+  return resultUri
+}
+
+export function fetchWorkerResult(scope: RunScope, resultPath: string, signal?: AbortSignal): Promise<WorkerResult> {
+  return requestJson(resultPath, input => {
+    const result = validateWorkerResult(input)
+    if (result.run_id !== scope.runId) throw new Error(`the result belongs to run ${result.run_id}.`)
+    return result
+  }, signal)
+}
+
+/** Text artifacts (logs, reports, patches) are read as plain text and rendered as text, never as HTML. */
+export async function fetchArtifactText(scope: RunScope, artifactId: string, signal?: AbortSignal): Promise<string> {
+  const response = await request(paths.artifact(scope, artifactId), signal, 'text/plain, */*')
+  return response.text()
+}
+=== routes.ts ===
+/**
+ * Projects routes: `/projects[/<project>[/workflows/<workflow>[/runs/<run>[/nodes/<node>]]]]`.
+ *
+ * Every ID is an opaque contract identifier: it must match the shared ID pattern and is percent-encoded
+ * as one path segment. Anything else is malformed rather than looked up. This domain is read-only and
+ * separate from the Pi/Claude skill sources; nothing here names a filesystem path.
+ */
+
+/** Same pattern as the shared projects contract (`contracts/projects/v1.ts`). */
+export const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+export const PROJECTS_ROUTE = 'projects'
+
+export type ProjectsRoute =
+  | { level: 'projects' }
+  | { level: 'project'; projectId: string }
+  | { level: 'workflow'; projectId: string; workflowId: string }
+  | { level: 'run'; projectId: string; workflowId: string; runId: string; nodeId: string | null }
+
+export function isContractId(value: string): boolean {
+  return PROJECT_ID_PATTERN.test(value)
+}
+
+function encode(segments: string[]): string {
+  return `/${segments.map(encodeURIComponent).join('/')}`
+}
+
+export function projectsPathname(): string {
+  return `/${PROJECTS_ROUTE}`
+}
+
+export function projectPathname(projectId: string): string {
+  return encode([PROJECTS_ROUTE, projectId])
+}
+
+export function workflowPathname(projectId: string, workflowId: string): string {
+  return encode([PROJECTS_ROUTE, projectId, 'workflows', workflowId])
+}
+
+export function runPathname(projectId: string, workflowId: string, runId: string, nodeId: string | null = null): string {
+  const segments = [PROJECTS_ROUTE, projectId, 'workflows', workflowId, 'runs', runId]
+  if (nodeId !== null) segments.push('nodes', nodeId)
+  return encode(segments)
+}
+
+export function routeToPathname(route: ProjectsRoute): string {
+  switch (route.level) {
+    case 'projects': return projectsPathname()
+    case 'project': return projectPathname(route.projectId)
+    case 'workflow': return workflowPathname(route.projectId, route.workflowId)
+    case 'run': return runPathname(route.projectId, route.workflowId, route.runId, route.nodeId)
+  }
+}
+
+/** Whether a pathname belongs to the Projects domain at all (decided before any decoding). */
+export function isProjectsPathname(pathname: string): boolean {
+  const first = pathname.split('/').filter(segment => segment !== '')[0]
+  return first === PROJECTS_ROUTE
+}
+
+/**
+ * Parses a Projects pathname. Returns null when it is not a Projects pathname or when any segment is
+ * malformed (bad encoding, an invalid ID, an unexpected literal or trailing segments).
+ */
+export function parseProjectsPathname(pathname: string): ProjectsRoute | null {
+  const raw = pathname.split('/').filter(segment => segment !== '')
+  if (raw[0] !== PROJECTS_ROUTE) return null
+  let segments: string[]
+  try {
+    segments = raw.slice(1).map(decodeURIComponent)
+  } catch {
+    return null
+  }
+  if (segments.length === 0) return { level: 'projects' }
+  const [projectId, workflowsLiteral, workflowId, runsLiteral, runId, nodesLiteral, nodeId, ...rest] = segments
+  if (!isContractId(projectId)) return null
+  if (workflowsLiteral === undefined) return { level: 'project', projectId }
+  if (workflowsLiteral !== 'workflows' || workflowId === undefined || !isContractId(workflowId)) return null
+  if (runsLiteral === undefined) return { level: 'workflow', projectId, workflowId }
+  if (runsLiteral !== 'runs' || runId === undefined || !isContractId(runId)) return null
+  if (nodesLiteral === undefined) return { level: 'run', projectId, workflowId, runId, nodeId: null }
+  if (nodesLiteral !== 'nodes' || nodeId === undefined || !isContractId(nodeId) || rest.length > 0) return null
+  return { level: 'run', projectId, workflowId, runId, nodeId }
+}
+=== status.ts ===
+/**
+ * Human wording for run and node states. The wording deliberately separates "this node finished" from
+ * "this workflow is complete": only a `succeeded` run is complete, and a worker node's success only means
+ * its native session launched and ended its turn.
+ */
+import type { RunDetail } from './api.ts'
+
+export type RunStatus = RunDetail['summary']['status']
+export type NodeKind = RunDetail['definition']['nodes'][number]['kind']
+
+export const STATUS_LABEL: Record<RunStatus, string> = {
+  pending: 'Pending',
+  running: 'Running',
+  awaiting_approval: 'Awaiting approval',
+  paused: 'Paused',
+  succeeded: 'Succeeded',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+}
+
+/** What a run in this status means for the workflow as a whole. */
+export const RUN_STATUS_MEANING: Record<RunStatus, string> = {
+  pending: 'Nothing has started yet.',
+  running: 'Work is in progress. The workflow is not complete.',
+  awaiting_approval: 'Stopped at a decision that has not been made. The workflow is not complete; nothing is approved by viewing it.',
+  paused: 'Paused with unresolved state (for example a session that could not be reconciled). The workflow is not complete.',
+  succeeded: 'Integration was confirmed and no graph work remains.',
+  failed: 'A graph step or check failed. The workflow did not complete.',
+  cancelled: 'The run was cancelled before completion.',
+}
+
+/** What a node in this status means, given its kind. */
+export function nodeStatusMeaning(kind: NodeKind, status: RunStatus): string {
+  switch (status) {
+    case 'pending': return 'Not started: no attempt has run.'
+    case 'running': return kind === 'worker' ? 'The native worker session is running or its turn has not been signalled complete.' : 'In progress.'
+    case 'awaiting_approval': return 'Waiting for an explicit decision recorded outside this viewer. Not complete.'
+    case 'paused': return 'Paused with unresolved evidence. Not complete.'
+    case 'succeeded':
+      return kind === 'worker'
+        ? 'The worker session launched and ended its turn. This is not workflow completion; verification, review and integration are separate nodes.'
+        : kind === 'integration'
+          ? 'This integration step completed.'
+          : 'This step completed.'
+    case 'failed': return 'This step failed. The run cannot succeed without intervention.'
+    case 'cancelled': return 'This step was cancelled.'
+  }
+}
+
+export const KIND_LABEL: Record<NodeKind, string> = {
+  prepare: 'Preparation',
+  worker: 'Worker',
+  verification: 'Verification',
+  review: 'Review',
+  integration: 'Integration',
+}
+
+export function shortRevision(revision: string): string {
+  return revision.slice(0, 12)
+}
+
+export function formatTime(iso: string): string {
+  const time = Date.parse(iso)
+  if (Number.isNaN(time)) return iso
+  return new Date(time).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC')
+}
+=== useResource.ts ===
+import { useCallback, useEffect, useRef, useState } from 'react'
+
+export type Resource<T> =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ready'; data: T }
+  | { status: 'error'; error: unknown }
+
+/**
+ * Loads one read-only resource identified by `key`. A null key means nothing to load. Changing the key or
+ * calling `reload` starts a fresh request and abandons the previous one; a stale response never wins
+ * because every settled value is tagged with the request token that produced it.
+ * `refreshToken` forces a reload without changing the key (the header Refresh button).
+ */
+export function useResource<T>(key: string | null, load: (signal: AbortSignal) => Promise<T>, refreshToken = 0): { state: Resource<T>; reload: () => void } {
+  const [settled, setSettled] = useState<{ token: string; value: Resource<T> } | null>(null)
+  const [attempt, setAttempt] = useState(0)
+  const loadRef = useRef(load)
+  useEffect(() => { loadRef.current = load }, [load])
+  const token = key === null ? null : `${key}\u0000${attempt}\u0000${refreshToken}`
+
+  useEffect(() => {
+    if (token === null) return
+    const controller = new AbortController()
+    loadRef.current(controller.signal).then(
+      data => { if (!controller.signal.aborted) setSettled({ token, value: { status: 'ready', data } }) },
+      error => { if (!controller.signal.aborted) setSettled({ token, value: { status: 'error', error } }) },
+    )
+    return () => controller.abort()
+  }, [token])
+
+  const reload = useCallback(() => setAttempt(previous => previous + 1), [])
+  const state: Resource<T> = token === null ? { status: 'idle' } : settled?.token === token ? settled.value : { status: 'loading' }
+  return { state, reload }
+}

@@ -1,0 +1,794 @@
+import { rulesPresets, type RulesPresetId } from "@pirate-sea-race/content";
+import {
+  objectiveRules,
+  presetRubbings,
+  presetRubbingTypes,
+  rubbingTypeOrder,
+  sourceId,
+  validateObjectiveRules,
+  validateSourceAssignment,
+  validateSourceSites,
+  type GoldGrantReason,
+  type ObjectiveRules,
+  type RubbingType,
+  type ShopItem,
+  type SourceAssignment,
+  type SourceSite,
+} from "@pirate-sea-race/content/objectives";
+import { nextInt } from "../random.js";
+
+/** An integer sub-unit position supplied by the caller; the ledger does not know the map. */
+export interface Position {
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * The one place a rubbing is (§4): sealed at its source, owned by a player, held in a recovery cache, or reserved for
+ * one of the two players inside an unresolved duel.
+ */
+export type RubbingLocation =
+  | { readonly kind: "source"; readonly sourceId: string }
+  | { readonly kind: "player"; readonly playerId: string }
+  | { readonly kind: "cache"; readonly cacheId: string }
+  | { readonly kind: "duel"; readonly duelId: string; readonly playerId: string };
+
+/** §16's rubbing: its id and type never change; `revision` counts the moves it has made. */
+export interface LedgerRubbing {
+  readonly id: string;
+  readonly type: RubbingType;
+  readonly location: RubbingLocation;
+  readonly revision: number;
+}
+
+/** A source and the rubbing sealed there at the start. It is empty once that rubbing has left; nothing respawns. */
+export interface LedgerSource {
+  readonly id: string;
+  readonly island: number;
+  readonly x: number;
+  readonly y: number;
+  readonly type: RubbingType;
+  readonly rubbingId: string;
+  /** Sources start locked; the ruin that guards one unlocks it. */
+  readonly unlocked: boolean;
+}
+
+/** A held interaction: `heldTicks` counts consecutive ticks of holding since `startTick`. */
+export type LedgerChannel =
+  | {
+      readonly kind: "collect";
+      readonly sourceId: string;
+      readonly rubbingId: string;
+      readonly startTick: number;
+      readonly lastTick: number;
+      readonly heldTicks: number;
+    }
+  | {
+      readonly kind: "claim";
+      readonly cacheId: string;
+      readonly rubbingId: string;
+      readonly startTick: number;
+      readonly lastTick: number;
+      readonly heldTicks: number;
+    };
+
+export type PlayerStatus = "connected" | "disconnected" | "left";
+
+export interface LedgerPlayer {
+  readonly id: string;
+  readonly gold: number;
+  readonly status: PlayerStatus;
+  /** While disconnected: the tick at which the seat reservation expires. Reconnecting never moves it. */
+  readonly reservationDeadline: number | null;
+  /** Once left: where rubbings still reserved in an unresolved duel go when that duel settles. */
+  readonly exit: Position | null;
+  readonly channel: LedgerChannel | null;
+  /** Types this player lost and is owed a fresh rumor for (§11), in type order. The rumor system reads it. */
+  readonly freshRumors: readonly RubbingType[];
+  /** Sail tonics carried (§11): 0 up to the rules' carry limit. A lost duel keeps them; leaving drops them. */
+  readonly tonics: number;
+  /** The last tonic activated, if any; it is active from `startTick` until just before `endTick`. */
+  readonly tonicEffect: TonicEffect | null;
+}
+
+/** An activated sail tonic: active on the ticks `startTick ≤ tick < endTick`, `endTick = startTick + tonicTicks`. */
+export interface TonicEffect {
+  readonly startTick: number;
+  readonly endTick: number;
+}
+
+/**
+ * Gold the rules minted (§11). Its key makes it once only: a `ruin` grant once per (player, `sourceKey`), a
+ * `supply-cache` grant once per `sourceKey` for the whole match.
+ */
+export interface GoldGrant {
+  readonly reason: GoldGrantReason;
+  readonly sourceKey: string;
+  readonly playerId: string;
+  readonly amount: number;
+  readonly tick: number;
+}
+
+/** A completed dockside purchase, kept under its request id so a retry finds it instead of paying again (§11, §16). */
+export interface PurchaseRecord {
+  readonly requestId: string;
+  readonly playerId: string;
+  readonly item: ShopItem;
+  readonly price: number;
+  readonly tick: number;
+  /** The buyer's gold and tonics right after the purchase. */
+  readonly goldAfter: number;
+  readonly tonicsAfter: number;
+}
+
+/** A recovery cache (§12). It never despawns; it disappears once empty. Its contents are the rubbings located in it. */
+export interface LedgerCache {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly createdTick: number;
+}
+
+/** `fighting` until the result arrives; `choosing` while the winner picks a type; `settled` once committed. */
+export type DuelPhase = "fighting" | "choosing" | "settled";
+
+export interface DuelResultRecord {
+  readonly outcome: "win" | "draw" | "cancelled";
+  readonly winner: string | null;
+  readonly loser: string | null;
+  /** Decided by leaving the match (quit or reservation expiry) during the fight: the loser for a win, both players for a cancellation. */
+  readonly forfeit: boolean;
+  readonly tick: number;
+}
+
+/** What the commit did. It happens once per duel. */
+export interface DuelSettlement {
+  readonly tick: number;
+  readonly stolenRubbingId: string | null;
+  readonly stolenType: RubbingType | null;
+  /** Who picked the stolen type: the winner, the default at the deadline, or nobody (nothing moved). */
+  readonly choice: "winner" | "default" | "none";
+  readonly gold: number;
+  readonly goldSuppressed: boolean;
+}
+
+export interface LedgerDuel {
+  readonly id: string;
+  readonly players: readonly [string, string];
+  readonly startTick: number;
+  readonly phase: DuelPhase;
+  readonly result: DuelResultRecord | null;
+  /** In `choosing`: the first tick at which the winner can no longer choose and the default applies. */
+  readonly choiceDeadline: number | null;
+  readonly settlement: DuelSettlement | null;
+}
+
+/** The last win of `winner` over `loser`, for §11's repeated-victory gold suppression. */
+export interface WinRecord {
+  readonly winner: string;
+  readonly loser: string;
+  readonly tick: number;
+}
+
+/** The whole ledger: plain, integer data that `hashState` covers entirely. */
+export interface LedgerState {
+  readonly preset: RulesPresetId;
+  readonly rules: ObjectiveRules;
+  /** The preset's types, in the fixed type order. */
+  readonly types: readonly RubbingType[];
+  /** The latest world tick an applied request carried. Requests from earlier ticks are stale. */
+  readonly tick: number;
+  readonly rng: number;
+  readonly sources: readonly LedgerSource[];
+  /** Every rubbing of the preset, by id. */
+  readonly rubbings: readonly LedgerRubbing[];
+  /** In join order; a player who left stays, with status `left`. */
+  readonly players: readonly LedgerPlayer[];
+  readonly caches: readonly LedgerCache[];
+  /** In reservation order, settled ones included, so a repeated message finds its result. */
+  readonly duels: readonly LedgerDuel[];
+  readonly wins: readonly WinRecord[];
+  readonly nextCacheNumber: number;
+  /**
+   * Gold players brought in when joining plus the gold grants minted. Settlements only move gold and purchases spend
+   * it, so the balances plus `goldSpent` always sum to this.
+   */
+  readonly goldIssued: number;
+  /** Gold spent at the shop: it leaves the balances and goes to nobody. */
+  readonly goldSpent: number;
+  /** Every grant made, in order. */
+  readonly grants: readonly GoldGrant[];
+  /** Every completed purchase, in order; request ids are unique in the match. */
+  readonly purchases: readonly PurchaseRecord[];
+}
+
+/**
+ * Deals the preset's rubbings onto the sites with the seeded generator: a Fisher–Yates shuffle, so the server alone
+ * decides, and the same seed and sites always give the same assignment. Source ids number each island's sites in the
+ * order given.
+ */
+export function assignSources(
+  presetId: RulesPresetId,
+  sites: readonly SourceSite[],
+  seed: number,
+): { assignment: SourceAssignment; rng: number } {
+  if (!Number.isInteger(seed)) throw new RangeError(`seed must be an integer, got ${seed}`);
+  const preset = rulesPresets[presetId];
+  const checked = validateSourceSites(preset, sites);
+  if (!checked.ok) throw new Error(`invalid source sites for ${presetId}: ${checked.issues.join("; ")}`);
+  const deck = presetRubbings(preset);
+  let rng = seed >>> 0;
+  for (let index = deck.length - 1; index > 0; index--) {
+    const drawn = nextInt(rng, index + 1);
+    rng = drawn.state;
+    [deck[index], deck[drawn.value]] = [deck[drawn.value]!, deck[index]!];
+  }
+  const slots = new Map<number, number>();
+  const sources = checked.value.map((site, index) => {
+    const slot = slots.get(site.island) ?? 0;
+    slots.set(site.island, slot + 1);
+    const rubbing = deck[index]!;
+    return { id: sourceId(site.island, slot), island: site.island, x: site.x, y: site.y, type: rubbing.type, rubbingId: rubbing.id };
+  });
+  const assignment = validateSourceAssignment({ preset: presetId, seed: seed >>> 0, sources });
+  if (!assignment.ok) throw new Error(`invalid source assignment: ${assignment.issues.join("; ")}`);
+  return { assignment: assignment.value, rng };
+}
+
+export interface CreateLedgerOptions {
+  readonly preset: RulesPresetId;
+  readonly seed: number;
+  readonly sites: readonly SourceSite[];
+  readonly rules?: ObjectiveRules;
+}
+
+/** A new match's ledger: every rubbing sealed at its (locked) source, no players, caches or duels. */
+export function createLedger(options: CreateLedgerOptions): LedgerState {
+  const rules = validateObjectiveRules(options.rules ?? objectiveRules);
+  if (!rules.ok) throw new Error(`invalid objective rules: ${rules.issues.join("; ")}`);
+  const { assignment, rng } = assignSources(options.preset, options.sites, options.seed);
+  return createLedgerFromAssignment(assignment, rng, rules.value);
+}
+
+/** A ledger from an assignment made earlier (validated again here), for example one restored from a match record. */
+export function createLedgerFromAssignment(
+  candidate: SourceAssignment,
+  rng: number,
+  rules: ObjectiveRules = objectiveRules,
+): LedgerState {
+  const parsed = validateSourceAssignment(candidate);
+  if (!parsed.ok) throw new Error(`invalid source assignment: ${parsed.issues.join("; ")}`);
+  const checkedRules = validateObjectiveRules(rules);
+  if (!checkedRules.ok) throw new Error(`invalid objective rules: ${checkedRules.issues.join("; ")}`);
+  const assignment = parsed.value;
+  const sources: LedgerSource[] = assignment.sources.map((source) => ({ ...source, unlocked: false }));
+  const rubbings: LedgerRubbing[] = sources
+    .map((source) => ({
+      id: source.rubbingId,
+      type: source.type,
+      location: { kind: "source", sourceId: source.id } as const,
+      revision: 0,
+    }))
+    .sort(byId);
+  return {
+    preset: assignment.preset,
+    rules: checkedRules.value,
+    types: presetRubbingTypes(rulesPresets[assignment.preset]),
+    tick: 0,
+    rng: rng >>> 0,
+    sources,
+    rubbings,
+    players: [],
+    caches: [],
+    duels: [],
+    wins: [],
+    nextCacheNumber: 1,
+    goldIssued: 0,
+    goldSpent: 0,
+    grants: [],
+    purchases: [],
+  };
+}
+
+export function byId<T extends { readonly id: string }>(a: T, b: T): number {
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+export function byTypeOrder(a: RubbingType, b: RubbingType): number {
+  return rubbingTypeOrder(a) - rubbingTypeOrder(b);
+}
+
+export function findPlayer(state: LedgerState, id: string): LedgerPlayer | undefined {
+  return state.players.find((player) => player.id === id);
+}
+
+export function findSource(state: LedgerState, id: string): LedgerSource | undefined {
+  return state.sources.find((source) => source.id === id);
+}
+
+export function findCache(state: LedgerState, id: string): LedgerCache | undefined {
+  return state.caches.find((cache) => cache.id === id);
+}
+
+export function findDuel(state: LedgerState, id: string): LedgerDuel | undefined {
+  return state.duels.find((duel) => duel.id === id);
+}
+
+export function findRubbing(state: LedgerState, id: string): LedgerRubbing | undefined {
+  return state.rubbings.find((rubbing) => rubbing.id === id);
+}
+
+/** A player's rubbings: those they own and those reserved for them in an unresolved duel. */
+export function heldRubbings(state: LedgerState, playerId: string): LedgerRubbing[] {
+  return state.rubbings.filter(
+    (rubbing) =>
+      (rubbing.location.kind === "player" || rubbing.location.kind === "duel") && rubbing.location.playerId === playerId,
+  );
+}
+
+export function heldTypes(state: LedgerState, playerId: string): RubbingType[] {
+  return heldRubbings(state, playerId)
+    .map((rubbing) => rubbing.type)
+    .sort(byTypeOrder);
+}
+
+/** The input §5's claim rules take: the player holds every type of the preset. */
+export function holdsAllTypes(state: LedgerState, playerId: string): boolean {
+  const held = new Set(heldTypes(state, playerId));
+  return state.types.every((type) => held.has(type));
+}
+
+export function cacheRubbings(state: LedgerState, cacheId: string): LedgerRubbing[] {
+  return state.rubbings.filter((rubbing) => rubbing.location.kind === "cache" && rubbing.location.cacheId === cacheId);
+}
+
+/** Sources of a type whose rubbing is still sealed there (locked or not). */
+export function freeSourceCount(state: LedgerState, type: RubbingType): number {
+  return state.rubbings.filter((rubbing) => rubbing.type === type && rubbing.location.kind === "source").length;
+}
+
+/** The duel a player is in that has not settled yet, if any. */
+export function activeDuelOf(state: LedgerState, playerId: string): LedgerDuel | undefined {
+  return state.duels.find((duel) => duel.phase !== "settled" && duel.players.includes(playerId));
+}
+
+export function reservedIn(state: LedgerState, duelId: string, playerId: string): LedgerRubbing[] {
+  return state.rubbings.filter(
+    (rubbing) => rubbing.location.kind === "duel" && rubbing.location.duelId === duelId && rubbing.location.playerId === playerId,
+  );
+}
+
+/**
+ * The types the winner of a decided duel may steal (§4): held by the loser, lacked by the winner. None once the
+ * winner has left the match, and none for a draw.
+ */
+export function eligibleTheftTypes(state: LedgerState, duelId: string): RubbingType[] {
+  const duel = findDuel(state, duelId);
+  if (!duel || duel.phase === "settled" || duel.result?.outcome !== "win") return [];
+  const { winner, loser } = duel.result;
+  if (winner === null || loser === null || findPlayer(state, winner)?.status === "left") return [];
+  const winnerTypes = new Set(heldTypes(state, winner));
+  return heldTypes(state, loser).filter((type) => !winnerTypes.has(type));
+}
+
+/** §4's default theft: the eligible type with the fewest free sources, then the fixed type order. */
+export function defaultTheftType(state: LedgerState, eligible: readonly RubbingType[]): RubbingType | null {
+  let best: RubbingType | null = null;
+  let bestFree = 0;
+  for (const type of [...eligible].sort(byTypeOrder)) {
+    const free = freeSourceCount(state, type);
+    if (best === null || free < bestFree) {
+      best = type;
+      bestFree = free;
+    }
+  }
+  return best;
+}
+import {
+  findPlayer,
+  type LedgerCache,
+  type LedgerPlayer,
+  type LedgerRubbing,
+  type LedgerState,
+  type Position,
+  type RubbingLocation,
+} from "./state.js";
+
+/**
+ * Why a request changed nothing (§16: duplicate, stale, unauthorised or already-resolved requests return the current
+ * result without mutating state). A rejected request always returns the very state object it was given.
+ */
+export type LedgerRejection =
+  | "invalid-request"
+  | "stale-tick"
+  | "duplicate"
+  | "unknown-player"
+  | "player-left"
+  | "player-disconnected"
+  | "player-in-duel"
+  | "same-player"
+  | "unknown-source"
+  | "source-locked"
+  | "source-empty"
+  | "type-held"
+  | "unknown-cache"
+  | "not-in-cache"
+  | "no-channel"
+  | "unknown-duel"
+  | "not-a-participant"
+  | "already-resolved"
+  | "not-choosing"
+  | "not-winner"
+  | "choice-window-closed"
+  | "ineligible-type"
+  | "not-disconnected"
+  | "reservation-active"
+  | "reservation-expired"
+  | "already-claimed"
+  | "insufficient-gold"
+  | "tonic-limit"
+  | "no-tonic"
+  | "tonic-active"
+  | "not-at-sea"
+  | "grappled";
+
+/** One rubbing move, for §16's transfer record. `revisionAfter` is always `revisionBefore + 1`. */
+export interface Transfer {
+  readonly rubbingId: string;
+  readonly from: RubbingLocation;
+  readonly to: RubbingLocation;
+  readonly revisionBefore: number;
+  readonly revisionAfter: number;
+}
+
+/** What every operation returns: the next state (the same object when nothing changed) and its result. */
+export interface LedgerStep<R> {
+  readonly state: LedgerState;
+  readonly result: R;
+}
+
+/** Moves made so far by one operation, and the caches it opened. */
+export interface Effects {
+  readonly transfers: Transfer[];
+  readonly cacheIds: string[];
+}
+
+export function noEffects(): Effects {
+  return { transfers: [], cacheIds: [] };
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+export function isPlayerId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+export function isPosition(value: unknown): value is Position {
+  if (typeof value !== "object" || value === null) return false;
+  const { x, y } = value as Record<string, unknown>;
+  return isSafeInteger(x) && isSafeInteger(y);
+}
+
+/** A request's tick must be a non-negative integer no earlier than the ledger's latest. */
+export function tickRejection(state: LedgerState, tick: unknown): LedgerRejection | null {
+  if (!isSafeInteger(tick) || tick < 0) return "invalid-request";
+  return tick < state.tick ? "stale-tick" : null;
+}
+
+export function atTick(state: LedgerState, tick: number): LedgerState {
+  return tick === state.tick ? state : { ...state, tick };
+}
+
+/** Why a player cannot act in the world right now, if they cannot. */
+export function playerRejection(state: LedgerState, playerId: unknown): LedgerRejection | null {
+  if (!isPlayerId(playerId)) return "invalid-request";
+  const player = findPlayer(state, playerId);
+  if (!player) return "unknown-player";
+  return player.status === "left" ? "player-left" : null;
+}
+
+export function updatePlayer(
+  state: LedgerState,
+  playerId: string,
+  update: (player: LedgerPlayer) => LedgerPlayer,
+): LedgerState {
+  return { ...state, players: state.players.map((player) => (player.id === playerId ? update(player) : player)) };
+}
+
+/** Moves each listed rubbing to its target, bumping its revision, and drops any cache the moves emptied. */
+export function moveRubbings(
+  state: LedgerState,
+  moves: readonly { readonly rubbingId: string; readonly to: RubbingLocation }[],
+  effects: Effects,
+): LedgerState {
+  if (moves.length === 0) return state;
+  const targets = new Map(moves.map((move) => [move.rubbingId, move.to]));
+  if (targets.size !== moves.length) throw new Error("a rubbing cannot move twice in one step");
+  const rubbings = state.rubbings.map((rubbing): LedgerRubbing => {
+    const to = targets.get(rubbing.id);
+    if (to === undefined) return rubbing;
+    targets.delete(rubbing.id);
+    effects.transfers.push({
+      rubbingId: rubbing.id,
+      from: rubbing.location,
+      to,
+      revisionBefore: rubbing.revision,
+      revisionAfter: rubbing.revision + 1,
+    });
+    return { ...rubbing, location: to, revision: rubbing.revision + 1 };
+  });
+  if (targets.size > 0) throw new Error(`unknown rubbings ${[...targets.keys()].join(", ")}`);
+  return dropEmptyCaches({ ...state, rubbings });
+}
+
+function dropEmptyCaches(state: LedgerState): LedgerState {
+  const used = new Set(
+    state.rubbings.flatMap((rubbing) => (rubbing.location.kind === "cache" ? [rubbing.location.cacheId] : [])),
+  );
+  const caches = state.caches.filter((cache) => used.has(cache.id));
+  return caches.length === state.caches.length ? state : { ...state, caches };
+}
+
+/** Opens a recovery cache holding the listed rubbings at a position; with none, no cache appears. */
+export function openCache(
+  state: LedgerState,
+  position: { readonly x: number; readonly y: number },
+  rubbingIds: readonly string[],
+  tick: number,
+  effects: Effects,
+): LedgerState {
+  if (rubbingIds.length === 0) return state;
+  const cache: LedgerCache = { id: `cache-${state.nextCacheNumber}`, x: position.x, y: position.y, createdTick: tick };
+  effects.cacheIds.push(cache.id);
+  const opened = { ...state, caches: [...state.caches, cache], nextCacheNumber: state.nextCacheNumber + 1 };
+  return moveRubbings(
+    opened,
+    rubbingIds.map((rubbingId) => ({ rubbingId, to: { kind: "cache", cacheId: cache.id } as const })),
+    effects,
+  );
+}
+
+/**
+ * Returns rubbings to a player, or, when that player has left the match, into a recovery cache at the place they
+ * left from, so a rubbing never follows a player out of the match.
+ */
+export function releaseTo(
+  state: LedgerState,
+  playerId: string,
+  rubbingIds: readonly string[],
+  tick: number,
+  effects: Effects,
+): LedgerState {
+  const player = findPlayer(state, playerId);
+  if (!player) throw new Error(`unknown player ${playerId}`);
+  if (player.status === "left") {
+    if (player.exit === null) throw new Error(`player ${playerId} left without an exit position`);
+    return openCache(state, player.exit, rubbingIds, tick, effects);
+  }
+  return moveRubbings(
+    state,
+    rubbingIds.map((rubbingId) => ({ rubbingId, to: { kind: "player", playerId } as const })),
+    effects,
+  );
+}
+import {
+  GOLD_GRANT_REASONS,
+  grantAmount,
+  itemPrice,
+  SHOP_ITEMS,
+  type GoldGrantReason,
+  type ShopItem,
+} from "@pirate-sea-race/content/objectives";
+import {
+  atTick,
+  isPlayerId,
+  playerRejection,
+  tickRejection,
+  updatePlayer,
+  type LedgerRejection,
+  type LedgerStep,
+} from "./internal.js";
+import {
+  activeDuelOf,
+  findPlayer,
+  type GoldGrant,
+  type LedgerPlayer,
+  type LedgerState,
+  type PurchaseRecord,
+} from "./state.js";
+
+function isKey(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function playerOf(state: LedgerState, playerId: unknown): LedgerPlayer | null {
+  return typeof playerId === "string" ? (findPlayer(state, playerId) ?? null) : null;
+}
+
+export interface GrantResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The grant made, or for a `duplicate` or `already-claimed` request the earlier grant that holds the key. */
+  readonly grant: GoldGrant | null;
+  /** The player as they now stand, or null for an unknown player. */
+  readonly player: LedgerPlayer | null;
+}
+
+export interface GrantGoldRequest {
+  readonly playerId: string;
+  readonly reason: GoldGrantReason;
+  /** The ruin id for `ruin`; the supply cache's id for `supply-cache`. */
+  readonly sourceKey: string;
+  readonly tick: number;
+}
+
+/** The earlier grant holding this request's key: the same player's for a ruin, anybody's for a supply cache. */
+function grantHolding(state: LedgerState, reason: GoldGrantReason, sourceKey: string, playerId: string): GoldGrant | undefined {
+  return state.grants.find(
+    (grant) => grant.reason === reason && grant.sourceKey === sourceKey && (reason === "supply-cache" || grant.playerId === playerId),
+  );
+}
+
+/**
+ * §11's minted gold: a fresh ruin completion (once per player per ruin) or a supply cache (one global claim). The
+ * amount comes from the rules, and `goldIssued` grows by it. A repeat of the same player's key is a `duplicate`; a
+ * supply cache someone else already claimed is `already-claimed`. A player who left gets nothing.
+ */
+export function grantGold(state: LedgerState, request: GrantGoldRequest): LedgerStep<GrantResult> {
+  const { playerId, reason, sourceKey, tick } = request;
+  const rejected = (rejection: LedgerRejection, grant: GoldGrant | null = null): LedgerStep<GrantResult> => ({
+    state,
+    result: { ok: false, rejection, grant, player: playerOf(state, playerId) },
+  });
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(bad);
+  if (!GOLD_GRANT_REASONS.includes(reason) || !isKey(sourceKey)) return rejected("invalid-request");
+  const refusal = playerRejection(state, playerId);
+  if (refusal) return rejected(refusal);
+  const earlier = grantHolding(state, reason, sourceKey, playerId);
+  if (earlier) return rejected(earlier.playerId === playerId ? "duplicate" : "already-claimed", earlier);
+  const amount = grantAmount(state.rules, reason);
+  const grant: GoldGrant = { reason, sourceKey, playerId, amount, tick };
+  const next = updatePlayer(
+    { ...atTick(state, tick), grants: [...state.grants, grant], goldIssued: state.goldIssued + amount },
+    playerId,
+    (player) => ({ ...player, gold: player.gold + amount }),
+  );
+  return { state: next, result: { ok: true, rejection: null, grant, player: findPlayer(next, playerId) ?? null } };
+}
+
+export interface PurchaseResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The purchase: the one just made, or the original one for a repeated request id. */
+  readonly purchase: PurchaseRecord | null;
+  /** The request id was already used by this purchase: nothing was charged again. */
+  readonly replayed: boolean;
+}
+
+export interface PurchaseRequest {
+  /** Unique in the match; a retry of the same purchase reuses it. */
+  readonly requestId: string;
+  readonly playerId: string;
+  readonly item: ShopItem;
+  readonly tick: number;
+}
+
+/**
+ * A dockside purchase (§11), at the rules' price. The gold is spent: it leaves the buyer's balance for `goldSpent`.
+ * A tonic goes into the buyer's carried count; a rumor is delivered by the caller after an applied purchase.
+ *
+ * A request id already used returns the original purchase with `replayed` and the same state, whatever the tick,
+ * so a retry never pays twice; reused for another player or item, it is a `duplicate`. Refused while the player is
+ * disconnected, in a duel (reserved) or gone, when gold is short, and for a tonic when they carry the limit already.
+ */
+export function purchase(state: LedgerState, request: PurchaseRequest): LedgerStep<PurchaseResult> {
+  const { requestId, playerId, item, tick } = request;
+  const rejected = (rejection: LedgerRejection): LedgerStep<PurchaseResult> => ({
+    state,
+    result: { ok: false, rejection, purchase: null, replayed: false },
+  });
+  if (!isKey(requestId) || !isPlayerId(playerId) || !SHOP_ITEMS.includes(item)) return rejected("invalid-request");
+  const original = state.purchases.find((record) => record.requestId === requestId);
+  if (original) {
+    if (original.playerId !== playerId || original.item !== item) return rejected("duplicate");
+    return { state, result: { ok: true, rejection: null, purchase: original, replayed: true } };
+  }
+  const bad = tickRejection(state, tick) ?? playerRejection(state, playerId);
+  if (bad) return rejected(bad);
+  const buyer = findPlayer(state, playerId)!;
+  if (buyer.status === "disconnected") return rejected("player-disconnected");
+  if (activeDuelOf(state, playerId)) return rejected("player-in-duel");
+  if (item === "tonic" && buyer.tonics >= state.rules.tonicCarryLimit) return rejected("tonic-limit");
+  const price = itemPrice(state.rules, item);
+  if (buyer.gold < price) return rejected("insufficient-gold");
+  const record: PurchaseRecord = {
+    requestId,
+    playerId,
+    item,
+    price,
+    tick,
+    goldAfter: buyer.gold - price,
+    tonicsAfter: item === "tonic" ? buyer.tonics + 1 : buyer.tonics,
+  };
+  const next = updatePlayer(
+    { ...atTick(state, tick), purchases: [...state.purchases, record], goldSpent: state.goldSpent + price },
+    playerId,
+    (player) => ({ ...player, gold: record.goldAfter, tonics: record.tonicsAfter }),
+  );
+  return { state: next, result: { ok: true, rejection: null, purchase: record, replayed: false } };
+}
+
+export interface TonicResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The player as they now stand, or null for an unknown player. */
+  readonly player: LedgerPlayer | null;
+}
+
+export interface UseTonicRequest {
+  readonly playerId: string;
+  readonly tick: number;
+  /** The player is sailing, not on an island or in a dock interaction. */
+  readonly atSea: boolean;
+  /** The player is being grappled right now (the world knows; the ledger does not). */
+  readonly grappled: boolean;
+}
+
+/** Whether a player's sail tonic is active at `tick`; the sailing code applies its speed bonus (§11). */
+export function activeTonic(state: LedgerState, playerId: string, tick: number): boolean {
+  const effect = findPlayer(state, playerId)?.tonicEffect ?? null;
+  return effect !== null && effect.startTick <= tick && tick < effect.endTick;
+}
+
+/**
+ * Activates one carried tonic at `tick` for `tonicTicks` (§11): active on ticks `tick` to `tick + tonicTicks - 1`.
+ * Refused while one is active (they never stack), in a duel, while disconnected, grappled or not at sea.
+ */
+export function useTonic(state: LedgerState, request: UseTonicRequest): LedgerStep<TonicResult> {
+  const { playerId, tick, atSea, grappled } = request;
+  const rejected = (rejection: LedgerRejection): LedgerStep<TonicResult> => ({
+    state,
+    result: { ok: false, rejection, player: playerOf(state, playerId) },
+  });
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(bad);
+  if (typeof atSea !== "boolean" || typeof grappled !== "boolean") return rejected("invalid-request");
+  const refusal = playerRejection(state, playerId);
+  if (refusal) return rejected(refusal);
+  const player = findPlayer(state, playerId)!;
+  if (player.status === "disconnected") return rejected("player-disconnected");
+  if (activeDuelOf(state, playerId)) return rejected("player-in-duel");
+  if (grappled) return rejected("grappled");
+  if (!atSea) return rejected("not-at-sea");
+  if (player.tonics === 0) return rejected("no-tonic");
+  if (activeTonic(state, playerId, tick)) return rejected("tonic-active");
+  const next = updatePlayer(atTick(state, tick), playerId, (current) => ({
+    ...current,
+    tonics: current.tonics - 1,
+    tonicEffect: { startTick: tick, endTick: tick + state.rules.tonicTicks },
+  }));
+  return { state: next, result: { ok: true, rejection: null, player: findPlayer(next, playerId) ?? null } };
+}
+export * from "./state.js";
+export * from "./invariant.js";
+export * from "./channels.js";
+export * from "./duels.js";
+export * from "./players.js";
+export * from "./economy.js";
+export type { LedgerRejection, LedgerStep, Transfer } from "./internal.js";
+export {
+  presetRubbingTypes,
+  presetRubbings,
+  RUBBING_TYPES,
+  objectiveRules,
+  type GoldGrantReason,
+  type ObjectiveRules,
+  type RubbingType,
+  type ShopItem,
+  type SourceAssignment,
+  type SourceSite,
+} from "@pirate-sea-race/content/objectives";
+export { hashState } from "../hash.js";

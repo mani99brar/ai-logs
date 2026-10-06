@@ -1,0 +1,649 @@
+   400	                if (cwd / name).is_symlink():
+   401	                    raise ValueError("Symlink changes require manual review before snapshot")
+   402	            index = self.directory / f"{node}.snapshot-index"
+   403	            if index.exists():
+   404	                index.unlink()  # Only our private temporary index, never a user's index.
+   405	            env = commit_env()
+   406	            env["GIT_INDEX_FILE"] = str(index)
+   407	            subprocess.run(["git", "-C", str(cwd), "read-tree", self.plan["base_commit"]], env=env, check=True)
+   408	            subprocess.run(["git", "-C", str(cwd), "add", "-A", "--", "."], env=env, check=True)
+   409	            tree = subprocess.check_output(["git", "-C", str(cwd), "write-tree"], env=env, text=True).strip()
+   410	            # Validate paths from the actual captured tree, including staged renames/deletes.
+   411	            captured = git(cwd, "diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", self.plan["base_commit"], tree).splitlines()
+   412	            if sorted(captured) != changed:
+   413	                raise ValueError("Files changed during snapshot; refuse inconsistent evidence")
+   414	            commit = self.plan["base_commit"]
+   415	            if changed:
+   416	                commit = subprocess.check_output(["git", "-C", str(cwd), "-c", "commit.gpgsign=false", "commit-tree", tree,
+   417	                                                  "-p", self.plan["base_commit"], "-m", f"Workflow {self.plan['run_id']}: {node}"], env=env, text=True).strip()
+   418	            ref = f"refs/workflow/{hashlib.sha256(str(self.directory).encode()).hexdigest()[:16]}/{node}"
+   419	            subprocess.run(["git", "-C", str(cwd), "update-ref", ref, commit], check=True)
+   420	            receipt = read_json(self.directory / f"{node}.interactive.json")
+   421	            snapshots[node] = {"commit": commit, "changed_files": changed, "session_id": receipt["session_id"], **handoffs[node]}
+   422	        save_json(record, snapshots)
+   423	        self.event("freeze", "succeeded", "Immutable snapshots captured; worker-reported checks are not trusted")
+   424	        return snapshots
+   425	
+   426	    def attempt(self, phase: str, node: str) -> int:
+   427	        path = self.directory / "attempts.json"
+   428	        value = read_json(path).get(f"{phase}:{node}", 1) if path.exists() else 1
+   429	        if type(value) is not int or value < 1 or value > self.policy.get("max_verification_attempts", 3):
+   430	            raise ValueError("Verification attempt exceeds the run's hard limit")
+   431	        return value
+   432	
+   433	    def retry_check(self, phase: str, node: str) -> int:
+   434	        value = self.attempt(phase, node) + 1
+   435	        if value > self.policy.get("max_verification_attempts", 3):
+   436	            raise ValueError("Verification attempt limit reached; inspect evidence and create an explicitly revised run")
+   437	        path = self.directory / "attempts.json"
+   438	        attempts = read_json(path) if path.exists() else {}
+   439	        attempts[f"{phase}:{node}"] = value
+   440	        save_json(path, attempts)
+   441	        return value
+   442	
+   443	    def native_evidence(self) -> dict:
+   444	        return {node: {key: read_json(self.directory / f"{node}.interactive.json").get(key)
+   445	                       for key in ("session_id", "background_id", "launcher_invocations", "native_started_at")}
+   446	                for node in self.workers}
+   447	
+   448	    def verify(self, node: str, snapshots: dict) -> str:
+   449	        snap = snapshots[node]
+   450	        attempt = self.attempt("worker", node)
+   451	        self.event(f"verify_{node}", "running", f"Attempt {attempt}; revision {snap['commit']}")
+   452	        packet = verify_revision(self.directory, self.plan, self.policy, node, snap["commit"], snap["changed_files"], snap["session_id"], attempt=attempt)
+   453	        path = self.directory / "verification" / "worker" / node / str(attempt) / "packet.json"
+   454	        drill = self.failure_drill()
+   455	        if drill and drill["node_id"] == node and attempt == 1:
+   456	            marker = "Intentional lab drill: verification branch failure, not a worker or test failure"
+   457	            if marker not in packet["capture_errors"]:
+   458	                packet["capture_errors"].append(marker)
+   459	                packet["gate"]["reasons"].append(marker)
+   460	            packet["gate"]["status"] = "blocked"
+   461	            drill_path = self.directory / "failure-drill.json"
+   462	            if not drill_path.exists():
+   463	                save_json(drill_path, {"node_id": node, "phase": "worker", "attempt": 1,
+   464	                                       "injected_at": now(), "native_before": self.native_evidence()})
+   465	        packet["result"]["summary"] = snap["summary"]
+   466	        packet["result"]["open_assumptions"] = snap["open_assumptions"]
+   467	        save_json(path, packet)
+   468	        passed = "Required tests and artifacts passed"
+   469	        if packet["gate"].get("deferred_checks"):
+   470	            passed += "; recorded for the candidate gate: " + ", ".join(packet["gate"]["deferred_checks"])
+   471	        self.event(f"verify_{node}", packet["gate"]["status"], "; ".join(packet["gate"]["reasons"]) or passed)
+   472	        if packet["gate"]["status"] != "passed":
+   473	            raise RuntimeError(f"{node} verification blocked; see {path}. Retry explicitly or start a revised run.")
+   474	        return str(path)
+   475	
+   476	    def candidate(self, state: PipelineState) -> str:
+   477	        # Validate branch evidence again before combining anything.
+   478	        worker_paths = [Path(state["packets"][node]) for node in self.workers]
+   479	        for path in worker_paths:
+   480	            packet = recheck_packet(read_json(path), self.policy, self.directory)
+   481	            if packet["gate"]["status"] != "passed":
+   482	                raise ValueError("Worker evidence no longer passes")
+   483	        saved = self.directory / "candidate.json"
+   484	        if saved.exists():
+   485	            candidate = read_json(saved)
+   486	        else:
+   487	            cwd = self.directory / "candidate"
+   488	            if cwd.exists():
+   489	                raise ValueError("Partial candidate worktree exists; inspect before recovery")
+   490	            git_worktree(self.plan["repository"], "add", "--detach", str(cwd), self.plan["base_commit"])
+   491	            for node in self.workers:  # Declared order, selected lanes only.
+   492	                commit = state["snapshots"][node]["commit"]
+   493	                if commit != self.plan["base_commit"]:
+   494	                    subprocess.run(["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "cherry-pick", commit], env=commit_env(), check=True, capture_output=True)
+   495	            candidate = {"commit": git(cwd, "rev-parse", "HEAD"), "worktree": str(cwd)}
+   496	            save_json(saved, candidate)
+   497	        candidate_paths = []
+   498	        for node in self.workers:
+   499	            attempt = self.attempt("candidate", node)
+   500	            packet = verify_revision(self.directory, self.plan, self.policy, node, candidate["commit"],
+   501	                                     changed_files(Path(candidate["worktree"]), self.plan["base_commit"]),
+   502	                                     state["snapshots"][node]["session_id"], phase="candidate", attempt=attempt)
+   503	            path = self.directory / "verification" / "candidate" / node / str(attempt) / "packet.json"
+   504	            self.event(f"candidate_{node}", packet["gate"]["status"], f"Combined revision {candidate['commit']}")
+   505	            if packet["gate"]["status"] != "passed":
+   506	                raise RuntimeError(f"Combined candidate failed {node} checks; see {path}")
+   507	            candidate_paths.append(path)
+   508	        bundle = {"run_id": self.plan["run_id"], "base_commit": self.plan["base_commit"],
+   509	                  "candidate_commit": candidate["commit"], "policy_sha256": policy_digest(self.policy),
+   510	                  "snapshots": state["snapshots"],
+   511	                  "packets": [{"path": str(path), "sha256": digest_file(path)} for path in worker_paths + candidate_paths]}
+   512	        path = self.directory / "review-bundle.json"
+   513	        drill_path = self.directory / "failure-drill.json"
+   514	        if drill_path.exists():
+   515	            before = read_json(drill_path)["native_before"]
+   516	            after = self.native_evidence()
+   517	            audit = {"run_id": self.plan["run_id"], "native_before": before, "native_after": after,
+   518	                     "workers_with_changed_launch_evidence": [node for node in self.workers if before.get(node) != after.get(node)],
+   519	                     "verification_attempts": {node: sorted(int(item.name) for item in (self.directory / "verification" / "worker" / node).iterdir() if item.is_dir() and item.name.isdigit()) for node in self.workers},
+   520	                     "scope": "Pipeline-issued sessions; native launch times/counts are null when unavailable. Out-of-band manual restarts are not certified."}
+   521	            save_json(self.directory / "failure-report.json", audit)
+   522	            bundle["failure_drill"] = audit
+   523	        save_json(path, bundle)
+   524	        return str(path)
+   525	
+   526	    def validate_bundle(self) -> tuple[dict, str]:
+   527	        path = self.directory / "review-bundle.json"
+   528	        bundle = read_json(path)
+   529	        if bundle["run_id"] != self.plan["run_id"] or bundle["policy_sha256"] != policy_digest(self.policy):
+   530	            raise ValueError("Bundle identity/policy changed")
+   531	        for reference in bundle["packets"]:
+   532	            packet_path = Path(reference["path"]).resolve()
+   533	            if not packet_path.is_relative_to(self.directory) or digest_file(packet_path) != reference["sha256"]:
+   534	                raise ValueError("Review evidence changed")
+   535	            packet = recheck_packet(read_json(packet_path), self.policy, self.directory)
+   536	            if packet["gate"]["status"] != "passed":
+   537	                raise ValueError("Review artifact missing, changed or failing")
+   538	        return bundle, digest_file(path)
+   539	
+   540	    def validate_review(self, review: dict, require_approved: bool = True) -> None:
+   541	        """The combined record must name exactly this run's declared reviewers; approval needs every one of them."""
+   542	        bundle, digest = self.validate_bundle()
+   543	        check_review(review, bundle, digest, require_approved=require_approved, reviewers=reviewer_ids(self.plan))
+   544	
+   545	    def integrate(self, approved: str) -> str:
+   546	        bundle, digest = self.validate_bundle()
+   547	        review = read_json(self.directory / "review.json")
+   548	        self.validate_review(review)
+   549	        if approved != digest:
+   550	            raise ValueError("Approval references stale evidence")
+   551	        repo = Path(self.plan["repository"])
+   552	        candidate = bundle["candidate_commit"]
+   553	        intent = self.directory / "integration-intent.json"
+   554	        if git(repo, "symbolic-ref", "--short", "HEAD") != self.plan["source_branch"]:
+   555	            raise ValueError("Source branch changed")
+   556	        if git(repo, "status", "--porcelain"):
+   557	            raise ValueError("Source worktree is dirty; refusing integration")
+   558	        if intent.exists():
+   559	            if read_json(intent) != {"bundle_sha256": digest, "candidate_commit": candidate}:
+   560	                raise ValueError("Integration intent changed")
+   561	            if git(repo, "rev-parse", "HEAD") == candidate:
+   562	                return candidate
+   563	        if git(repo, "rev-parse", "HEAD") != self.plan["base_commit"]:
+   564	            raise ValueError("Source advanced since preparation; rebase/review explicitly")
+   565	        save_json(intent, {"bundle_sha256": digest, "candidate_commit": candidate})
+   566	        subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", candidate], check=True, capture_output=True)
+   567	        self.event("integrate", "succeeded", f"Fast-forwarded to {candidate}; no push performed")
+   568	        return candidate
+   569	
+   570	
+   571	class ExportRuntime:
+   572	    """Read-only view of a run directory for re-exporting run-state.json.
+   573	
+   574	    It constructs no sessions and touches no worktree, so a copied or finished
+   575	    run whose worktrees are gone still exports. Contradictory files are refused.
+   576	    """
+   577	
+   578	    def __init__(self, directory: Path):
+   579	        self.directory = directory.resolve()
+   580	        self.plan = read_json(self.directory / "plan.json")
+   581	        if "automatic" in self.plan:
+   582	            from .automatic import validate_automatic
+   583	            validate_automatic(self.plan)
+   584	        self.policy = None
+   585	        policy_path = self.directory / "policy.json"
+   586	        if policy_path.exists():
+   587	            self.policy = validate_pipeline_policy(read_json(policy_path))
+   588	            if self.plan.get("policy_sha256") != policy_digest(self.policy):
+   589	                raise ValueError("Pinned policy changed")
+   590	        self.workers, self.excluded = lanes_of(self.plan, self.policy)
+   591	        review_path = self.directory / "review.json"
+   592	        if review_path.exists():
+   593	            bundle_path = self.directory / "review-bundle.json"
+   594	            if not bundle_path.exists():
+   595	                raise ValueError("review.json exists without review-bundle.json; contradictory run directory")
+   596	            # Packet hashes are not rechecked here; the adapter re-verifies packets itself. Reviews recorded
+   597	            # before configured lanes may attribute a finding to `both`; the viewer renders it as several lanes.
+   598	            check_review(read_json(review_path), read_json(bundle_path), digest_file(bundle_path), require_approved=False,
+   599	                         allow_legacy="workers" not in self.plan)
+   600	
+   601	
+   602	def lanes_of(plan: dict, policy: dict | None) -> tuple[list[str], list[str]]:
+   603	    """The run's selected and excluded lanes, checked against the pinned policy when it is present."""
+   604	    workers, excluded = plan_workers(plan), plan_excluded(plan)
+   605	    if policy is not None:
+   606	        declared = policy_workers(policy)
+   607	        if not set(workers) <= set(declared) or not set(excluded) <= set(declared):
+   608	            raise ValueError("Plan names lanes the pinned policy does not declare")
+   609	        if "workers" in plan and set(workers) | set(excluded) != set(declared):
+   610	            raise ValueError("Plan does not account for every declared lane")
+   611	    if set(plan.get("nodes", {})) != set(workers):
+   612	        raise ValueError("Plan nodes do not match the selected lanes; inspect retained allocation state")
+   613	    return workers, excluded
+   614	
+   615	
+   616	def carry_legacy_lanes(runtime: ExportRuntime, state, saver: SqliteSaver | None = None):
+   617	    """Carry a pre-lane checkpoint's per-lane evidence into the lane state shape.
+   618	
+   619	    A checkpoint written before configured lanes stored each lane under `<lane>` and
+   620	    `<lane>_packet`; the graph no longer has those channels, so `get_state` drops them.
+   621	    Read them from the raw checkpoint and carry them under `lanes`/`packets` so the launch
+   622	    evidence survives every export, whether from `export` or from the report written at
+   623	    each CLI boundary. Runs with configured lanes are returned unchanged.
+   624	    """
+   625	    from types import SimpleNamespace
+   626	    database = runtime.directory / "pipeline.sqlite"
+   627	    if "workers" in runtime.plan or not database.exists():
+   628	        return state
+   629	    config = {"configurable": {"thread_id": runtime.plan["run_id"]}}
+   630	
+   631	    def carry(saver: SqliteSaver):
+   632	        stored = saver.get_tuple(config)
+   633	        raw = stored.checkpoint.get("channel_values", {}) if stored else {}
+   634	        values = dict(state.values)
+   635	        for node in runtime.workers:
+   636	            if node in raw:
+   637	                values.setdefault("lanes", {}).setdefault(node, raw[node])
+   638	            if f"{node}_packet" in raw:
+   639	                values.setdefault("packets", {}).setdefault(node, raw[f"{node}_packet"])
+   640	        return SimpleNamespace(values=values, next=state.next, tasks=state.tasks)
+   641	
+   642	    if saver is not None:
+   643	        return carry(saver)
+   644	    with SqliteSaver.from_conn_string(str(database)) as own:
+   645	        return carry(own)
+   646	
+   647	
+   648	def export_run(runtime: ExportRuntime) -> dict:
+   649	    """Re-export from the persisted checkpoint. Reading state never invokes a node or a session."""
+   650	    from types import SimpleNamespace
+   651	    database = runtime.directory / "pipeline.sqlite"
+   652	    if database.exists():
+   653	        config = {"configurable": {"thread_id": runtime.plan["run_id"]}}
+   654	        with SqliteSaver.from_conn_string(str(database)) as saver:
+   655	            state = carry_legacy_lanes(runtime, build_pipeline(saver, runtime).get_state(config), saver)
+   656	    else:
+   657	        state = SimpleNamespace(values={}, next=tuple(f"launch_{node}" for node in runtime.workers), tasks=[])  # Prepared, never started.
+   658	    return export_state(runtime, state)
+   659	
+   660	
+   661	def build_pipeline(checkpointer, runtime):
+   662	    """The graph over the runtime's plan: `launch_<lane>` and `verify_<lane>` per selected lane, then the fixed tail."""
+   663	    workers = list(runtime.workers)
+   664	    def launcher(node):
+   665	        return lambda _state: {"lanes": {node: runtime.launch(node)}}
+   666	    def verifier(node):
+   667	        return lambda state: {"packets": {node: runtime.verify(node, state["snapshots"])}}
+   668	    def handoff(_state):
+   669	        message = ("Awaiting explicit completion signals and automatic freeze." if runtime.plan.get("automatic")
+   670	                   else f"Type in Claude terminals; provide a handoff for every lane ({', '.join(workers)}), then explicitly freeze.")
+   671	        decision = interrupt({"kind": "worker_handoff", "message": message})
+   672	        if decision != {"freeze": True}:
+   673	            raise ValueError("Explicit freeze required")
+   674	        return {"snapshots": runtime.freeze()}
+   675	    def candidate(state): return {"bundle": runtime.candidate(state)}
+   676	    def review(_state):
+   677	        _, digest = runtime.validate_bundle()
+   678	        if runtime.plan.get("automatic"):
+   679	            from .automatic import review_candidate
+   680	            decision = review_candidate(runtime)
+   681	        else:
+   682	            decision = interrupt({"kind": "independent_review", "bundle_sha256": digest,
+   683	                                  "bundle_path": str(runtime.directory / "review-bundle.json")})
+   684	        runtime.validate_review(decision)
+   685	        save_json(runtime.directory / "review.json", decision)
+   686	        runtime.event("review", "approved", decision["reviewer"])
+   687	        return {"review": decision}
+   688	    def approval(_state):
+   689	        _, digest = runtime.validate_bundle()
+   690	        if runtime.plan.get("automatic"):
+   691	            from .automatic import validate_automatic
+   692	            validate_automatic(runtime.plan)
+   693	            decision = {"approve": digest}  # Explicit run-level authority: feature branch only.
+   694	        else:
+   695	            decision = interrupt({"kind": "integration_approval", "bundle_sha256": digest,
+   696	                                  "message": "Approve fast-forward of source branch; no push."})
+   697	        if decision != {"approve": digest}:
+   698	            raise ValueError("Explicit exact-bundle approval required")
+   699	        return {"approved_bundle": digest}
+   700	    def integrate(state): return {"integrated_commit": runtime.integrate(state["approved_bundle"])}
+   701	    graph = StateGraph(PipelineState)
+   702	    launches = [f"launch_{node}" for node in workers]
+   703	    verifies = [f"verify_{node}" for node in workers]
+   704	    for node, name in zip(workers, launches):
+   705	        graph.add_node(name, launcher(node))
+   706	    for node, name in zip(workers, verifies):
+   707	        graph.add_node(name, verifier(node))
+   708	    for name, function in (("handoff", handoff), ("candidate", candidate), ("review", review), ("approval", approval), ("integrate", integrate)):
+   709	        graph.add_node(name, function)
+   710	    for name in launches:
+   711	        graph.add_edge(START, name)
+   712	    graph.add_edge(launches, "handoff")
+   713	    for name in verifies:
+   714	        graph.add_edge("handoff", name)
+   715	    graph.add_edge(verifies, "candidate")
+   716	    graph.add_edge("candidate", "review"); graph.add_edge("review", "approval")
+   717	    graph.add_edge("approval", "integrate"); graph.add_edge("integrate", END)
+   718	    return graph.compile(checkpointer=checkpointer)
+   719	
+   720	
+   721	def start_workers(runtime, attach: bool = False) -> None:
+   722	    """The first graph step (every launch) after `resume` decided the design challenge; `start` does the same inline."""
+   723	    from .guardrails import challenge_gate
+   724	    if not challenge_gate(runtime):
+   725	        raise RuntimeError("The design challenge has not passed; no worker is launched")
+   726	    config = graph_config(runtime)
+   727	    with SqliteSaver.from_conn_string(str(runtime.directory / "pipeline.sqlite")) as saver:
+   728	        graph = build_pipeline(saver, runtime)
+   729	        if graph.get_state(config).values:
+   730	            raise RuntimeError("Run already started; use status/explicit controls, never start again")
+   731	        try:
+   732	            graph.invoke({"run_id": runtime.plan["run_id"]}, config)
+   733	        finally:
+   734	            print(f"Report: {report(runtime, graph.get_state(config))}")
+   735	    if attach:
+   736	        print(json.dumps(attach_panels(runtime.sessions), indent=2))
+   737	
+   738	
+   739	def graph_config(runtime) -> dict:
+   740	    """One LangGraph thread per run; every lane's fan-out step may run concurrently."""
+   741	    return {"configurable": {"thread_id": runtime.plan["run_id"]}, "max_concurrency": max(2, len(runtime.workers))}
+   742	
+   743	
+   744	def report(runtime: Pipeline, state) -> Path:
+   745	    """Escaped local results viewer, generated on every CLI boundary; no server needed."""
+   746	    state = carry_legacy_lanes(runtime, state)  # `status` on a legacy run must export the same evidence as `export`.
+   747	    export_state(runtime, state)
+   748	    events_path = runtime.directory / "events.jsonl"
+   749	    events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
+   750	    packets = list((runtime.directory / "verification").glob("*/*/*/packet.json"))
+   751	    flow = ("Launch workers → completion signals → isolated checks → combined checks → independent review → verified feature branch (no main merge or push)"
+   752	            if runtime.plan.get("automatic") else "Launch workers → human handoff → isolated checks → combined checks → independent review → approval → integration")
+   753	    parts = ['<!doctype html><meta charset="utf-8"><title>Workflow report</title><style>body{font:16px system-ui;max-width:1100px;margin:40px auto;background:#151820;color:#eee}pre{white-space:pre-wrap}a{color:#8dcaff}img{max-width:100%}section{border:1px solid #555;padding:16px;margin:16px 0}</style>',
+   754	             '<h1>Workflow report</h1><p>' + html.escape(flow) + '</p>',
+   755	             '<h2>Current state</h2><pre>' + html.escape(json.dumps({"next": state.next, "interrupts": [str(task.interrupts) for task in state.tasks if task.interrupts], "errors": [str(task.error) for task in state.tasks if task.error], "integrated_commit": state.values.get("integrated_commit")}, indent=2)) + '</pre>',
+   756	             '<h2>Timeline</h2><pre>' + html.escape(json.dumps(events, indent=2)) + '</pre>']
+   757	    positions, edges, width, height = lane_positions(list(runtime.workers))
+   758	    svg = [f'<h2>Execution graph</h2><svg role="img" aria-label="Workflow execution graph" viewBox="0 0 {width} {height}">']
+   759	    for left, right in edges:
+   760	        x1, y1 = positions[left]; x2, y2 = positions[right]
+   761	        svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#9aa"/>')
+   762	    for name, (x, y) in positions.items():
+   763	        color = '#665000' if name in state.next else '#263747'
+   764	        svg.append(f'<rect x="{x-75}" y="{y-23}" width="150" height="46" rx="8" fill="{color}" stroke="#9aa"/><text x="{x}" y="{y+5}" text-anchor="middle" fill="white" font-size="14">{html.escape(name)}</text>')
+   765	    lanes = ", ".join(runtime.workers) + (f" (excluded: {', '.join(runtime.excluded)})" if runtime.excluded else "")
+   766	    svg.append(f'</svg><p>Lanes: {html.escape(lanes)}. Highlighted nodes are pending. A completed launch is not a completed worker task.</p>')
+   767	    parts[2:2] = svg
+   768	    from urllib.parse import quote
+   769	    for path in packets:
+   770	        packet = read_json(path)
+   771	        parts.append('<section><h2>' + html.escape(str(path.relative_to(runtime.directory))) + '</h2><pre>' + html.escape(json.dumps({"gate": packet["gate"], "result": packet["result"]}, indent=2)) + '</pre>')
+   772	        for artifact in packet["result"]["artifacts"]:
+   773	            local = Path(packet["artifact_paths"][artifact["artifact_id"]]).resolve()
+   774	            if not local.is_relative_to(runtime.directory):
+   775	                continue
+   776	            url = quote(str(local.relative_to(runtime.directory)), safe="/")
+   777	            parts.append(f'<p><a href="{url}">{html.escape(artifact["artifact_id"])}</a></p>')
+   778	            if artifact["kind"] == "screenshot":
+   779	                parts.append(f'<img alt="Browser scenario screenshot" src="{url}">')
+   780	        parts.append('</section>')
+   781	    failure_report = runtime.directory / "failure-report.json"
+   782	    if failure_report.exists():
+   783	        parts.append('<h2>Checkpoint failure drill</h2><pre>' + html.escape(failure_report.read_text()) + '</pre>')
+   784	    destination = runtime.directory / "report.html"
+   785	    destination.write_text("\n".join(parts))
+   786	    return destination
+   787	
+   788	
+   789	def main():
+   790	    parser = argparse.ArgumentParser(description=__doc__)
+   791	    parser.add_argument("action", choices=["preflight", "prepare", "start", "automatic", "automatic-step", "attach", "freeze", "retry", "reconcile", "review", "approve", "status", "export"],
+   792	                        help="resume and answer (feature.json 2.2.0 runs) have their own options: python -m workflow resume|answer --help")
+   793	    parser.add_argument("directory", type=Path)
+   794	    parser.add_argument("--repo", type=Path, default=Path.cwd())
+   795	    parser.add_argument("--policy", type=Path)
+   796	    parser.add_argument("--workers", help="prepare: comma-separated subset of the policy's lanes to launch (default: every declared lane)")
+   797	    parser.add_argument("--task", action="append", metavar="LANE=PATH", help="prepare: task file for one selected lane; repeat once per lane")
+   798	    parser.add_argument("--reviewer", action="append", metavar="ID[=PATH]",
+   799	                        help="prepare: a declared reviewer and its brief file (repeat per reviewer; omitted means the single built-in reviewer). "
+   800	                             "review: the reviewer id an imported review file belongs to")
+   801	    parser.add_argument("--live", action="store_true")
+   802	    parser.add_argument("--automatic", action="store_true", help="Prepare run-scoped permission bypass and automatic feature-branch completion")
+   803	    parser.add_argument("--worker-timeout-seconds", type=int, help="Automatic mode: deadline per worker from launch until its completion signal (default 4h)")
+   804	    parser.add_argument("--review-timeout-seconds", type=int, help="Automatic mode: reviewer deadline from its launch to its completion file (default 30m)")
+   805	    parser.add_argument("--reviewer-transport", choices=["native", "print"], help="Automatic mode: native attachable reviewer session (default) or headless claude --print")
+   806	    parser.add_argument("--herdr", action="store_true")
+   807	    parser.add_argument("--handoff", action="append", metavar="LANE=PATH", help="freeze: handoff file for one selected lane; repeat once per lane")
+   808	    parser.add_argument("--review-file", type=Path)
+   809	    parser.add_argument("--bundle-sha256")
+   810	    parser.add_argument("--node", help="retry: the lane whose failed check reruns (validated against the run's lanes)")
+   811	    parser.add_argument("--phase", choices=["worker", "candidate"], default="worker")
+   812	    parser.add_argument("--guardrails", action="store_true", help="prepare: a feature.json 2.2.0 run: completion 1.1.0, decisions.md pinned, "
+   813	                                                                  "and the design challenge before any worker launch")
+   814	    parser.add_argument("--decisions", type=Path, help="prepare --guardrails: the feature's decisions.md, pinned into the plan")
+   815	    parser.add_argument("--prd", type=Path, help="prepare --guardrails: the PRD the design challenge reads, copied into the run")
+   816	    parser.add_argument("--no-challenge", action="store_true", help="prepare --guardrails: the feature sets challenge: false")
+   817	    args = parser.parse_args()
+   818	    directory = args.directory.resolve()
+   819	    try:
+   820	        if args.action == "preflight":
+   821	            if not args.policy:
+   822	                parser.error("preflight requires --policy")
+   823	            policy = validate_pipeline_policy(read_json(args.policy))
+   824	            if git(args.repo.resolve(), "status", "--porcelain"):
+   825	                raise ValueError("Source must be clean before prepare")
+   826	            for executable in ("git", "claude", "node"):
+   827	                if not shutil.which(executable):
+   828	                    raise ValueError(f"Missing executable: {executable}")
+   829	            help_text = run_claude(["claude", "--help"], stdout=subprocess.PIPE, text=True, check=True, timeout=15).stdout
+   830	            required_flags = ["--bg", "--safe-mode", "--tools", "--permission-mode"]
+   831	            if args.automatic:
+   832	                # Workers: --dangerously-skip-permissions. Native reviewer: --add-dir and --allowedTools.
+   833	                # Print-mode reviewer (--reviewer-transport print): --json-schema, --print, --permission-prompts.
+   834	                required_flags += ["--dangerously-skip-permissions", "--add-dir", "--allowedTools", "--json-schema", "--print", "--permission-prompts"]
+   835	            if not all(flag in help_text for flag in required_flags):
+   836	                raise ValueError("Installed Claude CLI lacks required flags")
+   837	            auth = json.loads(run_claude(["claude", "auth", "status"], stdout=subprocess.PIPE, text=True, check=True, timeout=15).stdout)
+   838	            if auth.get("loggedIn") is not True:
+   839	                raise ValueError("Claude is not authenticated")
+   840	            if args.herdr and os.environ.get("HERDR_ENV") != "1":
+   841	                raise ValueError("Herdr attachment requires a managed caller pane")
+   842	            print(json.dumps({"preflight": "passed", "base_commit": git(args.repo.resolve(), "rev-parse", "HEAD"),
+   843	                              "policy_sha256": policy_digest(policy), "note": "No agents launched. Actual dependency/test availability is checked in isolated verification worktrees."}, indent=2))
+   844	            return
+   845	        if args.action == "prepare":
+   846	            if not args.policy or not args.task:
+   847	                parser.error("prepare requires --policy and --task <lane>=<path> for every selected lane")
+   848	            policy = validate_pipeline_policy(read_json(args.policy))
+   849	            declared = policy_workers(policy)
+   850	            selected = parse_lane_selection(args.workers, declared)
+   851	            task_files = parse_lane_files(args.task, "--task")
+   852	            if set(task_files) != set(selected):
+   853	                parser.error(f"--task must be given exactly once for each selected lane ({', '.join(selected)}); got {', '.join(task_files) or 'none'}")
+   854	            if args.automatic and not git(args.repo.resolve(), "symbolic-ref", "--short", "HEAD").startswith("feature/"):
+   855	                raise ValueError("Automatic preparation requires a feature/ branch")
+   856	            from .guardrails import brief_problems, pin_guardrails, pinned_task
+   857	            if args.guardrails:
+   858	                if not args.decisions:
+   859	                    parser.error("prepare --guardrails requires --decisions <decisions.md>")
+   860	                for node, path in task_files.items():
+   861	                    problems = brief_problems(path.read_text())
+   862	                    if problems:
+   863	                        raise ValueError(f"Task {path} for lane {node}: {', '.join(problems)}")
+   864	                if not args.decisions.is_file() or not args.decisions.read_text().strip():
+   865	                    raise ValueError(f"decisions.md is missing or empty: {args.decisions}")
+   866	                if args.prd and not args.prd.is_file():
+   867	                    raise ValueError(f"PRD does not exist: {args.prd}")
+   868	            elif args.decisions or args.prd or args.no_challenge:
+   869	                parser.error("--decisions, --prd and --no-challenge apply to prepare --guardrails (feature.json 2.2.0) only")
+   870	            tasks = {}
+   871	            for worker in policy["workers"]:
+   872	                node = worker["node_id"]
+   873	                if node in selected:
+   874	                    tasks[node] = pinned_task(task_files[node].read_text(), worker)
+   875	            reviewers = parse_reviewer_files(args.reviewer, declared)
+   876	            plan = prepare(directory, args.repo, "HEAD", tasks, True, declared=declared)
+   877	            if reviewers:
+   878	                plan["reviewers"] = reviewers
+   879	            drill = policy.get("failure_drill")
+   880	            drill_skipped = bool(drill) and drill["node_id"] not in selected
+   881	            plan.update(mode="interactive", policy_sha256=policy_digest(policy), created_at=now(), source_branch=git(args.repo.resolve(), "symbolic-ref", "--short", "HEAD"),
+   882	                        failure_drill=None if drill_skipped else drill)
+   883	            if args.guardrails:
+   884	                pin_guardrails(plan, directory, {node: task_files[node] for node in selected}, args.decisions, args.prd, not args.no_challenge)
+   885	            if args.automatic:
+   886	                from .automatic import automatic_settings
+   887	                plan["automatic"] = automatic_settings(args.worker_timeout_seconds, args.review_timeout_seconds, args.reviewer_transport)
+   888	            elif args.worker_timeout_seconds or args.review_timeout_seconds or args.reviewer_transport:
+   889	                parser.error("Timeouts and the reviewer transport apply to --automatic runs only; manual runs have operator-controlled lifetimes and review")
+   890	            save_json(directory / "policy.json", policy)
+   891	            save_json(directory / "plan.json", plan)
+   892	            from types import SimpleNamespace
+   893	            runtime = Pipeline(directory)
+   894	            if drill_skipped:
+   895	                runtime.event("controller", "running", f"Failure drill skipped: its lane {drill['node_id']} is not selected for this run")
+   896	            export_state(runtime, SimpleNamespace(values={}, next=tuple(f"launch_{node}" for node in selected), tasks=[]))
+   897	            print(f"Prepared {directory}; no agents launched. Pin: {plan['base_commit']}. Lanes: {', '.join(selected)}"
+   898	                  + (f" (excluded: {', '.join(plan['excluded_workers'])})" if plan["excluded_workers"] else "")
+   899	                  + f". Reviewers: {', '.join(reviewer_ids(plan))}")
+   900	            return
+   901	        if args.action == "automatic":
+   902	            if not args.live:
+   903	                parser.error("automatic requires --live because it can launch an independent reviewer")
+   904	            from .automatic import supervise
+   905	            try:
+   906	                supervise(directory)
+   907	            except TransientInfraError as error:
+   908	                # Resumable, not blocked: 75 (EX_TEMPFAIL). Stale long-lived sessions are the usual source of an update.
+   909	                warning = stale_claude_warning()
+   910	                parser.exit(75, f"Interrupted: {error}\n" + (f"{warning}\n" if warning else ""))
+   911	            print(f"Automatic run reached a verified feature branch. Evidence: {directory / 'report.html'}. No main merge or push.")
+   912	            return
+   913	        if args.action == "export":
+   914	            # Re-export an existing run (for example one recorded before a newer export version).
+   915	            with run_lock(directory):
+   916	                exported = export_run(ExportRuntime(directory))
+   917	            print(f"Exported run-state.json version {exported['version']}: {directory / 'run-state.json'}. No agents launched.")
+   918	            return
+   919	        with run_lock(directory):
+   920	            runtime = Pipeline(directory)
+   921	            if args.action == "automatic-step":
+   922	                if not args.live:
+   923	                    parser.error("automatic requires --live because it can launch an independent reviewer")
+   924	                from .automatic import UNAVAILABLE_EXIT, drive
+   925	                try:
+   926	                    commit = drive(runtime, single_step=True)
+   927	                except TransientInfraError as error:
+   928	                    parser.exit(UNAVAILABLE_EXIT, f"Interrupted: {error}\nNothing was stopped; the supervisor exits resumable.\n")
+   929	                if commit is None:
+   930	                    parser.exit(75, "Checkpoint persisted; continuing in a new controller process.\n")
+   931	                print(f"Verified feature branch: {runtime.plan['source_branch']} at {commit}. No main merge or push.")
+   932	                return
+   933	            if args.action == "attach":
+   934	                print(json.dumps(attach_panels(runtime.sessions), indent=2)); return
+   935	            with SqliteSaver.from_conn_string(str(directory / "pipeline.sqlite")) as saver:
+   936	                graph = build_pipeline(saver, runtime)
+   937	                config = graph_config(runtime)
+   938	                state = graph.get_state(config)
+   939	                pending = [item.value.get("kind") for task in state.tasks for item in task.interrupts]
+   940	                value = None
+   941	                if args.action == "start":
+   942	                    if not args.live:
+   943	                        parser.error("start requires --live; do not use it for offline tests")
+   944	                    if state.values:
+   945	                        parser.error("Run already started; use status/explicit controls, never start again")
+   946	                    from .guardrails import challenge_gate, paused_message
+   947	                    warning = stale_claude_warning()
+   948	                    if warning:
+   949	                        print(warning, file=sys.stderr)
+   950	                    # A 2.2.0 run's design challenge decides before any worker launch; a pause exits 0 with the resume commands.
+   951	                    if not challenge_gate(runtime):
+   952	                        print(paused_message(directory, args.herdr))
+   953	                        print(f"Report: {report(runtime, state)}")
+   954	                        return
+   955	                    value = {"run_id": runtime.plan["run_id"]}
+   956	                elif args.action == "freeze":
+   957	                    if pending != ["worker_handoff"]:
+   958	                        parser.error("Run is not waiting for worker handoff")
+   959	                    handoffs = parse_lane_files(args.handoff, "--handoff")
+   960	                    if set(handoffs) != set(runtime.workers):
+   961	                        parser.error(f"freeze requires --handoff <lane>=<path> once for each lane of this run ({', '.join(runtime.workers)})")
+   962	                    for node, handoff_path in handoffs.items():
+   963	                        save_json(directory / f"{node}.handoff.json", read_json(handoff_path))
+   964	                    value = Command(resume={"freeze": True})
+   965	                elif args.action == "review":
+   966	                    if pending != ["independent_review"] or not args.review_file:
+   967	                        parser.error("Review requires pending review and --review-file")
+   968	                    declared = reviewer_ids(runtime.plan)
+   969	                    reviewer_flags = args.reviewer or []
+   970	                    if len(reviewer_flags) > 1 or any("=" in item for item in reviewer_flags):
+   971	                        parser.error("review takes one --reviewer <id>")
+   972	                    reviewer = reviewer_flags[0] if reviewer_flags else (declared[0] if len(declared) == 1 else None)
+   973	                    if reviewer is None:
+   974	                        parser.error(f"--reviewer <id> is required: this run declares the reviewers {', '.join(declared)}")
+   975	                    if reviewer not in declared:
+   976	                        parser.error(f"--reviewer must be one of this run's reviewers ({', '.join(declared)}), got {reviewer!r}")
+   977	                    imported = read_json(args.review_file)
+   978	                    if isinstance(imported, dict) and "reviewers" in imported:
+   979	                        parser.error("--review-file is one reviewer's review (no reviewers list); the controller combines the imports")
+   980	                    bundle, digest = runtime.validate_bundle()
+   981	                    check_review(imported, bundle, digest)  # One reviewer's approved review, bound to the exact bundle.
+   982	                    save_json(directory / f"{review_node(reviewer)}.imported.json", {"reviewer_id": reviewer, "imported_at": now(), "review": imported})
+   983	                    imports = {}
+   984	                    for item in declared:
+   985	                        path = directory / f"{review_node(item)}.imported.json"
+   986	                        if path.exists():
+   987	                            imports[item] = read_json(path)
+   988	                    missing = [item for item in declared if item not in imports]
+   989	                    if missing:
+   990	                        print(f"Imported the {reviewer} review; still waiting for: {', '.join(missing)}. The run stays at the review gate.")
+   991	                        return
+   992	                    decision = combine_imported_reviews(bundle, digest, imports)
+   993	                    runtime.validate_review(decision)
+   994	                    value = Command(resume=decision)
+   995	                elif args.action == "approve":
+   996	                    if pending == ["independent_review"]:
+   997	                        imported = [item for item in reviewer_ids(runtime.plan) if (directory / f"{review_node(item)}.imported.json").exists()]
+   998	                        parser.error("Run is waiting for independent review: approve needs every declared reviewer imported and approved "
+   999	                                     f"(reviewers: {', '.join(reviewer_ids(runtime.plan))}; imported: {', '.join(imported) or 'none'})")
+  1000	                    if pending != ["integration_approval"]:
+  1001	                        parser.error("Run is not waiting for integration approval")
+  1002	                    _, digest = runtime.validate_bundle()
+  1003	                    if args.bundle_sha256 != digest:
+  1004	                        parser.error("Provide the exact --bundle-sha256 displayed at approval")
+  1005	                    runtime.validate_review(read_json(directory / "review.json"))  # Every declared reviewer approved.
+  1006	                    value = Command(resume={"approve": digest})
+  1007	                elif args.action == "reconcile":
+  1008	                    if pending or not state.next or not any(step.startswith("launch_") for step in state.next):
+  1009	                        parser.error("Reconcile requires failed launch steps")
+  1010	                    for step in state.next:
+  1011	                        if step.startswith("launch_"):
+  1012	                            node = step.removeprefix("launch_")
+  1013	                            if not (directory / f"{node}.interactive.json").exists():
+  1014	                                parser.error("No durable launch intent; cannot reconcile without potentially launching a new agent")
+  1015	                            runtime.sessions.run(node)  # Existing receipt path never starts a new process.
+  1016	                elif args.action == "retry":
+  1017	                    if not state.values or pending or not state.next:
+  1018	                        parser.error("Retry requires a failed graph step, not an interrupt/completed run")
+  1019	                    if args.node:
+  1020	                        if args.node not in runtime.workers:
+  1021	                            parser.error(f"--node must be a lane of this run ({', '.join(runtime.workers)}), got {args.node!r}")
+  1022	                        step = f"verify_{args.node}" if args.phase == "worker" else "candidate"
+  1023	                        if step not in state.next:
+  1024	                            parser.error("Selected check is not a failed/pending step")
+  1025	                        runtime.retry_check(args.phase, args.node)
+  1026	                    # No new agent launch is ever permitted during retry.
+  1027	                    if any(step.startswith("launch_") for step in state.next):
+  1028	                        parser.error("Launch failure requires explicit session reconciliation; do not blindly retry")
+  1029	                if args.action != "status":
+  1030	                    try:
+  1031	                        graph.invoke(value, config)
+  1032	                    finally:
+  1033	                        print(f"Report: {report(runtime, graph.get_state(config))}")
+  1034	                    if args.action == "start" and args.herdr:
+  1035	                        print(json.dumps(attach_panels(runtime.sessions), indent=2))
+  1036	                else:
+  1037	                    status = {"workers": runtime.workers, "excluded_workers": runtime.excluded, "next": state.next, "pending": pending,
+  1038	                              "errors": [str(task.error) for task in state.tasks if task.error]}
+  1039	                    if (directory / "challenge.json").exists():
+  1040	                        status["challenge"] = read_json(directory / "challenge.json")["status"]
+  1041	                    print(json.dumps(status, indent=2))
+  1042	                    print(f"Report: {report(runtime, state)}")
+  1043	    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+  1044	        parser.exit(1, f"Blocked: {error}\nAll work/evidence retained at {directory}. No automatic fallback or push.\n")
+  1045	
+  1046	
+  1047	if __name__ == "__main__":
+  1048	    main()

@@ -1,0 +1,146 @@
+import { expect, test, type Page } from "@playwright/test";
+import { chooseFinalSocket, seaMap } from "../../packages/content/src/index.js";
+import { TREASURE_CIRCLE_RADIUS_TILES } from "../../packages/content/src/claim/index.js";
+import { attachScreenshot, clearCourse, createMatch, FINAL_SECRET, joinMatch, place, readout, sailTo, selfId, TILE } from "./helpers.js";
+
+/**
+ * The first winnable match (§18 stage 2's exit), in two browsers against the browser server's test-only settings: a
+ * 3 s ready countdown, a 10-minute match, the fixed source layout (Suns on Palm Key, Moons on Ember Rock) and the
+ * pinned final-socket secret, so the scenario knows where the treasure is.
+ */
+const PALM_WEST = seaMap.docks.find((dock) => dock.island === 0)!;
+const EMBER_EAST = seaMap.docks.find((dock) => dock.island === 1)!;
+const SOCKET = seaMap.finalSockets[chooseFinalSocket(seaMap, FINAL_SECRET)]!;
+const CLAIM = { x: SOCKET.claimTile.tileX * TILE + TILE / 2, y: SOCKET.claimTile.tileY * TILE + TILE / 2 };
+/** Out at sea eight tiles off the claim tile, on the side away from the islet, facing it. */
+const outward = SOCKET.claimTile.tileY < SOCKET.rect.tileY ? -1 : 1;
+const OFFSHORE = { tileX: SOCKET.claimTile.tileX, tileY: SOCKET.claimTile.tileY + 8 * outward, heading: outward < 0 ? 16 : 48 };
+
+/** Holds E moored at the page's dock until the purse shows the rubbing, as a player does. */
+async function holdToCollect(page: Page, types: string): Promise<void> {
+  await page.keyboard.down("e");
+  try {
+    await expect(page.getByTestId("hud-hold")).toHaveAttribute("data-state", /^collect:/);
+    await expect(page.getByTestId("purse-rubbings")).toHaveAttribute("data-types", types, { timeout: 12_000 });
+  } finally {
+    await page.keyboard.up("e");
+  }
+}
+
+test("two browsers play a whole match: the lobby, the countdown and timer, a full set, the reveal and the route, and a ten-second claim that both see won [scenario:full-match]", async ({ browser, request }, testInfo) => {
+  // Two six-second collections, a short sail, the ten-second claim.
+  test.setTimeout(180_000);
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+
+    // The lobby: the host sees both players and the Start button; the guest waits for the host.
+    const code = await createMatch(host);
+    await joinMatch(guest, code);
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("lobby")).toBeVisible();
+      await expect(page.getByTestId("lobby-code")).toHaveText(code);
+      await expect(page.getByTestId("lobby-players").getByRole("listitem")).toHaveCount(2);
+      await expect(page.getByTestId("flow-phase")).toHaveText("Lobby");
+    }
+    await expect(host.getByTestId("lobby-players").getByRole("listitem")).toHaveText(["Player 1 (you, host)", "Player 2"]);
+    await expect(guest.getByTestId("lobby-players").getByRole("listitem")).toHaveText(["Player 1 (host)", "Player 2 (you)"]);
+    await expect(guest.getByRole("button", { name: "Start match" })).toBeHidden();
+    await expect(guest.getByTestId("lobby-hint")).toHaveText("Waiting for the host to start the match.");
+
+    // The host starts: both see the ready countdown, then the match timer running from 10:00.
+    await host.getByRole("button", { name: "Start match" }).click();
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("flow-phase")).toHaveText("Ready check");
+      await expect(page.getByTestId("lobby-hint")).toHaveText(/^Setting sail in [1-3] s/);
+      await expect(page.getByTestId("match-timer")).toHaveText("10:00");
+    }
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("match-timer")).toHaveAttribute("data-state", "running", { timeout: 10_000 });
+      await expect(page.getByTestId("lobby")).toBeHidden();
+      await expect(page.getByTestId("match-timer")).toHaveText(/^(10:00|9:[0-5]\d)$/);
+    }
+    // The timer counts down in both browsers.
+    await expect.poll(async () => Number(await guest.getByTestId("match-timer").getAttribute("data-remaining")), { timeout: 5000 }).toBeLessThan(12_000 - 20);
+
+    // The host collects both types, moored at two islands.
+    await place(request, host, code, PALM_WEST.tileX, PALM_WEST.tileY, 0);
+    await holdToCollect(host, "sun");
+    await expect(host.getByTestId("banner")).toBeHidden();
+    await place(request, host, code, EMBER_EAST.tileX, EMBER_EAST.tileY, 32);
+    await holdToCollect(host, "sun,moon");
+
+    // The reveal: the host holds every type and gets the route; everyone learns the sector.
+    await expect(host.getByTestId("banner")).toBeVisible();
+    await expect(host.getByTestId("reveal-log").getByRole("listitem")).toHaveCount(2);
+    await expect(host.getByTestId("reveal-log")).toContainText("You hold every rubbing!");
+    await expect(host.getByTestId("reveal-log")).toContainText("A full set of rubbings exists!");
+    await expect(guest.getByTestId("banner-title")).toHaveText("A full set of rubbings exists!");
+    const sector = (await guest.getByTestId("flow-sector").textContent())!;
+    expect(sector).toMatch(/^Treasure sector: /);
+    await expect(host.getByTestId("flow-sector")).toHaveText(sector);
+    // The route: the compass and the minimap mark for the host only.
+    await expect(host.getByTestId("compass")).toBeVisible();
+    await expect(host.getByTestId("compass")).toHaveAttribute("data-state", "active");
+    await expect(host.getByTestId("compass-text")).toHaveText(/^Treasure: \d+ tiles [a-z-]+$/);
+    await expect(host.getByTestId("game")).toHaveAttribute("data-route", `${CLAIM.x},${CLAIM.y},true`);
+    await expect(guest.getByTestId("compass")).toBeHidden();
+    expect(await guest.getByTestId("game").getAttribute("data-route")).toBeFalsy();
+    await expect(host.getByTestId("claim-text")).toHaveText("Sail into the treasure circle to claim");
+
+    // The host sails with the keyboard to the claim tile and stops inside the treasure circle.
+    expect(clearCourse({ x: OFFSHORE.tileX * TILE + TILE / 2, y: OFFSHORE.tileY * TILE + TILE / 2 }, CLAIM)).toBe(true);
+    await place(request, host, code, OFFSHORE.tileX, OFFSHORE.tileY, OFFSHORE.heading);
+    const stopped = await sailTo(host, CLAIM, { within: TILE });
+    expect(Math.hypot(stopped.x - CLAIM.x, stopped.y - CLAIM.y)).toBeLessThanOrEqual(TREASURE_CIRCLE_RADIUS_TILES * TILE);
+    await expect(host.getByTestId("claim-text")).toHaveText("Hold E to claim the treasure (ten seconds)");
+    await expect(host.getByTestId("claim-risk")).toHaveText("Any rival in range can interrupt you with a grapple");
+    // The guest waits offshore, in sight of the claim tile.
+    const hostId = await selfId(host);
+    await place(request, guest, code, OFFSHORE.tileX, OFFSHORE.tileY, OFFSHORE.heading);
+    await expect.poll(async () => (await readout(guest, hostId)) !== undefined, { timeout: 5000 }).toBe(true);
+
+    // The claim: E held for ten seconds, the channel's progress shown with its risk, and the win.
+    await host.keyboard.down("e");
+    try {
+      await expect(host.getByTestId("claim-text")).toHaveAttribute("data-state", "channel");
+      await expect(host.getByTestId("claim-progress")).toBeVisible();
+      await expect.poll(async () => Number(await host.getByTestId("claim-progress").getAttribute("data-held")), { timeout: 5000 }).toBeGreaterThan(40);
+      // The rival in sight sees the channel on the host's ship and is warned.
+      await expect(guest.getByTestId("game")).toHaveAttribute("data-claiming", hostId);
+      await expect(guest.getByTestId("claim-text")).toHaveText("A rival is claiming the treasure! Grapple them before the channel completes");
+      await expect(host.getByTestId("game")).toHaveAttribute("data-claiming", hostId);
+      await expect(host.getByTestId("results")).toBeVisible({ timeout: 15_000 });
+    } finally {
+      await host.keyboard.up("e");
+    }
+    expect((await readout(host, hostId))?.speed).toBe(0);
+
+    // Both browsers show the results, the host as the winner, with each player's accomplishments.
+    await expect(host.getByTestId("results-headline")).toHaveText("You claimed the treasure!");
+    await expect(guest.getByTestId("results")).toBeVisible({ timeout: 5000 });
+    await expect(guest.getByTestId("results-headline")).toHaveText("Player 1 claimed the treasure");
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("results")).toHaveAttribute("data-reason", "claim");
+      await expect(page.getByTestId("results")).toHaveAttribute("data-winner-seat", "1");
+      const rows = page.getByTestId("results-table").locator("tbody tr");
+      await expect(rows).toHaveCount(2);
+      await expect(rows.first()).toHaveAttribute("data-winner", "true");
+      await expect(rows.first()).toHaveAttribute("data-seat", "1");
+      // Collected 2, no thefts or losses or duels, 50 gold, no cache, 2 islands.
+      await expect(rows.first().locator("td")).toHaveText([/^Player 1/, "2", "0", "0", "0", "0", "0", "50", "0", "2"]);
+      await expect(page.getByTestId("flow-phase")).toHaveText("Match over");
+      await expect(page.getByRole("button", { name: "Back to lobby" })).toBeVisible();
+    }
+    await attachScreenshot(host, testInfo, "full-match");
+
+    // Back to lobby returns the guest to the landing page.
+    await guest.getByRole("button", { name: "Back to lobby" }).click();
+    await expect(guest.getByRole("button", { name: "Create match" })).toBeVisible();
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

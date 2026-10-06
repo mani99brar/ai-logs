@@ -1,0 +1,552 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { isNavigable, seaMap } from "@pirate-sea-race/content";
+import { ShopMessageType } from "@pirate-sea-race/protocol";
+import { startGameServer, type MatchRoom, type RunningGameServer } from "@pirate-sea-race/server";
+import { defaultSimulationConfig, drinkTonic, hashState, step, type MatchState } from "@pirate-sea-race/simulation";
+import { checkLedger, findPlayer, objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { AHEAD, HeadlessClient, sleep } from "@pirate-sea-race/test-tools";
+import { placePair, tuned } from "./rubbingsSetup.js";
+import { dockFor, EAST, HOLD_E, HUB_X, NORTH, OPEN_ROW, openWater, playersAt, roomOf, startThroughLobby, tracker, until, WEST, type Seat } from "./seaDuelSetup.js";
+
+/**
+ * §11's economy through the real room: the supply crates at sea, the dockside shop's sail tonic (and its rumor, the
+ * journal's purchase), and the tonic's speed. Players drive it as a browser does: they sail with the helm, moor with E,
+ * send `buy-tonic` and `use-tonic` with their request ids. Every player starts with the rules' 50 gold; a tonic costs 30,
+ * a crate pays 25. The rooms check `checkLedger` (the gold identity among it) and their own invariant after every world
+ * tick, and that the ledger refused nothing the room asked (`tracker`). Cases that need one exact tick hold the clock
+ * with the room's test hooks (`pauseAfterTick`, `stepWorldTicks`).
+ */
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  server = await startGameServer({
+    port: 0,
+    host: "127.0.0.1",
+    handleSignals: false,
+    testPlacement: true,
+    matchTuning: tuned({ objectives: { ...objectiveRules, collectTicks: 20, cacheClaimTicks: 20 }, testHooks: true }),
+  });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+const PRICE = objectiveRules.tonicPrice;
+const CRATE_GOLD = objectiveRules.supplyCacheGold;
+const TONIC_TICKS = objectiveRules.tonicTicks;
+const START = objectiveRules.startingGold;
+/** Somewhere on the open row south of the hub, out of every crate's sight. */
+const ROW: Seat = { tileX: HUB_X - 6, tileY: OPEN_ROW, heading: EAST };
+
+const goldOf = (room: MatchRoom, id: string) => findPlayer(room.ledgerState, id)!.gold;
+const tonicsOf = (room: MatchRoom, id: string) => findPlayer(room.ledgerState, id)!.tonics;
+const supplyGrants = (room: MatchRoom) => room.ledgerState.grants.filter((grant) => grant.reason === "supply-cache");
+
+/** A crate's site and a seat three tiles west of it, facing it along clear water. */
+function crateSeat(room: MatchRoom, index: number): { crate: { id: string; x: number; y: number; tileX: number; tileY: number }; seat: Seat } {
+  const crate = room.crateSites[index]!;
+  const seat = { tileX: crate.tileX - 3, tileY: crate.tileY, heading: EAST };
+  expect(openWater(seat, { ...crate, heading: EAST })).toBe(true);
+  return { crate, seat };
+}
+
+/** Sails a ship over a crate from three tiles west of it until it has the crate's gold. */
+async function takeCrate(client: HeadlessClient, index: number): Promise<void> {
+  const room = roomOf(client);
+  const before = goldOf(room, client.sessionId);
+  await client.placeShip(endpoint, crateSeat(room, index).seat);
+  await client.holdUntil(AHEAD, () => goldOf(room, client.sessionId) === before + CRATE_GOLD, 5000);
+}
+
+/** Places a ship on a dock's tile and holds E until it is moored there. */
+async function moor(client: HeadlessClient, dock: { id: number; tileX: number; tileY: number } = dockFor("sun")): Promise<void> {
+  await client.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+  await client.holdUntil(HOLD_E, () => client.ship()?.dock === dock.id, 5000);
+}
+
+/** Sends a tonic purchase (a fresh id unless given) and resolves with its answer (the latest, for a retried id). */
+async function buy(client: HeadlessClient, requestId?: string) {
+  const id = client.buyTonic(requestId);
+  const before = client.tonicPurchaseAnswers(id).length;
+  await client.waitFor(() => client.tonicPurchaseAnswers(id).length > before, 3000);
+  return client.tonicPurchaseAnswers(id).at(-1)!;
+}
+
+/** Sends a drink request (a fresh id unless given) and resolves with its answer. */
+async function drink(client: HeadlessClient, requestId?: string) {
+  const id = client.useTonic(requestId);
+  const before = client.tonicUseAnswers(id).length;
+  await client.waitFor(() => client.tonicUseAnswers(id).length > before, 3000);
+  return client.tonicUseAnswers(id).at(-1)!;
+}
+
+/** Holds the room's clock after the current world tick. */
+async function pause(room: MatchRoom): Promise<void> {
+  room.pauseAfterTick(room.matchState.worldTick);
+  await until(() => room.worldPaused, 2000, "the pause");
+}
+
+describe.concurrent("supply crates (§3, §11)", () => {
+  it("pays the first ship to touch a crate 25 gold once; the crate vanishes for everyone in sight, and a second ship gets nothing", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [first, second] = (await playersAt(endpoint, [ROW, { ...ROW, tileX: ROW.tileX + 4 }], track)) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(first);
+    const { crate, seat } = crateSeat(room, 0);
+    // The second ship waits four tiles south of the crate, in sight of it.
+    const below: Seat = { tileX: crate.tileX, tileY: crate.tileY + 4, heading: NORTH };
+    await first.placeShip(endpoint, seat);
+    await second.placeShip(endpoint, below);
+    for (const client of [first, second]) await client.waitFor(() => client.crates().some((each) => each.id === crate.id));
+    expect(first.crates().find((each) => each.id === crate.id)).toEqual({ id: crate.id, x: crate.x, y: crate.y });
+    await first.holdUntil(AHEAD, () => first.gold() === START + CRATE_GOLD, 5000);
+    expect(supplyGrants(room)).toEqual([expect.objectContaining({ sourceKey: crate.id, playerId: first.sessionId, amount: CRATE_GOLD })]);
+    // Gone for both, the one who took it and the one watching.
+    for (const client of [first, second]) await client.waitFor(() => !client.crates().some((each) => each.id === crate.id));
+    // The second ship sails right over where it floated: nothing.
+    await second.holdUntil(AHEAD, () => (second.ship()?.y ?? Infinity) < crate.y - 200 || second.ship()?.speed === 0, 5000);
+    await sleep(200);
+    expect(goldOf(room, second.sessionId)).toBe(START);
+    expect(goldOf(room, first.sessionId)).toBe(START + CRATE_GOLD);
+    expect(supplyGrants(room)).toHaveLength(1);
+    expect(checkLedger(room.ledgerState)).toEqual([]);
+  }, 30_000);
+
+  it("gives a crate two ships touch on the same tick to the lower player id, whatever the join order", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // Players join until one has a lower id than someone who joined before them (each join has at least even odds);
+    // that pair plays, the earlier one first in join order, and the rest leave the lobby.
+    const present = [await HeadlessClient.create(endpoint)];
+    track(present[0]!);
+    let pair: [HeadlessClient, HeadlessClient] | undefined;
+    while (pair === undefined) {
+      expect(present.length).toBeLessThan(6);
+      const next = await HeadlessClient.join(endpoint, present[0]!.code);
+      track(next);
+      const earlier = present.find((client) => next.sessionId < client.sessionId);
+      if (earlier !== undefined) pair = [earlier, next];
+      else present.push(next);
+    }
+    for (const client of present) if (client !== pair[0]) await client.leave();
+    const [host, guest] = pair;
+    await host.waitFor(() => host.playerCount === 2);
+    await host.waitFor(() => host.seat !== 0 && host.hostSeat === host.seat);
+    await startThroughLobby(endpoint, [host, guest]);
+    const room = roomOf(host);
+    expect(room.matchState.ships.map((ship) => ship.id)).toEqual([host.sessionId, guest.sessionId]);
+    expect(guest.sessionId < host.sessionId).toBe(true);
+    const { crate } = crateSeat(room, 1);
+    await pause(room);
+    // Both ships put at rest on the crate's tile while the clock is held: both touch it on the next tick.
+    for (const client of [host, guest]) await client.placeShip(endpoint, { tileX: crate.tileX, tileY: crate.tileY, heading: EAST });
+    expect(supplyGrants(room)).toEqual([]);
+    const tick = room.matchState.worldTick + 1;
+    room.stepWorldTicks(1);
+    room.resumeWorld();
+    expect(supplyGrants(room)).toEqual([{ reason: "supply-cache", sourceKey: crate.id, playerId: guest.sessionId, amount: CRATE_GOLD, tick }]);
+    expect(goldOf(room, guest.sessionId)).toBe(START + CRATE_GOLD);
+    expect(goldOf(room, host.sessionId)).toBe(START);
+    expect(checkLedger(room.ledgerState)).toEqual([]);
+  }, 30_000);
+
+  it("hides the crates in sight from a player in a duel, as every other marker", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [attacker, defender] = (await playersAt(endpoint, [ROW, { ...ROW, tileX: ROW.tileX + 4 }], track, { clients: [{}, { autoReady: false }] })) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(attacker);
+    const crate = room.crateSites[0]!;
+    // Both two rows south of the crate, in grapple range, the attacker facing the defender; neither touches it.
+    const west: Seat = { tileX: crate.tileX - 4, tileY: crate.tileY + 2, heading: EAST };
+    const east: Seat = { tileX: crate.tileX, tileY: crate.tileY + 2, heading: WEST };
+    expect(openWater(west, east)).toBe(true);
+    await attacker.placeShip(endpoint, west);
+    await defender.placeShip(endpoint, east);
+    for (const client of [attacker, defender]) await client.waitFor(() => client.crates().some((each) => each.id === crate.id));
+    attacker.tapGrapple();
+    for (const client of [attacker, defender]) await client.waitFor(() => client.status()?.mode === "duel", 5000);
+    for (const client of [attacker, defender]) await client.waitFor(() => client.crates().length === 0);
+    expect(supplyGrants(room)).toEqual([]);
+  }, 30_000);
+
+  it("shows crates only in sight, and a player's gold, tonics and purchases only to that player", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [buyer, stranger] = (await playersAt(endpoint, [ROW, { ...ROW, tileX: ROW.tileX + 4 }], track)) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(buyer);
+    // The stranger stays on the open row, more than the sight radius from every crate: it never decodes one.
+    const strangerCrates = new Set<string>();
+    stranger.room.onStateChange(() => {
+      for (const crate of stranger.crates()) strangerCrates.add(crate.id);
+    });
+    for (const crate of room.crateSites) {
+      const [dx, dy] = [crate.x - stranger.ship()!.x, crate.y - stranger.ship()!.y];
+      expect(dx * dx + dy * dy).toBeGreaterThan(defaultSimulationConfig.sightRadius ** 2);
+    }
+    expect(buyer.crates()).toEqual([]);
+    await takeCrate(buyer, 2);
+    await moor(buyer);
+    expect(await buy(buyer)).toMatchObject({ outcome: "bought" });
+    expect(await drink(buyer)).toMatchObject({ outcome: "refused", reason: "not-at-sea" });
+    await sleep(300);
+    expect(strangerCrates).toEqual(new Set());
+    // The stranger's state holds its own status only, and no message of the buyer's reached it.
+    expect([...(stranger.room.state.status?.keys() ?? [])]).toEqual([stranger.sessionId]);
+    expect(stranger.messages.map((each) => each.type)).not.toContain(ShopMessageType.TonicPurchase);
+    expect(stranger.messages.map((each) => each.type)).not.toContain(ShopMessageType.TonicUsed);
+    expect(stranger.tonicPurchases).toEqual([]);
+    expect(stranger.shopView()).toMatchObject({ gold: START, tonics: 0 });
+    // The buyer's own status says it all.
+    await buyer.waitFor(() => buyer.shopView()?.tonics === 1);
+    expect(buyer.shopView()).toMatchObject({ gold: START + CRATE_GOLD - PRICE, tonics: 1, tonicUntil: 0, maxSpeed: 39 });
+    expect([...(buyer.room.state.status?.keys() ?? [])]).toEqual([buyer.sessionId]);
+  }, 30_000);
+});
+
+describe.concurrent("the dockside shop (§11)", () => {
+  it("sells a tonic for 30 gold at a dock, replays a retried id without charging again, and refuses a third tonic (tonic-limit) at no cost", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [buyer] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(buyer);
+    // Two crates first: 100 gold, enough for three tonics.
+    await takeCrate(buyer, 0);
+    await takeCrate(buyer, 1);
+    await moor(buyer);
+    expect(await buy(buyer, "a")).toEqual({ requestId: "a", outcome: "bought", price: PRICE, tonics: 1, replayed: false });
+    expect(goldOf(room, buyer.sessionId)).toBe(100 - PRICE);
+    expect(tonicsOf(room, buyer.sessionId)).toBe(1);
+    await buyer.waitFor(() => buyer.shopView()?.tonics === 1 && buyer.gold() === 100 - PRICE);
+    // The same id again: the same answer, replayed, nothing charged.
+    expect(await buy(buyer, "a")).toEqual({ requestId: "a", outcome: "bought", price: PRICE, tonics: 1, replayed: true });
+    expect(goldOf(room, buyer.sessionId)).toBe(100 - PRICE);
+    expect(await buy(buyer, "b")).toMatchObject({ outcome: "bought", tonics: 2 });
+    // A third: refused, gold and tonics unchanged; retried, the refusal replays.
+    expect(await buy(buyer, "c")).toEqual({ requestId: "c", outcome: "refused", reason: "tonic-limit", replayed: false });
+    expect(await buy(buyer, "c")).toEqual({ requestId: "c", outcome: "refused", reason: "tonic-limit", replayed: true });
+    expect(goldOf(room, buyer.sessionId)).toBe(100 - 2 * PRICE);
+    expect(tonicsOf(room, buyer.sessionId)).toBe(2);
+    expect(room.ledgerState.goldSpent).toBe(2 * PRICE);
+    expect(room.ledgerState.requests.map((request) => request.requestId)).toEqual(["tonic:a", "tonic:b", "tonic:c"]);
+  }, 30_000);
+
+  it("refuses too little gold at no cost, and a purchase after casting off (not-at-dock), decided on the tick it is processed", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [buyer] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(buyer);
+    await moor(buyer);
+    expect(await buy(buyer)).toMatchObject({ outcome: "bought" });
+    expect(await buy(buyer, "short")).toEqual({ requestId: "short", outcome: "refused", reason: "insufficient-gold", replayed: false });
+    expect(goldOf(room, buyer.sessionId)).toBe(START - PRICE);
+    // Sent while moored, decided after the ship cast off: the tick that processes it decides.
+    await pause(room);
+    buyer.buyTonic("late");
+    buyer.sendInput(AHEAD);
+    await sleep(150);
+    room.stepWorldTicks(1);
+    room.resumeWorld();
+    buyer.sendInput({ moveX: 0, moveY: 0 });
+    expect(room.matchState.ships.find((ship) => ship.id === buyer.sessionId)!.dock).toBe(-1);
+    await buyer.waitFor(() => buyer.tonicPurchaseAnswers("late").length === 1);
+    expect(buyer.tonicPurchaseAnswers("late")[0]).toEqual({ requestId: "late", outcome: "refused", reason: "not-at-dock", replayed: false });
+    // At sea: refused again; a retry of the refused id replays it even back at the dock.
+    expect(await buy(buyer)).toMatchObject({ outcome: "refused", reason: "not-at-dock" });
+    await moor(buyer);
+    expect(await buy(buyer, "late")).toMatchObject({ outcome: "refused", reason: "not-at-dock", replayed: true });
+    expect(goldOf(room, buyer.sessionId)).toBe(START - PRICE);
+    expect(room.ledgerState.goldSpent).toBe(PRICE);
+  }, 30_000);
+
+  it("is no safe zone: a ship moored at the shop can be grappled, and a purchase in the duel is refused at no cost", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const dock = dockFor("moon");
+    // The attacker waits four tiles out from the dock, facing it.
+    const out = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([dx, dy]) => ({ tileX: dock.tileX + dx! * 4, tileY: dock.tileY + dy! * 4, heading: dx === 1 ? WEST : dx === -1 ? EAST : dy === 1 ? NORTH : 16 }));
+    const attackerSeat = out.find((seat) => isNavigable(seaMap, seat.tileX, seat.tileY) && openWater(seat, { ...dock, heading: 0 }))!;
+    const [attacker, shopper] = (await playersAt(endpoint, [attackerSeat, ROW], track, { clients: [{}, { autoReady: false }] })) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(attacker);
+    await moor(shopper, dock);
+    await attacker.placeShip(endpoint, attackerSeat);
+    attacker.tapGrapple();
+    await shopper.waitFor(() => shopper.status()?.mode === "duel", 5000);
+    // Still at the dock, but reserved for the duel: the ledger refuses it.
+    expect(shopper.ship()?.dock).toBe(dock.id);
+    expect(await buy(shopper, "fight")).toEqual({ requestId: "fight", outcome: "refused", reason: "player-in-duel", replayed: false });
+    expect(goldOf(room, shopper.sessionId)).toBe(START);
+    expect(tonicsOf(room, shopper.sessionId)).toBe(0);
+    // It never readies, loses by forfeit and waits out of the world to respawn, its ship still at the dock: no shop there.
+    await shopper.waitFor(() => shopper.status()?.mode === "respawning", 10_000);
+    expect(room.matchState.ships.find((ship) => ship.id === shopper.sessionId)!.dock).toBe(dock.id);
+    // (The lost duel moved 20 % of its gold to the winner; the refusal moves nothing.)
+    const left = goldOf(room, shopper.sessionId);
+    expect(left).toBe(START - START / 5);
+    expect(await buy(shopper, "waiting")).toEqual({ requestId: "waiting", outcome: "refused", reason: "not-at-dock", replayed: false });
+    expect(goldOf(room, shopper.sessionId)).toBe(left);
+    expect(tonicsOf(room, shopper.sessionId)).toBe(0);
+  }, 30_000);
+
+  it("keeps a tonic bought with id x and a rumor bought with id x apart: two purchases, and the match goes on", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [buyer] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(buyer);
+    await takeCrate(buyer, 3);
+    await moor(buyer);
+    expect(await buy(buyer, "x")).toMatchObject({ outcome: "bought" });
+    // The shop's rumor is the journal's purchase: `buy-rumor`, the same flow, the same client id.
+    await buyer.waitFor(() => buyer.rumorOffers().some((offer) => offer.type === "moon" && offer.offer === "available"));
+    buyer.buyRumor("moon", "x");
+    await buyer.waitFor(() => buyer.rumorAnswers("x").length === 1);
+    expect(buyer.rumorAnswers("x")[0]).toMatchObject({ outcome: "bought", price: objectiveRules.rumorPrice, replayed: false });
+    await sleep(200);
+    expect(room.flowState.end).toBeNull();
+    expect(goldOf(room, buyer.sessionId)).toBe(START + CRATE_GOLD - PRICE - objectiveRules.rumorPrice);
+    expect(room.ledgerState.requests.map((request) => [request.requestId, request.kind])).toEqual([
+      ["tonic:x", "purchase"],
+      ["rumor:x", "purchase"],
+    ]);
+  }, 30_000);
+});
+
+describe.concurrent("shop requests at the edges (§11, §16)", () => {
+  it("answers tonic purchases and drinks still waiting when the match ends not-in-play, charging nothing", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await moor(player);
+    await pause(room);
+    player.buyTonic("end1");
+    player.useTonic("end2");
+    await until(() => room.pendingShop(player.sessionId) === 2, 2000, "both requests waiting");
+    room.injectFault();
+    room.stepWorldTicks(1);
+    room.resumeWorld();
+    await player.waitFor(() => player.tonicPurchaseAnswers("end1").length === 1 && player.tonicUseAnswers("end2").length === 1, 2000);
+    expect(player.tonicPurchaseAnswers("end1")[0]).toEqual({ requestId: "end1", outcome: "refused", reason: "not-in-play", replayed: false });
+    expect(player.tonicUseAnswers("end2")[0]).toEqual({ requestId: "end2", outcome: "refused", reason: "not-in-play", replayed: false });
+    expect(room.pendingShop(player.sessionId)).toBe(0);
+    expect(goldOf(room, player.sessionId)).toBe(START);
+    // After the end, a new request is refused at once, a purchase or a drink.
+    expect(await buy(player, "after")).toMatchObject({ outcome: "refused", reason: "not-in-play" });
+    expect(await drink(player, "after")).toMatchObject({ outcome: "refused", reason: "not-in-play" });
+  }, 30_000);
+
+  it("refuses a third waiting request of a kind busy, drops malformed ones and those past 8 a second, and answers not-in-play in the lobby", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    // In the lobby: refused, not kept.
+    expect(await buy(host, "early")).toEqual({ requestId: "early", outcome: "refused", reason: "not-in-play", replayed: false });
+    const bench = await startThroughLobby(endpoint, [host]);
+    track(bench!);
+    const room = roomOf(host);
+    // The rate cap counts per second of the room's own clock: wait out a window by its frames, not the wall clock.
+    const nextWindow = async () => {
+      const from = room.matchState.frame;
+      await until(() => room.matchState.frame > from + 60, 5000, "a new rate window");
+    };
+    await moor(host);
+    await nextWindow();
+    // Three purchases and three drinks between two ticks: two of each wait, the third of each is busy at once.
+    await pause(room);
+    for (const id of ["p1", "p2", "p3"]) host.buyTonic(id);
+    for (const id of ["d1", "d2", "d3"]) host.useTonic(id);
+    await host.waitFor(() => host.tonicPurchaseAnswers("p3").length === 1 && host.tonicUseAnswers("d3").length === 1, 2000);
+    expect(host.tonicPurchaseAnswers("p3")[0]).toEqual({ requestId: "p3", outcome: "refused", reason: "busy", replayed: false });
+    expect(host.tonicUseAnswers("d3")[0]).toEqual({ requestId: "d3", outcome: "refused", reason: "busy", replayed: false });
+    expect(room.pendingShop(host.sessionId)).toBe(4);
+    room.stepWorldTicks(2);
+    room.resumeWorld();
+    await host.waitFor(() => host.tonicPurchaseAnswers("p2").length === 1 && host.tonicUseAnswers("d2").length === 1);
+    expect([host.tonicPurchaseAnswers("p1")[0]!.outcome, host.tonicPurchaseAnswers("p2")[0]!.outcome]).toEqual(["bought", "refused"]);
+    // Malformed: dropped without an answer.
+    await nextWindow();
+    const answers = host.tonicPurchases.length + host.tonicUses.length;
+    for (const payload of [{ requestId: "bad id" }, { requestId: "x", extra: 1 }, { requestId: "y".repeat(40) }, "buy", null]) {
+      host.sendRaw(ShopMessageType.BuyTonic, payload);
+      host.sendRaw(ShopMessageType.UseTonic, payload);
+    }
+    await sleep(1100);
+    expect(host.tonicPurchases.length + host.tonicUses.length).toBe(answers);
+    // A burst: 8 read a second, purchases and drinks together; the rest get no answer.
+    await nextWindow();
+    for (let index = 0; index < 10; index++) host.buyTonic(`burst${index}`);
+    for (let index = 0; index < 10; index++) host.useTonic(`sip${index}`);
+    await host.waitFor(() => host.tonicPurchases.length + host.tonicUses.length - answers >= 8, 5000);
+    await sleep(500);
+    expect(host.tonicPurchases.length + host.tonicUses.length - answers).toBe(8);
+    expect(goldOf(room, host.sessionId)).toBe(START - PRICE);
+  }, 30_000);
+
+  it("keeps a drink's id for good: retried after sixteen later refusals it replays, and no second tonic is drunk", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await takeCrate(player, 0);
+    await moor(player);
+    expect(await buy(player)).toMatchObject({ outcome: "bought" });
+    expect(await buy(player)).toMatchObject({ outcome: "bought", tonics: 2 });
+    await player.placeShip(endpoint, ROW);
+    expect(await drink(player, "first")).toMatchObject({ outcome: "active", replayed: false });
+    // Sixteen refused drinks after it, one a tick (one works already): the room keeps its last sixteen refusals.
+    await pause(room);
+    for (let each = 0; each < 16; each++) {
+      room.testUseTonic(player.sessionId, `again${each}`);
+      room.stepWorldTicks(1);
+    }
+    room.resumeWorld();
+    await player.waitFor(() => player.tonicUses.filter((answer) => answer.outcome === "refused" && answer.reason === "tonic-active").length === 16);
+    const answer = await drink(player, "first");
+    expect(answer).toMatchObject({ outcome: "active", replayed: true });
+    expect(tonicsOf(room, player.sessionId)).toBe(1);
+  }, 30_000);
+
+  it("answers a retried id the room no longer keeps from the ledger's own record: the same refusal, replayed, nothing charged", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await moor(player);
+    expect(await buy(player)).toMatchObject({ outcome: "bought" });
+    // The ledger keeps this refusal.
+    expect(await buy(player, "old")).toMatchObject({ outcome: "refused", reason: "insufficient-gold", replayed: false });
+    // Sixteen refusals at sea, one a tick, that the ledger never sees: the room keeps only its last sixteen.
+    await player.placeShip(endpoint, ROW);
+    await pause(room);
+    for (let each = 0; each < 16; each++) {
+      room.testBuyTonic(player.sessionId, `sea${each}`);
+      room.stepWorldTicks(1);
+    }
+    room.resumeWorld();
+    await player.waitFor(() => player.tonicPurchases.filter((answer) => answer.outcome === "refused" && answer.reason === "not-at-dock").length === 16);
+    await moor(player);
+    expect(await buy(player, "old")).toEqual({ requestId: "old", outcome: "refused", reason: "insufficient-gold", replayed: true });
+    expect(goldOf(room, player.sessionId)).toBe(START - PRICE);
+    expect(room.ledgerState.goldSpent).toBe(PRICE);
+  }, 30_000);
+});
+
+describe.concurrent("the sail tonic (§11)", () => {
+  it("drunk on tick t, sails the steps of ticks t+1 to t+240 at a 43 cap (43 a tick on a cardinal heading), back to 39 on t+241; replaying the room's inputs and drinks gives its hash", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The open row runs clear across the whole sea: a 240-tick run at 43 fits from its west end.
+    const lane: Seat = { tileX: 3, tileY: OPEN_ROW, heading: EAST };
+    expect(openWater(lane, { ...lane, tileX: 107 })).toBe(true);
+    const [player] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await moor(player);
+    expect(await buy(player)).toMatchObject({ outcome: "bought" });
+    await player.placeShip(endpoint, lane);
+    const shipOf = () => room.matchState.ships.find((ship) => ship.id === player.sessionId)!;
+    await player.holdUntil(AHEAD, () => shipOf().speed === 39, 5000);
+    player.sendInput(AHEAD);
+    await pause(room);
+    const snapshot: MatchState = room.recordWorld();
+    // Tick by tick with the clock held, the helm resent as a browser does (well inside its 250 ms hold), T pressed once.
+    const moves = new Map<number, number>();
+    const drinkId = player.useTonic();
+    let tick = room.matchState.worldTick;
+    const last = tick + TONIC_TICKS + 6;
+    let sawBoost = false;
+    while (tick < last) {
+      player.sendInput(AHEAD);
+      await sleep(25);
+      for (let each = 0; each < 4; each++) {
+        const before = shipOf().x;
+        room.stepWorldTicks(1);
+        tick = room.matchState.worldTick;
+        moves.set(tick, shipOf().x - before);
+      }
+      sawBoost ||= player.shopView()?.maxSpeed === 43;
+    }
+    const answer = player.tonicUseAnswers(drinkId)[0]!;
+    expect(answer).toMatchObject({ outcome: "active", replayed: false });
+    const t = (answer as { endTick: number }).endTick - TONIC_TICKS;
+    expect(t).toBe(snapshot.worldTick + 1);
+    expect(moves.get(t)).toBe(39);
+    // Tick t + 1 accelerates by the tuning's 3 under the new cap; t + 2 to t + 240 sail at 43.
+    expect(moves.get(t + 1)).toBe(42);
+    for (let each = t + 2; each <= t + TONIC_TICKS; each++) expect(moves.get(each), `tick ${each}`).toBe(43);
+    // Tick t + 241: the plain cap, the speed clamped to it that tick.
+    for (let each = t + TONIC_TICKS + 1; each <= t + TONIC_TICKS + 4; each++) expect(moves.get(each), `tick ${each}`).toBe(39);
+    expect(shipOf().tonicUntil).toBe(t + TONIC_TICKS);
+    expect(sawBoost).toBe(true);
+    // Server-side determinism: the room's own inputs and drinks, replayed from the snapshot, give the room's state.
+    let replay = snapshot;
+    for (const frame of room.recordedWorld()) {
+      replay = step(defaultSimulationConfig, replay, frame.inputs);
+      for (const each of frame.drinks) replay = drinkTonic(replay, each.playerId, each.until);
+    }
+    expect(room.recordedWorld().some((frame) => frame.drinks.length === 1)).toBe(true);
+    expect(hashState(replay)).toBe(hashState(room.matchState));
+    room.resumeWorld();
+    player.sendInput({ moveX: 0, moveY: 0 });
+    await player.waitFor(() => player.shopView()?.maxSpeed === 39 && player.shopView()?.tonics === 0);
+  }, 45_000);
+
+  it("refuses a drink while moored, while one is active (a second T), and answers a repeated id once: only one tonic is drunk", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [ROW], track)) as [HeadlessClient];
+    const room = roomOf(player);
+    await takeCrate(player, 0);
+    await moor(player);
+    expect(await buy(player)).toMatchObject({ outcome: "bought" });
+    expect(await buy(player)).toMatchObject({ outcome: "bought", tonics: 2 });
+    expect(await drink(player, "moored")).toEqual({ requestId: "moored", outcome: "refused", reason: "not-at-sea", replayed: false });
+    await player.placeShip(endpoint, ROW);
+    // The same id five times before its tick: merged into one request, answered once.
+    for (let each = 0; each < 5; each++) player.useTonic("t1");
+    await player.waitFor(() => player.tonicUseAnswers("t1").length === 1);
+    // (A second of the room's clock later: the shop takes 8 requests a second.)
+    const from = room.matchState.frame;
+    await until(() => room.matchState.frame > from + 60, 5000, "a new rate window");
+    expect(player.tonicUseAnswers("t1")).toHaveLength(1);
+    // Retried once decided: the same answer, replayed, and no second tonic.
+    player.useTonic("t1");
+    await player.waitFor(() => player.tonicUseAnswers("t1").length === 2);
+    const answers = player.tonicUseAnswers("t1");
+    expect(answers[0]).toMatchObject({ outcome: "active", replayed: false });
+    expect(answers[1]).toEqual({ ...answers[0], replayed: true });
+    // T pressed again: a new id, refused while the first works.
+    expect(await drink(player, "t2")).toEqual({ requestId: "t2", outcome: "refused", reason: "tonic-active", replayed: false });
+    expect(tonicsOf(room, player.sessionId)).toBe(1);
+    await player.waitFor(() => player.shopView()?.tonics === 1 && player.shopView()?.maxSpeed === 43);
+    expect(player.shopView()!.tonicUntil).toBe((answers[0] as { endTick: number }).endTick);
+  }, 30_000);
+
+  it("refuses a drink to the defender of a grapple in its windup (grappled) and while reserved for the duel; a lost duel keeps the tonic", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The defender never readies its arena: it loses by forfeit.
+    const [attacker, defender] = (await playersAt(endpoint, [ROW, { ...ROW, tileX: ROW.tileX + 4 }], track, { clients: [{}, { autoReady: false }] })) as [
+      HeadlessClient,
+      HeadlessClient,
+    ];
+    const room = roomOf(attacker);
+    await moor(defender);
+    expect(await buy(defender)).toMatchObject({ outcome: "bought" });
+    await placePair(endpoint, attacker, defender);
+    await pause(room);
+    // J and T reach the room between the same two ticks: the grapple starts first on that tick, then the drink is refused.
+    attacker.tapGrapple();
+    defender.useTonic("windup");
+    await sleep(150);
+    room.stepWorldTicks(1);
+    expect(room.encounterState.attempts.map((attempt) => attempt.defenderId)).toEqual([defender.sessionId]);
+    await defender.waitFor(() => defender.tonicUseAnswers("windup").length === 1);
+    expect(defender.tonicUseAnswers("windup")[0]).toMatchObject({ outcome: "refused", reason: "grappled" });
+    // The grapple lands: reserved for the duel, the ledger refuses it.
+    while (room.encounterState.duels.length === 0) room.stepWorldTicks(1);
+    defender.useTonic("reserved");
+    await sleep(150);
+    room.stepWorldTicks(1);
+    room.resumeWorld();
+    await defender.waitFor(() => defender.tonicUseAnswers("reserved").length === 1);
+    expect(defender.tonicUseAnswers("reserved")[0]).toMatchObject({ outcome: "refused", reason: "player-in-duel" });
+    // The defender forfeits and loses; its tonic stays.
+    await until(() => room.ledgerState.duels.some((duel) => duel.phase === "settled"), 15_000, "the settlement");
+    expect(room.ledgerState.duels[0]!.result).toMatchObject({ outcome: "win", winner: attacker.sessionId });
+    expect(tonicsOf(room, defender.sessionId)).toBe(1);
+    await defender.waitFor(() => defender.shopView()?.tonics === 1);
+    // Waiting out of the world to respawn (its ship stopped at sea where the grapple landed): not at sea for a tonic.
+    await defender.waitFor(() => defender.status()?.mode === "respawning", 5000);
+    expect(room.matchState.ships.find((ship) => ship.id === defender.sessionId)!.dock).toBe(-1);
+    expect(await drink(defender, "waiting")).toEqual({ requestId: "waiting", outcome: "refused", reason: "not-at-sea", replayed: false });
+    expect(tonicsOf(room, defender.sessionId)).toBe(1);
+  }, 45_000);
+});

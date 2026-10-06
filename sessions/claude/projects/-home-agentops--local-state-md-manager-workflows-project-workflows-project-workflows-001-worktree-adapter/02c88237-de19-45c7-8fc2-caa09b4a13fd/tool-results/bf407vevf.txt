@@ -1,0 +1,563 @@
+import { createHash, randomBytes } from 'node:crypto'
+import fs, { type FileHandle } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
+import type { Source } from './config.ts'
+import type { LocationRegistry } from './registry.ts'
+
+export type { Source }
+
+export function isSource(value: unknown): value is Source {
+  return value === 'Pi' || value === 'Claude'
+}
+
+export function isMarkdownName(name: string): boolean {
+  return name.toLowerCase().endsWith('.md')
+}
+
+export function sha256(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+/** A rejected request: `status` is the HTTP status, `code` is stable and machine-readable, `message` is safe to send. */
+export class RequestError extends Error {
+  readonly status: number
+  readonly code: string
+  constructor(status: number, code: string, message: string) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+export class PathError extends RequestError {
+  constructor(status: 400 | 404, message: string, code = status === 400 ? 'INVALID_PATH' : 'NOT_FOUND') {
+    super(status, code, message)
+  }
+}
+
+const INVALID_PATH = 'The file path is invalid.'
+export const NOT_FOUND = 'The file was not found or is not a Markdown file.'
+export const HASH_CONFLICT_MESSAGE = 'This file changed on disk. Reload it or copy your draft.'
+/** Version-control internals are never listed, read or changed, however a request addresses them. */
+export const EXCLUDED_DIRECTORY = '.git'
+
+/**
+ * Splits a relative path into safe components. Rejects before any normalisation: `..` and `.` components,
+ * empty components (leading, trailing or doubled separators), backslashes, NULs, absolute forms including
+ * Windows drive letters and UNC prefixes, and any `.git` component.
+ */
+export function splitRelativePath(path: string): string[] {
+  if (typeof path !== 'string' || path.length === 0) throw new PathError(400, INVALID_PATH)
+  if (path.includes('\0') || path.includes('\\')) throw new PathError(400, INVALID_PATH)
+  if (path.startsWith('/') || isAbsolute(path) || /^[A-Za-z]:/.test(path)) throw new PathError(400, INVALID_PATH)
+  const components = path.split('/')
+  for (const component of components) {
+    if (component === '' || component === '.' || component === '..') throw new PathError(400, INVALID_PATH)
+    if (component === EXCLUDED_DIRECTORY) throw new PathError(400, `Paths inside ${EXCLUDED_DIRECTORY} are not managed.`)
+  }
+  return components
+}
+
+/** Runs mutations one at a time so two app requests can never interleave their check-then-write steps. */
+export class MutationQueue {
+  private tail: Promise<unknown> = Promise.resolve()
+  run<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(task, task)
+    this.tail = result.catch(() => undefined)
+    return result
+  }
+}
+
+export type ReadFile = (file: FileHandle) => Promise<Buffer>
+/** The identity of a managed file: never a label, never an absolute path. */
+export type Identity = { source: Source; locationId: string; path: string }
+export type FileDocument = Identity & { content: string; hash: string }
+
+export const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+export const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW
+
+function filesystemError(error: unknown): never {
+  const code = (error as NodeJS.ErrnoException)?.code
+  if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP') {
+    throw new PathError(404, NOT_FOUND)
+  }
+  throw error
+}
+
+/** A descriptor-relative path: the parent is an already-open directory, the name is one validated component. */
+export function at(parent: FileHandle, name?: string): string {
+  const base = `/proc/self/fd/${parent.fd}`
+  return name === undefined ? base : `${base}/${name}`
+}
+
+/** Validates a request path lexically and returns the safe components. Nothing on disk is touched. */
+export function validateEntryPath(path: unknown, kind: 'file' | 'folder' | 'any'): string[] {
+  if (typeof path !== 'string') throw new PathError(400, INVALID_PATH)
+  const components = splitRelativePath(path)
+  // Defence in depth: the validated components must resolve strictly below a root.
+  if (!resolve('/root', ...components).startsWith('/root/')) throw new PathError(400, INVALID_PATH)
+  const markdown = isMarkdownName(components[components.length - 1])
+  if (kind === 'file' && !markdown) throw new PathError(400, 'The file name must end in .md.')
+  if (kind === 'folder' && markdown) throw new PathError(400, 'A folder name must not end in .md.')
+  return components
+}
+
+/** Read/write validation: a non-Markdown name is reported as an unavailable file, not a malformed path. */
+export function validateMarkdownPath(path: unknown): string[] {
+  const components = validateEntryPath(path, 'any')
+  if (!isMarkdownName(components[components.length - 1])) throw new PathError(404, NOT_FOUND)
+  return components
+}
+
+/**
+ * Walks from an open location root to the directory containing the target, one no-follow open per component.
+ * O_NOFOLLOW applies to ONE component at each step; the parent is an already-open directory.
+ * Rename/symlink replacement can therefore only yield the pinned original or an unavailable target,
+ * never re-resolve an earlier component. Keep all handles alive until the operation completes.
+ */
+export async function withParentDirectory<T>(
+  root: FileHandle, components: string[],
+  operation: (parent: FileHandle, name: string, track: (handle: FileHandle) => void) => Promise<T>,
+): Promise<T> {
+  const handles: FileHandle[] = []
+  try {
+    let parent = root
+    for (const component of components.slice(0, -1)) {
+      parent = await fs.open(at(parent, component), DIRECTORY_FLAGS)
+      handles.push(parent)
+    }
+    return await operation(parent, components[components.length - 1], handle => handles.push(handle))
+  } catch (error) { filesystemError(error) }
+  finally { await Promise.all(handles.reverse().map(handle => handle.close())) }
+}
+
+/** Opens the final component no-follow and non-blocking and requires a regular file. */
+export async function openRegularFile(parent: FileHandle, name: string): Promise<FileHandle> {
+  // ENXIO here identifies an unopenable special target (e.g. a socket), not a read failure.
+  // O_NONBLOCK lets us fstat/reject FIFOs without waiting for a writer.
+  const file = await fs.open(at(parent, name), FILE_FLAGS).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === 'ENXIO') throw new PathError(404, NOT_FOUND)
+    throw error
+  })
+  try {
+    if (!(await file.stat()).isFile()) throw new PathError(404, NOT_FOUND)
+  } catch (error) {
+    await file.close()
+    throw error
+  }
+  return file
+}
+
+/** Validates location and path, opens the root for this operation only, then runs on the validated descriptor. */
+export async function withMarkdownFile<T>(
+  registry: LocationRegistry, source: unknown, locationId: unknown, path: unknown,
+  operation: (file: FileHandle, identity: Identity) => Promise<T>,
+): Promise<T> {
+  const location = registry.resolve(source, locationId)
+  const components = validateMarkdownPath(path)
+  return registry.withRoot(location, root => withParentDirectory(root, components, async (parent, name, track) => {
+    const file = await openRegularFile(parent, name)
+    track(file)
+    return operation(file, { source: location.source, locationId: location.id, path: components.join('/') })
+  }))
+}
+
+/** Reads from the validated descriptor once; content and SHA-256 use that same buffer. */
+export async function readMarkdownFile(
+  registry: LocationRegistry, source: unknown, locationId: unknown, path: unknown, readFile: ReadFile = file => file.readFile(),
+): Promise<FileDocument> {
+  return withMarkdownFile(registry, source, locationId, path, async (file, identity) => {
+    const bytes = await readFile(file)
+    return { ...identity, content: bytes.toString('utf8'), hash: sha256(bytes) }
+  })
+}
+
+/** Bounded sibling staging name, independent of the target basename and never Markdown. */
+export function temporaryFileName(): string {
+  return `.md-manager-${randomBytes(16).toString('hex')}.tmp`
+}
+
+export type WriteResult = Identity & { hash: string }
+
+/**
+ * Hash-guarded atomic replacement, serialized with every other app mutation:
+ * open the pinned original, compare its bytes to the expected hash, stage the new bytes in an exclusively
+ * created sibling temp file carrying the original mode, re-verify the original's identity and bytes,
+ * then rename the temp file over it. Any handled failure removes the temp file and leaves the original.
+ * Residual limit: an external writer racing between the final re-check and the rename is not detected.
+ */
+export async function writeMarkdownFile(
+  registry: LocationRegistry, source: unknown, locationId: unknown, path: unknown, content: string, expectedHash: string,
+): Promise<WriteResult> {
+  const location = registry.resolve(source, locationId)
+  const components = validateMarkdownPath(path)
+  return registry.mutations.run(() => registry.withRoot(location, root => withParentDirectory(root, components, async (parent, name, track) => {
+    const original = await openRegularFile(parent, name)
+    track(original)
+    const stats = await original.stat()
+    if (sha256(await original.readFile()) !== expectedHash) throw new RequestError(409, 'HASH_CONFLICT', HASH_CONFLICT_MESSAGE)
+
+    const bytes = Buffer.from(content, 'utf8')
+    const tempName = temporaryFileName()
+    const temp = await fs.open(at(parent, tempName), CREATE_FLAGS, 0o600)
+    try {
+      await temp.chmod(stats.mode & 0o7777)
+      await temp.writeFile(bytes)
+      await temp.sync()
+      await temp.close()
+      // Staging took time: the same name must still be the same regular file with the expected bytes.
+      const fresh = await openRegularFile(parent, name).catch(error => {
+        const code = (error as NodeJS.ErrnoException)?.code
+        if (error instanceof PathError || code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP') {
+          throw new RequestError(409, 'HASH_CONFLICT', HASH_CONFLICT_MESSAGE)
+        }
+        throw error
+      })
+      track(fresh)
+      const freshStats = await fresh.stat()
+      const unchanged = freshStats.ino === stats.ino && freshStats.dev === stats.dev && sha256(await fresh.readFile()) === expectedHash
+      if (!unchanged) throw new RequestError(409, 'HASH_CONFLICT', HASH_CONFLICT_MESSAGE)
+      await fs.rename(at(parent, tempName), at(parent, name))
+    } catch (error) {
+      await temp.close().catch(() => undefined)
+      await fs.unlink(at(parent, tempName)).catch(() => undefined)
+      throw error
+    }
+    return { source: location.source, locationId: location.id, path: components.join('/'), hash: sha256(bytes) }
+  })))
+}
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createApp } from './app.ts'
+import { defaultFixtureRoot, fixtureLocations } from './config.ts'
+
+const PI = 'pi-fixtures'
+const CLAUDE = 'claude-fixtures'
+
+const expectedLocations = [
+  { id: PI, source: 'Pi', label: 'Fixtures', category: 'personal', status: 'available', error: null },
+  { id: CLAUDE, source: 'Claude', label: 'Fixtures', category: 'personal', status: 'available', error: null },
+]
+
+const expected = [
+  { source: 'Pi', locationId: PI, path: 'skills', kind: 'directory' },
+  { source: 'Pi', locationId: PI, path: 'skills/review.md', kind: 'file' },
+  { source: 'Pi', locationId: PI, path: 'workflow.md', kind: 'file' },
+  { source: 'Claude', locationId: CLAUDE, path: 'empty.md', kind: 'file' },
+  { source: 'Claude', locationId: CLAUDE, path: 'subagents', kind: 'directory' },
+  { source: 'Claude', locationId: CLAUDE, path: 'subagents/implementer.md', kind: 'file' },
+  { source: 'Claude', locationId: CLAUDE, path: 'workflow.md', kind: 'file' },
+]
+
+async function withTempRoot(run: (root: string) => Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), 'md-manager-test-'))
+  try {
+    await mkdir(join(root, 'pi'))
+    await mkdir(join(root, 'claude'))
+    await run(root)
+  } finally {
+    await chmod(join(root, 'pi'), 0o755).catch(() => undefined)
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+test('lists the committed fixtures as location metadata plus a flat, ordered list of directories and Markdown files', async () => {
+  const app = createApp(fixtureLocations(defaultFixtureRoot))
+  try {
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 200)
+    assert.deepEqual(response.json(), { locations: expectedLocations, entries: expected })
+    assert.ok(!response.body.includes(defaultFixtureRoot), 'absolute root paths are never exposed')
+    // Query parameters cannot select a different root or path.
+    assert.equal((await app.inject('/api/entries?root=/tmp&path=..&locationId=x')).body, response.body)
+    // The previous endpoint is gone.
+    assert.equal((await app.inject('/api/files')).statusCode, 404)
+  } finally { await app.close() }
+})
+
+test('includes nested, empty and other dot directories and uppercase .MD; excludes .git at any depth, other files and symlinks', async () => {
+  await withTempRoot(async root => {
+    await mkdir(join(root, 'pi', 'b-empty'))
+    await mkdir(join(root, 'pi', 'a-nested', 'deeper'), { recursive: true })
+    await writeFile(join(root, 'pi', 'a-nested', 'deeper', 'NOTE.MD'), '')
+    await writeFile(join(root, 'pi', 'a-nested', 'ignored.txt'), 'nope')
+    await writeFile(join(root, 'pi', 'a-nested', 'archive.md.bak'), 'nope')
+    await writeFile(join(root, 'pi', 'zeta.md'), '')
+    await mkdir(join(root, 'pi', '.git', 'hooks'), { recursive: true })
+    await writeFile(join(root, 'pi', '.git', 'README.md'), 'git internals')
+    await mkdir(join(root, 'pi', 'a-nested', '.git'))
+    await writeFile(join(root, 'pi', 'a-nested', '.git', 'HEAD.md'), 'nested git')
+    await mkdir(join(root, 'pi', '.hidden'))
+    await writeFile(join(root, 'pi', '.hidden', 'note.md'), 'dot directories other than .git count')
+    await writeFile(join(root, 'outside.md'), 'Not in a source folder')
+    await symlink(join(root, 'outside.md'), join(root, 'pi', 'linked.md'))
+    await symlink(root, join(root, 'claude', 'linked-directory'))
+    await symlink(join(root, 'pi'), join(root, 'claude', 'linked-source'))
+    const app = createApp(fixtureLocations(root))
+    try {
+      const response = await app.inject('/api/entries')
+      assert.equal(response.statusCode, 200)
+      assert.deepEqual(response.json().entries, [
+        { source: 'Pi', locationId: PI, path: '.hidden', kind: 'directory' },
+        { source: 'Pi', locationId: PI, path: '.hidden/note.md', kind: 'file' },
+        { source: 'Pi', locationId: PI, path: 'a-nested', kind: 'directory' },
+        { source: 'Pi', locationId: PI, path: 'a-nested/deeper', kind: 'directory' },
+        { source: 'Pi', locationId: PI, path: 'a-nested/deeper/NOTE.MD', kind: 'file' },
+        { source: 'Pi', locationId: PI, path: 'b-empty', kind: 'directory' },
+        { source: 'Pi', locationId: PI, path: 'zeta.md', kind: 'file' },
+      ])
+      assert.ok(!response.body.includes('.git'))
+    } finally { await app.close() }
+  })
+})
+
+test('a missing, symlinked or unreadable location is reported unavailable per location; healthy locations still list; refresh recovers', async () => {
+  await withTempRoot(async root => {
+    await writeFile(join(root, 'pi', 'keep.md'), '')
+    await writeFile(join(root, 'claude', 'other.md'), '')
+    const app = createApp(fixtureLocations(root))
+    try {
+      const both = (await app.inject('/api/entries')).json()
+      assert.deepEqual(both.locations.map((location: { status: string }) => location.status), ['available', 'available'])
+
+      await rm(join(root, 'claude'), { recursive: true })
+      const missing = await app.inject('/api/entries')
+      assert.equal(missing.statusCode, 200)
+      const missingBody = missing.json()
+      assert.deepEqual(missingBody.entries, [{ source: 'Pi', locationId: PI, path: 'keep.md', kind: 'file' }])
+      assert.equal(missingBody.locations[0].status, 'available')
+      assert.equal(missingBody.locations[1].status, 'unavailable')
+      assert.match(missingBody.locations[1].error, /does not exist|not found|missing/i)
+      assert.ok(!missing.body.includes(root), 'no absolute path in the unavailable diagnostic')
+
+      await symlink(join(root, 'pi'), join(root, 'claude'))
+      const linked = (await app.inject('/api/entries')).json()
+      assert.equal(linked.locations[1].status, 'unavailable')
+      assert.match(linked.locations[1].error, /symbolic link/i)
+      assert.equal(linked.entries.length, 1)
+
+      await rm(join(root, 'claude'))
+      await mkdir(join(root, 'claude'))
+      await writeFile(join(root, 'claude', 'restored.md'), '')
+      const restored = (await app.inject('/api/entries')).json()
+      assert.deepEqual(restored.locations.map((location: { status: string }) => location.status), ['available', 'available'])
+      assert.ok(restored.entries.some((entry: { locationId: string; path: string }) => entry.locationId === CLAUDE && entry.path === 'restored.md'))
+      assert.equal((await app.inject(`/api/file?source=Claude&locationId=${CLAUDE}&path=restored.md`)).statusCode, 200)
+
+      if (process.getuid?.() !== 0) {
+        await chmod(join(root, 'pi'), 0o000)
+        const unreadable = (await app.inject('/api/entries')).json()
+        assert.equal(unreadable.locations[0].status, 'unavailable')
+        assert.match(unreadable.locations[0].error, /readable|permission/i)
+        assert.equal(unreadable.locations[1].status, 'available')
+        await chmod(join(root, 'pi'), 0o755)
+        const readable = (await app.inject('/api/entries')).json()
+        assert.equal(readable.locations[0].status, 'available')
+      }
+    } finally { await app.close() }
+  })
+})
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { ConfigError, defaultConfigPath, fixtureLocations, loadConfig, parseConfig, validateLocations, type LocationConfig } from './config.ts'
+
+async function withTempDir(run: (directory: string) => Promise<void>) {
+  const directory = await mkdtemp(join(tmpdir(), 'md-manager-config-test-'))
+  try { await run(directory) } finally { await rm(directory, { recursive: true, force: true }) }
+}
+
+function config(locations: unknown[], version: unknown = 1): string {
+  return JSON.stringify({ version, locations })
+}
+
+function location(overrides: Partial<LocationConfig> & { id: string }): LocationConfig {
+  return { source: 'Pi', label: `Label ${overrides.id}`, path: `/srv/${overrides.id}`, category: 'personal', ...overrides }
+}
+
+test('fixture mode maps a root to two stable locations, Pi first, without touching the environment', () => {
+  const locations = fixtureLocations('/tmp/fixtures/')
+  assert.deepEqual(locations, [
+    { id: 'pi-fixtures', source: 'Pi', label: 'Fixtures', path: '/tmp/fixtures/pi', category: 'personal' },
+    { id: 'claude-fixtures', source: 'Claude', label: 'Fixtures', path: '/tmp/fixtures/claude', category: 'personal' },
+  ])
+  assert.equal(fixtureLocations('relative/root')[0].path, join(process.cwd(), 'relative/root/pi'))
+})
+
+test('the default config path lives under $HOME/.config/md-manager and follows the given environment only', () => {
+  assert.equal(defaultConfigPath({ HOME: '/home/someone' }), '/home/someone/.config/md-manager/sources.json')
+  assert.notEqual(defaultConfigPath({ HOME: '/home/other' }), defaultConfigPath({ HOME: '/home/someone' }))
+})
+
+test('parseConfig accepts a valid file and orders locations Pi first, then Claude, keeping configured order within a source', async () => {
+  const text = config([
+    location({ id: 'claude-b', source: 'Claude', path: '/srv/claude-b', category: 'plugin', label: 'Plugin: b' }),
+    location({ id: 'pi-z', path: '/srv/pi/z', category: 'package', label: 'Package: z' }),
+    location({ id: 'claude-a', source: 'Claude', path: '/srv/claude-a', label: 'Personal' }),
+    location({ id: 'pi-a', path: '/srv/pi/a', category: 'project', label: 'Project: a' }),
+  ])
+  const locations = await parseConfig(text, 'test config')
+  assert.deepEqual(locations.map(entry => entry.id), ['pi-z', 'pi-a', 'claude-b', 'claude-a'])
+  assert.deepEqual(locations[0], { id: 'pi-z', source: 'Pi', label: 'Package: z', path: '/srv/pi/z', category: 'package' })
+  // Parsing is deterministic: the same text yields the same order every time.
+  assert.deepEqual(await parseConfig(text, 'test config'), locations)
+  // Trailing separators are normalized so identity never depends on spelling.
+  const normalized = await parseConfig(config([location({ id: 'x', path: '/srv/x/' })]), 'test config')
+  assert.equal(normalized[0].path, '/srv/x')
+})
+
+test('malformed JSON, wrong shapes and unsupported versions fail with actionable ConfigErrors', async () => {
+  const cases: Array<[string, string, RegExp]> = [
+    ['not JSON', '{"version": 1,', /JSON/],
+    ['array root', '[]', /object/],
+    ['null root', 'null', /object/],
+    ['missing version', JSON.stringify({ locations: [location({ id: 'a' })] }), /version/],
+    ['wrong version', config([location({ id: 'a' })], 2), /version/],
+    ['string version', config([location({ id: 'a' })], '1'), /version/],
+    ['missing locations', JSON.stringify({ version: 1 }), /locations/],
+    ['locations not array', JSON.stringify({ version: 1, locations: {} }), /locations/],
+    ['empty locations', config([]), /at least one/i],
+    ['location not object', config(['x']), /locations\[0\]/],
+  ]
+  for (const [label, text, pattern] of cases) {
+    await assert.rejects(parseConfig(text, 'sources.json'), (error: unknown) => {
+      assert.ok(error instanceof ConfigError, `${label}: ${String(error)}`)
+      assert.match(error.message, pattern, label)
+      assert.match(error.message, /sources\.json/, `${label} names the file`)
+      return true
+    }, label)
+  }
+})
+
+test('every location field is validated: stable id syntax, known source, non-empty label, absolute path, known category', () => {
+  const valid = location({ id: 'ok' })
+  assert.deepEqual(validateLocations([valid]), [valid])
+  const cases: Array<[string, unknown, RegExp]> = [
+    ['missing id', { ...valid, id: undefined }, /id/],
+    ['empty id', { ...valid, id: '' }, /id/],
+    ['numeric id', { ...valid, id: 7 }, /id/],
+    ['id with slash', { ...valid, id: 'a/b' }, /id/],
+    ['id with space', { ...valid, id: 'a b' }, /id/],
+    ['id with percent', { ...valid, id: 'a%b' }, /id/],
+    ['id starting with dot', { ...valid, id: '.hidden' }, /id/],
+    ['id starting with dash', { ...valid, id: '-x' }, /id/],
+    ['overlong id', { ...valid, id: 'a'.repeat(65) }, /id/],
+    ['missing source', { ...valid, source: undefined }, /source/],
+    ['lowercase source', { ...valid, source: 'pi' }, /source/],
+    ['unknown source', { ...valid, source: 'Nope' }, /source/],
+    ['missing label', { ...valid, label: undefined }, /label/],
+    ['blank label', { ...valid, label: '   ' }, /label/],
+    ['numeric label', { ...valid, label: 1 }, /label/],
+    ['missing path', { ...valid, path: undefined }, /path/],
+    ['relative path', { ...valid, path: 'skills' }, /absolute/],
+    ['tilde path', { ...valid, path: '~/skills' }, /absolute/],
+    ['env path', { ...valid, path: '$HOME/skills' }, /absolute/],
+    ['NUL path', { ...valid, path: '/srv/a\0b' }, /path/],
+    ['root path', { ...valid, path: '/' }, /path/],
+    ['missing category', { ...valid, category: undefined }, /category/],
+    ['unknown category', { ...valid, category: 'system' }, /category/],
+  ]
+  for (const [label, entry, pattern] of cases) {
+    assert.throws(() => validateLocations([entry]), (error: unknown) => {
+      assert.ok(error instanceof ConfigError, label)
+      assert.match(error.message, pattern, `${label}: ${(error as Error).message}`)
+      return true
+    }, label)
+  }
+  // Extra keys are ignored rather than rejected, so the file can carry comments-as-fields.
+  assert.equal(validateLocations([{ ...valid, note: 'ignored' }])[0].id, 'ok')
+})
+
+test('duplicate ids and duplicate, nested or aliased roots are rejected, naming the conflicting ids', async () => {
+  await withTempDir(async directory => {
+    await mkdir(join(directory, 'real', 'child'), { recursive: true })
+    await symlink(join(directory, 'real'), join(directory, 'alias'))
+    const cases: Array<[string, LocationConfig[], RegExp]> = [
+      ['duplicate id', [location({ id: 'same', path: '/srv/a' }), location({ id: 'same', path: '/srv/b', source: 'Claude' })], /same/],
+      ['same path', [location({ id: 'one', path: '/srv/a' }), location({ id: 'two', path: '/srv/a', source: 'Claude' })], /one.*two|two.*one/],
+      ['trailing slash alias', [location({ id: 'one', path: '/srv/a' }), location({ id: 'two', path: '/srv/a/' })], /one.*two|two.*one/],
+      ['nested root', [location({ id: 'parent', path: '/srv/a' }), location({ id: 'child', path: '/srv/a/b/c' })], /parent.*child|child.*parent/],
+      ['nested root reversed', [location({ id: 'child', path: '/srv/a/b' }), location({ id: 'parent', path: '/srv/a' })], /parent.*child|child.*parent/],
+      ['symlink alias', [location({ id: 'real', path: join(directory, 'real') }), location({ id: 'alias', path: join(directory, 'alias') })], /real.*alias|alias.*real/],
+      ['symlink alias child', [location({ id: 'real', path: join(directory, 'real') }), location({ id: 'alias', path: join(directory, 'alias', 'child') })], /real.*alias|alias.*real/],
+    ]
+    for (const [label, locations, pattern] of cases) {
+      await assert.rejects(parseConfig(config(locations), 'sources.json'), (error: unknown) => {
+        assert.ok(error instanceof ConfigError, label)
+        assert.match(error.message, pattern, `${label}: ${(error as Error).message}`)
+        return true
+      }, label)
+    }
+    // Sibling paths with a shared prefix are not overlapping.
+    const siblings = await parseConfig(config([location({ id: 'a', path: '/srv/skills' }), location({ id: 'b', path: '/srv/skills-extra' })]), 'sources.json')
+    assert.equal(siblings.length, 2)
+    // A missing root is a runtime availability problem, not a configuration error.
+    const missing = await parseConfig(config([location({ id: 'gone', path: join(directory, 'does-not-exist') })]), 'sources.json')
+    assert.equal(missing[0].id, 'gone')
+  })
+})
+
+test('loadConfig: missing configuration fails startup with the path and the env vars, never falling back to fixtures', async () => {
+  await withTempDir(async home => {
+    await assert.rejects(loadConfig({ HOME: home }), (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.match(error.message, /sources\.json/)
+      assert.match(error.message, /MD_MANAGER_CONFIG/)
+      assert.match(error.message, /MD_MANAGER_FIXTURE_ROOT/)
+      assert.doesNotMatch(error.message, /fixtures\/pi/)
+      return true
+    })
+    await assert.rejects(loadConfig({ HOME: home, MD_MANAGER_CONFIG: join(home, 'nope.json') }), /nope\.json/)
+    await writeFile(join(home, 'bad.json'), '{')
+    await assert.rejects(loadConfig({ HOME: home, MD_MANAGER_CONFIG: join(home, 'bad.json') }), /bad\.json.*JSON|JSON.*bad\.json/)
+  })
+})
+
+test('loadConfig: setting both MD_MANAGER_CONFIG and MD_MANAGER_FIXTURE_ROOT is an error; each alone selects its mode', async () => {
+  await withTempDir(async home => {
+    const file = join(home, 'sources.json')
+    await writeFile(file, config([location({ id: 'pi-live', path: join(home, 'pi-live') })]))
+    await assert.rejects(loadConfig({ HOME: home, MD_MANAGER_CONFIG: file, MD_MANAGER_FIXTURE_ROOT: join(home, 'fixtures') }), (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.match(error.message, /MD_MANAGER_CONFIG/)
+      assert.match(error.message, /MD_MANAGER_FIXTURE_ROOT/)
+      return true
+    })
+    const live = await loadConfig({ HOME: home, MD_MANAGER_CONFIG: file })
+    assert.equal(live.mode, 'live')
+    assert.equal(live.configPath, file)
+    assert.deepEqual(live.locations.map(entry => entry.id), ['pi-live'])
+    const fixture = await loadConfig({ HOME: home, MD_MANAGER_FIXTURE_ROOT: join(home, 'fixtures') })
+    assert.equal(fixture.mode, 'fixture')
+    assert.deepEqual(fixture.locations.map(entry => entry.id), ['pi-fixtures', 'claude-fixtures'])
+    assert.equal(fixture.locations[0].path, join(home, 'fixtures', 'pi'))
+    // Blank values count as unset.
+    const blank = await loadConfig({ HOME: home, MD_MANAGER_CONFIG: file, MD_MANAGER_FIXTURE_ROOT: '   ' })
+    assert.equal(blank.mode, 'live')
+  })
+})
+
+test('loadConfig: the default path under HOME is used only when nothing explicit is set, so tests can isolate themselves', async () => {
+  await withTempDir(async home => {
+    await mkdir(join(home, '.config', 'md-manager'), { recursive: true })
+    await writeFile(join(home, '.config', 'md-manager', 'sources.json'), config([location({ id: 'from-home', path: join(home, 'skills') })]))
+    const fromHome = await loadConfig({ HOME: home })
+    assert.equal(fromHome.mode, 'live')
+    assert.deepEqual(fromHome.locations.map(entry => entry.id), ['from-home'])
+    assert.equal(fromHome.configPath, join(home, '.config', 'md-manager', 'sources.json'))
+
+    const explicit = join(home, 'explicit.json')
+    await writeFile(explicit, config([location({ id: 'explicit', path: join(home, 'other') })]))
+    const isolated = await loadConfig({ HOME: home, MD_MANAGER_CONFIG: explicit })
+    assert.deepEqual(isolated.locations.map(entry => entry.id), ['explicit'])
+    const fixture = await loadConfig({ HOME: home, MD_MANAGER_FIXTURE_ROOT: join(home, 'fixtures') })
+    assert.ok(!fixture.locations.some(entry => entry.id === 'from-home'))
+  })
+})

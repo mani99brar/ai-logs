@@ -1,0 +1,92 @@
+import { matchMaker } from "colyseus";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { DuelRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { MAX_INPUT_DELAY, MIN_INPUT_DELAY } from "@pirate-sea-race/simulation/netcode";
+import { HeadlessDuelClient, ImpairmentProxy, logFromBundles, replayRecordedDuel, type Impairment } from "@pirate-sea-race/test-tools";
+import { attacker, defender, expectWithinBudget, opponentChanges, PLAY_FRAMES, SETTLE_FRAMES, type ScenarioReport } from "./harness.js";
+
+let server: RunningGameServer;
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+async function runScenario(scenario: string, impairment: Impairment, seed: number): Promise<ScenarioReport> {
+  const proxies = await Promise.all([ImpairmentProxy.start(server.port, impairment, seed), ImpairmentProxy.start(server.port, impairment, seed + 1)]);
+  const host = await HeadlessDuelClient.create(proxies[0].endpoint);
+  const guest = await HeadlessDuelClient.join(proxies[1].endpoint, host.code);
+  const players = [host, guest] as const;
+  try {
+    host.play((frame) => (frame <= PLAY_FRAMES ? attacker(frame, host.duel!) : 0));
+    guest.play((frame) => (frame <= PLAY_FRAMES ? defender(frame, guest.duel!) : 0));
+    await host.waitFor(() => host.phase === "fighting", 8000);
+    for (const player of players) await player.waitForConfirmed(PLAY_FRAMES + SETTLE_FRAMES, 30_000);
+    const room = matchMaker.getLocalRoomById(host.room.roomId) as unknown as DuelRoom;
+    const diagnostics = room.diagnostics();
+
+    // Determinism on top of the live hash checks: the pairs each client received replay to the server's state.
+    for (const player of players) {
+      const log = logFromBundles(player.bundles);
+      const serverLog = room.inputLog();
+      const replayed = await replayRecordedDuel(log, { seed: room.state.seed });
+      const fromServer = await replayRecordedDuel({ ...serverLog, inputs: serverLog.inputs.slice(0, log.inputs.length) }, { seed: room.state.seed });
+      expect(log.inputs.length).toBeGreaterThanOrEqual(PLAY_FRAMES + SETTLE_FRAMES);
+      expect(replayed.hash).toBe(fromServer.hash);
+    }
+    const through = PLAY_FRAMES + SETTLE_FRAMES;
+    const pair = <T>(pick: (player: HeadlessDuelClient, index: 0 | 1) => T): [T, T] => [pick(host, 0), pick(guest, 1)];
+    return {
+      scenario,
+      inputDelay: diagnostics.inputDelay,
+      corrections: pair((player) => player.stats!.corrections),
+      correctionBound: pair((player, index) => opponentChanges(player, through) + player.stats!.substitutedFrames[index]),
+      substituted: [diagnostics.authority.repeated[0] + diagnostics.authority.neutral[0], diagnostics.authority.repeated[1] + diagnostics.authority.neutral[1]],
+      hashChecks: pair((player) => player.stats!.hashChecks),
+      desyncs: pair((player) => player.stats!.desyncs),
+      deepestReplay: pair((player) => player.stats!.deepestReplay),
+      rateLimited: [diagnostics.dropped["0"]!["rate-limited"], diagnostics.dropped["1"]!["rate-limited"]],
+      lostMessages: proxies[0].stats.lost[0] + proxies[0].stats.lost[1] + proxies[1].stats.lost[0] + proxies[1].stats.lost[1],
+    };
+  } finally {
+    await Promise.all(players.map((player) => player.leave()));
+    await Promise.all(proxies.map((proxy) => proxy.close()));
+  }
+}
+
+describe("duel netcode through the impairment harness", () => {
+  const scenarios: readonly [string, Impairment, number][] = [
+    ["no impairment", { rttMs: 0, jitterMs: 0, loss: 0 }, 11],
+    ["80 ms round trip, 20 ms jitter, 1% loss", { rttMs: 80, jitterMs: 20, loss: 0.01 }, 21],
+  ];
+  /** The input delay each scenario's room chose, by scenario. */
+  const delays = new Map<string, number>();
+  for (const [scenario, impairment, seed] of scenarios) it(`keeps both clients on the server's state with ${scenario}`, async ({ annotate }) => {
+    const report = await runScenario(scenario, impairment, seed);
+    delays.set(scenario, report.inputDelay);
+    console.log(`duel harness: ${JSON.stringify(report)}`);
+    await annotate(
+      `${scenario}: input delay ${report.inputDelay}; corrections ${report.corrections.join("/")} (bound ${report.correctionBound.join("/")}); ` +
+        `server substitutions ${report.substituted.join("/")}; hash checks ${report.hashChecks.join("/")}, desyncs ${report.desyncs.join("/")}; ` +
+        `deepest replay ${report.deepestReplay.join("/")} frames; rate-limited drops ${report.rateLimited.join("/")}; lost messages ${report.lostMessages}`,
+    );
+    expectWithinBudget(report);
+    if (impairment.loss > 0) expect(report.lostMessages).toBeGreaterThan(0);
+  }, 60_000);
+
+  // Live sockets on a shared machine give no exact values (the pure selection is unit-tested for those): the delay
+  // stays within §15's 3 to 8 frames, and the impaired link gets a longer one than the unimpaired.
+  it("chooses a longer input delay for the impaired link than for the unimpaired one", () => {
+    const [plain, impaired] = scenarios.map(([scenario]) => delays.get(scenario));
+    expect(plain, "the unimpaired scenario ran").toBeDefined();
+    expect(impaired, "the impaired scenario ran").toBeDefined();
+    for (const delay of [plain!, impaired!]) {
+      expect(delay).toBeGreaterThanOrEqual(MIN_INPUT_DELAY);
+      expect(delay).toBeLessThanOrEqual(MAX_INPUT_DELAY);
+    }
+    expect(impaired!).toBeGreaterThan(plain!);
+  });
+});

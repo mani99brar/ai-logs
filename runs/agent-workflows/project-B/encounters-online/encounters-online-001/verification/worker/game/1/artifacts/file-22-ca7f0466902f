@@ -1,0 +1,115 @@
+# Duel simulation
+
+The pure 1v1 duel of §7 and §8 with the Duelist kit. `@pirate-sea-race/simulation/duel` has the step, snapshots and replay. `@pirate-sea-race/content/moves` has the move data, rules, validators and the input log schema. The code has no clocks, no `Math.random` and uses integer maths only.
+
+## Units
+
+- **Time:** 60 Hz frames. `startup` frames come before the first active frame. Blockstun and hitstun count the contact frame, so block advantage is `blockstun − active − recovery` (heavy mid: 16 − 4 − 24 = −12).
+- **Space:** integer sub-pixels, 16 per pixel. x runs from the left wall (0) to `arena.width`, and y goes up from the floor. The origin is the middle of the feet.
+- **Boxes:** half-open `[x, x + w) × [y, y + h)`, drawn facing right. Facing left mirrors `[x, x + w)` to `[−x − w, −x)`. There is one hitbox per move and one hurtbox per stance.
+- **Input:** one integer per player per frame: left 1, right 2, up 4, down 8, light 16, heavy 32, special one 64, special two 128, dash 256. Directions are absolute; throw is light + heavy, pressed together or within the **throw chord window** (below).
+
+## State
+
+`DuelState` is plain data, and `hashState` covers all of it. Each fighter also carries its kit and its bolt and smoke-screen slots; see `docs/fruit-kits.md` for the Ember and Smoke kits, their state and their data:
+
+- `movesetVersion` (`movesetVersion(moveset)`, below), `frame`, and `phase` (`round`, `overtime` or `over`);
+- `rng`: a seeded generator that no current rule draws from, kept so snapshots stay complete;
+- `fighters[2]`;
+- `events`: the last frame's hits, blocks, guard breaks, grabs, throws, escapes and throw clashes;
+- `result`: `winner` (0, 1 or null for a draw) and `reason` (`ko`, `double-ko`, `timeout` or `overtime`).
+
+Each fighter holds:
+
+- position, velocity, `facing`, `health`, `stamina` and `staminaIdle`;
+- `action`, `actionFrame` (counts up; for an attack, the move's frame) and `timer` (counts down; the fighter is free on the frame after 0);
+- `moveId`, `moveHit` (a move connects once), `crouching` and `combo`;
+- `held` (last frame's bits) and `buffer` (frames left per button press).
+
+`canAct(fighter)` tells whether the fighter can start something on the next frame.
+
+## One frame: `stepDuel(config, state, [p1, p2])`
+
+The kits add bolt and zone resolution to this order; `docs/fruit-kits.md` ("Step-order changes") lists exactly where.
+
+1. **Inputs.** Left + right and up + down are neutral. A new press stays usable for 4 frames.
+2. **Detection**, against the start-of-frame state of both fighters.
+   - A fighter guards when it can act (or is in blockstun), is grounded and holds away from the attacker.
+   - Standing guard blocks highs and mids. Crouching guard blocks lows. A crouching fighter is never hit by a high.
+   - Throws ignore guard but cannot take a fighter who is airborne, in hitstun or blockstun, being thrown, recovering from a throw break, or knocked down.
+   - Knocked-down and held fighters cannot be struck, nor can a fighter in its move's `strikeInvulnerable` frames (the counter slash's whole 8-frame startup).
+3. **Same-frame interactions.** Two grabs on one frame break each other with no damage. A grab fails against a strike that hits or is blocked on that frame; a hitbox that misses does not. A throw still in startup is simply struck.
+4. **Apply.** All results land together.
+   - Damage is scaled by the defender's start-of-frame combo count (100/80/65/50/40 %). The fifth damaging hit forces a 40-frame knockdown that cannot be hit.
+   - A block that costs more than the start-of-frame stamina breaks the guard: 30 frames of stagger, and 30 stamina is added, up to the maximum.
+   - Pushback that meets a wall moves the attacker instead.
+   - A grabbed fighter escapes by pressing light + heavy within the ten frames after the grab; otherwise the throw lands on the eleventh frame.
+   - Other fighters advance their action. A free fighter first turns to face the opponent, then starts, in priority order: throw, special one, special two, heavy (down: low sweep; forward: launcher), light (down: anti-air), dash or backdash, jump, crouch, walk.
+   - **Throw chord window** (`rules.throwChordFrames`, 2), for keyboard rollover: a light or heavy move that a free fighter started becomes the throw when the other button is pressed up to 2 frames after the move started, before its first active frame. The throw keeps the frames spent, so it is active when a simultaneous press would be. A lone light or heavy is not delayed (the jab still hits 7 frames after the press).
+5. **Movement.** Velocity, gravity and landing, then walls. Overlapping pushboxes are separated, each fighter moving half the overlap, rounded up. The lower x goes left, then (on a tie) the lower start-of-frame x, the lower velocity, the one facing right. These all flip in a mirrored arena, so the slot never decides; a tie on all of them stays put.
+6. **Stamina and result.**
+   - Stamina regenerates 1 point per 3 frames after 60 frames without spending or blocking.
+   - A KO is judged from both fighters' final health, so a double KO is a draw and beats the clock.
+   - At frame 3600, higher health wins. Equal health goes to overtime until frame 4200, where an exact tie is a draw. After that the step only advances `frame`.
+
+Nothing computed for one fighter reads the other fighter's result from the same frame. A test swaps slots and mirrors the arena, then checks the mirrored outcome on every frame.
+
+**Punish tuning:** the heavy mid hits a standing hurtbox up to 80 px away, and its block pushback is **4 px**, so it leaves at most 84 px − 1 sub-pixel. The jab reaches **64 px** (84 px against a standing hurtbox). The defender's jab, started on its first free frame, lands with 5 frames of the heavy's recovery left.
+
+## Snapshots, restore and replay (for `duel-online`)
+
+- `snapshotDuel(state)`: an independent, JSON-safe deep copy. Keep two seconds of these along with the inputs sent (§15).
+- `restoreDuel(config, snapshot)`: takes a checkpoint, for example one parsed from JSON. It refuses another moveset version (so does `stepDuel`) and any field a duel state cannot hold: missing or extra fields, wrong types, integers out of range, unknown actions or move ids, a move outside an attack, a result without `over`.
+- On a mismatch, restore the authoritative frame N and step the unacknowledged inputs from N + 1. `replayDuel(config, state, log)` does the same from a log and returns `{ state, hash }`. `sliceDuelInputLog(log, N)` starts a log at a snapshot's frame.
+- Log JSON: `{ "format": "pirate-sea-race/duel-input-log", "version": 1, "movesetVersion": "a32af270c3979db5", "startFrame": N, "inputs": [[p1, p2], …] }`, where `inputs[i]` is frame N + i + 1. `duelInputLogSchema` validates it. A replay is refused for a malformed log, another moveset version, or a `startFrame` that is not the state's frame.
+- The version is the data's hash: `movesetVersion(moveset)` equals `hashState(moveset)`, and `MOVESET_VERSION` is the Duelist's. Changed data changes it, so states, snapshots and logs from old data are refused. A test pins the Duelist's value so data changes are deliberate.
+- The throw chord window re-timed recorded inputs: `duelist-1` logs and snapshots (duel-core-001) are refused, and the determinism fixture and version pin were re-recorded.
+
+## Netcode (`duel-online`)
+
+§15's server-authoritative prediction and rollback, in `@pirate-sea-race/simulation/netcode` (pure: the caller passes the time). `DuelAuthority` is the server's half, `DuelClientSession` (the clock, the input stream and `DuelRollback`) the client's; the browser and the headless test client run the same session. On the server, `DuelMachine` (`apps/server`) runs one duel around `DuelAuthority`, the same in a standalone `DuelRoom` and inside a `MatchRoom` (below).
+
+**Timeline.** One frame counter: the countdown is frames −180 to 0, the fight starts at frame 1, and `inputs[i]` of any message is for consecutive frames ending with its `frame`.
+
+**Messages** (Colyseus messages on the room's WebSocket, validated with zod in `packages/protocol`, protocol v5):
+
+| Direction | Type | Content | Rate |
+| --- | --- | --- | --- |
+| client → server | `duel-input` | `{seq, frame, inputs}`: the input bits of the last 4 tagged frames, the newest last | one every 2nd frame, never more than 30 a second |
+| server → client | `duel-frames` | `{frame, inputs, substituted, snapshot \| hash}`: the pairs the server applied since the last bundle (bit `2k + p` of `substituted` marks a repeated or neutral input), then the state after `frame` | every 3rd frame; a snapshot in every 2nd bundle (every 6 frames), the `hashState` otherwise |
+| server → client | `duel-probe` | `{id, frame, rtt}`: the server's frame and the client's last measured round trip | every 6 frames in the countdown, every 30 in the fight |
+| client → server | `duel-probe` | `{id}`, echoed at once | — |
+| client → server | `duel-practice` | `{dummy: "idle" \| "guard"}` (practice rooms) | — |
+| client → server | `duel-ready` | `{}`: this fighter's arena is loaded (duels at sea) | once per duel |
+
+Each frame travels in two input messages, so one lost message costs nothing. The world input gate's limits apply unchanged: 128 bytes, 60 messages a second, increasing `seq`, `frame` at most 30 frames past the server's. The lobby (code, phase, countdown, seed, input delay, seats, result) is the room's Schema state.
+
+**Server** (`DuelAuthority`, stepped by the `DuelMachine` at 60 Hz). A frame's input is the first copy received; a copy for a frame already stepped is ignored (late input never rewrites a frame). With no input for a frame, the player's last input repeats for 15 frames (250 ms) after their last received frame, then neutral. The fight starts with a frame-0 snapshot bundle; the step's result ends it (the last bundle carries a snapshot) and the room's state announces it.
+
+**Input delay.** The input held at client frame `c` is tagged for `c + delay`, for both players. `DELAY_DECISION_FRAMES` (30) before the countdown ends the server picks `ceil((rtt / 2 + 2 × jitter) / 16.7 ms) + 2`, clamped to 3–8, from the slower player's probes (`inputDelayFromSamples`): `rtt` is the median and `jitter` the interquartile range of up to 25 round trips (a stall behind a lost packet does not count as jitter). No samples means 8. The HUD shows it. Unit tests pin its exact values; live tests only check that it stays within 3–8 and rises with latency.
+
+**Client clock.** Every bundle and probe that left the server after frame F and arrived at local time T suggests the server's frame 0 was at `T − rtt/2 − F × 16.7 ms`; the earliest suggestion of the last two seconds is the estimate (delays only add). Every 4 ms tick moves the client's frame towards it, at most 4 frames per tick; a gap over 30 frames (a stall or a hidden tab) restarts from the latest snapshot instead. The display's frame rate plays no part.
+
+**Rollback loop** (`DuelRollback`, two seconds of states and inputs):
+
+1. Predict each frame past the last confirmed one with the local input as sent and the opponent's last confirmed input repeated; stop 120 frames past it.
+2. On a bundle, record the applied pairs. If one differs from the pair its frame was predicted with, restore the last confirmed state and step every frame to the head again: confirmed frames with the server's pairs (never the client's own record), later frames with local and predicted inputs. That is one correction.
+3. Advance the confirmed frame over frames stepped with confirmed pairs. At each bundle's frame, hash the client's own state before restoring anything and compare it with the server's hash; a mismatch is a desync, and the snapshot (every second bundle) replaces the state.
+4. A gap in the confirmed frames (a rejoin) waits for a snapshot and restarts from it.
+5. Prediction stops at a frame with a result (KO, double KO or the clock); a correction that takes the result back lets it go on. Once the room's phase is `over`, the client tags and sends nothing more and steps only up to the last bundle's frame (`DuelClientSession.finish`), so the HUD ends on the server's final frame and never passes it.
+
+Events carry stable ids (`frame:kind:attacker:move`, and `frame:result:reason` for the end), so a re-stepped hit, throw or KO is reported once. The browser's pending-event buffer and the arena's flashes (`apps/web/src/duelEvents.ts`) keep that: each id is drawn once.
+
+**Reconnect** (§12). A player who drops keeps their seat for 10 seconds (Colyseus `allowReconnection`); meanwhile the server substitutes their input as above, so they fall to neutral after 250 ms. The SDK reconnects on its own; the room sends the returning client a snapshot bundle, from which it continues. Absent past 10 seconds, or quitting once the countdown has begun, forfeits. Forfeits are decided together at the next frame boundary, so the order the room processes two leaves in never picks a winner (§7): one forfeit is the opponent's win by `forfeit`, even when the opponent is away but still inside their own window; both on the same frame is a result with no winner (`winner` −1, reason `forfeit`, "Both forfeit: no winner"), so nothing is awarded.
+
+**Practice.** One player against a server-side dummy (player two) whose input is scripted, not received: `idle`, or `guard`, which holds back while player one strikes and while in blockstun (so it neither backs off nor escapes a throw).
+
+## Inside a match room (`encounters-online`)
+
+§14: a duel at sea is a simulation object of the match room, not a room of its own. A grapple that lands (`duel-reserved` from the encounter rules, `docs/encounters.md`) opens one: a `DuelMachine` with the attacker as player one and the grappled player as player two, a fresh seed, and its lobby in the match state's `duels` map under an opaque key. Its countdown starts at once. Fighters, their frames and their result are exactly a duel room's: the same machine, messages, gates, rates, input delay, bundles, hash checks and forfeits. What differs:
+
+- **Start.** The machine's fight starts when the room calls `start()`, on the rules' `duel-started`: the 3 s countdown is over and both fighters have sent `duel-ready` (the browser sends it once its arena scene is up, the headless client when the lobby appears). A countdown that ends first leaves the lobby in `waiting`, with no probes, and clients drop their session: the fight's clock then starts from its own frame-0 snapshot rather than from a countdown that stopped. A fighter still not ready 10 s after the grapple forfeits, both cancels (reason `cancelled`, winner −1): the rules decide it and the room ends the machine.
+- **End.** The machine's result (a KO, the clock, a forfeit) goes back to the rules at the next world tick as an end report (a win, a draw, or `cancelled` for a double forfeit), and, with no rubbings to steal yet, the settlement on the same tick. The winner goes back to its own position with 8 s of protection; the loser waits 15 s from that end tick and respawns at the dock the rules choose with 20 s; a draw returns both to separate points. The lobby stays in the fighters' views for 2 s more with the result, then the clients return to the sea.
+- **Absence.** A fighter who drops during an unfinished duel keeps the seat for 10 s (`allowReconnection`, the same view); the SDK reconnects on its own and the machine sends a snapshot bundle to continue from. Past 10 s, or on leaving the match, the fighter forfeits (and the ship leaves the match).
+- **Routing and visibility.** Frames and probes go to the two fighters only; inputs, probe echoes and `duel-ready` count only from the duel's own fighters. Everyone else gets a duel marker (position and start tick, no names) if it is within sight, and no fighter's ship while the duel lasts.
+- **Clients.** The browser's `DuelClient` takes a `DuelTransport`: `duelRoomTransport(room)` for a duel room, `SeaDuelRouter.transport(key)` inside a match (the router listens for duel messages once per match and holds any that beat the lobby). `HeadlessDuelClient` does the same (`HeadlessClient.fighter`). Kits come later (`fruit-kits-online`): a duel at sea is the Duelist mirror.

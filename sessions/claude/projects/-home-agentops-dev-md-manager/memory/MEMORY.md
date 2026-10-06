@@ -1,0 +1,10 @@
+- [MD Manager PRD/TDD workflow](md-manager-prd-tdd-workflow.md) — slice PRDs in docs/, red/green evidence + handoff doc expected, isolated Playwright harness (temp roots, ports 5184/3014), live config in ~/.config/md-manager, graph click/label traps
+- [Workflow live-run lessons](workflow-live-run-lessons.md) — automatic mode first run 2026-09-21: bypass disclaimer, controller from a main worktree while source is pinned, lane rerun steps, transcript resume paths
+- [Review visibility implementation](review-visibility-implementation.md) — 2026-09-21 slices A/B/C on branch ultra; parallel benchmark worktrees, shared node_modules/venv, never re-export the live run before merge
+- [Review visibility, branch high](review-visibility-high-branch.md) — Write allow-list for the reviewer, per-message contract versions, scratch smoke-test recipe, operator steps owed
+- [Review visibility merged](review-visibility-merged.md) — PR 11 merged 2026-09-22 as af119c7, feature dirs removed, live run re-exported 1.2.0, PRs 9/10 open and superseded, known debts
+- [Portable workflow plan](portable-workflow-plan.md) — 3-slice PRD: portability+trim, guardrails from user's templates, project-B from spec PDF
+- [Worker test policy](worker-test-policy.md) — workers run targeted tests only; verifier keeps the full checks
+- [Open workflow issues](open-workflow-issues.md) — slice 2 run issue checklist to fix before slice 3 (auto-update loop, pane reconnect, worktree race…)
+- [VPS capacity](vps-capacity.md) — 4 cores/7.9 GB: ~8–10 agents, 1 full suite + 1–2 Playwright at once, 3–4 worker lanes; 2-agent cap per workflow
+- [Workflow viewer UX redesign](workflow-viewer-ux-redesign.md) — 2026-09-24 user wants the Projects viewer UX fixed; audit+design workflow, mockup checkpoint before implementing

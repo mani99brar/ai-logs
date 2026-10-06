@@ -1,0 +1,120 @@
+import { expect, test, type Page } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/index.js";
+import { encounterRules } from "../../packages/content/src/encounters/index.js";
+import { attachScreenshot, createMatch, joinMatch, place, readout, selfId, TILE } from "./helpers.js";
+
+const HUB_X = seaMap.hub.tileX;
+/** The row three tiles south of the hub, which the map keeps clear for a hull 20 tiles either side of the hub. */
+const OPEN_ROW = seaMap.hub.tileY + 3;
+const RANGE = encounterRules.grapple.rangeTiles * TILE;
+/**
+ * The browser server deals the sources in the test-only layout (`PIRATE_SEA_RACE_TEST_SOURCES` in the Playwright
+ * config): Palm Key seals Suns, Ember Rock Moons. Palm Key's west dock and Ember Rock's east dock.
+ */
+const PALM_WEST = seaMap.docks.find((dock) => dock.island === 0)!;
+const EMBER_EAST = seaMap.docks.find((dock) => dock.island === 1)!;
+
+const scene = (page: Page) => page.getByTestId("game").getAttribute("data-scene");
+
+/** Holds E moored at the page's dock until the HUD says the rubbing is collected, as a player does. */
+async function holdToCollect(page: Page, island: string, type: string, name: string): Promise<void> {
+  await page.keyboard.down("e");
+  try {
+    // One gesture: E moors the ship, and the same hold collects; the HUD shows the island's types and the hold.
+    await expect(page.getByTestId("hud-island")).toHaveText(`${island} holds: ${name}, ${name}`);
+    await expect(page.getByTestId("hud-hold")).toHaveAttribute("data-state", `collect:${type}`);
+    await expect(page.getByTestId("hud-hold-progress")).toBeVisible();
+    await expect(page.getByTestId("purse-rubbings")).toHaveAttribute("data-types", type, { timeout: 10_000 });
+  } finally {
+    await page.keyboard.up("e");
+  }
+  await expect(page.getByTestId("hud-result")).toHaveText(`Collected the ${name} rubbing`);
+  await expect(page.getByTestId("hud-island")).toHaveText(`${island} holds: ${name}`);
+}
+
+test("two browsers each collect a rubbing at their own island, the host grapples the guest, wins by tapping attack keys and steals the guest's type within five seconds [scenario:theft-loop]", async ({ browser, request }, testInfo) => {
+  // Two six-second holds at once, the grapple, a three-second countdown, a KO in about ten seconds, the choice.
+  test.setTimeout(180_000);
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+    const code = await createMatch(host);
+    await joinMatch(guest, code);
+    const [hostId, guestId] = [await selfId(host), await selfId(guest)];
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("purse-gold")).toHaveText("50");
+      await expect(page.getByTestId("purse-rubbings")).toHaveText("none yet");
+    }
+
+    // Each on the dock of its own island; at sea the HUD says nothing about the island.
+    await place(request, host, code, PALM_WEST.tileX, PALM_WEST.tileY, 0);
+    await place(request, guest, code, EMBER_EAST.tileX, EMBER_EAST.tileY, 32);
+    await expect(host.getByTestId("hud-island")).toHaveText("");
+    await Promise.all([holdToCollect(host, "Palm Key", "sun", "Sun"), holdToCollect(guest, "Ember Rock", "moon", "Moon")]);
+    await expect(host.getByTestId("purse-rubbings")).toHaveText("Sun");
+    await expect(guest.getByTestId("purse-rubbings")).toHaveText("Moon");
+
+    // At sea, eight tiles apart; the host sails at the guest and, within range, taps J.
+    await place(request, host, code, HUB_X - 4, OPEN_ROW, 0);
+    await place(request, guest, code, HUB_X + 4, OPEN_ROW, 32);
+    await expect.poll(async () => (await readout(host, guestId)) !== undefined).toBe(true);
+    await host.keyboard.down("ArrowUp");
+    try {
+      await expect
+        .poll(
+          async () => {
+            const [own, target] = [await readout(host, hostId), await readout(host, guestId)];
+            return own === undefined || target === undefined ? Number.POSITIVE_INFINITY : Math.hypot(target.x - own.x, target.y - own.y);
+          },
+          { intervals: [25], timeout: 10_000 },
+        )
+        .toBeLessThanOrEqual(RANGE - TILE);
+      await host.keyboard.press("j");
+    } finally {
+      await host.keyboard.up("ArrowUp");
+    }
+    for (const page of [host, guest]) {
+      await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "countdown", { timeout: 5000 });
+      await expect.poll(() => scene(page)).toBe("arena");
+    }
+    for (const page of [host, guest]) await expect(page.getByTestId("duel-phase")).toHaveAttribute("data-phase", "fighting", { timeout: 15_000 });
+
+    // The host taps its first special (U) at the guest, who stands still, until the KO. Duel buttons act on the press.
+    const result = host.getByTestId("duel-result");
+    for (let press = 0; press < 60 && !(await result.isVisible()); press++) {
+      await host.keyboard.press("u");
+      await host.waitForTimeout(500);
+    }
+    await expect(host.getByTestId("duel-result-text")).toHaveText("Player 1 wins by KO", { timeout: 10_000 });
+
+    // The winner's choice, beside the arena: the guest's Moon on key 1, with the seconds left. The loser gets none.
+    const choice = host.getByTestId("theft-choice");
+    await expect(choice).toBeVisible({ timeout: 5000 });
+    await expect(host.getByTestId("theft-options").getByRole("button")).toHaveText(["1: Moon"]);
+    const seconds = Number(await host.getByTestId("theft-deadline").getAttribute("data-seconds"));
+    expect(seconds).toBeGreaterThan(0);
+    expect(seconds).toBeLessThanOrEqual(5);
+    await expect(guest.getByTestId("theft-choice")).toBeHidden();
+    await host.keyboard.press("1");
+    await expect(choice).toBeHidden({ timeout: 3000 });
+
+    // The host holds both types and more gold; the guest sees what it lost.
+    await expect(host.getByTestId("purse-rubbings")).toHaveAttribute("data-types", "sun,moon");
+    await expect(host.getByTestId("purse-rubbings")).toHaveText("Sun, Moon");
+    await expect(host.getByTestId("purse-gold")).toHaveText("60");
+    await expect(host.getByTestId("purse-settlement")).toHaveText("Duel won: you took the Moon rubbing and 10 gold");
+    await expect(guest.getByTestId("purse-rubbings")).toHaveText("none yet");
+    await expect(guest.getByTestId("purse-gold")).toHaveText("40");
+    await expect(guest.getByTestId("purse-settlement")).toHaveText("Duel lost: they took your Moon rubbing and 10 gold");
+
+    // Then back at sea, the winner protected.
+    await expect.poll(() => scene(host), { timeout: 10_000 }).toBe("sea");
+    await expect(host.getByTestId("hud-protection")).toHaveAttribute("data-state", "win");
+    await attachScreenshot(host, testInfo, "theft-loop");
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

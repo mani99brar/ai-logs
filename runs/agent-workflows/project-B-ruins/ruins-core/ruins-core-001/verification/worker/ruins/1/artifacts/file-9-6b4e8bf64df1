@@ -1,0 +1,250 @@
+import { RUIN_MOVES, type RuinSymbol } from "@pirate-sea-race/content/ruins";
+import { attemptSolves, type RuinAttempt, type RuinClue } from "./puzzles.js";
+import {
+  clueFor,
+  findRuin,
+  hasSolved,
+  lockedUntil,
+  presenceOf,
+  sessionOf,
+  type Ruin,
+  type RuinPresence,
+  type RuinsState,
+} from "./state.js";
+
+/**
+ * Why a request changed nothing (§16: duplicate, stale or refused requests return the current result without
+ * mutating state). A rejected request always returns the very state object it was given. No rejection depends on the
+ * answer: a malformed attempt is refused for its shape alone, and a well-formed wrong one is a wrong answer.
+ */
+export type RuinRejection =
+  | "invalid-request"
+  | "stale-tick"
+  | "duplicate"
+  | "unknown-ruin"
+  | "not-at-ruin"
+  | "in-duel"
+  | "no-session"
+  | "already-solved"
+  | "locked-out";
+
+/**
+ * What the caller applies to the ledger later:
+ * - `sources-unlocked`: the first solve of a ruin, once per ruin; `unlockSource` for each id.
+ * - `gold-awarded`: a player's first solve of a ruin, once per player and ruin; new gold (§11).
+ */
+export type RuinEvent =
+  | { readonly kind: "sources-unlocked"; readonly island: number; readonly sourceIds: readonly string[]; readonly playerId: string; readonly tick: number }
+  | { readonly kind: "gold-awarded"; readonly island: number; readonly playerId: string; readonly amount: number; readonly tick: number };
+
+/** What every operation returns: the next state (the same object when nothing changed) and its result. */
+export interface RuinStep<R> {
+  readonly state: RuinsState;
+  readonly result: R;
+}
+
+function isTick(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPlayerId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isIsland(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function tickRejection(state: RuinsState, tick: unknown): RuinRejection | null {
+  if (!isTick(tick)) return "invalid-request";
+  return tick < state.tick ? "stale-tick" : null;
+}
+
+function byPlayer<T extends { readonly playerId: string }>(a: T, b: T): number {
+  return a.playerId < b.playerId ? -1 : a.playerId > b.playerId ? 1 : 0;
+}
+
+/** Puts (or with null, removes) a player's entry in a list sorted by player id. */
+function upsert<T extends { readonly playerId: string }>(list: readonly T[], playerId: string, entry: T | null): T[] {
+  const rest = list.filter((item) => item.playerId !== playerId);
+  return entry === null ? rest : [...rest, entry].sort(byPlayer);
+}
+
+function withRuin(state: RuinsState, ruin: Ruin): RuinsState {
+  return { ...state, ruins: { ...state.ruins, [String(ruin.island)]: ruin } };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Presence
+
+export interface ReportPresenceRequest {
+  readonly playerId: string;
+  /** The island whose dock the player is moored at, or null when at sea (or anywhere without a ruin). */
+  readonly island: number | null;
+  readonly inDuel: boolean;
+  readonly tick: number;
+}
+
+export interface PresenceResult {
+  readonly ok: boolean;
+  readonly rejection: RuinRejection | null;
+  /** The islands whose ruin session this report closed. */
+  readonly closed: readonly number[];
+}
+
+/**
+ * The caller reports where a player is whenever it changes (it may report every tick; an unchanged report is a
+ * duplicate). Being elsewhere than a ruin's island, or in a duel, closes the player's session there. Lockouts stay.
+ */
+export function reportPresence(state: RuinsState, request: ReportPresenceRequest): RuinStep<PresenceResult> {
+  const { playerId, island, inDuel, tick } = request;
+  const reject = (rejection: RuinRejection): RuinStep<PresenceResult> => ({ state, result: { ok: false, rejection, closed: [] } });
+  const bad = tickRejection(state, tick);
+  if (bad) return reject(bad);
+  if (!isPlayerId(playerId) || (island !== null && !isIsland(island)) || typeof inDuel !== "boolean") return reject("invalid-request");
+  const current = presenceOf(state, playerId);
+  if (current.island === island && current.inDuel === inDuel) return reject("duplicate");
+  const closed: number[] = [];
+  const ruins: Record<string, Ruin> = { ...state.ruins };
+  for (const [key, ruin] of Object.entries(state.ruins)) {
+    if (!sessionOf(ruin, playerId) || (!inDuel && ruin.island === island)) continue;
+    ruins[key] = { ...ruin, sessions: upsert(ruin.sessions, playerId, null) };
+    closed.push(ruin.island);
+  }
+  const entry: RuinPresence | null = island === null && !inDuel ? null : { playerId, island, inDuel };
+  const next: RuinsState = { ...state, tick, ruins, presence: upsert(state.presence, playerId, entry) };
+  return { state: next, result: { ok: true, rejection: null, closed: closed.sort((a, b) => a - b) } };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Opening a ruin
+
+export interface OpenRuinRequest {
+  readonly playerId: string;
+  readonly island: number;
+  readonly tick: number;
+}
+
+export interface OpenResult {
+  readonly ok: boolean;
+  readonly rejection: RuinRejection | null;
+  /** The clue, for a player with a session at this ruin (a repeated open gets it again); otherwise null. */
+  readonly clue: RuinClue | null;
+  /** The tick before which this player's attempts here are refused; 0 when never locked out. */
+  readonly lockedUntil: number;
+  /** Whether this player has already solved this ruin. */
+  readonly solved: boolean;
+}
+
+/** Starts a player's session at the ruin of the island they are moored at and hands them its clue. */
+export function openRuin(state: RuinsState, request: OpenRuinRequest): RuinStep<OpenResult> {
+  const { playerId, island, tick } = request;
+  const ruin = isIsland(island) ? findRuin(state, island) : undefined;
+  const reject = (rejection: RuinRejection): RuinStep<OpenResult> => {
+    const session = ruin && isPlayerId(playerId) ? sessionOf(ruin, playerId) : undefined;
+    return {
+      state,
+      result: {
+        ok: false,
+        rejection,
+        clue: session ? clueFor(ruin!) : null,
+        lockedUntil: ruin && isPlayerId(playerId) ? lockedUntil(ruin, playerId) : 0,
+        solved: ruin !== undefined && isPlayerId(playerId) && hasSolved(ruin, playerId),
+      },
+    };
+  };
+  const bad = tickRejection(state, tick);
+  if (bad) return reject(bad);
+  if (!isPlayerId(playerId) || !isIsland(island)) return reject("invalid-request");
+  if (!ruin) return reject("unknown-ruin");
+  const presence = presenceOf(state, playerId);
+  if (presence.inDuel) return reject("in-duel");
+  if (presence.island !== island) return reject("not-at-ruin");
+  if (sessionOf(ruin, playerId)) return reject("duplicate");
+  const opened: Ruin = { ...ruin, sessions: upsert(ruin.sessions, playerId, { playerId, openedTick: tick }) };
+  return {
+    state: withRuin({ ...state, tick }, opened),
+    result: { ok: true, rejection: null, clue: clueFor(opened), lockedUntil: lockedUntil(ruin, playerId), solved: hasSolved(ruin, playerId) },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Answering
+
+export interface AnswerRuinRequest {
+  readonly playerId: string;
+  readonly island: number;
+  readonly tick: number;
+  readonly attempt: RuinAttempt;
+}
+
+export type AnswerOutcome = "solved" | "wrong";
+
+export interface AnswerResult {
+  readonly ok: boolean;
+  readonly rejection: RuinRejection | null;
+  readonly outcome: AnswerOutcome | null;
+  /** The tick before which this player's attempts here are refused; 0 when never locked out. */
+  readonly lockedUntil: number;
+  /** For the caller to apply to the ledger, in order. */
+  readonly events: readonly RuinEvent[];
+}
+
+/**
+ * Whether an attempt has a well-formed shape for the ruin's kind, which the clue already tells: a sequence of the
+ * right length of distinct known symbols, or one to `size²` compass moves. The check never looks at the answer.
+ */
+function attemptShapeOk(state: RuinsState, ruin: Ruin, attempt: unknown): attempt is RuinAttempt {
+  if (typeof attempt !== "object" || attempt === null) return false;
+  const candidate = attempt as Record<string, unknown>;
+  if (candidate.kind !== ruin.puzzle.kind) return false;
+  if (ruin.puzzle.kind === "sequence") {
+    const symbols = candidate.symbols;
+    if (!Array.isArray(symbols) || symbols.length !== ruin.puzzle.answer.length) return false;
+    const known: readonly string[] = state.rules.symbols;
+    return symbols.every((symbol) => typeof symbol === "string" && known.includes(symbol)) && new Set(symbols as RuinSymbol[]).size === symbols.length;
+  }
+  const moves = candidate.moves;
+  const longest = ruin.puzzle.size * ruin.puzzle.size;
+  const compass: readonly string[] = RUIN_MOVES;
+  return Array.isArray(moves) && moves.length > 0 && moves.length <= longest && moves.every((move) => typeof move === "string" && compass.includes(move));
+}
+
+/**
+ * Checks a player's attempt at the ruin they have open. A right answer solves the ruin for that player: the first
+ * solve unlocks the island's sources for everyone, and every player's first solve pays the completion gold. A wrong
+ * answer locks that player out of that ruin for `lockoutTicks`.
+ */
+export function answerRuin(state: RuinsState, request: AnswerRuinRequest): RuinStep<AnswerResult> {
+  const { playerId, island, tick, attempt } = request;
+  const ruin = isIsland(island) ? findRuin(state, island) : undefined;
+  const reject = (rejection: RuinRejection): RuinStep<AnswerResult> => ({
+    state,
+    result: { ok: false, rejection, outcome: null, lockedUntil: ruin && isPlayerId(playerId) ? lockedUntil(ruin, playerId) : 0, events: [] },
+  });
+  const bad = tickRejection(state, tick);
+  if (bad) return reject(bad);
+  if (!isPlayerId(playerId) || !isIsland(island)) return reject("invalid-request");
+  if (!ruin) return reject("unknown-ruin");
+  const presence = presenceOf(state, playerId);
+  if (presence.inDuel) return reject("in-duel");
+  if (presence.island !== island) return reject("not-at-ruin");
+  if (!sessionOf(ruin, playerId)) return reject("no-session");
+  if (hasSolved(ruin, playerId)) return reject("already-solved");
+  if (tick < lockedUntil(ruin, playerId)) return reject("locked-out");
+  if (!attemptShapeOk(state, ruin, attempt)) return reject("invalid-request");
+
+  if (!attemptSolves(ruin.puzzle, attempt)) {
+    const until = tick + state.rules.lockoutTicks;
+    const locked: Ruin = { ...ruin, lockouts: upsert(ruin.lockouts, playerId, { playerId, until }) };
+    return { state: withRuin({ ...state, tick }, locked), result: { ok: true, rejection: null, outcome: "wrong", lockedUntil: until, events: [] } };
+  }
+  const events: RuinEvent[] = [];
+  if (!ruin.unlocked) events.push({ kind: "sources-unlocked", island: ruin.island, sourceIds: [...ruin.sourceIds], playerId, tick });
+  events.push({ kind: "gold-awarded", island: ruin.island, playerId, amount: state.rules.completionGold, tick });
+  const solved: Ruin = { ...ruin, unlocked: true, solvedBy: [...ruin.solvedBy, { playerId, tick }] };
+  return {
+    state: withRuin({ ...state, tick }, solved),
+    result: { ok: true, rejection: null, outcome: "solved", lockedUntil: lockedUntil(ruin, playerId), events },
+  };
+}

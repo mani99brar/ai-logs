@@ -1,0 +1,175 @@
+import { describe, expect, it } from "vitest";
+import {
+  createDuelState,
+  defaultDuelConfig as config,
+  duelInput as I,
+  FEINT_REAPPEARANCE_FRAMES,
+  fighterTells,
+  findMove,
+  strikesWithHitbox,
+  traceDuel,
+  type DuelInputs,
+  type DuelState,
+  type FighterState,
+  type KitId,
+} from "./index.js";
+
+const U = I("special1");
+const SCREEN = I("special2");
+const LIGHT = I("light");
+const feint = findMove(config.moveset, "feint-dash");
+const screen = findMove(config.moveset, "smoke-screen");
+/** The dash: the feint's startup and active frames. */
+const DASH = feint.timing.startup + feint.timing.active;
+/** The feint's last frame. */
+const END = DASH + feint.timing.recovery;
+
+function duel(kits: readonly [KitId, KitId], x0: number, x1: number, patch0: Partial<FighterState> = {}, patch1: Partial<FighterState> = {}): DuelState {
+  const state = createDuelState(config, { x: [x0, x1], kits });
+  return { ...state, fighters: [{ ...state.fighters[0], ...patch0 }, { ...state.fighters[1], ...patch1 }] };
+}
+
+function hold(frames: number, p1 = 0, p2 = 0): DuelInputs[] {
+  return Array.from({ length: frames }, () => [p1, p2] as const);
+}
+
+/** `frames` of neutral input with the given presses: `[frame, p1, p2]` (frames count from 1). */
+function presses(frames: number, ...at: readonly (readonly [number, number, number])[]): DuelInputs[] {
+  const inputs = hold(frames);
+  for (const [frame, p1, p2] of at) inputs[frame - 1] = [p1, p2];
+  return inputs;
+}
+
+function run(state: DuelState, inputs: readonly DuelInputs[]): DuelState[] {
+  return traceDuel(config, state, inputs);
+}
+
+function events(trace: readonly DuelState[]): string[] {
+  return trace.flatMap((state) => state.events.map((event) => `${state.frame} ${event.kind} ${event.attacker} ${event.moveId}`));
+}
+
+describe("Smoke's specials deal no damage (§9: low direct damage)", () => {
+  it("never strike: the feint and the screen have no damage, stun or pushback of their own", () => {
+    for (const move of [feint, screen]) {
+      expect(strikesWithHitbox(move)).toBe(false);
+      expect(move).toMatchObject({ damage: 0, hitstun: 0, blockstun: 0, hitPushback: 0, blockPushback: 0, launch: 0 });
+      expect(move.projectile).toBeUndefined();
+    }
+    expect(config.moveset.kits.smoke).toEqual({ special1: "feint-dash", special2: "smoke-screen" });
+  });
+
+  it("leave an opponent untouched: Smoke's offence is the shared normals", () => {
+    // Feints into and past a standing Duelist, then a screen on top of it.
+    const trace = run(duel(["smoke", "duelist"], 4000, 5600), presses(120, [1, U, 0], [31, U, 0], [61, SCREEN, 0]));
+    expect(events(trace)).toEqual([]);
+    expect(trace[120]!.fighters[1].health).toBe(1000);
+  });
+});
+
+describe("Smoke's feint dash (U)", () => {
+  it("dashes 72 px forward, then stands for its recovery", () => {
+    const trace = run(duel(["smoke", "duelist"], 3000, 7000), presses(40, [1, U, 0]));
+    expect(trace[DASH]!.fighters[0].x).toBe(3000 + DASH * feint.advance);
+    expect(DASH * feint.advance).toBe(72 * 16);
+    expect(trace[END]!.fighters[0]).toMatchObject({ x: 3000 + DASH * feint.advance, action: "attack", moveId: "feint-dash" });
+    expect(trace[END + 1]!.fighters[0].action).toBe("idle");
+  });
+
+  it("changes spacing and cancels into a normal after the reappearance: a jab from outside its range", () => {
+    // 125 px apart: beyond the jab (84 px). The feint closes 72 px and cancels into a jab on frame 25.
+    const trace = run(duel(["smoke", "duelist"], 4000, 6000), presses(50, [1, U, 0], [25, LIGHT, 0]));
+    expect(feint.cancel!.opens).toBe(DASH + FEINT_REAPPEARANCE_FRAMES + 1);
+    expect(trace[25]!.fighters[0]).toMatchObject({ action: "attack", moveId: "jab", actionFrame: 1 });
+    expect(events(trace)).toEqual(["32 hit 0 jab"]);
+    expect(events(run(duel(["smoke", "duelist"], 4000, 6000), presses(50, [1, LIGHT, 0])))).toEqual([]);
+  });
+
+  it("cancels into the other normals too: a heavy, a low sweep and the throw", () => {
+    const cancelled = (press: number) => run(duel(["smoke", "duelist"], 3000, 7000), presses(30, [1, U, 0], [25, press, 0]))[25]!.fighters[0].moveId;
+    expect([I("heavy"), I("down", "heavy"), I("light", "heavy")].map(cancelled)).toEqual(["heavy-mid", "low-sweep", "throw"]);
+  });
+
+  it(`keeps a reappearance of at least FEINT_REAPPEARANCE_FRAMES (${FEINT_REAPPEARANCE_FRAMES}) frames`, () => {
+    expect(FEINT_REAPPEARANCE_FRAMES).toBe(12);
+    expect(feint.timing.recovery).toBeGreaterThanOrEqual(FEINT_REAPPEARANCE_FRAMES);
+    expect(feint.strikeInvulnerable).toBeLessThanOrEqual(feint.timing.startup);
+    const trace = run(duel(["smoke", "duelist"], 3000, 7000), presses(40, [1, U, 0]));
+    const reappearing = trace.flatMap((state, frame) => (fighterTells(config, state.fighters[0]).reappearing ? [frame] : []));
+    expect(reappearing).toEqual(Array.from({ length: FEINT_REAPPEARANCE_FRAMES }, (_, index) => DASH + 1 + index));
+  });
+
+  it("is strike-invulnerable only during its dash, never in the reappearance", () => {
+    // Player two's jab is active on frames 8-10 (in the invulnerable dash) or 13-15 (in the reappearance).
+    const start = duel(["smoke", "duelist"], 5000, 6600);
+    expect(events(run(start, presses(30, [1, U, LIGHT])))).toEqual([]);
+    expect(events(run(start, presses(30, [1, U, 0], [6, 0, LIGHT])))).toEqual(["13 hit 1 jab"]);
+  });
+
+  it("refuses to cancel into another feint or a special", () => {
+    for (const special of [U, SCREEN]) {
+      const trace = run(duel(["smoke", "duelist"], 3000, 7000), presses(40, [1, U, 0], [26, special, 0]));
+      for (let frame = 26; frame <= END; frame++) expect(trace[frame]!.fighters[0]).toMatchObject({ moveId: "feint-dash", actionFrame: frame });
+      // The press has left the buffer by the time the feint ends.
+      expect(trace[END + 1]!.fighters[0].action).toBe("idle");
+    }
+  });
+
+  it("refuses a cancel before the 12th reappearance frame, and a press buffered early cancels no sooner", () => {
+    const early = run(duel(["smoke", "duelist"], 3000, 7000), presses(40, [1, U, 0], [20, LIGHT, 0]));
+    for (let frame = 20; frame <= END; frame++) expect(early[frame]!.fighters[0]).toMatchObject({ moveId: "feint-dash", actionFrame: frame });
+    const buffered = run(duel(["smoke", "duelist"], 3000, 7000), presses(40, [1, U, 0], [22, LIGHT, 0]));
+    expect(buffered[24]!.fighters[0]).toMatchObject({ moveId: "feint-dash", actionFrame: 24 });
+    expect(buffered[25]!.fighters[0]).toMatchObject({ moveId: "jab", actionFrame: 1 });
+  });
+
+  it("shows all 12 reappearance frames, without invulnerability, even when cancelled", () => {
+    const trace = run(duel(["smoke", "duelist"], 3000, 7000), presses(40, [1, U, 0], [13, LIGHT, 0], [21, LIGHT, 0], [25, LIGHT, 0]));
+    for (let frame = DASH + 1; frame <= DASH + FEINT_REAPPEARANCE_FRAMES; frame++) {
+      expect(trace[frame]!.fighters[0]).toMatchObject({ moveId: "feint-dash", actionFrame: frame });
+      expect(fighterTells(config, trace[frame]!.fighters[0]).reappearing).toBe(true);
+      expect(feint.strikeInvulnerable).toBeLessThan(frame);
+    }
+    expect(trace[25]!.fighters[0].moveId).toBe("jab");
+  });
+});
+
+describe("Smoke's smoke screen (I)", () => {
+  it("is laid on the cast's first active frame where Smoke stands, and expires on time", () => {
+    const trace = run(duel(["smoke", "duelist"], 3000, 7000), presses(200, [1, SCREEN, 0]));
+    const laid = screen.timing.startup + 1;
+    expect(trace[laid - 1]!.fighters[0].zone).toBeNull();
+    expect(trace[laid]!.fighters[0].zone).toEqual({ moveId: "smoke-screen", x: 3000, facing: 1, life: screen.zone!.life });
+    const present = trace.flatMap((state, frame) => (state.fighters[0].zone === null ? [] : [frame]));
+    expect(present).toEqual(Array.from({ length: screen.zone!.life }, (_, index) => laid + index));
+  });
+
+  it("marks the fighters inside it, whoever they are, and no one outside it", () => {
+    const near = run(duel(["smoke", "duelist"], 3000, 4000), [[SCREEN, 0], ...hold(28), ...hold(60, 0, I("right"))]);
+    expect(near[12]!.fighters.map((fighter) => fighter.obscured)).toEqual([false, false]);
+    expect(near[13]!.fighters.map((fighter) => fighter.obscured)).toEqual([true, true]);
+    // Player two walks out of it from frame 30.
+    const out = near.findIndex((state, frame) => frame > 13 && !state.fighters[1].obscured);
+    expect(out).toBeGreaterThan(30);
+    expect(out).toBeLessThan(60);
+    expect(near[out]!.fighters[0].obscured).toBe(true);
+    const far = run(duel(["smoke", "duelist"], 3000, 7000), presses(20, [1, SCREEN, 0]));
+    expect(far[13]!.fighters.map((fighter) => fighter.obscured)).toEqual([true, false]);
+  });
+
+  it("hides no position, health or active hitbox: the tells the renderer must still show", () => {
+    // Inside the screen, Smoke starts a jab at player two.
+    const trace = run(duel(["smoke", "duelist"], 3000, 3600), presses(50, [1, SCREEN, 0], [35, LIGHT, 0]));
+    const starting = fighterTells(config, trace[36]!.fighters[0]);
+    expect(starting).toMatchObject({ obscured: true, x: 3000, health: 1000, startingUp: true, activeHitbox: null });
+    const active = fighterTells(config, trace[42]!.fighters[0]);
+    expect(active.activeHitbox).not.toBeNull();
+    expect(events(trace)).toEqual(["42 hit 0 jab"]);
+    expect(fighterTells(config, trace[42]!.fighters[1])).toMatchObject({ obscured: true, health: 955 });
+  });
+
+  it("keeps at most one screen per fighter: the cast does not start while it lasts", () => {
+    const trace = run(duel(["smoke", "duelist"], 3000, 7000), presses(260, [1, SCREEN, 0], [60, SCREEN, 0], [200, SCREEN, 0]));
+    expect(trace[60]!.fighters[0].action).not.toBe("attack");
+    expect(trace[200]!.fighters[0]).toMatchObject({ action: "attack", moveId: "smoke-screen", actionFrame: 1 });
+  });
+});

@@ -1,0 +1,352 @@
+import { performance } from "node:perf_hooks";
+import type { ArraySchema } from "@colyseus/schema";
+import {
+  DUEL_COUNTDOWN_FRAMES,
+  DuelMessageType,
+  duelProbeReplySchema,
+  formatDuelKits,
+  type DuelEndReason,
+  type DuelKitName,
+  type DuelProbe,
+  type DuelRoomPhase,
+} from "@pirate-sea-race/protocol";
+import { createDuelState, defaultDuelConfig, type DuelConfig, type DuelState, type PlayerIndex } from "@pirate-sea-race/simulation/duel";
+import { DuelAuthority, inputDelayFromSamples, linkStats, type AuthorityBundle, type AuthorityStats } from "@pirate-sea-race/simulation/netcode";
+import { DuelInputGate } from "./duelInputGate.js";
+import { DuelSeatSchema } from "./schema.js";
+
+/** Round-trip probes: every 6 frames during the countdown (for the input delay), every 30 during the fight (the HUD). */
+const COUNTDOWN_PROBE_FRAMES = 6;
+const FIGHT_PROBE_FRAMES = 30;
+/** Round-trip samples kept per seat. */
+const PROBE_SAMPLES = 25;
+/** The input delay is chosen this many frames before the countdown ends, from the probes measured until then. */
+export const DELAY_DECISION_FRAMES = 30;
+
+/**
+ * The synced lobby a duel writes: a standalone duel room's own state (`DuelRoomStateSchema`), or at sea one fighter
+ * pair's entry in the match state (`SeaDuelSchema`, in the fighters' views only).
+ */
+export interface DuelLobbySchema {
+  phase: string;
+  countdown: number;
+  seed: number;
+  kits: string;
+  inputDelay: number;
+  seats: ArraySchema<DuelSeatSchema>;
+  winner: number;
+  reason: string;
+  resultFrame: number;
+}
+
+/** Sends one message to one seat's client, if it is connected; the host room owns the clients. */
+export type DuelSend = (sessionId: string, type: string, message: AuthorityBundle | DuelProbe) => void;
+
+export interface DuelMachineOptions {
+  readonly lobby: DuelLobbySchema;
+  readonly seed: number;
+  readonly send: DuelSend;
+  /**
+   * How the fight starts. `countdown` (the standalone duel): when the countdown ends. `called` (a duel at sea): when
+   * the host calls `start()`, which the encounter rules decide (§6: the countdown is over and both fighters are
+   * ready); a countdown that ends first waits in `waiting`, with no probes.
+   */
+  readonly start: "countdown" | "called";
+  readonly config?: DuelConfig;
+  /**
+   * Both fighters' kits (§9), player one's first; the Duelist mirror by default. They are fixed in the duel's frame-0
+   * state, which the per-frame hashes cover, and synced in the lobby so both clients build the same state.
+   */
+  readonly kits?: readonly [DuelKitName, DuelKitName];
+}
+
+interface Seat {
+  readonly slot: PlayerIndex;
+  readonly gate: DuelInputGate;
+  readonly schema: DuelSeatSchema;
+  /** Probe ids in flight and when they were sent (performance.now()). */
+  readonly probes: Map<number, number>;
+  readonly rtts: number[];
+  nextProbe: number;
+  /** At sea: the fighter reported its arena loaded. */
+  ready: boolean;
+}
+
+/** What a duel reports to tests and diagnostics, running or finished. */
+export interface DuelDiagnostics {
+  readonly phase: DuelRoomPhase;
+  readonly frame: number;
+  readonly inputDelay: number;
+  readonly authority: AuthorityStats;
+  /** Input messages the gate dropped, per slot and reason. */
+  readonly dropped: Record<string, DuelInputGate["dropped"]>;
+  readonly rttSamples: Record<string, readonly number[]>;
+}
+
+/** How a duel ended: the winner's slot (null for none) and why, on which frame. */
+export interface DuelOutcome {
+  readonly winner: PlayerIndex | null;
+  readonly reason: DuelEndReason;
+  readonly frame: number;
+}
+
+/**
+ * One 1v1 duel's machine (§15), the same for a standalone duel room and a duel inside a match room, so the two
+ * cannot drift: seats and their input gates, the three-second countdown with round-trip probes and the shared input
+ * delay chosen DELAY_DECISION_FRAMES before its end, then `DuelAuthority` stepped once per `advance` (60 Hz) with a
+ * frame bundle every third frame. It keeps the reconnection bookkeeping (a dropped seat is marked away and gets a
+ * snapshot bundle when it is back) and the forfeits (a seat that left for good during the countdown or the fight),
+ * decided together at the next frame boundary, so the order two leaves are processed in never picks a winner (§12).
+ * The host room owns the clients and the timer: it calls these methods from its handlers and its fixed step.
+ */
+export class DuelMachine {
+  readonly authority: DuelAuthority;
+  private readonly config: DuelConfig;
+  private readonly lobby: DuelLobbySchema;
+  private readonly send: DuelSend;
+  private readonly startWhen: DuelMachineOptions["start"];
+  private readonly seats = new Map<string, Seat>();
+  /** Players who left for good (quit, or absent past the reconnection window) since the last frame boundary. */
+  private readonly forfeits = new Set<PlayerIndex>();
+  /** Room ticks (one per `advance`), the input gates' rate window. */
+  private tick = 0;
+  private startCalled = false;
+  private ended: DuelOutcome | undefined;
+
+  constructor(options: DuelMachineOptions) {
+    this.config = options.config ?? defaultDuelConfig;
+    this.lobby = options.lobby;
+    this.send = options.send;
+    this.startWhen = options.start;
+    const kits = options.kits ?? ["duelist", "duelist"];
+    this.authority = new DuelAuthority(this.config, createDuelState(this.config, { seed: options.seed, kits }));
+    this.lobby.phase = "waiting";
+    this.lobby.countdown = DUEL_COUNTDOWN_FRAMES;
+    this.lobby.seed = options.seed;
+    this.lobby.kits = formatDuelKits(kits);
+    this.lobby.winner = -1;
+  }
+
+  get phase(): DuelRoomPhase {
+    return this.lobby.phase as DuelRoomPhase;
+  }
+
+  /** The result once the duel is over. */
+  get outcome(): DuelOutcome | undefined {
+    return this.ended;
+  }
+
+  /** The authoritative duel state. */
+  get state(): DuelState {
+    return this.authority.state;
+  }
+
+  /** The seat's slot, if the session holds one. */
+  slotOf(sessionId: string): PlayerIndex | undefined {
+    return this.seats.get(sessionId)?.slot;
+  }
+
+  /** The session holding a slot. */
+  sessionOf(slot: PlayerIndex): string | undefined {
+    return [...this.seats.entries()].find(([, seat]) => seat.slot === slot)?.[0];
+  }
+
+  /** Whether the seat's fighter reported ready (at sea). */
+  isReady(sessionId: string): boolean {
+    return this.seats.get(sessionId)?.ready === true;
+  }
+
+  /** Seats a player; the lobby lists the seat. */
+  addSeat(sessionId: string, slot: PlayerIndex): void {
+    const schema = new DuelSeatSchema();
+    schema.sessionId = sessionId;
+    schema.slot = slot;
+    schema.connected = true;
+    this.lobby.seats.push(schema);
+    this.seats.set(sessionId, { slot, gate: new DuelInputGate(), schema, probes: new Map(), rtts: [], nextProbe: 1, ready: false });
+  }
+
+  /** Frees a seat before the countdown (a standalone duel's player who left while waiting). */
+  removeSeat(sessionId: string): void {
+    this.seats.delete(sessionId);
+    const index = this.lobby.seats.findIndex((entry) => entry.sessionId === sessionId);
+    if (index >= 0) this.lobby.seats.splice(index, 1);
+  }
+
+  /** Starts the three-second countdown. */
+  beginCountdown(): void {
+    if (this.phase === "waiting" && this.lobby.countdown === DUEL_COUNTDOWN_FRAMES) this.lobby.phase = "countdown";
+  }
+
+  /** At sea: the encounter rules started the fight. It begins when the countdown is over (at once if it is). */
+  start(): void {
+    if (this.startWhen !== "called" || this.ended !== undefined) return;
+    this.startCalled = true;
+    if (this.phase === "waiting" && this.lobby.countdown === 0) this.beginFight();
+  }
+
+  /** Makes a player's input come from a script (the practice dummy). */
+  script(player: PlayerIndex, script: ((state: DuelState) => number) | undefined): void {
+    this.authority.script(player, script);
+  }
+
+  /** A fighter's arena is loaded (at sea). */
+  markReady(sessionId: string): void {
+    const seat = this.seats.get(sessionId);
+    if (seat !== undefined) seat.ready = true;
+  }
+
+  /** The duel's frame on one timeline: negative during the countdown, then the frames stepped. */
+  get serverFrame(): number {
+    return this.phase === "countdown" || this.phase === "waiting" ? 0 - this.lobby.countdown : this.authority.frame;
+  }
+
+  /** One untrusted input message from a seat; `acceptFrom` refuses a slot whose input is scripted. */
+  receiveInput(sessionId: string, message: unknown, acceptFrom: (slot: PlayerIndex) => boolean = () => true): void {
+    const seat = this.seats.get(sessionId);
+    if (seat === undefined || (this.phase !== "countdown" && this.phase !== "fighting")) return;
+    const input = seat.gate.receive(message, this.tick, this.serverFrame);
+    if (input === undefined || !acceptFrom(seat.slot)) return;
+    this.authority.receive(seat.slot, input.frame, input.inputs);
+  }
+
+  /** One untrusted probe echo from a seat. */
+  receiveProbeReply(sessionId: string, message: unknown): void {
+    const seat = this.seats.get(sessionId);
+    const reply = duelProbeReplySchema.safeParse(message);
+    if (seat === undefined || !reply.success) return;
+    const sentAt = seat.probes.get(reply.data.id);
+    if (sentAt === undefined) return;
+    seat.probes.delete(reply.data.id);
+    seat.rtts.push(performance.now() - sentAt);
+    if (seat.rtts.length > PROBE_SAMPLES) seat.rtts.shift();
+    seat.schema.rtt = Math.round(linkStats(seat.rtts)!.rttMs);
+  }
+
+  /** A seat's connection dropped (the host keeps it for DUEL_RECONNECT_SECONDS). */
+  drop(sessionId: string): void {
+    const seat = this.seats.get(sessionId);
+    if (seat === undefined || this.phase === "over") return;
+    seat.schema.connected = false;
+    seat.probes.clear();
+  }
+
+  /** The same player is back: they continue from the authoritative state, which a snapshot bundle gives them. */
+  reconnect(sessionId: string): void {
+    const seat = this.seats.get(sessionId);
+    if (seat === undefined) return;
+    seat.schema.connected = true;
+    if (this.phase === "fighting" || this.phase === "over") this.send(sessionId, DuelMessageType.Frames, this.authority.snapshotBundle());
+  }
+
+  /**
+   * A seat left for good (quit, or absent past the reconnection window). Once the countdown has begun that forfeits,
+   * decided at the next frame boundary together with any other forfeit on that frame.
+   */
+  leave(sessionId: string): void {
+    const seat = this.seats.get(sessionId);
+    if (seat === undefined) return;
+    seat.schema.connected = false;
+    if (this.phase === "countdown" || this.phase === "fighting" || (this.phase === "waiting" && this.lobby.countdown < DUEL_COUNTDOWN_FRAMES)) {
+      this.forfeits.add(seat.slot);
+    }
+  }
+
+  /** Ends the duel from outside (at sea, the encounter rules' ready check: one forfeit, or a cancellation). */
+  end(winner: PlayerIndex | null, reason: DuelEndReason): void {
+    this.finish(winner, reason, Math.max(0, this.authority.frame));
+  }
+
+  /** One 60 Hz frame: forfeits, then the countdown or the fight. */
+  advance(): void {
+    this.tick++;
+    if (this.resolveForfeits()) return;
+    switch (this.phase) {
+      case "countdown":
+        this.lobby.countdown--;
+        if (this.lobby.countdown % COUNTDOWN_PROBE_FRAMES === 0) this.sendProbes();
+        if (this.lobby.countdown === DELAY_DECISION_FRAMES) {
+          this.lobby.inputDelay = inputDelayFromSamples([...this.seats.values()].map((seat) => seat.rtts));
+        }
+        if (this.lobby.countdown === 0) {
+          if (this.startWhen === "countdown" || this.startCalled) this.beginFight();
+          else this.lobby.phase = "waiting";
+        }
+        return;
+      case "fighting": {
+        const bundle = this.authority.step();
+        if (bundle !== undefined) this.broadcast(bundle);
+        if (this.authority.frame % FIGHT_PROBE_FRAMES === 0) this.sendProbes();
+        const result = this.authority.state.result;
+        if (result !== null) this.finish(result.winner, result.reason, result.frame);
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  /** The duel's counters, for tests and the harness. */
+  diagnostics(): DuelDiagnostics {
+    const bySlot = <T>(pick: (seat: Seat) => T) => Object.fromEntries([...this.seats.values()].map((seat) => [String(seat.slot), pick(seat)]));
+    return {
+      phase: this.phase,
+      frame: this.authority.frame,
+      inputDelay: this.lobby.inputDelay,
+      authority: structuredClone(this.authority.stats),
+      dropped: bySlot((seat) => ({ ...seat.gate.dropped })),
+      rttSamples: bySlot((seat) => [...seat.rtts]),
+    };
+  }
+
+  /** Inputs dropped for a seat, by reason. */
+  droppedInputs(sessionId: string): DuelInputGate["dropped"] | undefined {
+    return this.seats.get(sessionId)?.gate.dropped;
+  }
+
+  private beginFight(): void {
+    this.lobby.phase = "fighting";
+    this.broadcast(this.authority.snapshotBundle());
+  }
+
+  private broadcast(bundle: AuthorityBundle): void {
+    for (const sessionId of this.seats.keys()) this.send(sessionId, DuelMessageType.Frames, bundle);
+  }
+
+  private sendProbes(): void {
+    for (const [sessionId, seat] of this.seats) {
+      if (!seat.schema.connected) continue;
+      const id = seat.nextProbe++;
+      seat.probes.set(id, performance.now());
+      // Probes that never came back (a dropped connection) are forgotten after a few seconds' worth.
+      for (const old of seat.probes.keys()) if (old < id - 20) seat.probes.delete(old);
+      const probe: DuelProbe = { id, frame: this.serverFrame, rtt: seat.rtts.length === 0 ? 0 : linkStats(seat.rtts)!.rttMs };
+      this.send(sessionId, DuelMessageType.Probe, probe);
+    }
+  }
+
+  /**
+   * §12 at a frame boundary: one player who forfeited since the last frame loses to the other (connected or still
+   * inside their own window); both forfeiting on the same frame is a result with no winner, so there is nothing to
+   * award. True when the duel ended here.
+   */
+  private resolveForfeits(): boolean {
+    if (this.forfeits.size === 0) return false;
+    const [first] = this.forfeits;
+    const winner: PlayerIndex | null = this.forfeits.size > 1 ? null : first === 0 ? 1 : 0;
+    this.forfeits.clear();
+    if (this.phase === "over") return false;
+    this.finish(winner, "forfeit", Math.max(0, this.authority.frame));
+    return true;
+  }
+
+  /** Ends the duel: the step's result, a forfeit or a cancellation. Both players see it in the lobby. */
+  private finish(winner: PlayerIndex | null, reason: DuelEndReason, frame: number): void {
+    if (this.ended !== undefined) return;
+    this.ended = { winner, reason, frame };
+    this.lobby.phase = "over";
+    this.lobby.winner = winner ?? -1;
+    this.lobby.reason = reason;
+    this.lobby.resultFrame = frame;
+  }
+}

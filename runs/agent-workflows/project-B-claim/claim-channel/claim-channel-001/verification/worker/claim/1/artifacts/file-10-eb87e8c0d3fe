@@ -1,0 +1,197 @@
+import { hashState } from "../hash.js";
+import type {
+  ClaimChannel,
+  ClaimConfig,
+  ClaimEncounter,
+  ClaimEvent,
+  ClaimInterruptReason,
+  ClaimPlayer,
+  ClaimResult,
+  ClaimState,
+  ClaimStepResult,
+  ClaimTickInput,
+} from "./state.js";
+
+/** Squared distance from the claim point, refusing coordinates whose square would not be an exact integer. */
+export function claimDistanceSquared(config: ClaimConfig, x: number, y: number): number {
+  const dx = x - config.claimPoint.x;
+  const dy = y - config.claimPoint.y;
+  const squared = dx * dx + dy * dy;
+  if (!Number.isSafeInteger(squared)) throw new RangeError(`position (${x}, ${y}) is too far from the claim point`);
+  return squared;
+}
+
+export function insideTreasureCircle(config: ClaimConfig, x: number, y: number): boolean {
+  return claimDistanceSquared(config, x, y) <= config.circleRadius * config.circleRadius;
+}
+
+/**
+ * Whether a player meets §5's conditions to start claiming on this tick, protection aside: starting ends protection
+ * (§6), so a protected player may start. A player can wait with interact held; this does not say a channel is free.
+ */
+export function canStartClaim(config: ClaimConfig, player: ClaimPlayer, reserved: boolean): boolean {
+  return (
+    player.connected &&
+    player.holdsAllTypes &&
+    player.interact &&
+    !reserved &&
+    player.speed === 0 &&
+    insideTreasureCircle(config, player.x, player.y)
+  );
+}
+
+/** Why the active channel cannot continue on this tick, or null. Reservations are checked before this. */
+function channelBreak(channel: ClaimChannel, player: ClaimPlayer | undefined): ClaimInterruptReason | null {
+  if (player === undefined || !player.connected) return "disconnected";
+  if (!player.holdsAllTypes) return "ineligible";
+  // The channel pins the position it started at, which lies inside the circle.
+  if (player.speed !== 0 || player.x !== channel.x || player.y !== channel.y) return "moved";
+  if (!player.interact) return "released";
+  return null;
+}
+
+/** Lowest id by UTF-16 code units, independent of locale. */
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function requireInteger(value: unknown, name: string): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new RangeError(`${name} must be a safe integer, got ${String(value)}`);
+}
+
+function requireBoolean(value: unknown, name: string): void {
+  if (typeof value !== "boolean") throw new RangeError(`${name} must be a boolean, got ${String(value)}`);
+}
+
+function requireId(value: unknown, name: string): void {
+  if (typeof value !== "string" || value.length === 0) throw new RangeError(`${name} must be a non-empty string`);
+}
+
+/** Refuses a malformed tick: a skipped or repeated tick, duplicate ids, a player in two encounters. */
+function readInput(state: ClaimState, input: ClaimTickInput): { players: Map<string, ClaimPlayer>; reservedBy: Map<string, ClaimEncounter> } {
+  requireInteger(input.tick, "tick");
+  if (input.tick !== state.tick + 1) throw new RangeError(`expected tick ${state.tick + 1}, got ${input.tick}`);
+  const players = new Map<string, ClaimPlayer>();
+  for (const player of input.players) {
+    requireId(player.id, "player id");
+    if (players.has(player.id)) throw new RangeError(`player ${player.id} appears twice`);
+    requireInteger(player.x, `${player.id}.x`);
+    requireInteger(player.y, `${player.id}.y`);
+    requireInteger(player.speed, `${player.id}.speed`);
+    for (const flag of ["holdsAllTypes", "interact", "connected", "protected"] as const) requireBoolean(player[flag], `${player.id}.${flag}`);
+    players.set(player.id, player);
+  }
+  const encounterIds = new Set<string>();
+  const reservedBy = new Map<string, ClaimEncounter>();
+  for (const encounter of input.encounters) {
+    requireId(encounter.id, "encounter id");
+    if (encounterIds.has(encounter.id)) throw new RangeError(`encounter ${encounter.id} appears twice`);
+    encounterIds.add(encounter.id);
+    const [a, b] = encounter.playerIds;
+    requireId(a, `encounter ${encounter.id} player`);
+    requireId(b, `encounter ${encounter.id} player`);
+    if (a === b) throw new RangeError(`encounter ${encounter.id} reserves ${a} twice`);
+    for (const id of [a, b]) {
+      if (reservedBy.has(id)) throw new RangeError(`player ${id} is in two encounters`);
+      reservedBy.set(id, encounter);
+    }
+  }
+  return { players, reservedBy };
+}
+
+/**
+ * One world tick of §5's claim rules, in a fixed order: (1) accepted encounter reservations interrupt the channel,
+ * (2) the active channel breaks or advances, (3) with no channel active the best eligible starter begins one,
+ * (4) a channel that has run `channelTicks` completes, and (5) on the deadline tick a match without a winner ends with
+ * none. Players and encounters are read as sets, so their order in the input never matters. Once the match has a
+ * result, every later input is ignored and the state is returned unchanged. The input state is never mutated.
+ */
+export function stepClaim(config: ClaimConfig, state: ClaimState, input: ClaimTickInput): ClaimStepResult {
+  if (state.result !== null) return { state, events: [] };
+  const { players, reservedBy } = readInput(state, input);
+  const tick = input.tick;
+  const events: ClaimEvent[] = [];
+  let channel = state.channel;
+  const interrupt = (active: ClaimChannel, reason: ClaimInterruptReason) =>
+    events.push({ kind: "claim-interrupted", tick, playerId: active.playerId, reason, progress: active.progress });
+
+  // 1. Reservations first (§5): a duel accepted on the tick a claim would complete still stops it.
+  if (channel !== null && reservedBy.has(channel.playerId)) {
+    interrupt(channel, "duel");
+    channel = null;
+  }
+
+  // 2. The active channel.
+  if (channel !== null) {
+    const reason = channelBreak(channel, players.get(channel.playerId));
+    if (reason === null) {
+      channel = { ...channel, progress: channel.progress + 1 };
+    } else {
+      interrupt(channel, reason);
+      channel = null;
+    }
+  }
+
+  // 3. One channel at a time: others wait. Simultaneous starters: the closest to the claim point, then the lowest id.
+  if (channel === null) {
+    let best: { player: ClaimPlayer; distance: number } | null = null;
+    for (const player of players.values()) {
+      if (!canStartClaim(config, player, reservedBy.has(player.id))) continue;
+      const distance = claimDistanceSquared(config, player.x, player.y);
+      if (best === null || distance < best.distance || (distance === best.distance && compareIds(player.id, best.player.id) < 0)) {
+        best = { player, distance };
+      }
+    }
+    if (best !== null) {
+      const { id, x, y } = best.player;
+      if (best.player.protected) events.push({ kind: "protection-ended", tick, playerId: id });
+      events.push({ kind: "claim-started", tick, playerId: id });
+      channel = { playerId: id, startTick: tick, x, y, progress: 0 };
+    }
+  }
+
+  // 4. Completion commits the winner; it comes before the deadline, so a claim completing on the deadline tick wins.
+  let result: ClaimResult | null = null;
+  if (channel !== null && channel.progress >= config.channelTicks) {
+    events.push({ kind: "claim-completed", tick, playerId: channel.playerId });
+    result = { reason: "claim", winner: channel.playerId, tick };
+    channel = null;
+  }
+
+  // 5. The deadline: no winner, and an unfinished channel is cancelled.
+  if (result === null && tick >= config.deadlineTick) {
+    if (channel !== null) interrupt(channel, "deadline");
+    channel = null;
+    result = { reason: "deadline", winner: null, tick };
+  }
+
+  // The match is over: outcomes freeze, so every duel still reserved or running ends without theft.
+  if (result !== null) {
+    const encounters = [...input.encounters].sort((a, b) => compareIds(a.id, b.id));
+    for (const encounter of encounters) {
+      const playerIds: [string, string] = [encounter.playerIds[0], encounter.playerIds[1]];
+      events.push({ kind: "duel-ended-without-theft", tick, encounterId: encounter.id, playerIds });
+    }
+    events.push({ kind: "match-ended", tick, reason: result.reason, winner: result.winner });
+  }
+
+  return { state: { tick, channel, result }, events };
+}
+
+export interface ClaimReplay {
+  readonly state: ClaimState;
+  readonly events: readonly ClaimEvent[];
+  readonly hash: string;
+}
+
+/** Steps a sequence of ticks from a state, collecting every event; `hash` is the final state's `hashState`. */
+export function replayClaim(config: ClaimConfig, state: ClaimState, inputs: readonly ClaimTickInput[]): ClaimReplay {
+  let current = state;
+  const events: ClaimEvent[] = [];
+  for (const input of inputs) {
+    const stepped = stepClaim(config, current, input);
+    current = stepped.state;
+    events.push(...stepped.events);
+  }
+  return { state: current, events, hash: hashState(current) };
+}

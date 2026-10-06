@@ -1,0 +1,374 @@
+import {
+  DUEL_UNAVAILABLE_MESSAGE,
+  FruitMessageType,
+  JournalMessageType,
+  MATCH_UNAVAILABLE_MESSAGE,
+  MatchMessageType,
+  parseRumorResultMessage,
+  PROTOCOL_VERSION,
+  RubbingMessageType,
+  RuinMessageType,
+  ShopMessageType,
+  type ChooseTheftMessage,
+  type DummyBehaviour,
+  type RuinSymbolName,
+  type StartMatchMessage,
+} from "@pirate-sea-race/protocol";
+import { defaultSimulationConfig } from "@pirate-sea-race/simulation";
+import { startArena } from "./arenaScene.js";
+import { createMatch, joinMatch, refusalMessage, serverEndpoint, type MatchRoom } from "./connection.js";
+import { DuelClient } from "./duelClient.js";
+import { createDuel, joinDuel, type DuelRoom } from "./duelConnection.js";
+import { duelRoomTransport, SeaDuelRouter } from "./duelTransport.js";
+import { applyFruit, FruitPanel, renderFruitHud, type FruitStatus } from "./fruitPanel.js";
+import { claimingShipsOf, flowModelOf, renderFlow, showBanner, showReveal, showStartRefusal } from "./flowHud.js";
+import { renderHud, renderPurse, theftChooser, type ConnectionStatus } from "./hud.js";
+import { InputSender } from "./inputSender.js";
+import { applyJournal, JournalPanel, journalStatusOf, nextFocus, showToast } from "./journal.js";
+import { KeyboardHelm, NEUTRAL_HELM } from "./keyboard.js";
+import { MatchView, type ShipSnapshot } from "./matchView.js";
+import { panelKeydown } from "./pageKeys.js";
+import { applyRuin, renderRuinHud, RuinPanel, sightedRuinsLine, type RuinStatus } from "./ruinPanel.js";
+import { MatchGame } from "./seaScene.js";
+import { applyShop, renderTonicHud, ShopPanel, shopStatusOf, TonicKey, tonicHud, useLine } from "./shop.js";
+
+const INPUT_INTERVAL_MS = 1000 / 60;
+
+function element<T extends HTMLElement>(selector: string): T {
+  const found = document.querySelector<T>(selector);
+  if (found === null) throw new Error(`missing element ${selector}`);
+  return found;
+}
+
+const landing = element<HTMLElement>("#landing");
+const matchSection = element<HTMLElement>("#match");
+const createButton = element<HTMLButtonElement>("#create-match");
+const joinForm = element<HTMLFormElement>("#join-form");
+const joinButton = element<HTMLButtonElement>("#join-match");
+const codeInput = element<HTMLInputElement>("#join-code");
+const errorText = element<HTMLElement>("#join-error");
+const duelSection = element<HTMLElement>("#duel");
+const duelHud = element<HTMLElement>("#duel-hud");
+const seaHud = element<HTMLElement>("#hud");
+const duelButtons = [element<HTMLButtonElement>("#create-duel"), element<HTMLButtonElement>("#practice-duel"), element<HTMLButtonElement>("#join-duel")];
+const duelCodeInput = element<HTMLInputElement>("#duel-code");
+const duelErrorText = element<HTMLElement>("#duel-error");
+const endpoint = serverEndpoint(window.location);
+
+element<HTMLElement>('[data-testid="landing-protocol"]').textContent = String(PROTOCOL_VERSION);
+
+createButton.addEventListener("click", () => void connect(() => createMatch(endpoint)));
+joinForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void connect(() => joinMatch(endpoint, codeInput.value));
+});
+
+element<HTMLButtonElement>("#create-duel").addEventListener("click", () => void connectDuel(() => createDuel(endpoint, false)));
+element<HTMLButtonElement>("#practice-duel").addEventListener("click", () => void connectDuel(() => createDuel(endpoint, true)));
+element<HTMLFormElement>("#join-duel-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  void connectDuel(() => joinDuel(endpoint, duelCodeInput.value));
+});
+
+async function connectDuel(open: () => Promise<DuelRoom>): Promise<void> {
+  for (const button of duelButtons) button.disabled = true;
+  duelErrorText.textContent = "";
+  try {
+    const room = await open();
+    // Development only: `?rtt=80&jitter=20` delays this socket both ways (README). Vite drops this branch, and the
+    // module it imports, from the production build.
+    if (import.meta.env.DEV) {
+      const { applyDevLatency, devLatencyFromQuery } = await import("./devLatency.js");
+      const latency = devLatencyFromQuery(window.location.search);
+      if (latency !== undefined) applyDevLatency(room, latency);
+    }
+    enterDuel(room);
+  } catch (error) {
+    const message = refusalMessage(error);
+    duelErrorText.textContent = message === MATCH_UNAVAILABLE_MESSAGE ? DUEL_UNAVAILABLE_MESSAGE : message;
+    for (const button of duelButtons) button.disabled = false;
+  }
+}
+
+/** The duel HUD's developer toggle drives whichever duel is showing. */
+function wireHitboxToggle(current: () => DuelClient | undefined): void {
+  const boxes = element<HTMLInputElement>("#show-boxes");
+  boxes.addEventListener("change", () => {
+    current()?.setShowBoxes(boxes.checked);
+    boxes.blur();
+  });
+}
+
+function enterDuel(room: DuelRoom): void {
+  landing.hidden = true;
+  duelSection.hidden = false;
+  const duel = new DuelClient(duelRoomTransport(room), duelHud);
+  wireHitboxToggle(() => duel);
+  const dummy = element<HTMLSelectElement>("#dummy-select");
+  dummy.addEventListener("change", () => {
+    duel.setDummy(dummy.value as DummyBehaviour);
+    dummy.blur();
+  });
+  const dummyControl = element<HTMLElement>("#dummy-control");
+  const showDummyControl = () => {
+    dummyControl.hidden = room.state?.practice !== true;
+  };
+  showDummyControl();
+  room.onStateChange(showDummyControl);
+  startArena(element<HTMLElement>("#arena"), duel);
+}
+
+async function connect(open: () => Promise<MatchRoom>): Promise<void> {
+  setBusy(true);
+  errorText.textContent = "";
+  try {
+    enterMatch(await open());
+  } catch (error) {
+    errorText.textContent = refusalMessage(error);
+    setBusy(false);
+  }
+}
+
+function setBusy(busy: boolean): void {
+  createButton.disabled = busy;
+  joinButton.disabled = busy;
+}
+
+function enterMatch(room: MatchRoom): void {
+  landing.hidden = true;
+  matchSection.hidden = false;
+
+  const view = new MatchView(room.sessionId);
+  const sender = new InputSender({ send: (type, message) => room.send(type, message) });
+  const keyboard = new KeyboardHelm(window);
+  const router = new SeaDuelRouter(room);
+  let status: ConnectionStatus = "connected";
+  let duel: { readonly key: string; readonly client: DuelClient } | undefined;
+  let game: MatchGame | undefined;
+  wireHitboxToggle(() => duel?.client);
+  // §3's ruins: R opens the ruin where the ship is moored; the clue and the verdicts come to this player only.
+  const ruins = new RuinPanel(
+    (type, message) => room.send(type, message),
+    (panel) => applyRuin(matchSection, panel),
+  );
+  // §9's fruit: F inspects the pedestal where the ship is moored; held with the panel open, it eats the fruit.
+  const fruit = new FruitPanel(
+    (type, message) => room.send(type, message),
+    (panel) => applyFruit(matchSection, panel),
+  );
+  const map = defaultSimulationConfig.map;
+  const islandName = (island: number) => map.islands[island]?.name ?? "This island";
+  // §3, §11, §13's journal: M opens it; its leads and purchase answers come to this player only.
+  const journalPanel = element<HTMLElement>('[data-testid="journal"]');
+  const toastTimers: { hide?: number } = {};
+  const journal = new JournalPanel(
+    (type, message) => room.send(type, message),
+    (panel) => applyJournal(matchSection, panel),
+    (toast) => showToast(matchSection, toast, toastTimers),
+    (backwards) => {
+      const buttons = [...journalPanel.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+      const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      buttons[nextFocus(buttons.length, index, backwards)]?.focus();
+    },
+    islandName,
+  );
+  // §11's dockside shop: B opens it moored at a dock; it sells the tonic, and the journal's own targeted rumor.
+  const shopPanel = element<HTMLElement>('[data-testid="shop"]');
+  const shop = new ShopPanel(
+    (type, message) => room.send(type, message),
+    (panel) => applyShop(matchSection, panel),
+    (backwards) => {
+      const buttons = [...shopPanel.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+      const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      buttons[nextFocus(buttons.length, index, backwards)]?.focus();
+    },
+    {
+      get status() {
+        return journal.currentStatus;
+      },
+      get pendingType() {
+        return journal.pendingType;
+      },
+      buy: (type) => journal.buy(type),
+    },
+  );
+  // T drinks a sail tonic at sea: one message per key press.
+  const tonicKey = new TonicKey((type, message) => room.send(type, message));
+
+  /**
+   * A duel at sea (§6): when the room holds one for this player, the arena scene takes over the game and the duel HUD
+   * the sea HUD's place, until the room lets the duel go; then the sea is back.
+   */
+  const followDuel = () => {
+    const key = router.current();
+    if (duel !== undefined && duel.key !== key) {
+      duel.client.dispose();
+      router.forget();
+      duel = undefined;
+      game?.showSea();
+      duelSection.append(duelHud);
+      seaHud.hidden = false;
+    }
+    if (duel === undefined && key !== undefined && game !== undefined) {
+      const client = new DuelClient(router.transport(key), duelHud);
+      duel = { key, client };
+      seaHud.hidden = true;
+      matchSection.append(duelHud);
+      game.showArena(client);
+    }
+  };
+
+  const refresh = () => {
+    const state = room.state;
+    if (state?.ships === undefined) return;
+    const now = performance.now();
+    const ships: ShipSnapshot[] = [...state.ships.values()];
+    const grapples = [...(state.grapples?.values() ?? [])];
+    const encounter = state.status?.get(room.sessionId);
+    view.ingest(ships, now);
+    view.ingestEncounters(grapples, state.markers?.values() ?? [], encounter, state.worldTick);
+    view.ingestObjectives(encounter, state.caches?.values() ?? []);
+    view.ingestPedestals(state.pedestals?.values() ?? []);
+    view.ingestCrates(state.crates?.entries() ?? []);
+    sender.observeFrame(state.frame, now);
+    renderHud(matchSection, {
+      code: state.code,
+      protocolVersion: state.protocolVersion,
+      custom: state.custom,
+      status,
+      selfId: room.sessionId,
+      players: state.players,
+      ships,
+      worldTick: state.worldTick,
+      encounter: view.status(),
+      grapples: view.grapples(),
+      objectives: view.objectives(),
+    });
+    renderPurse(matchSection, { objectives: view.objectives(), worldTick: state.worldTick });
+    const flow = flowModelOf(state, room.sessionId, defaultSimulationConfig.map.subUnitsPerTile);
+    view.ingestFlow(flow.claim, claimingShipsOf(state), flow.treasureRadius);
+    renderFlow(matchSection, flow);
+    const ruin: RuinStatus | undefined = encounter === undefined ? undefined : { ruin: encounter.ruin, ruinOpen: encounter.ruinOpen, ruinLockedUntil: encounter.ruinLockedUntil };
+    ruins.update(ruin, state.worldTick);
+    renderRuinHud(matchSection, {
+      status: ruin,
+      verdict: ruins.lastVerdict,
+      sighted: sightedRuinsLine([...(state.ruins?.values() ?? [])], islandName),
+    });
+    const fruitStatus: FruitStatus | undefined =
+      encounter === undefined
+        ? undefined
+        : {
+            kit: encounter.kit,
+            pedestal: encounter.pedestal,
+            fruitHeld: encounter.fruitHeld,
+            fruitTotal: encounter.fruitTotal,
+            fruitResult: encounter.fruitResult,
+            fruitResultAt: encounter.fruitResultAt,
+          };
+    fruit.update(fruitStatus, state.worldTick);
+    renderFruitHud(matchSection, fruitStatus);
+    journal.update(journalStatusOf(encounter, state.ships.get(room.sessionId)?.dock), state.worldTick);
+    const shopStatus = shopStatusOf(encounter, state.ships.get(room.sessionId)?.dock);
+    shop.update(shopStatus, state.worldTick);
+    renderTonicHud(matchSection, seaHud, tonicHud(shopStatus, state.worldTick), useLine(tonicKey.last));
+    view.ingestJournal(journal.isOpen, journal.entries());
+    followDuel();
+  };
+  room.onMessage(FruitMessageType.Inspected, (message: unknown) => fruit.inspected(message));
+  room.onMessage(JournalMessageType.Lead, (message: unknown) => journal.lead(message));
+  room.onMessage(JournalMessageType.RumorResult, (message: unknown) => {
+    journal.result(message);
+    const result = parseRumorResultMessage(message);
+    if (result !== undefined) shop.rumorResult(result);
+  });
+  room.onMessage(ShopMessageType.TonicPurchase, (message: unknown) => shop.purchased(message));
+  room.onMessage(ShopMessageType.TonicUsed, (message: unknown) => {
+    tonicKey.used(message);
+    refresh();
+  });
+  room.onMessage(RuinMessageType.Clue, (message: unknown) => ruins.clue(message));
+  room.onMessage(RuinMessageType.Result, (message: unknown) => {
+    ruins.result(message);
+    refresh();
+  });
+  // The panels' keys: R where the HUD offers a ruin, F where it offers a fruit (never in a duel: the status shows
+  // neither there), M the journal, each panel's own keys while it is open, and never a key typed into a text field.
+  // While the ruin panel is open the helm stays neutral; while the fruit panel is, F held is the input's fruit button;
+  // while the journal is, the helm stays live and Tab moves among its buttons.
+  window.addEventListener("keydown", (event) => {
+    if (panelKeydown(event, { ruins, fruit, journal, shop }) || tonicKey.keydown(event)) event.preventDefault();
+  });
+  shopPanel.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("button");
+    if (button === null || button === undefined) return;
+    if (button.dataset["testid"] === "shop-close") shop.toggle();
+    else if (button.dataset["testid"] === "shop-tonic") shop.buyTonic();
+    else if (button.dataset["type"] !== undefined) shop.buyRumor(button.dataset["type"]);
+  });
+  journalPanel.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("button");
+    if (button === null || button === undefined) return;
+    if (button.dataset["testid"] === "journal-close") journal.toggle();
+    else if (button.dataset["type"] !== undefined) journal.buy(button.dataset["type"]);
+  });
+  window.addEventListener("keyup", (event) => fruit.keyup(event.code));
+  window.addEventListener("blur", () => fruit.blur());
+  const panel = element<HTMLElement>('[data-testid="ruin-panel"]');
+  panel.addEventListener("click", (event) => {
+    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>("button");
+    if (target === null || target === undefined) return;
+    const symbol = target.dataset["symbol"];
+    const action = target.dataset["testid"];
+    if (symbol !== undefined) ruins.press({ kind: "symbol", symbol: symbol as RuinSymbolName });
+    else if (action === "ruin-undo") ruins.press({ kind: "undo" });
+    else if (action === "ruin-submit") ruins.press({ kind: "submit" });
+    else if (action === "ruin-close") ruins.press({ kind: "close" });
+    target.blur();
+  });
+
+  // §2's lobby: the host's Start, and the server's answer when it refuses one.
+  const lobbyError = element<HTMLElement>('[data-testid="lobby-error"]');
+  element<HTMLButtonElement>("#start-match").addEventListener("click", () => {
+    lobbyError.textContent = "";
+    room.send(MatchMessageType.Start, {} satisfies StartMatchMessage);
+  });
+  room.onMessage(MatchMessageType.StartRefused, (message: unknown) => showStartRefusal(message, (line) => (lobbyError.textContent = line)));
+  // §2 and §5's reveals, each as a banner over the sea and a line in the list of reveals.
+  const bannerTimers: { hide?: number } = {};
+  room.onMessage(MatchMessageType.Reveal, (message: unknown) => showReveal(message, (banner) => showBanner(matchSection, banner, bannerTimers)));
+  // The results stay until the player leaves: back to the landing page.
+  element<HTMLButtonElement>("#back-to-lobby").addEventListener("click", () => {
+    void room.leave(true).catch(() => undefined).finally(() => window.location.assign("/"));
+  });
+
+  /** §4's theft choice: the winner presses 1 or 2 (or clicks an option); the server checks it and settles. */
+  const theft = theftChooser(
+    () => ({ objectives: view.objectives(), worldTick: view.worldTick() }),
+    (message) => room.send(RubbingMessageType.ChooseTheft, message as ChooseTheftMessage),
+  );
+  // A held key's auto-repeat is not a new choice.
+  window.addEventListener("keydown", (event) => theft.keydown(event));
+  element<HTMLElement>('[data-testid="theft-options"]').addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("button[data-key]");
+    if (button !== null && button !== undefined) theft.choose({ option: Number(button.dataset["key"]) });
+  });
+
+  room.onStateChange(refresh);
+  room.onLeave(() => {
+    status = "disconnected";
+    refresh();
+  });
+  refresh();
+
+  const inputTimer = window.setInterval(() => {
+    // The helm is read even in a duel, so a key tapped there (J is also the light attack) is not kept for the sea.
+    const helm = keyboard.helm();
+    const sea = duel === undefined && !ruins.isOpen ? { ...helm, buttons: helm.buttons | fruit.buttons() } : NEUTRAL_HELM;
+    if (status === "connected") sender.update(sea, performance.now());
+    else window.clearInterval(inputTimer);
+  }, INPUT_INTERVAL_MS);
+
+  game = new MatchGame(element<HTMLElement>("#game"), view);
+  followDuel();
+}

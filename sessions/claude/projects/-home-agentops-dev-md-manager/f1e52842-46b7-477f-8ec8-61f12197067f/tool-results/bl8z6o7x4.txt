@@ -1,0 +1,865 @@
+import { test, expect, type Page, type Route } from '@playwright/test'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFile, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { waitForApi } from './helpers.ts'
+
+const fixtureRoot = fileURLToPath(new URL('../fixtures/', import.meta.url))
+const created: string[] = []
+
+function sha256(bytes: Buffer | string) {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+async function scratchFile(source: 'pi' | 'claude', content: string | Buffer, suffix = '.md') {
+  const name = `scratch-${randomUUID().slice(0, 8)}${suffix}`
+  const path = join(fixtureRoot, source, name)
+  created.push(path)
+  await writeFile(path, content)
+  return { name, path, url: `/file/${source === 'pi' ? 'Pi' : 'Claude'}/${encodeURIComponent(name)}` }
+}
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+test.afterEach(async () => {
+  for (const path of created.splice(0)) await rm(path, { force: true })
+})
+
+const editButton = (page: Page) => page.getByRole('button', { name: 'Edit', exact: true })
+const saveButton = (page: Page) => page.getByRole('button', { name: 'Save', exact: true })
+const saveStatus = (page: Page) => page.getByTestId('save-status')
+const editor = (page: Page) => page.locator('.cm-content')
+
+async function openForEditing(page: Page, url: string) {
+  await page.goto(url)
+  await expect(editButton(page)).toBeEnabled()
+  await editButton(page).click()
+  await expect(editor(page)).toBeVisible()
+}
+
+/** Places the caret at the end of the document and types. */
+async function typeAtEnd(page: Page, text: string) {
+  await editor(page).click()
+  await page.keyboard.press('Control+End')
+  await page.keyboard.type(text)
+}
+
+test('Edit is available only once a document is loaded; editing shows Edit/Preview tabs and highlighted CodeMirror', async ({ page }) => {
+  const file = await scratchFile('pi', '# Heading\n\nSome [link](https://example.com) text.\n')
+  let release: () => void = () => {}
+  const held = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/file?*', async route => { await held; await route.continue() })
+  await page.goto(file.url)
+  await expect(page.getByTestId('document-view').getByText(`Loading ${file.name}`)).toBeVisible()
+  await expect(editButton(page)).toHaveCount(0)
+  release()
+  await expect(editButton(page)).toBeEnabled()
+  await page.unroute('**/api/file?*')
+
+  await editButton(page).click()
+  const tabs = page.getByRole('tablist', { name: 'Editor' })
+  await expect(tabs.getByRole('tab', { name: 'Edit' })).toHaveAttribute('aria-selected', 'true')
+  await expect(tabs.getByRole('tab', { name: 'Preview' })).toHaveAttribute('aria-selected', 'false')
+  await expect(editor(page)).toContainText('# Heading')
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await expect(saveButton(page)).toBeVisible()
+  // Rendered/Source tabs of the read-only view are replaced while editing.
+  await expect(page.getByRole('tab', { name: 'Rendered' })).toHaveCount(0)
+
+  // Markdown syntax highlighting: the heading token is bold and the link URL is coloured differently from plain text.
+  type Styled = { getComputedStyle(element: unknown): { fontWeight: string; color: string } }
+  const headingWeight = await editor(page).locator('.cm-line').first().locator('span').first().evaluate(element => (globalThis as unknown as Styled).getComputedStyle(element).fontWeight)
+  expect(['700', 'bold']).toContain(headingWeight)
+  const plainColor = await editor(page).locator('.cm-line').nth(2).evaluate(element => (globalThis as unknown as Styled).getComputedStyle(element).color)
+  const urlColor = await editor(page).getByText('https://example.com').evaluate(element => (globalThis as unknown as Styled).getComputedStyle(element).color)
+  expect(urlColor).not.toBe(plainColor)
+
+  // Preview renders the current draft with the safe renderer, not the saved content.
+  await typeAtEnd(page, '\n\n<div id="raw-element">raw</div>\n\n## Draft only')
+  await tabs.getByRole('tab', { name: 'Preview' }).click()
+  const preview = page.getByRole('tabpanel')
+  await expect(preview.getByRole('heading', { level: 2, name: 'Draft only' })).toBeVisible()
+  await expect(preview.locator('#raw-element')).toHaveCount(0)
+  await expect(preview).toContainText('<div id="raw-element">raw</div>')
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  await tabs.getByRole('tab', { name: 'Edit' }).click()
+  await expect(editor(page)).toContainText('## Draft only')
+  // No write reached the disk.
+  expect(await readFile(file.path, 'utf8')).toBe('# Heading\n\nSome [link](https://example.com) text.\n')
+})
+
+test('nothing is written on keystrokes, tab switches or timers; Save and Ctrl+S write with the read hash and persist', async ({ page }) => {
+  const original = '# Note\n'
+  const file = await scratchFile('claude', original)
+  const puts: Array<{ body: Record<string, unknown> }> = []
+  page.on('request', request => { if (request.method() === 'PUT' && request.url().includes('/api/file')) puts.push({ body: request.postDataJSON() }) })
+  await openForEditing(page, file.url)
+  const readHash = await page.getByTestId('document-view').getAttribute('data-hash')
+  expect(readHash).toBe(sha256(original))
+
+  await typeAtEnd(page, 'typed')
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  await page.getByRole('tab', { name: 'Preview' }).click()
+  await page.getByRole('tab', { name: 'Edit' }).click()
+  await page.waitForTimeout(1500)
+  expect(puts).toHaveLength(0)
+  expect(await readFile(file.path, 'utf8')).toBe(original)
+
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(puts).toHaveLength(1)
+  expect(puts[0].body).toEqual({ source: 'Claude', path: file.name, content: '# Note\ntyped', expectedHash: sha256(original) })
+  expect(await readFile(file.path, 'utf8')).toBe('# Note\ntyped')
+  await expect(page.getByRole('status')).toContainText(`Saved ${file.name}`)
+
+  // Ctrl+S saves with the hash returned by the previous save and does not open the browser's save dialog.
+  await typeAtEnd(page, ' again')
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  await page.evaluate(`window.__savePrevented = undefined; window.addEventListener('keydown', event => { if (event.key === 's') window.__savePrevented = event.defaultPrevented })`)
+  await page.keyboard.press('Control+s')
+  await expect.poll(() => page.evaluate('window.__savePrevented')).toBe(true)
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(puts).toHaveLength(2)
+  expect(puts[1].body.expectedHash).toBe(sha256('# Note\ntyped'))
+  expect(await readFile(file.path, 'utf8')).toBe('# Note\ntyped again')
+
+  // Ctrl+S while focus is on the Preview tab still saves (editing mode), and nothing is written when unchanged.
+  await page.getByRole('tab', { name: 'Preview' }).click()
+  await page.getByRole('tab', { name: 'Preview' }).focus()
+  await page.keyboard.press('Control+s')
+  await page.waitForTimeout(300)
+  expect(puts).toHaveLength(2)
+
+  await page.reload()
+  await expect(page.getByRole('tabpanel')).toContainText('typed again')
+  expect(await page.getByTestId('document-view').getAttribute('data-hash')).toBe(sha256('# Note\ntyped again'))
+})
+
+type Held = { route: Route; body: Record<string, unknown> }
+
+/** Holds every PUT so the test controls when and how each save settles. */
+function holdSaves(page: Page) {
+  const held: Held[] = []
+  const waiters: Array<(held: Held) => void> = []
+  let consumed = 0
+  void page.route('**/api/file', async route => {
+    if (route.request().method() !== 'PUT') return route.fallback()
+    const entry = { route, body: route.request().postDataJSON() as Record<string, unknown> }
+    held.push(entry)
+    waiters.splice(0).forEach(resolve => resolve(entry))
+  })
+  return {
+    held,
+    /** The next request not yet handed out, waiting for it if necessary. */
+    next: () => {
+      const index = consumed
+      consumed += 1
+      return index < held.length ? Promise.resolve(held[index]) : new Promise<Held>(resolve => waiters.push(resolve))
+    },
+    count: () => held.length,
+  }
+}
+
+test('one save in flight; later explicit saves replace one pending slot and use the returned hash; unsent edits stay Unsaved', async ({ page }) => {
+  const file = await scratchFile('pi', 'base\n')
+  const saves = holdSaves(page)
+  await openForEditing(page, file.url)
+
+  await typeAtEnd(page, '1')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saving')
+  const first = await saves.next()
+  expect(saves.count()).toBe(1)
+  expect(first.body.content).toBe('base\n1')
+
+  // Editor stays usable; a second and third explicit save only replace the pending snapshot.
+  await typeAtEnd(page, '2')
+  await saveButton(page).click()
+  await typeAtEnd(page, '3')
+  await saveButton(page).click()
+  await typeAtEnd(page, '4')
+  await page.waitForTimeout(300)
+  expect(saves.count()).toBe(1)
+  await expect(saveStatus(page)).toHaveText('Saving')
+
+  // Release the first save with a server-chosen hash: the queued snapshot is sent with exactly that hash.
+  const firstHash = 'a'.repeat(64)
+  await first.route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ source: 'Pi', path: file.name, hash: firstHash }) })
+  const second = await saves.next()
+  expect(saves.count()).toBe(2)
+  expect(second.body).toEqual({ source: 'Pi', path: file.name, content: 'base\n123', expectedHash: firstHash })
+  await expect(saveStatus(page)).toHaveText('Saving')
+
+  const secondHash = 'b'.repeat(64)
+  await second.route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ source: 'Pi', path: file.name, hash: secondHash }) })
+  // "4" was typed after the last explicit save: it is not saved and must not show Saved.
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  await page.waitForTimeout(300)
+  expect(saves.count()).toBe(2)
+  await expect(editor(page)).toContainText('base')
+  expect(await editor(page).innerText()).toContain('1234')
+
+  await saveButton(page).click()
+  const third = await saves.next()
+  expect(third.body).toEqual({ source: 'Pi', path: file.name, content: 'base\n1234', expectedHash: secondHash })
+  await third.route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ source: 'Pi', path: file.name, hash: 'c'.repeat(64) }) })
+  await expect(saveStatus(page)).toHaveText('Saved')
+})
+
+test('a failed save stops the queue, keeps every edit, shows Error with Retry, and Retry uses the acknowledged hash', async ({ page }) => {
+  const file = await scratchFile('pi', 'base\n')
+  const saves = holdSaves(page)
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, '1')
+  await saveButton(page).click()
+  await typeAtEnd(page, '2')
+  await saveButton(page).click()
+  await typeAtEnd(page, '3')
+  const first = await saves.next()
+  expect(saves.count()).toBe(1)
+  await first.route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'WRITE_FAILED', error: 'The file could not be written.' }) })
+
+  await expect(saveStatus(page)).toHaveText('Error')
+  const alert = page.getByRole('alert')
+  await expect(alert).toContainText('could not be written')
+  await expect(alert.getByRole('button', { name: 'Retry' })).toBeVisible()
+  await expect(alert.getByRole('button', { name: 'Copy draft' })).toBeVisible()
+  await page.waitForTimeout(300)
+  expect(saves.count()).toBe(1)
+  expect(await editor(page).innerText()).toContain('123')
+  expect(await readFile(file.path, 'utf8')).toBe('base\n')
+
+  await alert.getByRole('button', { name: 'Retry' }).click()
+  const retry = await saves.next()
+  expect(retry.body).toEqual({ source: 'Pi', path: file.name, content: 'base\n123', expectedHash: sha256('base\n') })
+  await retry.route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ source: 'Pi', path: file.name, hash: sha256('base\n123') }) })
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await expect(page.getByRole('alert')).toHaveCount(0)
+
+  // An unreachable API is an ordinary failure with the same recovery.
+  await typeAtEnd(page, '4')
+  await saveButton(page).click()
+  const dropped = await saves.next()
+  await dropped.route.abort('connectionrefused')
+  await expect(saveStatus(page)).toHaveText('Error')
+  await expect(page.getByRole('alert')).toContainText('could not be reached')
+  expect(await editor(page).innerText()).toContain('1234')
+})
+
+test('a response from an abandoned editing session cannot affect another document', async ({ page }) => {
+  const first = await scratchFile('pi', 'first\n')
+  const second = await scratchFile('pi', 'second\n')
+  const saves = holdSaves(page)
+  await page.goto('/Pi')
+  await page.getByRole('button', { name: 'Outline' }).click()
+  const outline = page.getByRole('navigation', { name: 'Directory outline' })
+  await outline.getByRole('button', { name: new RegExp(`^${first.name}\\s*, Markdown file$`) }).click()
+  await editButton(page).click()
+  await typeAtEnd(page, ' edited')
+  await saveButton(page).click()
+  const held = await saves.next()
+  await expect(saveStatus(page)).toHaveText('Saving')
+
+  // Browser Back is not intercepted; it abandons the pending session.
+  await page.goBack()
+  await expect(page).toHaveURL('/Pi')
+  await outline.getByRole('button', { name: new RegExp(`^${second.name}\\s*, Markdown file$`) }).click()
+  await editButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await typeAtEnd(page, ' two')
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+
+  await held.route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ source: 'Pi', path: first.name, hash: 'd'.repeat(64) }) })
+  await page.waitForTimeout(300)
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  expect(await editor(page).innerText()).toContain(' two')
+  await saveButton(page).click()
+  const own = await saves.next()
+  expect(own.body).toEqual({ source: 'Pi', path: second.name, content: 'second\n two', expectedHash: sha256('second\n') })
+  await own.route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ source: 'Pi', path: second.name, hash: sha256('second\n two') }) })
+  await expect(saveStatus(page)).toHaveText('Saved')
+  // Returning to the first document reads the disk: the abandoned draft is gone.
+  await page.goto(first.url)
+  await expect(page.getByRole('tabpanel')).toContainText('first')
+  await expect(page.getByRole('tabpanel')).not.toContainText('edited')
+})
+
+test('unchanged CRLF, BOM and no-final-newline files round-trip byte for byte; edits keep the file line ending', async ({ page }) => {
+  const cases: Array<[string, Buffer]> = [
+    ['crlf', Buffer.from('# CRLF\r\n\r\nline two\r\n', 'utf8')],
+    ['bom', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('# BOM\r\nno final newline', 'utf8')])],
+    ['nofinal', Buffer.from('# No newline at end', 'utf8')],
+    ['blank', Buffer.from('\n\n\n', 'utf8')],
+  ]
+  for (const [, bytes] of cases) {
+    const file = await scratchFile('claude', bytes)
+    await openForEditing(page, file.url)
+    // Force a write of the unchanged text: type and delete one character.
+    await typeAtEnd(page, 'x')
+    await page.keyboard.press('Backspace')
+    await expect(saveStatus(page)).toHaveText('Saved')
+    await editor(page).click()
+    await page.keyboard.press('Control+Home')
+    await page.keyboard.type('!')
+    await page.keyboard.press('Backspace')
+    await expect(saveStatus(page)).toHaveText('Saved')
+    // The unchanged draft equals the acknowledged content, so Save sends nothing; force a real change and back.
+    await typeAtEnd(page, 'Z')
+    await saveButton(page).click()
+    await expect(saveStatus(page)).toHaveText('Saved')
+    await editor(page).click()
+    await page.keyboard.press('Control+End')
+    await page.keyboard.press('Backspace')
+    await expect(saveStatus(page)).toHaveText('Unsaved')
+    await saveButton(page).click()
+    await expect(saveStatus(page)).toHaveText('Saved')
+    expect((await readFile(file.path)).toString('hex'), JSON.stringify(bytes.toString('utf8'))).toBe(bytes.toString('hex'))
+  }
+  // An edited CRLF file keeps CRLF for new lines too.
+  const crlf = await scratchFile('claude', 'one\r\ntwo\r\n')
+  await openForEditing(page, crlf.url)
+  await typeAtEnd(page, 'three\nfour')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await readFile(crlf.path, 'utf8')).toBe('one\r\ntwo\r\nthree\r\nfour')
+})
+
+test('files that cannot round-trip losslessly stay read-only with an explanation', async ({ page }) => {
+  const mixed = await scratchFile('pi', 'one\r\ntwo\nthree')
+  await page.goto(mixed.url)
+  await expect(page.getByRole('tabpanel')).toContainText('one')
+  await expect(editButton(page)).toBeDisabled()
+  await expect(page.getByTestId('edit-unavailable')).toContainText('mixed line endings')
+
+  const invalid = await scratchFile('pi', Buffer.from([0x23, 0x20, 0x68, 0x69, 0x0a, 0xff, 0xfe, 0x0a]))
+  await page.goto(invalid.url)
+  await expect(page.getByRole('tabpanel')).toContainText('hi')
+  await expect(editButton(page)).toBeDisabled()
+  await expect(page.getByTestId('edit-unavailable')).toContainText('not valid UTF-8')
+  expect(await readFile(invalid.path)).toEqual(Buffer.from([0x23, 0x20, 0x68, 0x69, 0x0a, 0xff, 0xfe, 0x0a]))
+})
+
+test('the empty document can be edited and saved, and a document over 100 KB stays responsive while editing', async ({ page }) => {
+  const empty = await scratchFile('claude', '')
+  await openForEditing(page, empty.url)
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await typeAtEnd(page, '# Was empty')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await readFile(empty.path, 'utf8')).toBe('# Was empty')
+
+  const large = await scratchFile('pi', `# Large\n${'A paragraph of text that repeats. '.repeat(4000)}\n`)
+  const started = Date.now()
+  await openForEditing(page, large.url)
+  await typeAtEnd(page, 'end')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(Date.now() - started).toBeLessThan(6000)
+  expect((await readFile(large.path, 'utf8')).endsWith('\nend')).toBe(true)
+})
+import { test, expect, type Page } from '@playwright/test'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFile, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { waitForApi } from './helpers.ts'
+
+const fixtureRoot = fileURLToPath(new URL('../fixtures/', import.meta.url))
+const created: string[] = []
+
+function sha256(bytes: Buffer | string) {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+async function scratchFile(source: 'pi' | 'claude', content: string) {
+  const name = `scratch-${randomUUID().slice(0, 8)}.md`
+  const path = join(fixtureRoot, source, name)
+  created.push(path)
+  await writeFile(path, content)
+  return { name, path, url: `/file/${source === 'pi' ? 'Pi' : 'Claude'}/${encodeURIComponent(name)}` }
+}
+
+test.beforeEach(async ({ request }) => { await waitForApi(request) })
+test.afterEach(async () => {
+  for (const path of created.splice(0)) await rm(path, { force: true })
+})
+
+const editButton = (page: Page) => page.getByRole('button', { name: 'Edit', exact: true })
+const saveButton = (page: Page) => page.getByRole('button', { name: 'Save', exact: true })
+const revertButton = (page: Page) => page.getByRole('button', { name: 'Revert', exact: true })
+const saveStatus = (page: Page) => page.getByTestId('save-status')
+const editor = (page: Page) => page.locator('.cm-content')
+const dialog = (page: Page) => page.getByRole('dialog')
+
+async function openForEditing(page: Page, url: string) {
+  await page.goto(url)
+  await expect(editButton(page)).toBeEnabled()
+  await editButton(page).click()
+  await expect(editor(page)).toBeVisible()
+}
+
+async function typeAtEnd(page: Page, text: string) {
+  await editor(page).click()
+  await page.keyboard.press('Control+End')
+  await page.keyboard.type(text)
+}
+
+test('a save against a file changed on disk conflicts: Save and Revert are blocked, the draft is kept, Reload and Copy draft are offered', async ({ page }) => {
+  const file = await scratchFile('pi', 'original\n')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, 'my draft')
+  await writeFile(file.path, 'changed outside\n')
+  await saveButton(page).click()
+
+  await expect(saveStatus(page)).toHaveText('Error')
+  const alert = page.getByRole('alert')
+  await expect(alert).toContainText('changed on disk')
+  await expect(alert.getByRole('button', { name: 'Reload' })).toBeVisible()
+  await expect(alert.getByRole('button', { name: 'Copy draft' })).toBeVisible()
+  await expect(alert.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+  await expect(saveButton(page)).toBeDisabled()
+  await expect(revertButton(page)).toBeDisabled()
+  expect(await editor(page).innerText()).toContain('my draft')
+  expect(await readFile(file.path, 'utf8')).toBe('changed outside\n')
+
+  // Neither Ctrl+S nor further typing sends anything while conflicted.
+  const puts: string[] = []
+  page.on('request', request => { if (request.method() === 'PUT') puts.push(request.url()) })
+  await typeAtEnd(page, ' more')
+  await page.keyboard.press('Control+s')
+  await page.waitForTimeout(300)
+  expect(puts).toHaveLength(0)
+  expect(await readFile(file.path, 'utf8')).toBe('changed outside\n')
+  await expect(saveStatus(page)).toHaveText('Error')
+})
+
+test('Copy draft copies the current draft; when the clipboard is unavailable a selectable fallback is shown', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const file = await scratchFile('claude', 'base\n')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, 'first')
+  await writeFile(file.path, 'outside\n')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  // The draft keeps changing after the failed save; Copy draft copies what the editor holds now.
+  await typeAtEnd(page, ' second')
+  await page.getByRole('button', { name: 'Copy draft' }).click()
+  await expect(page.getByRole('status')).toContainText('Draft copied')
+  expect(await page.evaluate('navigator.clipboard.readText()')).toBe('base\nfirst second')
+
+  await page.evaluate(`Object.defineProperty(navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) }, configurable: true })`)
+  await page.getByRole('button', { name: 'Copy draft' }).click()
+  await expect(page.getByRole('status')).not.toContainText('Draft copied')
+  const fallback = page.getByRole('textbox', { name: 'Draft text' })
+  await expect(fallback).toBeVisible()
+  await expect(fallback).toHaveValue('base\nfirst second')
+  await expect(page.getByTestId('editor').getByText(/clipboard is unavailable/i)).toBeVisible()
+})
+
+test('Reload asks before discarding the draft; cancel keeps it, failure keeps it, success installs a new baseline and hash', async ({ page }) => {
+  const file = await scratchFile('pi', 'original\n')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, 'draft')
+  await writeFile(file.path, 'outside version\n')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+
+  await page.getByRole('button', { name: 'Reload' }).click()
+  await expect(dialog(page)).toContainText('discard')
+  await dialog(page).getByRole('button', { name: 'Cancel' }).click()
+  await expect(dialog(page)).toHaveCount(0)
+  expect(await editor(page).innerText()).toContain('draft')
+  await expect(saveButton(page)).toBeDisabled()
+
+  // A failed fresh read keeps the draft and the conflict.
+  await page.route('**/api/file?*', route => route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'READ_FAILED', error: 'nope' }) }))
+  await page.getByRole('button', { name: 'Reload' }).click()
+  await dialog(page).getByRole('button', { name: 'Reload' }).click()
+  await expect(page.getByRole('status')).toContainText('Reloading')
+  await expect(page.getByRole('status')).toContainText('failed')
+  expect(await editor(page).innerText()).toContain('draft')
+  await expect(saveButton(page)).toBeDisabled()
+  await page.unroute('**/api/file?*')
+
+  await page.getByRole('button', { name: 'Reload' }).click()
+  await dialog(page).getByRole('button', { name: 'Reload' }).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await editor(page).innerText()).toContain('outside version')
+  expect(await editor(page).innerText()).not.toContain('draft')
+  await expect(saveButton(page)).toBeEnabled()
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  await expect(page.getByTestId('document-view')).toHaveAttribute('data-hash', sha256('outside version\n'))
+
+  await typeAtEnd(page, ' plus')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await readFile(file.path, 'utf8')).toBe('outside version\n plus')
+})
+
+test('Revert restores the Edit baseline on disk after several saves, through the hash check, after confirmation', async ({ page }) => {
+  const file = await scratchFile('pi', 'baseline\n')
+  await openForEditing(page, file.url)
+  await expect(revertButton(page)).toBeDisabled()
+  await typeAtEnd(page, 'one')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await typeAtEnd(page, ' two')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await readFile(file.path, 'utf8')).toBe('baseline\none two')
+  await expect(revertButton(page)).toBeEnabled()
+
+  const puts: Array<Record<string, unknown>> = []
+  page.on('request', request => { if (request.method() === 'PUT') puts.push(request.postDataJSON()) })
+  await revertButton(page).click()
+  await expect(dialog(page)).toContainText('discard')
+  await dialog(page).getByRole('button', { name: 'Cancel' }).click()
+  expect(puts).toHaveLength(0)
+  await revertButton(page).click()
+  await dialog(page).getByRole('button', { name: 'Revert' }).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(puts).toHaveLength(1)
+  expect(puts[0]).toEqual({ source: 'Pi', path: file.name, content: 'baseline\n', expectedHash: sha256('baseline\none two') })
+  expect(await readFile(file.path, 'utf8')).toBe('baseline\n')
+  expect(await editor(page).innerText()).not.toContain('one two')
+  await expect(page.getByRole('status')).toContainText('Reverted')
+  await expect(revertButton(page)).toBeDisabled()
+
+  // Saving again after a revert uses the hash returned by the revert.
+  await typeAtEnd(page, 'three')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(puts[1].expectedHash).toBe(sha256('baseline\n'))
+  expect(await readFile(file.path, 'utf8')).toBe('baseline\nthree')
+})
+
+test('a stale or failed Revert keeps the pre-Revert draft and explains recovery; Revert is unavailable while a save is pending', async ({ page }) => {
+  const file = await scratchFile('claude', 'baseline\n')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, 'saved edit')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await typeAtEnd(page, ' unsaved edit')
+
+  // Stale: the file changed outside since the last acknowledged save.
+  await writeFile(file.path, 'outside\n')
+  await revertButton(page).click()
+  await dialog(page).getByRole('button', { name: 'Revert' }).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  await expect(page.getByRole('alert')).toContainText('changed on disk')
+  expect(await editor(page).innerText()).toContain('saved edit unsaved edit')
+  expect(await readFile(file.path, 'utf8')).toBe('outside\n')
+  await expect(revertButton(page)).toBeDisabled()
+
+  // Recover by reloading, then a Revert that fails at the server keeps the draft too.
+  await page.getByRole('button', { name: 'Reload' }).click()
+  await dialog(page).getByRole('button', { name: 'Reload' }).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await typeAtEnd(page, 'again')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await typeAtEnd(page, ' pending')
+  let hold = true
+  await page.route('**/api/file', async route => {
+    if (route.request().method() !== 'PUT') return route.fallback()
+    if (hold) await expect.poll(() => hold, { timeout: 10_000 }).toBe(false)
+    return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'WRITE_FAILED', error: 'disk error' }) })
+  })
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saving')
+  await expect(revertButton(page)).toBeDisabled()
+  hold = false
+  await expect(saveStatus(page)).toHaveText('Error')
+  await expect(revertButton(page)).toBeEnabled()
+  await revertButton(page).click()
+  await dialog(page).getByRole('button', { name: 'Revert' }).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  await expect(page.getByRole('alert')).toContainText('failed')
+  expect(await editor(page).innerText()).toContain('again pending')
+  expect(await readFile(file.path, 'utf8')).toBe('outside\nagain')
+})
+
+test('in-app navigation with a dirty draft asks "Discard changes?"; Cancel keeps everything, Edit/Preview never asks', async ({ page }) => {
+  const file = await scratchFile('pi', 'nav\n')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, 'dirty')
+  await page.getByRole('tab', { name: 'Preview' }).click()
+  await expect(dialog(page)).toHaveCount(0)
+  await page.getByRole('tab', { name: 'Edit' }).click()
+
+  for (const trigger of ['Back to folder', 'Done'] as const) {
+    await page.getByRole('button', { name: trigger, exact: true }).click()
+    await expect(dialog(page)).toContainText('Discard changes?')
+    await dialog(page).getByRole('button', { name: 'Cancel' }).click()
+    await expect(dialog(page)).toHaveCount(0)
+    await expect(page).toHaveURL(file.url)
+    await expect(editor(page)).toBeVisible()
+    expect(await editor(page).innerText()).toContain('dirty')
+    await expect(page.getByRole('button', { name: trigger, exact: true })).toBeFocused()
+  }
+  const home = page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'Home' })
+  await home.click()
+  await expect(dialog(page)).toContainText('Discard changes?')
+  await page.keyboard.press('Escape')
+  await expect(dialog(page)).toHaveCount(0)
+  await expect(page).toHaveURL(file.url)
+  await expect(home).toBeFocused()
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+
+  // Discard through the breadcrumb: the draft is gone and the file on disk is unchanged.
+  await home.click()
+  await dialog(page).getByRole('button', { name: 'Discard' }).click()
+  await expect(page).toHaveURL('/')
+  await expect(page.locator('.graph-canvas')).toBeVisible()
+  expect(await readFile(file.path, 'utf8')).toBe('nav\n')
+  await page.goto(file.url)
+  await expect(page.getByRole('tabpanel')).not.toContainText('dirty')
+})
+
+test('Done with a clean draft leaves editing and shows the saved content; a dirty Done can be discarded', async ({ page }) => {
+  const file = await scratchFile('claude', 'done\n')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, 'kept')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await page.getByRole('button', { name: 'Done', exact: true }).click()
+  await expect(dialog(page)).toHaveCount(0)
+  await expect(page.getByRole('tab', { name: 'Rendered' })).toBeVisible()
+  await expect(page.getByRole('tabpanel')).toContainText('done kept')
+  await expect(editButton(page)).toBeFocused()
+
+  await editButton(page).click()
+  await typeAtEnd(page, ' lost')
+  await page.getByRole('button', { name: 'Done', exact: true }).click()
+  await dialog(page).getByRole('button', { name: 'Discard' }).click()
+  await expect(page.getByRole('tabpanel')).toContainText('done kept')
+  await expect(page.getByRole('tabpanel')).not.toContainText('lost')
+  expect(await readFile(file.path, 'utf8')).toBe('done\nkept')
+})
+
+test('while a save is pending, app navigation is refused with an explanation until it settles', async ({ page }) => {
+  const file = await scratchFile('pi', 'pending\n')
+  let release: () => void = () => {}
+  const held = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/file', async route => {
+    if (route.request().method() !== 'PUT') return route.fallback()
+    await held
+    return route.fallback()
+  })
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, 'x')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saving')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await expect(dialog(page)).toHaveCount(0)
+  await expect(page).toHaveURL(file.url)
+  await expect(page.getByRole('alert')).toContainText('save')
+  await expect(page.getByRole('alert')).toContainText('finish')
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeDisabled()
+  await page.getByRole('navigation', { name: 'Breadcrumb' }).getByRole('link', { name: 'Home' }).click()
+  await expect(page).toHaveURL(file.url)
+  release()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  await page.getByRole('button', { name: 'Back to folder' }).click()
+  await expect(page).toHaveURL('/Pi')
+  expect(await readFile(file.path, 'utf8')).toBe('pending\nx')
+})
+
+test('beforeunload warns only while there is unsaved or unacknowledged work', async ({ page }) => {
+  const file = await scratchFile('pi', 'unload\n')
+  const warns = () => page.evaluate(`(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return event.defaultPrevented })()`)
+  await openForEditing(page, file.url)
+  expect(await warns()).toBe(false)
+  await typeAtEnd(page, 'dirty')
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  expect(await warns()).toBe(true)
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await warns()).toBe(false)
+  // A failed save is unacknowledged work.
+  await page.route('**/api/file', route => route.request().method() === 'PUT'
+    ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'WRITE_FAILED', error: 'x' }) })
+    : route.fallback())
+  await typeAtEnd(page, ' failed')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  expect(await warns()).toBe(true)
+  await page.unroute('**/api/file')
+  await page.getByRole('button', { name: 'Retry' }).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await warns()).toBe(false)
+
+  // The native dialog appears on reload after a real interaction; dismissing it keeps the page and draft.
+  await typeAtEnd(page, ' again')
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  const nativeDialog = page.waitForEvent('dialog')
+  await page.evaluate('setTimeout(() => location.reload(), 0)')
+  const shown = await nativeDialog
+  expect(shown.type()).toBe('beforeunload')
+  await shown.dismiss()
+  await expect(editor(page)).toBeVisible()
+  expect(await editor(page).innerText()).toContain('again')
+})
+
+test('browser Back after a failed save is not intercepted and loses the draft; returning reads the disk', async ({ page }) => {
+  const file = await scratchFile('claude', 'history\n')
+  await page.goto('/Claude')
+  await page.getByRole('button', { name: 'Outline' }).click()
+  await page.getByRole('navigation', { name: 'Directory outline' }).getByRole('button', { name: new RegExp(`^${file.name}\\s*, Markdown file$`) }).click()
+  await editButton(page).click()
+  await page.route('**/api/file', route => route.request().method() === 'PUT'
+    ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ code: 'WRITE_FAILED', error: 'x' }) })
+    : route.fallback())
+  await typeAtEnd(page, 'lost draft')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  await page.goBack()
+  await expect(page).toHaveURL('/Claude')
+  await expect(dialog(page)).toHaveCount(0)
+  await page.goForward()
+  await expect(page).toHaveURL(file.url)
+  await expect(page.getByRole('tab', { name: 'Rendered' })).toBeVisible()
+  await expect(page.getByRole('tabpanel')).toContainText('history')
+  await expect(page.getByRole('tabpanel')).not.toContainText('lost draft')
+  await expect(editor(page)).toHaveCount(0)
+  expect(await readFile(file.path, 'utf8')).toBe('history\n')
+})
+
+for (const [initial, fresh] of [
+  ['\uFEFFold\r\ntext', 'NEW disk\ntext'],
+  ['old\ntext', '\uFEFFNEW disk\r\ntext'],
+  ['old\r\ntext', 'NEW disk\ntext'],
+]) {
+  test(`Reload refreshes serialization metadata ${JSON.stringify(initial)} to ${JSON.stringify(fresh)}`, async ({ page }) => {
+    const file = await scratchFile('pi', initial)
+    await openForEditing(page, file.url)
+    await typeAtEnd(page, ' draft')
+    await writeFile(file.path, fresh)
+    await saveButton(page).click()
+    await expect(saveStatus(page)).toHaveText('Error')
+    await page.getByRole('button', { name: 'Reload', exact: true }).click()
+    await dialog(page).getByRole('button', { name: 'Reload', exact: true }).click()
+    await expect(dialog(page)).toHaveCount(0)
+    await expect(saveStatus(page)).toHaveText('Saved')
+    await expect(editor(page)).toHaveText('NEW disktext')
+    await typeAtEnd(page, '!')
+    await saveButton(page).click()
+    await expect(saveStatus(page)).toHaveText('Saved')
+    expect(await readFile(file.path, 'utf8')).toBe(fresh + '!')
+    await page.getByRole('button', { name: 'Done', exact: true }).click()
+    await editButton(page).click()
+    await typeAtEnd(page, '?')
+    await saveButton(page).click()
+    await expect(saveStatus(page)).toHaveText('Saved')
+    expect(await readFile(file.path, 'utf8')).toBe(fresh + '!?')
+  })
+}
+
+for (const bytes of [Buffer.from('mixed\r\nline\nend'), Buffer.from([0xff, 0x61])]) {
+  test(`Reload of non-roundtrippable bytes stays read-only and retains recovery draft: ${bytes.toString('hex')}`, async ({ page }) => {
+    const file = await scratchFile('pi', 'original')
+    await openForEditing(page, file.url)
+    await typeAtEnd(page, ' draft')
+    await writeFile(file.path, bytes)
+    await saveButton(page).click()
+    await expect(saveStatus(page)).toHaveText('Error')
+    await page.getByRole('button', { name: 'Reload', exact: true }).click()
+    await dialog(page).getByRole('button', { name: 'Reload', exact: true }).click()
+    await expect(dialog(page)).toHaveCount(0)
+    await expect(page.getByTestId('editor')).toContainText('read-only')
+    await expect(saveButton(page)).toBeDisabled()
+    await expect(revertButton(page)).toBeDisabled()
+    await expect(page.getByRole('textbox', { name: 'Draft before reload' })).toHaveValue('original draft')
+    // Retrying a still-uneditable disk read must not replace the recovery draft with decoded disk text.
+    await page.getByRole('button', { name: 'Reload', exact: true }).click()
+    await dialog(page).getByRole('button', { name: 'Reload', exact: true }).click()
+    await expect(dialog(page)).toHaveCount(0)
+    await expect(page.getByRole('textbox', { name: 'Draft before reload' })).toHaveValue('original draft')
+    await page.keyboard.press('Control+s')
+    expect(await readFile(file.path)).toEqual(bytes)
+    await page.getByRole('button', { name: 'Done', exact: true }).click()
+    await expect(editButton(page)).toBeDisabled()
+    await expect(page.getByTestId('edit-unavailable')).toBeVisible()
+  })
+}
+
+test('pending Reload cannot be dismissed with Escape', async ({ page }) => {
+  const file = await scratchFile('pi', 'original')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, ' draft')
+  await writeFile(file.path, 'fresh')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/file?**', async route => { await held; await route.continue() })
+  await page.getByRole('button', { name: 'Reload', exact: true }).click()
+  await dialog(page).getByRole('button', { name: 'Reload', exact: true }).click()
+  await expect(dialog(page).getByRole('button', { name: 'Cancel' })).toBeDisabled()
+  await page.keyboard.press('Escape')
+  await expect(dialog(page)).toBeVisible()
+  release()
+  await expect(dialog(page)).toHaveCount(0)
+  await expect(editor(page)).toHaveText('fresh')
+})
+
+test('a Reload response from a session abandoned through history cannot affect the new editor', async ({ page }) => {
+  const file = await scratchFile('pi', 'original')
+  // Establish app-owned history so Back leaves editing without a full page reload.
+  await page.goto('/Pi')
+  await page.locator(`.graph-canvas [data-node-id="Pi/${file.name}"] .node-body`).focus()
+  await page.keyboard.press('Enter')
+  await editButton(page).click()
+  await typeAtEnd(page, ' draft')
+  await writeFile(file.path, 'fresh')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  let received!: () => void
+  const ready = new Promise<void>(resolve => { received = resolve })
+  await page.route('**/api/file?**', async route => {
+    const response = await route.fetch()
+    received()
+    await held
+    await route.fulfill({ response })
+  }, { times: 1 })
+  await page.getByRole('button', { name: 'Reload', exact: true }).click()
+  await dialog(page).getByRole('button', { name: 'Reload', exact: true }).click()
+  await ready
+  await page.goBack()
+  await expect(dialog(page)).toHaveCount(0)
+  await page.goForward()
+  await editButton(page).click()
+  await typeAtEnd(page, ' new draft')
+  release()
+  await expect(editor(page)).toHaveText('fresh new draft')
+  await expect(saveStatus(page)).toHaveText('Unsaved')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await readFile(file.path, 'utf8')).toBe('fresh new draft')
+})
+
+test('a read-only Reload can recover to a new editable baseline without dropping the retained draft', async ({ page }) => {
+  const file = await scratchFile('pi', 'original')
+  await openForEditing(page, file.url)
+  await typeAtEnd(page, ' draft')
+  await writeFile(file.path, 'mixed\r\nline\nend')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Error')
+  await page.getByRole('button', { name: 'Reload', exact: true }).click()
+  await dialog(page).getByRole('button', { name: 'Reload', exact: true }).click()
+  await expect(saveButton(page)).toBeDisabled()
+  await expect(page.getByRole('textbox', { name: 'Draft before reload' })).toHaveValue('original draft')
+  const fresh = '\uFEFFnew\r\neditable'
+  await writeFile(file.path, fresh)
+  await page.getByRole('button', { name: 'Reload', exact: true }).click()
+  await dialog(page).getByRole('button', { name: 'Reload', exact: true }).click()
+  await expect(dialog(page)).toHaveCount(0)
+  await expect(saveButton(page)).toBeEnabled()
+  await expect(page.getByRole('textbox', { name: 'Draft before reload' })).toHaveValue('original draft')
+  await typeAtEnd(page, '!')
+  await saveButton(page).click()
+  await expect(saveStatus(page)).toHaveText('Saved')
+  expect(await readFile(file.path, 'utf8')).toBe(fresh + '!')
+})

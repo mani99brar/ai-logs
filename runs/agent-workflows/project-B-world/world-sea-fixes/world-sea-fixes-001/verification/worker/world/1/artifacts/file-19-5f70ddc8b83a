@@ -1,0 +1,148 @@
+import { describe, expect, it } from "vitest";
+import { Buttons, MessageType, PROTOCOL_VERSION, type InputMessage } from "@pirate-sea-race/protocol";
+import { followScroll, TILE_PIXELS, VIEW_HEIGHT, VIEW_WIDTH } from "./camera.js";
+import { FogOfWar } from "./fog.js";
+import { dockText } from "./hud.js";
+import { INTERPOLATION_DELAY_MS, SnapshotBuffer } from "./interpolation.js";
+import { axis } from "./keyboard.js";
+import { estimateServerFrame, InputSender } from "./inputSender.js";
+import { MatchView } from "./matchView.js";
+
+describe("SnapshotBuffer", () => {
+  it("interpolates between the snapshots around the render time", () => {
+    const buffer = new SnapshotBuffer();
+    buffer.push(0, 0, 100);
+    buffer.push(50, 100, 100);
+    buffer.push(100, 100, 200);
+    expect(buffer.sample(25)).toEqual({ x: 50, y: 100 });
+    expect(buffer.sample(75)).toEqual({ x: 100, y: 150 });
+  });
+
+  it("holds the ends instead of extrapolating", () => {
+    const buffer = new SnapshotBuffer();
+    expect(buffer.sample(10)).toBeUndefined();
+    buffer.push(10, 5, 5);
+    buffer.push(20, 15, 5);
+    expect(buffer.sample(0)).toEqual({ x: 5, y: 5 });
+    expect(buffer.sample(500)).toEqual({ x: 15, y: 5 });
+  });
+
+  it("keeps a bounded history and ignores out-of-order snapshots", () => {
+    const buffer = new SnapshotBuffer(3);
+    for (let time = 0; time < 10; time++) buffer.push(time * 10, time, 0);
+    buffer.push(5, 999, 999);
+    expect(buffer.latest).toEqual({ time: 90, x: 9, y: 0 });
+    expect(buffer.sample(0)).toEqual({ x: 7, y: 0 });
+  });
+});
+
+describe("MatchView", () => {
+  const ship = (x: number, y: number) => ({ id: "a", slot: 0, x, y, heading: 0, speed: 0, dock: -1 });
+
+  it("draws ships between two snapshots INTERPOLATION_DELAY_MS behind now, not at the latest one", () => {
+    const view = new MatchView("a");
+    view.ingest([ship(0, 500)], 1000);
+    view.ingest([ship(100, 500)], 1050);
+    view.ingest([ship(200, 600)], 1100);
+    expect(INTERPOLATION_DELAY_MS).toBe(100);
+    // At 1175 the scene draws the ship as it was at 1075, halfway between the patches of 1050 and 1100.
+    const drawn = view.renderPosition("a", 1175)!;
+    expect(drawn).toEqual({ x: 150, y: 550 });
+    expect(drawn.x).toBeGreaterThan(100);
+    expect(drawn.x).toBeLessThan(200);
+    // The HUD's readout is the latest decoded server position.
+    expect(view.ships()).toEqual([ship(200, 600)]);
+    // Once now is INTERPOLATION_DELAY_MS past the last patch, the drawing catches up with it.
+    expect(view.renderPosition("a", 1100 + INTERPOLATION_DELAY_MS)).toEqual({ x: 200, y: 600 });
+  });
+
+  it("forgets a ship that leaves the decoded state, as one that sails out of sight does", () => {
+    const view = new MatchView("a");
+    view.ingest([ship(0, 0)], 0);
+    view.ingest([], 50);
+    expect(view.renderPosition("a", 200)).toBeUndefined();
+    expect(view.ships()).toEqual([]);
+  });
+});
+
+describe("keyboard axes", () => {
+  it("makes opposing keys neutral", () => {
+    expect(axis(true, true)).toBe(0);
+    expect(axis(true, false)).toBe(-1);
+    expect(axis(false, true)).toBe(1);
+    expect(axis(false, false)).toBe(0);
+  });
+});
+
+describe("frame estimate", () => {
+  it("advances the last patched frame by elapsed match time, within the lead limit", () => {
+    expect(estimateServerFrame(300, 1000, 1000)).toBe(300);
+    expect(estimateServerFrame(300, 1000, 1050)).toBe(303);
+    expect(estimateServerFrame(300, 1000, 60_000)).toBe(315);
+  });
+});
+
+describe("input sender", () => {
+  function recorder() {
+    const sent: InputMessage[] = [];
+    return { sent, sender: new InputSender({ send: (type, message) => type === MessageType.Input && sent.push(message) }) };
+  }
+
+  it("sends the interact button and resends held input, but stays quiet at rest", () => {
+    const { sent, sender } = recorder();
+    sender.update({ moveX: 0, moveY: 0, buttons: 0 }, 0);
+    expect(sent).toHaveLength(0);
+    sender.update({ moveX: 0, moveY: -1, buttons: 0 }, 10);
+    sender.update({ moveX: 0, moveY: -1, buttons: 0 }, 50);
+    sender.update({ moveX: 0, moveY: -1, buttons: 0 }, 120);
+    sender.update({ moveX: 0, moveY: 0, buttons: Buttons.Interact }, 130);
+    sender.update({ moveX: 0, moveY: 0, buttons: Buttons.Interact }, 240);
+    sender.update({ moveX: 0, moveY: 0, buttons: 0 }, 250);
+    sender.update({ moveX: 0, moveY: 0, buttons: 0 }, 500);
+    expect(sent.map(({ moveY, buttons }) => [moveY, buttons])).toEqual([[-1, 0], [-1, 0], [0, 1], [0, 1], [0, 0]]);
+    expect(sent.map((message) => message.seq)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("speaks protocol v3, where the throttle and the interact button steer a ship", () => {
+    expect(PROTOCOL_VERSION).toBe(3);
+  });
+});
+
+describe("minimap fog", () => {
+  it("reveals the disc around the ship once, and keeps it revealed", () => {
+    const fog = new FogOfWar(40, 30, 3);
+    const fresh = fog.revealAround(10, 10);
+    expect(fresh).toContainEqual([13, 10]);
+    expect(fresh).not.toContainEqual([13, 13]);
+    expect(fog.revealedCount).toBe(fresh.length);
+    expect(fog.revealAround(10, 10)).toEqual([]);
+    // Sailing one tile east reveals only the new edge; the old disc stays clear.
+    const next = fog.revealAround(11, 10);
+    expect(next.length).toBeGreaterThan(0);
+    expect(next.every(([x]) => x >= 11)).toBe(true);
+    expect(fog.isRevealed(7, 10)).toBe(true);
+    expect(fog.isRevealed(20, 20)).toBe(false);
+  });
+
+  it("clips at the map edge", () => {
+    const fog = new FogOfWar(5, 5, 3);
+    expect(fog.revealAround(0, 0).every(([x, y]) => x >= 0 && y >= 0)).toBe(true);
+  });
+});
+
+describe("HUD dock state", () => {
+  it("names the dock a ship is moored at", () => {
+    expect(dockText(-1)).toBe("at sea");
+    expect(dockText(0)).toMatch(/^[A-Z][a-z]+ [A-Z][a-z]+, (north|east|south|west) dock$/);
+  });
+});
+
+describe("camera", () => {
+  it("centres the player's ship, and stops at the map's edges", () => {
+    expect(followScroll(1600, 1200)).toEqual({ x: 1600 - VIEW_WIDTH / 2, y: 1200 - VIEW_HEIGHT / 2 });
+    expect(followScroll(10, 10)).toEqual({ x: 0, y: 0 });
+    const far = followScroll(1e6, 1e6);
+    expect(far.x + VIEW_WIDTH).toBe(224 * TILE_PIXELS);
+    expect(far.y + VIEW_HEIGHT).toBe(208 * TILE_PIXELS);
+  });
+});

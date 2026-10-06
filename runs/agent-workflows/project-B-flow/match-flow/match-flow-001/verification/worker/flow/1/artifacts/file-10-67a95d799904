@@ -1,0 +1,337 @@
+import { hashState } from "../hash.js";
+import {
+  requireId,
+  requireInteger,
+  type ClaimEndReport,
+  type MatchConfig,
+  type MatchEnd,
+  type MatchEvent,
+  type MatchInput,
+  type MatchPhase,
+  type MatchPlayer,
+  type MatchPlayerResult,
+  type MatchPlayerStats,
+  type MatchReport,
+  type MatchResults,
+  type MatchState,
+  type MatchStatEvent,
+  type MatchStepResult,
+} from "./state.js";
+
+/** Lowest id by UTF-16 code units, independent of locale. */
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Player control has started and the match has not ended: the only phases that count accomplishments or end reports. */
+function inPlay(phase: MatchPhase): boolean {
+  return phase === "departure" || phase === "exploration";
+}
+
+/** Refuses a malformed report; a well-formed one about an unknown player is checked where it is applied. */
+function checkReport(report: MatchReport, tick: number): void {
+  switch (report.kind) {
+    case "join":
+    case "leave":
+    case "start":
+    case "collected":
+    case "stole":
+    case "lost":
+    case "cache-claimed":
+      requireId(report.playerId, `${report.kind} playerId`);
+      return;
+    case "island-visited":
+      requireId(report.playerId, "island-visited playerId");
+      requireId(report.island, "island-visited island");
+      return;
+    case "gold":
+      requireId(report.playerId, "gold playerId");
+      requireInteger(report.gold, "gold");
+      if (report.gold < 0) throw new RangeError(`gold must not be negative, got ${report.gold}`);
+      return;
+    case "duel-ended": {
+      const [a, b] = report.playerIds;
+      requireId(a, "duel-ended player");
+      requireId(b, "duel-ended player");
+      if (a === b) throw new RangeError(`a duel cannot pit ${a} against themselves`);
+      if (report.winner !== null && report.winner !== a && report.winner !== b) throw new RangeError(`duel winner ${String(report.winner)} did not fight`);
+      return;
+    }
+    case "match-ended":
+      if (report.tick !== tick) throw new RangeError(`the claim's match-ended is for tick ${report.tick}, reported on tick ${tick}`);
+      if (report.reason === "claim") requireId(report.winner, "claim winner");
+      else if (report.reason === "deadline") {
+        if (report.winner !== null) throw new RangeError("a deadline has no winner");
+      } else throw new RangeError(`unknown claim end reason ${String((report as { reason: unknown }).reason)}`);
+      return;
+    case "fault":
+      return;
+    default:
+      throw new RangeError(`unknown report kind ${String((report as { kind: unknown }).kind)}`);
+  }
+}
+
+type MutableStats = { -readonly [K in keyof MatchPlayerStats]: MatchPlayerStats[K] };
+type WorkingPlayer = { id: string; order: number; left: boolean; stats: MutableStats };
+
+function heldRubbings(stats: MatchPlayerStats): number {
+  return Math.max(0, stats.collected + stats.thefts + stats.cachesClaimed - stats.lost);
+}
+
+/** The results screen: every player who reached control start, the winner first, then by rubbings held, then by id. */
+export function buildResults(end: MatchEnd, custom: boolean, controlStartTick: number | null, players: readonly MatchPlayer[]): MatchResults {
+  const lines: MatchPlayerResult[] = players.map((player) => ({
+    id: player.id,
+    winner: player.id === end.winner,
+    left: player.left,
+    rubbingsHeld: heldRubbings(player.stats),
+    collected: player.stats.collected,
+    thefts: player.stats.thefts,
+    lost: player.stats.lost,
+    duelsWon: player.stats.duelsWon,
+    duelsLost: player.stats.duelsLost,
+    duelsDrawn: player.stats.duelsDrawn,
+    gold: player.stats.gold,
+    cachesClaimed: player.stats.cachesClaimed,
+    islandsVisited: player.stats.islands.length,
+  }));
+  lines.sort((a, b) => Number(b.winner) - Number(a.winner) || b.rubbingsHeld - a.rubbingsHeld || compareIds(a.id, b.id));
+  return {
+    reason: end.reason,
+    winner: end.winner,
+    tick: end.tick,
+    custom,
+    elapsedTicks: controlStartTick === null ? 0 : Math.max(0, end.tick - controlStartTick),
+    players: lines,
+  };
+}
+
+/**
+ * Up to one world tick of §2's match flow, in a fixed order: (1) the timed transitions due by `tick` (the ready check
+ * ends in control start and `departure`; `departure` becomes `exploration`), each on its own scheduled tick, (2) the
+ * reports in order (joins, leaves, start requests, accomplishments, end reports), (3) the end, if any: a claim, then
+ * the deadline, then a fault (`aborted`), then no player left after the lobby (`abandoned`), and (4) with no end, the
+ * lobby and ready rules (a full public lobby or the private host's request starts the ready check; too few players in
+ * it return to the lobby). A stale or repeated tick, or any input once the match has ended, returns the same state and
+ * no events. The input state is never mutated.
+ */
+export function stepMatch(config: MatchConfig, state: MatchState, input: MatchInput): MatchStepResult {
+  if (state.end !== null) return { state, events: [] };
+  requireInteger(input.tick, "tick");
+  if (input.tick <= state.tick) return { state, events: [] };
+  const tick = input.tick;
+  for (const report of input.reports) checkReport(report, tick);
+
+  const events: MatchEvent[] = [];
+  let phase = state.phase;
+  let readyTick = state.readyTick;
+  let controlStartTick = state.controlStartTick;
+  let host = state.host;
+  let nextOrder = state.nextOrder;
+  const players = new Map<string, WorkingPlayer>(
+    state.players.map((player) => [player.id, { id: player.id, order: player.order, left: player.left, stats: { ...player.stats } }]),
+  );
+  const present = () => [...players.values()].filter((player) => !player.left);
+  const moveTo = (to: MatchPhase, at: number) => {
+    events.push({ kind: "phase-changed", tick: at, from: phase, to });
+    phase = to;
+  };
+  const passHost = () => {
+    if (!config.custom || (host !== null && players.get(host)?.left === false)) return;
+    const next = present().sort((a, b) => a.order - b.order)[0]?.id ?? null;
+    if (next !== host) {
+      host = next;
+      events.push({ kind: "host-changed", tick, playerId: host });
+    }
+  };
+
+  // 1. Time first: a transition due on this tick happens before this tick's reports.
+  if (phase === "ready" && readyTick !== null && readyTick + config.readyTicks <= tick) {
+    controlStartTick = readyTick + config.readyTicks;
+    readyTick = null;
+    moveTo("departure", controlStartTick);
+    events.push({ kind: "control-started", tick: controlStartTick });
+  }
+  if (phase === "departure" && controlStartTick !== null && controlStartTick + config.departureTicks <= tick) {
+    moveTo("exploration", controlStartTick + config.departureTicks);
+  }
+
+  // 2. The reports, in order.
+  const starters: string[] = [];
+  let claimEnd: ClaimEndReport | null = null;
+  let fault = false;
+  const known = (id: string): WorkingPlayer => {
+    const player = players.get(id);
+    if (player === undefined) throw new RangeError(`unknown player ${id}`);
+    return player;
+  };
+  const count = (event: MatchStatEvent) => {
+    if (!inPlay(phase)) return;
+    switch (event.kind) {
+      case "collected":
+        known(event.playerId).stats.collected++;
+        return;
+      case "stole":
+        known(event.playerId).stats.thefts++;
+        return;
+      case "lost":
+        known(event.playerId).stats.lost++;
+        return;
+      case "cache-claimed":
+        known(event.playerId).stats.cachesClaimed++;
+        return;
+      case "gold":
+        known(event.playerId).stats.gold = event.gold;
+        return;
+      case "island-visited": {
+        const stats = known(event.playerId).stats;
+        if (!stats.islands.includes(event.island)) stats.islands = [...stats.islands, event.island].sort(compareIds);
+        return;
+      }
+      case "duel-ended": {
+        const fighters = event.playerIds.map(known);
+        for (const fighter of fighters) {
+          if (event.winner === null) fighter.stats.duelsDrawn++;
+          else if (event.winner === fighter.id) fighter.stats.duelsWon++;
+          else fighter.stats.duelsLost++;
+        }
+        return;
+      }
+    }
+  };
+  for (const report of input.reports) {
+    switch (report.kind) {
+      case "join": {
+        const existing = players.get(report.playerId);
+        if (existing !== undefined && !existing.left) break;
+        if (phase !== "lobby") {
+          events.push({ kind: "join-refused", tick, playerId: report.playerId, reason: "started" });
+        } else if (present().length >= config.seats) {
+          events.push({ kind: "join-refused", tick, playerId: report.playerId, reason: "full" });
+        } else {
+          players.set(report.playerId, {
+            id: report.playerId,
+            order: nextOrder++,
+            left: false,
+            stats: { collected: 0, thefts: 0, lost: 0, duelsWon: 0, duelsLost: 0, duelsDrawn: 0, gold: config.startingGold, cachesClaimed: 0, islands: [] },
+          });
+          events.push({ kind: "player-joined", tick, playerId: report.playerId });
+          passHost();
+        }
+        break;
+      }
+      case "leave": {
+        const player = players.get(report.playerId);
+        if (player === undefined || player.left) break;
+        // Before control start the player never raced: they leave no line in the results.
+        if (controlStartTick === null) players.delete(player.id);
+        else player.left = true;
+        events.push({ kind: "player-left", tick, playerId: player.id });
+        passHost();
+        break;
+      }
+      case "start":
+        starters.push(report.playerId);
+        break;
+      case "match-ended":
+        // Only a running match can end by the claim rules; the claim wins over a deadline reported on the same tick.
+        if (!inPlay(phase)) break;
+        if (report.winner !== null) known(report.winner);
+        if (claimEnd === null || (claimEnd.reason === "deadline" && report.reason === "claim")) claimEnd = report;
+        break;
+      case "fault":
+        fault = true;
+        break;
+      default:
+        count(report);
+    }
+  }
+
+  // 3. The first end wins, and within a tick: a claim, the deadline, a fault, then an empty room.
+  let end: MatchEnd | null = null;
+  if (claimEnd !== null) end = { reason: claimEnd.reason, winner: claimEnd.winner, tick };
+  else if (fault) end = { reason: "aborted", winner: null, tick };
+  else if (phase !== "lobby" && present().length === 0) end = { reason: "abandoned", winner: null, tick };
+
+  if (end === null) {
+    // 4. The lobby and the ready check.
+    if (phase === "lobby") {
+      for (const playerId of starters) {
+        if (phase !== "lobby") break;
+        if (!config.custom) events.push({ kind: "start-refused", tick, playerId, reason: "public" });
+        else if (playerId !== host) events.push({ kind: "start-refused", tick, playerId, reason: "not-host" });
+        else if (present().length < config.minPlayers) events.push({ kind: "start-refused", tick, playerId, reason: "too-few" });
+        else {
+          readyTick = tick;
+          moveTo("ready", tick);
+        }
+      }
+      if (phase === "lobby" && !config.custom && present().length >= config.seats) {
+        readyTick = tick;
+        moveTo("ready", tick);
+      }
+    } else if (phase === "ready" && present().length < config.minPlayers) {
+      readyTick = null;
+      moveTo("lobby", tick);
+    }
+  }
+
+  const sorted: MatchPlayer[] = [...players.values()]
+    .sort((a, b) => compareIds(a.id, b.id))
+    .map((player) => ({ id: player.id, order: player.order, left: player.left, stats: player.stats }));
+  let results: MatchResults | null = null;
+  if (end !== null) {
+    moveTo("ended", tick);
+    results = buildResults(end, config.custom, controlStartTick, sorted);
+    events.push({ kind: "match-ended", tick, reason: end.reason, winner: end.winner, results });
+    readyTick = null;
+  }
+
+  return {
+    state: {
+      tick,
+      phase,
+      custom: state.custom,
+      durationTicks: state.durationTicks,
+      players: sorted,
+      nextOrder,
+      host,
+      readyTick,
+      controlStartTick,
+      end,
+      results,
+    },
+    events,
+  };
+}
+
+/** Match time since control start, frozen at the end; 0 before control start and never negative. */
+export function elapsed(state: MatchState, tick: number): number {
+  requireInteger(tick, "tick");
+  if (state.controlStartTick === null) return 0;
+  const until = state.end === null ? tick : Math.min(tick, state.end.tick);
+  return Math.max(0, until - state.controlStartTick);
+}
+
+/** Match time left before the deadline: the full duration before control start, never negative. */
+export function remaining(state: MatchState, tick: number): number {
+  return Math.max(0, state.durationTicks - elapsed(state, tick));
+}
+
+export interface MatchReplay {
+  readonly state: MatchState;
+  readonly events: readonly MatchEvent[];
+  readonly hash: string;
+}
+
+/** Steps a sequence of inputs from a state, collecting every event; `hash` is the final state's `hashState`. */
+export function replayMatch(config: MatchConfig, state: MatchState, inputs: readonly MatchInput[]): MatchReplay {
+  let current = state;
+  const events: MatchEvent[] = [];
+  for (const input of inputs) {
+    const stepped = stepMatch(config, current, input);
+    current = stepped.state;
+    events.push(...stepped.events);
+  }
+  return { state: current, events, hash: hashState(current) };
+}

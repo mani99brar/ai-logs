@@ -1,0 +1,334 @@
+import { hashState } from "../hash.js";
+import { sanitizeDuelInput, type DuelInputs } from "../duel/input.js";
+import { restoreDuel } from "../duel/snapshot.js";
+import type { DuelConfig, DuelState, PlayerIndex } from "../duel/state.js";
+import { stepDuel } from "../duel/step.js";
+import { DuelEventFeed, type DuelFeedEvent } from "./events.js";
+
+/** Two seconds of 60 Hz frames: how far the client predicts past its last confirmed frame, and the history it keeps. */
+export const HISTORY_FRAMES = 120;
+
+/**
+ * The server repeats a player's last input for at most this many frames (250 ms) before it substitutes neutral (§15);
+ * the client predicts its own missing inputs the same way.
+ */
+export const HELD_INPUT_FRAMES = 15;
+
+/**
+ * What the server confirmed (the protocol's frame bundle, structurally): the input pairs it applied for the frames
+ * ending with `frame`, oldest first, and either the state after `frame` as a snapshot or its `hashState`.
+ */
+export interface ConfirmedFrames {
+  readonly frame: number;
+  readonly inputs: readonly (readonly [number, number])[];
+  /** Bit `2k + p`: player `p`'s input for the k-th frame was substituted by the server. */
+  readonly substituted?: number;
+  readonly snapshot?: unknown;
+  readonly hash?: string;
+}
+
+export interface DuelNetStats {
+  /** Restores caused by a confirmed input that differed from the one the prediction used. */
+  corrections: number;
+  /** Frames stepped again by those corrections and by snapshot restores. */
+  replayedFrames: number;
+  /** The longest single replay, in frames. */
+  deepestReplay: number;
+  /** Server hashes compared with the client's own state at the same frame. */
+  hashChecks: number;
+  /** Comparisons that differed. */
+  desyncs: number;
+  /** Times the timeline was restored from a server snapshot (after a desync, a gap or a resync). */
+  snapshotRestores: number;
+  /** Frames whose input the server substituted, per player. */
+  substitutedFrames: [number, number];
+}
+
+interface Check {
+  readonly hash: string;
+  readonly snapshot: unknown;
+}
+
+const samePair = (a: DuelInputs | undefined, b: DuelInputs | undefined) => a !== undefined && b !== undefined && a[0] === b[0] && a[1] === b[1];
+
+/**
+ * The client's side of §15's server-authoritative prediction and rollback, for one duel and one local player. It is
+ * pure: it keeps plain duel states and inputs, steps them with the shared `stepDuel`, and never reads a clock.
+ *
+ * - Prediction: each frame past the last confirmed one is stepped with the local player's own input for it (as sent;
+ *   a missing one repeats the last for up to HELD_INPUT_FRAMES, like the server) and the opponent's last confirmed
+ *   input repeated.
+ * - Confirmation: `applyBundle` records the input pairs the server applied. When one differs from the pair a frame
+ *   was predicted with, the last confirmed state is restored and every frame since is stepped again: confirmed frames
+ *   with the server's inputs (never the client's own record of what it sent), later frames with local and predicted
+ *   inputs. Each such restore counts as a correction.
+ * - Desync detection: at every bundle's frame, once the client has stepped it from confirmed inputs, the hash of its
+ *   own state is compared with the server's, before anything is restored. A mismatch is counted, and the server's
+ *   snapshot (every second bundle) replaces the client's state.
+ * - A gap in the confirmed frames (a rejoin) waits for the next snapshot and restarts from it.
+ *
+ * States, used inputs and local inputs are kept for about HISTORY_FRAMES; prediction stops that far past the last
+ * confirmed frame until the server is heard from again.
+ */
+export class DuelRollback {
+  readonly stats: DuelNetStats = {
+    corrections: 0,
+    replayedFrames: 0,
+    deepestReplay: 0,
+    hashChecks: 0,
+    desyncs: 0,
+    snapshotRestores: 0,
+    substitutedFrames: [0, 0],
+  };
+
+  private readonly states = new Map<number, DuelState>();
+  private readonly used = new Map<number, DuelInputs>();
+  private readonly confirmed = new Map<number, DuelInputs>();
+  private readonly local = new Map<number, number>();
+  private readonly checks = new Map<number, Check>();
+  private readonly feed = new DuelEventFeed();
+  private head: number;
+  private confirmedThrough: number;
+  /** The newest frame the server has confirmed inputs for (possibly ahead of `head`). */
+  private receivedThrough: number;
+  private lastConfirmed: DuelInputs = [0, 0];
+  private latestSnapshot: { frame: number; snapshot: unknown } | undefined;
+  private awaitingSnapshot = false;
+
+  constructor(
+    private readonly config: DuelConfig,
+    readonly player: PlayerIndex,
+    initial: DuelState,
+    private readonly historyFrames = HISTORY_FRAMES,
+  ) {
+    this.head = initial.frame;
+    this.confirmedThrough = initial.frame;
+    this.receivedThrough = initial.frame;
+    this.states.set(initial.frame, initial);
+  }
+
+  /** The newest simulated frame (predicted past `confirmedFrame`). */
+  get frame(): number {
+    return this.head;
+  }
+
+  /** The predicted state at `frame`: what the view draws. */
+  get state(): DuelState {
+    return this.states.get(this.head)!;
+  }
+
+  /** The newest frame stepped from confirmed inputs only. */
+  get confirmedFrame(): number {
+    return this.confirmedThrough;
+  }
+
+  /** The state at `confirmedFrame`: the server's, unless a desync is waiting for its snapshot. */
+  get confirmedState(): DuelState {
+    return this.states.get(this.confirmedThrough)!;
+  }
+
+  /** True while a gap in the server's frames waits for a snapshot to restart from. */
+  get waitingForSnapshot(): boolean {
+    return this.awaitingSnapshot;
+  }
+
+  /** The newest frame the server has sent the applied inputs for (the last bundle's frame, unless one is missing). */
+  get receivedFrame(): number {
+    return this.receivedThrough;
+  }
+
+  /**
+   * Whether `step` can go on: prediction stops HISTORY_FRAMES past the last confirmed frame, and at a frame that ended
+   * the duel (a KO, a double KO or the clock), since nothing is predicted past the end. A correction that takes a
+   * predicted end back lets it go on; a confirmed end is the last frame.
+   */
+  get canStep(): boolean {
+    return this.head < this.confirmedThrough + this.historyFrames && this.state.result === null;
+  }
+
+  /** The state stepped for `frame` on the current timeline, while it is in the history. */
+  stateAt(frame: number): DuelState | undefined {
+    return this.states.get(frame);
+  }
+
+  /** The newest snapshot the server sent, if any. */
+  get snapshot(): { readonly frame: number; readonly snapshot: unknown } | undefined {
+    return this.latestSnapshot;
+  }
+
+  /** The local player's input for `frame`, as the caller tagged it (after the input delay). */
+  setLocalInput(frame: number, bits: number): void {
+    this.local.set(frame, sanitizeDuelInput(bits));
+  }
+
+  localInput(frame: number): number | undefined {
+    return this.local.get(frame);
+  }
+
+  /** The input pair the frame was (or will be) stepped with: the server's when confirmed, a prediction otherwise. */
+  inputsFor(frame: number): DuelInputs {
+    const confirmed = this.confirmed.get(frame);
+    if (confirmed !== undefined) return confirmed;
+    let own = 0;
+    for (let back = frame; back >= frame - HELD_INPUT_FRAMES; back--) {
+      const bits = this.local.get(back);
+      if (bits !== undefined) {
+        own = bits;
+        break;
+      }
+    }
+    const opponent = this.lastConfirmed[this.player === 0 ? 1 : 0];
+    return this.player === 0 ? [own, opponent] : [opponent, own];
+  }
+
+  /** Steps one frame past `frame`. False when prediction has reached its limit. */
+  step(): boolean {
+    if (!this.canStep) return false;
+    this.simulate(this.head + 1);
+    this.head++;
+    this.fold();
+    return true;
+  }
+
+  /** Steps until `frame` (or the prediction limit); returns the frames stepped. */
+  stepTo(frame: number): number {
+    let stepped = 0;
+    while (this.head < frame && this.step()) stepped++;
+    return stepped;
+  }
+
+  /** Takes one frame bundle from the server. */
+  applyBundle(bundle: ConfirmedFrames): void {
+    const first = bundle.frame - bundle.inputs.length + 1;
+    const serverHash = bundle.hash ?? (bundle.snapshot === undefined ? undefined : hashState(bundle.snapshot));
+    if (bundle.snapshot !== undefined) this.latestSnapshot = { frame: bundle.frame, snapshot: bundle.snapshot };
+
+    if (this.awaitingSnapshot || first > this.receivedThrough + 1) {
+      // Frames are missing (the connection was replaced): nothing can be confirmed until a snapshot restarts it.
+      this.awaitingSnapshot = true;
+      if (bundle.snapshot !== undefined) this.restartFrom(bundle.frame, bundle.snapshot, bundle.inputs.at(-1));
+      return;
+    }
+
+    bundle.inputs.forEach((pair, index) => {
+      const frame = first + index;
+      for (const player of [0, 1] as const) if (((bundle.substituted ?? 0) >> (2 * index + player)) & 1) this.stats.substitutedFrames[player]++;
+      if (frame <= this.receivedThrough) return;
+      const clean: DuelInputs = [sanitizeDuelInput(pair[0]), sanitizeDuelInput(pair[1])];
+      this.confirmed.set(frame, clean);
+      this.receivedThrough = frame;
+      this.lastConfirmed = clean;
+    });
+
+    // The earliest simulated frame whose confirmed inputs differ from the ones it was predicted with.
+    for (let frame = this.confirmedThrough + 1; frame <= Math.min(this.head, this.receivedThrough); frame++) {
+      if (!samePair(this.used.get(frame), this.confirmed.get(frame))) {
+        this.stats.corrections++;
+        this.replayFrom(this.confirmedThrough);
+        break;
+      }
+    }
+
+    if (serverHash !== undefined && bundle.frame >= this.confirmedThrough - this.historyFrames) {
+      this.checks.set(bundle.frame, { hash: serverHash, snapshot: bundle.snapshot });
+      // A check for a frame already confirmed (a snapshot sent on joining) runs now; the others as frames confirm.
+      if (bundle.frame < this.confirmedThrough) this.runCheck(bundle.frame);
+    }
+    this.fold();
+  }
+
+  /**
+   * Restarts from the newest server snapshot (after a stall, or a hidden tab), then steps back up to the frame the
+   * client had reached. False when no snapshot has arrived yet.
+   */
+  resync(): boolean {
+    const latest = this.latestSnapshot;
+    if (latest === undefined) return false;
+    this.restartFrom(latest.frame, latest.snapshot, undefined);
+    return true;
+  }
+
+  /** The events of newly simulated frames, each reported once whatever rollback re-simulates. */
+  drainEvents(): DuelFeedEvent[] {
+    return this.feed.drain();
+  }
+
+  /** Steps frame `frame` from the stored state before it, with `inputsFor(frame)`. */
+  private simulate(frame: number): void {
+    const inputs = this.inputsFor(frame);
+    const state = stepDuel(this.config, this.states.get(frame - 1)!, inputs);
+    this.states.set(frame, state);
+    this.used.set(frame, inputs);
+    this.feed.observe(state);
+  }
+
+  /** Steps every frame after `from` up to the head again, from the stored state at `from`. */
+  private replayFrom(from: number): void {
+    const frames = this.head - from;
+    for (let frame = from + 1; frame <= this.head; frame++) this.simulate(frame);
+    this.stats.replayedFrames += frames;
+    this.stats.deepestReplay = Math.max(this.stats.deepestReplay, frames);
+  }
+
+  /**
+   * Advances the confirmed frame over every simulated frame that was stepped with confirmed inputs, comparing the
+   * client's own state with the server's hash wherever one is due, before any snapshot replaces it.
+   */
+  private fold(): void {
+    for (;;) {
+      this.runCheck(this.confirmedThrough);
+      const next = this.confirmedThrough + 1;
+      if (next > this.head || !samePair(this.used.get(next), this.confirmed.get(next))) break;
+      this.confirmedThrough = next;
+    }
+    this.prune();
+  }
+
+  private runCheck(frame: number): void {
+    const check = this.checks.get(frame);
+    const own = this.states.get(frame);
+    if (check === undefined || own === undefined) return;
+    this.checks.delete(frame);
+    this.stats.hashChecks++;
+    if (hashState(own) === check.hash) return;
+    this.stats.desyncs++;
+    if (check.snapshot === undefined) return;
+    // The server's state is the authority: restart from it and predict forward again.
+    this.states.set(frame, restoreDuel(this.config, check.snapshot));
+    this.stats.snapshotRestores++;
+    this.replayFrom(frame);
+  }
+
+  /** Discards the timeline and restarts from a server snapshot at `frame`, keeping the local inputs. */
+  private restartFrom(frame: number, snapshot: unknown, lastPair: readonly [number, number] | undefined): void {
+    const restored = restoreDuel(this.config, snapshot);
+    const previousHead = this.head;
+    this.states.clear();
+    this.used.clear();
+    // Confirmed inputs after the snapshot stay only while they follow it without a hole.
+    let next = frame + 1;
+    while (this.confirmed.has(next)) next++;
+    for (const key of [...this.confirmed.keys()]) if (key <= frame || key >= next) this.confirmed.delete(key);
+    for (const key of [...this.checks.keys()]) if (key <= frame) this.checks.delete(key);
+    this.states.set(frame, restored);
+    this.head = frame;
+    this.confirmedThrough = frame;
+    this.receivedThrough = next - 1;
+    if (lastPair !== undefined) this.lastConfirmed = [sanitizeDuelInput(lastPair[0]), sanitizeDuelInput(lastPair[1])];
+    this.awaitingSnapshot = false;
+    this.stats.snapshotRestores++;
+    const target = Math.min(previousHead, frame + this.historyFrames);
+    const stepped = this.stepTo(target);
+    this.stats.replayedFrames += stepped;
+    this.stats.deepestReplay = Math.max(this.stats.deepestReplay, stepped);
+  }
+
+  private prune(): void {
+    const keepFrom = Math.min(this.confirmedThrough, this.head - this.historyFrames);
+    for (const map of [this.states, this.used] as const) for (const key of map.keys()) if (key < keepFrom) map.delete(key);
+    const inputsFrom = this.confirmedThrough - this.historyFrames;
+    for (const map of [this.confirmed, this.local] as const) for (const key of map.keys()) if (key < inputsFrom) map.delete(key);
+    for (const key of this.checks.keys()) if (key < inputsFrom) this.checks.delete(key);
+    this.feed.prune(inputsFrom);
+  }
+}

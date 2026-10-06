@@ -1,0 +1,186 @@
+import { isNavigable, type Dock, type ShipTuning } from "@pirate-sea-race/content";
+import type { SimulationConfig } from "./config.js";
+import { divTrunc } from "./fixed.js";
+import { HEADING_DX, HEADING_DY, HEADING_SCALE, normalizeHeading } from "./heading.js";
+import { AXIS_SCALE, INTERACT_BUTTON, sanitizeInput, type PlayerInput } from "./input.js";
+import { NOT_DOCKED, tileCentre, WORLD_STEP_INTERVAL, type MatchState, type ShipState } from "./state.js";
+
+/** Held inputs by ship id; a ship without an entry is neutral. */
+export type StepInputs = Readonly<Record<string, PlayerInput>>;
+
+export function isWorldStep(frame: number): boolean {
+  return frame % WORLD_STEP_INTERVAL === 0;
+}
+
+/**
+ * Advances the match clock by one 60 Hz step and returns the new state. World logic (sailing) runs only when the new
+ * frame is a multiple of WORLD_STEP_INTERVAL. The input state is never mutated.
+ */
+export function step(config: SimulationConfig, state: MatchState, inputs: StepInputs): MatchState {
+  const frame = state.frame + 1;
+  if (!isWorldStep(frame)) return { ...state, frame };
+  return {
+    ...state,
+    frame,
+    worldTick: state.worldTick + 1,
+    ships: state.ships.map((ship) => sail(config, ship, sanitizeInput(inputs[ship.id]))),
+  };
+}
+
+/**
+ * One world step of one ship (§3). The throttle (`-moveY`) accelerates, brakes or reverses; `moveX` turns the
+ * heading; the ship then moves along its heading and stops or slides against land, shoals and the map edge.
+ *
+ * Docking: interact at low speed near a dock moors the ship there (at the dock tile's centre, speed 0), if its hull
+ * could sail straight there. The throttle does not matter, so a ship driven into its dock with ahead still held (and
+ * stopped against the shore) docks too. A moored ship stays put while interact is held, without throttle, or while
+ * the throttle it moored with is still held; releasing that throttle and then any throttle (or the other direction)
+ * casts off and sails in the same step.
+ */
+export function sail(config: SimulationConfig, ship: ShipState, input: PlayerInput): ShipState {
+  const tuning = config.ship;
+  const throttle = -input.moveY;
+  const interact = (input.buttons & INTERACT_BUTTON) !== 0;
+  const direction = Math.sign(throttle);
+  let dock = ship.dock;
+  if (dock !== NOT_DOCKED) {
+    if (direction === 0 || interact || direction === ship.mooredThrottle) {
+      const mooredThrottle = direction === 0 ? 0 : ship.mooredThrottle;
+      return ship.speed === 0 && ship.mooredThrottle === mooredThrottle ? ship : { ...ship, speed: 0, mooredThrottle };
+    }
+    dock = NOT_DOCKED;
+  } else if (interact && Math.abs(ship.speed) <= tuning.dockMaxSpeed) {
+    const berth = dockInReach(config, ship.x, ship.y);
+    if (berth !== undefined) {
+      return { ...ship, ...tileCentre(config, berth.tileX, berth.tileY), speed: 0, dock: berth.id, mooredThrottle: direction };
+    }
+  }
+
+  const heading = normalizeHeading(ship.heading + Math.sign(input.moveX) * tuning.turnRate);
+  const speed = nextSpeed(tuning, ship.speed, throttle);
+  const dx = divTrunc(speed * HEADING_DX[heading]!, HEADING_SCALE);
+  const dy = divTrunc(speed * HEADING_DY[heading]!, HEADING_SCALE);
+  const x = sweepX(config, ship.x, ship.y, dx);
+  const y = sweepY(config, x, ship.y, dy);
+  // Blocked on every axis it tried to move along: the ship has run aground and stops. Blocked on one axis only, it
+  // slides along the obstacle on the other.
+  const aground = (dx !== 0 || dy !== 0) && x === ship.x && y === ship.y;
+  return { ...ship, x, y, heading, speed: aground ? 0 : speed, dock, mooredThrottle: 0 };
+}
+
+/** The speed after one world step of throttle in [-AXIS_SCALE, AXIS_SCALE] (positive forward). */
+export function nextSpeed(tuning: ShipTuning, speed: number, throttle: number): number {
+  if (throttle > 0) {
+    if (speed < 0) return Math.min(speed + tuning.braking, 0);
+    const target = divTrunc(tuning.maxSpeed * throttle, AXIS_SCALE);
+    return speed < target ? Math.min(speed + tuning.acceleration, target) : Math.max(speed - tuning.drag, target);
+  }
+  if (throttle < 0) {
+    // Down brakes a ship under way, and reverses slowly from a stop.
+    if (speed > 0) return Math.max(speed - tuning.braking, 0);
+    const target = -divTrunc(tuning.maxReverseSpeed * -throttle, AXIS_SCALE);
+    return speed > target ? Math.max(speed - tuning.reverseAcceleration, target) : Math.min(speed + tuning.drag, target);
+  }
+  return speed > 0 ? Math.max(speed - tuning.drag, 0) : Math.min(speed + tuning.drag, 0);
+}
+
+/**
+ * The nearest dock whose tile centre is within the dock radius of a position and that the hull can reach in a straight
+ * line without touching land or a shoal, or undefined. Mooring moves the ship to that centre, so without the path
+ * check it could cut a corner of land that sailing would have stopped it at.
+ */
+export function dockInReach(config: SimulationConfig, x: number, y: number): Dock | undefined {
+  const reach = config.ship.dockRadius * config.ship.dockRadius;
+  let best: Dock | undefined;
+  let bestDistance = reach + 1;
+  for (const dock of config.map.docks) {
+    const centre = tileCentre(config, dock.tileX, dock.tileY);
+    const distance = (centre.x - x) * (centre.x - x) + (centre.y - y) * (centre.y - y);
+    if (distance < bestDistance && hullPathIsClear(config, x, y, centre.x, centre.y)) {
+      best = dock;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+/**
+ * The hull is a square of `hullHalfSize` around the position. It never overlaps a blocked tile, so a move only needs
+ * to check the tile columns (or rows) its leading edge enters, in order: the first blocked one stops the hull flush
+ * against it. However fast the ship, it cannot pass through a tile, so it never tunnels.
+ */
+function sweepX(config: SimulationConfig, x: number, y: number, dx: number): number {
+  if (dx === 0) return x;
+  const size = config.map.subUnitsPerTile;
+  const half = config.ship.hullHalfSize;
+  const top = Math.floor((y - half) / size);
+  const bottom = Math.floor((y + half) / size);
+  const blocked = (column: number) => {
+    for (let row = top; row <= bottom; row++) if (!isNavigable(config.map, column, row)) return true;
+    return false;
+  };
+  if (dx > 0) {
+    const last = Math.floor((x + half + dx) / size);
+    for (let column = Math.floor((x + half) / size) + 1; column <= last; column++) {
+      if (blocked(column)) return column * size - 1 - half;
+    }
+  } else {
+    const last = Math.floor((x - half + dx) / size);
+    for (let column = Math.floor((x - half) / size) - 1; column >= last; column--) {
+      if (blocked(column)) return (column + 1) * size + half;
+    }
+  }
+  return x + dx;
+}
+
+function sweepY(config: SimulationConfig, x: number, y: number, dy: number): number {
+  if (dy === 0) return y;
+  const size = config.map.subUnitsPerTile;
+  const half = config.ship.hullHalfSize;
+  const left = Math.floor((x - half) / size);
+  const right = Math.floor((x + half) / size);
+  const blocked = (row: number) => {
+    for (let column = left; column <= right; column++) if (!isNavigable(config.map, column, row)) return true;
+    return false;
+  };
+  if (dy > 0) {
+    const last = Math.floor((y + half + dy) / size);
+    for (let row = Math.floor((y + half) / size) + 1; row <= last; row++) {
+      if (blocked(row)) return row * size - 1 - half;
+    }
+  } else {
+    const last = Math.floor((y - half + dy) / size);
+    for (let row = Math.floor((y - half) / size) - 1; row >= last; row--) {
+      if (blocked(row)) return (row + 1) * size + half;
+    }
+  }
+  return y + dy;
+}
+
+/**
+ * Whether the hull stays clear along the straight segment between two positions. It checks every position one
+ * sub-unit apart along the longer axis, so between two checks the hull moves at most one sub-unit on either axis and
+ * no tile corner can slip between them.
+ */
+export function hullPathIsClear(config: SimulationConfig, fromX: number, fromY: number, toX: number, toY: number): boolean {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy));
+  if (steps === 0) return hullIsClear(config, fromX, fromY);
+  for (let index = 0; index <= steps; index++) {
+    if (!hullIsClear(config, fromX + divTrunc(dx * index, steps), fromY + divTrunc(dy * index, steps))) return false;
+  }
+  return true;
+}
+
+/** Whether a ship's hull at (x, y) overlaps only navigable tiles. Tests use it to check the collision invariant. */
+export function hullIsClear(config: SimulationConfig, x: number, y: number): boolean {
+  const size = config.map.subUnitsPerTile;
+  const half = config.ship.hullHalfSize;
+  for (let row = Math.floor((y - half) / size); row <= Math.floor((y + half) / size); row++) {
+    for (let column = Math.floor((x - half) / size); column <= Math.floor((x + half) / size); column++) {
+      if (!isNavigable(config.map, column, row)) return false;
+    }
+  }
+  return true;
+}

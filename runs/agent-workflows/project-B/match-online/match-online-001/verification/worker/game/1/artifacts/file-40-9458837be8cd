@@ -1,0 +1,177 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { AHEAD, ImpairmentProxy, sleep, type HeadlessClient } from "@pirate-sea-race/test-tools";
+import { quickEncounters } from "./rubbingsSetup.js";
+import { CHALLENGER_SEAT, CLAIM_SEAT, collectFullSet, expectClaimSeats, FINAL, flowTuning } from "./matchFlowSetup.js";
+import { GUEST_SEAT, HOST_SEAT, placePair } from "./rubbingsSetup.js";
+import { collectAt, dockFor, grapple, HOLD_E, playersAt, roomOf, tracker, until, type Seat } from "./seaDuelSetup.js";
+
+/**
+ * §5's claim through the real room: a full-set holder stopped in the treasure circle holds E for ten seconds and wins,
+ * and each interrupt resets the channel: moving, releasing E, a grapple reservation landing on the tick the claim would
+ * complete (the reservation comes first), a type lost to that duel, and a disconnect. After the win nothing changes.
+ * The claim's own ten seconds; one-second collections and quick duels (test-only).
+ */
+const CHANNEL = claimRules.channelTicks;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  // A duel's winner is protected for 20 s, so starting the claim is what ends that protection.
+  const matchTuning = flowTuning({ encounters: { ...quickEncounters, winProtectionTicks: 400 }, claim: { ...claimRules, deadlineTicks: 2400 } });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+/** Somewhere well away from the final island for the other player to wait. */
+const ASIDE: Seat = { tileX: CHALLENGER_SEAT.tileX, tileY: CHALLENGER_SEAT.tileY + 4 * Math.sign(CHALLENGER_SEAT.tileY - CLAIM_SEAT.tileY), heading: CHALLENGER_SEAT.heading };
+
+/** Puts a full-set holder on the claim tile and has it hold E (as a player does, refreshing the key) until `until`. */
+function holdClaim(client: HeadlessClient, until: () => boolean, timeoutMs = 15_000): Promise<void> {
+  return client.holdUntil(HOLD_E, until, timeoutMs);
+}
+
+const channelOf = (client: HeadlessClient) => roomOf(client).claimState?.channel ?? null;
+
+describe.concurrent("the claim (§5)", () => {
+  it("wins for a full-set holder stopped in the circle holding E for ten seconds, ends its protection, and ignores every input after the win", async ({ onTestFinished }) => {
+    expectClaimSeats();
+    const track = tracker(onTestFinished);
+    // The guest never readies its arena: it forfeits the duel.
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { clients: [{}, { autoReady: false }] })) as [HeadlessClient, HeadlessClient];
+    // The host completes its set by stealing the guest's Moon, and comes out of the duel protected.
+    await collectAt(host, endpoint, dockFor("sun"), "sun");
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => host.objectives()!.theftOptions.join(",") === "moon", 10_000);
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "sun,moon" && host.status()!.mode === "sea", 5000);
+    await guest.waitFor(() => guest.status()!.mode === "sea", 8000);
+    await host.placeShip(endpoint, CLAIM_SEAT);
+    await guest.placeShip(endpoint, CHALLENGER_SEAT);
+    expect(host.status()!.protection).toBe("win");
+    const room = roomOf(host);
+    let startTick = -1;
+    const holding = holdClaim(host, () => {
+      startTick = channelOf(host)?.startTick ?? startTick;
+      return host.results() !== undefined;
+    });
+    // The channel shows in the holder's status, and on its ship for whoever sees it.
+    await host.waitFor(() => host.claimView()?.claim === "channel");
+    await guest.waitFor(() => guest.ship(host.sessionId)?.x !== undefined && guest.room.state.ships.get(host.sessionId)?.claiming === true);
+    // Starting the claim ended the departure's protection (§6), on the next tick.
+    await host.waitFor(() => host.status()!.protection === "");
+    await holding;
+    const results = host.results()!;
+    expect(results).toMatchObject({ reason: "claim", winnerSeat: host.seat });
+    expect(results.tick - startTick).toBe(CHANNEL);
+    expect(room.claimState!.result).toEqual({ reason: "claim", winner: host.sessionId, tick: results.tick });
+    await guest.waitFor(() => guest.results()?.winnerSeat === host.seat);
+
+    // After the win, inputs change nothing: no ship moves, no grapple, no hold, and the outcome stands.
+    const frozen = { flow: room.flowState, ledger: room.ledgerState, ships: room.matchState.ships.map((ship) => ({ ...ship })) };
+    await Promise.all([host.hold(AHEAD, 500), guest.hold({ moveX: 1, moveY: -1 }, 500)]);
+    guest.tapGrapple();
+    await sleep(300);
+    expect(room.flowState).toBe(frozen.flow);
+    expect(room.ledgerState).toBe(frozen.ledger);
+    expect(room.matchState.ships.map(({ id, x, y, speed }) => ({ id, x, y, speed }))).toEqual(frozen.ships.map(({ id, x, y, speed }) => ({ id, x, y, speed })));
+    expect(room.encounterState.attempts).toEqual([]);
+    expect(host.results()).toEqual(results);
+  }, 40_000);
+
+  it("resets the channel to zero when the holder moves or releases E, and starts it again from zero", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host] = (await playersAt(endpoint, [CLAIM_SEAT, ASIDE], track)) as [HeadlessClient];
+    await collectFullSet(host, endpoint);
+    await host.placeShip(endpoint, CLAIM_SEAT);
+    // Moving: ahead with E still held.
+    await holdClaim(host, () => (channelOf(host)?.progress ?? 0) >= 20);
+    await host.waitFor(() => host.claimView()!.claimHeld > 0);
+    await host.holdUntil({ ...AHEAD, buttons: HOLD_E.buttons }, () => host.claimView()!.claimInterrupt === "moved", 3000);
+    expect(host.claimView()).toMatchObject({ claim: "", claimHeld: 0, claimInterrupt: "moved" });
+    expect(channelOf(host)).toBeNull();
+    // Releasing E: back on the tile, the channel starts from zero and resets when E goes up.
+    await host.placeShip(endpoint, CLAIM_SEAT);
+    const back = host.worldTick;
+    await holdClaim(host, () => (channelOf(host)?.progress ?? 0) >= 10);
+    expect(channelOf(host)!.startTick).toBeGreaterThan(back - 1);
+    await host.waitFor(() => host.claimView()!.claimInterrupt === "released", 3000);
+    expect(host.claimView()).toMatchObject({ claim: "", claimHeld: 0 });
+    expect(host.results()).toBeUndefined();
+  }, 30_000);
+
+  it("lets a rival's grapple landing on the completion tick stop the claim, and the type the duel takes keeps the loser from claiming again", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // The holder never readies its arena: it forfeits the duel.
+    const [holder, rival] = (await playersAt(endpoint, [CLAIM_SEAT, CHALLENGER_SEAT], track, { clients: [{ autoReady: false }, {}] })) as [HeadlessClient, HeadlessClient];
+    await collectFullSet(holder, endpoint);
+    await holder.placeShip(endpoint, CLAIM_SEAT);
+    await rival.placeShip(endpoint, CHALLENGER_SEAT);
+    const room = roomOf(holder);
+    const windup = quickEncounters.grapple.windupTicks;
+    const holding = holdClaim(holder, () => holder.status()?.mode === "duel", 20_000);
+    await until(() => channelOf(holder) !== null, 5000, "the channel");
+    const start = channelOf(holder)!.startTick;
+    // The clock stops after the tick from which a grapple pressed now lands on the claim's completion tick.
+    const completion = start + CHANNEL;
+    room.pauseAfterTick(completion - windup - 1);
+    await until(() => room.worldPaused, 12_000, "the pause");
+    rival.tapGrapple();
+    await sleep(250);
+    room.resumeWorld();
+    await holding;
+    // The reservation came first: the channel reset on its completion tick, and nobody won.
+    await until(() => room.encounterState.duels.length === 1, 3000, "the reservation");
+    expect(room.encounterState.duels[0]!.reservedTick).toBe(completion);
+    expect(room.claimState!.result).toBeNull();
+    await holder.waitFor(() => holder.claimView()!.claimInterrupt === "duel");
+    expect(holder.claimView()!.claimInterruptAt).toBe(completion);
+    expect(holder.results()).toBeUndefined();
+
+    // The rival wins by forfeit and takes a type: the holder's set is broken.
+    await rival.waitFor(() => rival.objectives()!.theftOptions.length > 0, 10_000);
+    rival.chooseTheft("sun");
+    await holder.waitFor(() => holder.rubbings().join(",") === "moon", 5000);
+    await holder.waitFor(() => holder.claimView()!.fullSet === false && holder.claimView()!.routeActive === false);
+    // Back on the claim tile holding E, it cannot claim: no channel starts.
+    await holder.waitFor(() => holder.status()?.mode === "sea", 8000);
+    await holder.placeShip(endpoint, CLAIM_SEAT);
+    await holder.hold(HOLD_E, 800);
+    expect(channelOf(holder)).toBeNull();
+    expect(holder.claimView()!.claim).toBe("");
+    expect(room.flowState.end).toBeNull();
+  }, 45_000);
+
+  it("resets the channel when the holder's connection drops", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    const [host] = (await playersAt(endpoint, [CLAIM_SEAT, ASIDE], track, { endpoints: [proxy.endpoint, endpoint] })) as [HeadlessClient];
+    // The SDK reconnects only a room it joined at least five seconds ago.
+    const reconnectable = Date.now() + 5500;
+    await collectFullSet(host, endpoint);
+    await host.placeShip(endpoint, CLAIM_SEAT);
+    await sleep(Math.max(0, reconnectable - Date.now() - 1000));
+    const room = roomOf(host);
+    const holding = host.hold(HOLD_E, 3000);
+    await until(() => (channelOf(host)?.progress ?? 0) >= 20, 5000, "the channel under way");
+    proxy.sever({ refuse: true });
+    await holding;
+    await until(() => channelOf(host) === null, 3000, "the reset");
+    const status = room.state.status.get(host.sessionId)!;
+    expect(status.claimInterrupt).toBe("disconnected");
+    expect(room.claimState!.result).toBeNull();
+    // Back within the seat's reservation, the player reads why the channel reset.
+    await sleep(500);
+    proxy.restore();
+    await host.waitFor(() => host.connected && host.claimView()?.claimInterrupt === "disconnected", 12_000);
+    expect(host.claimView()).toMatchObject({ claim: "", claimHeld: 0, routeX: FINAL.claimPoint.x });
+  }, 45_000);
+});

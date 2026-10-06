@@ -1,0 +1,437 @@
+import { describe, expect, it } from "vitest";
+import { canonicalize } from "../hash.js";
+import { nextInt } from "../random.js";
+import {
+  canAct,
+  createDuelInputLog,
+  createDuelState,
+  defaultDuelConfig as config,
+  duelInput as I,
+  fighterTells,
+  hashState,
+  KIT_IDS,
+  mirrorDuelInput,
+  replayDuel,
+  restoreDuel,
+  sliceDuelInputLog,
+  snapshotDuel,
+  traceDuel,
+  type DuelEvent,
+  type DuelInputs,
+  type DuelState,
+  type FighterState,
+  type KitId,
+} from "./index.js";
+
+const { rules, arena } = config.moveset;
+const U = I("special1");
+const SPECIAL2 = I("special2");
+const LIGHT = I("light");
+const HEAVY = I("heavy");
+
+function duel(kits: readonly [KitId, KitId], x0: number, x1: number): DuelState {
+  return createDuelState(config, { x: [x0, x1], kits });
+}
+
+function hold(frames: number, p1 = 0, p2 = 0): DuelInputs[] {
+  return Array.from({ length: frames }, () => [p1, p2] as const);
+}
+
+/** `frames` of neutral input with the given presses: `[frame, p1, p2]` (frames count from 1). */
+function presses(frames: number, ...at: readonly (readonly [number, number, number])[]): DuelInputs[] {
+  const inputs = hold(frames);
+  for (const [frame, p1, p2] of at) inputs[frame - 1] = [p1, p2];
+  return inputs;
+}
+
+function run(state: DuelState, inputs: readonly DuelInputs[]): DuelState[] {
+  return traceDuel(config, state, inputs);
+}
+
+function events(trace: readonly DuelState[]): string[] {
+  return trace.flatMap((state) => state.events.map((event) => `${state.frame} ${event.kind} ${event.attacker} ${event.moveId}`));
+}
+
+/** The pairs of §9's slice: every fruit against the Duelist, the fruits against each other, and the fruit mirrors. */
+const PAIRS: readonly (readonly [KitId, KitId])[] = [
+  ["duelist", "ember"],
+  ["duelist", "smoke"],
+  ["ember", "smoke"],
+  ["ember", "ember"],
+  ["smoke", "smoke"],
+];
+
+describe("Duelist vs Ember", () => {
+  it("Ember controls space where the Duelist has limited long-range pressure", () => {
+    // 250 px apart, both use U: the advancing thrust falls short and runs into the flame bolt.
+    const trace = run(duel(["duelist", "ember"], 3000, 7000), presses(90, [1, U, U]));
+    expect(events(trace)).toEqual([expect.stringMatching(/^\d+ hit 1 flame-bolt$/)]);
+  });
+
+  it("Ember's long recovery is punished when a jump clears the bolt", () => {
+    const trace = run(duel(["duelist", "ember"], 4000, 6560), presses(80, [1, 0, U], [5, I("up", "right"), 0], [45, HEAVY, 0]));
+    expect(events(trace)).toEqual(["64 hit 0 heavy-mid"]);
+  });
+
+  it("the Duelist's reliable close combat: a jab beats the bolt's 22-frame startup up close", () => {
+    const trace = run(duel(["duelist", "ember"], 5000, 5700), presses(40, [1, LIGHT, U]));
+    expect(events(trace)).toEqual(["8 hit 0 jab"]);
+    expect(trace.every((state) => state.fighters[1].bolt === null)).toBe(true);
+  });
+
+  it("a whiffed rising flare is punished by a Duelist heavy", () => {
+    const inputs = presses(80, [1, 0, SPECIAL2]);
+    for (let frame = 16; frame <= 22; frame++) inputs[frame - 1] = [I("right"), 0];
+    inputs[22] = [HEAVY, 0];
+    expect(events(run(duel(["duelist", "ember"], 4000, 5600), inputs))).toEqual(["41 hit 0 heavy-mid"]);
+  });
+});
+
+describe("Duelist vs Smoke", () => {
+  it("Smoke changes spacing: the feint passes through a heavy, then cancels into a jab that punishes it", () => {
+    // The Duelist's heavy is active on frames 19-22; the feint, started on frame 13, is invulnerable until frame 22.
+    const trace = run(duel(["smoke", "duelist"], 4400, 6000), presses(60, [1, 0, HEAVY], [13, U, 0], [37, LIGHT, 0]));
+    expect(events(trace)).toEqual(["44 hit 0 jab"]);
+    expect(trace[43]!.fighters[1]).toMatchObject({ action: "attack", moveId: "heavy-mid" });
+  });
+
+  it("Smoke obscures its intent inside its screen, but not its position, health or active hitboxes", () => {
+    const trace = run(duel(["smoke", "duelist"], 3000, 3600), presses(50, [1, SPECIAL2, 0], [35, LIGHT, 0]));
+    expect(fighterTells(config, trace[36]!.fighters[0])).toMatchObject({ obscured: true, startingUp: true, x: 3000, health: 1000 });
+    expect(fighterTells(config, trace[42]!.fighters[0]).activeHitbox).not.toBeNull();
+  });
+
+  it("Smoke's reappearance is readable: the Duelist's jab lands in it; Smoke's specials never deal damage", () => {
+    // The feint ends 30 px from the Duelist, who presses J on the reappearance's first frame.
+    const trace = run(duel(["smoke", "duelist"], 4000, 5600), presses(40, [1, U, 0], [13, 0, LIGHT]));
+    expect(events(trace)).toEqual(["20 hit 1 jab"]);
+    expect(trace[19]!.fighters[0]).toMatchObject({ moveId: "feint-dash", actionFrame: 19 });
+    expect(trace.every((state) => state.fighters[1].health === 1000)).toBe(true);
+  });
+
+  it("the Duelist's limited long-range pressure: it cannot reach a Smoke that holds range, and its whiffed thrust is punished", () => {
+    // The Duelist walks in while Smoke walks back, then lunges with the advancing thrust, its farthest-reaching move.
+    const walked: DuelInputs[] = [...hold(30, I("left"), I("left")), [0, U], ...hold(59)];
+    const kept = run(duel(["smoke", "duelist"], 4000, 7200), walked);
+    expect(events(kept)).toEqual([]);
+    // Smoke kept the gap above 180 px through the walk.
+    expect(kept[30]!.fighters[1].x - kept[30]!.fighters[0].x).toBeGreaterThan(180 * arena.subPixelsPerPixel);
+    expect(kept.every((state) => state.fighters[0].health === 1000)).toBe(true);
+    // Standing 200 px away is enough: the thrust whiffs and the Duelist ends it 128 px short, still recovering.
+    const whiffed = run(duel(["smoke", "duelist"], 4000, 7200), presses(60, [1, 0, U]));
+    expect(events(whiffed)).toEqual([]);
+    expect(whiffed[44]!.fighters[1]).toMatchObject({ action: "attack", moveId: "advancing-thrust", x: 6048 });
+    // Smoke feints in during the thrust and cancels into a jab that lands on its last recovery frame.
+    const punished = run(duel(["smoke", "duelist"], 4000, 7200), presses(60, [1, 0, U], [13, U, 0], [37, LIGHT, 0]));
+    expect(events(punished)).toEqual(["44 hit 0 jab"]);
+    expect(punished[43]!.fighters[1]).toMatchObject({ action: "attack", moveId: "advancing-thrust" });
+  });
+
+  it("the Duelist's reliable close combat: the counter slash goes through Smoke's jab", () => {
+    const trace = run(duel(["smoke", "duelist"], 5000, 5600), presses(40, [1, LIGHT, 0], [3, 0, SPECIAL2]));
+    expect(events(trace)).toEqual(["11 hit 1 counter-slash"]);
+  });
+});
+
+describe("Ember vs Smoke", () => {
+  it("Ember controls space: the bolt hits Smoke at range, which has no projectile to answer", () => {
+    const trace = run(duel(["smoke", "ember"], 3000, 7000), presses(90, [1, 0, U]));
+    expect(events(trace)).toEqual([expect.stringMatching(/^\d+ hit 1 flame-bolt$/)]);
+  });
+
+  it("Smoke feints through the bolt and punishes the Ember's long recovery", () => {
+    // Timed so the bolt passes inside the feint's invulnerable dash; the jab lands on frame 63, the Ember recovers on 65.
+    const trace = run(duel(["smoke", "ember"], 4000, 6400), presses(100, [1, 0, U], [32, U, 0], [56, LIGHT, 0]));
+    expect(events(trace)).toEqual(["63 hit 0 jab"]);
+    expect(canAct(trace[62]!.fighters[1])).toBe(false);
+    // A feint started two frames earlier leaves the reappearance inside the bolt.
+    expect(events(run(duel(["smoke", "ember"], 4000, 6400), presses(100, [1, 0, U], [30, U, 0])))).toEqual(["40 hit 1 flame-bolt"]);
+  });
+
+  it("Smoke's readable reappearance is punished by the rising flare", () => {
+    const trace = run(duel(["smoke", "ember"], 4000, 6000), presses(80, [1, U, 0], [13, 0, SPECIAL2]));
+    expect(events(trace)).toEqual(["22 hit 1 rising-flare"]);
+    expect(fighterTells(config, trace[21]!.fighters[0]).reappearing).toBe(true);
+  });
+});
+
+describe("Ember vs Ember", () => {
+  it("bolts cancel each other: neither controls the space alone", () => {
+    const trace = run(duel(["ember", "ember"], 3000, 7000), presses(120, [1, U, U]));
+    expect(events(trace)).toEqual([]);
+    expect(trace[120]!.fighters.map((fighter) => fighter.bolt)).toEqual([null, null]);
+  });
+
+  it("the rising flare punishes a jump; a whiffed flare is punished in turn", () => {
+    expect(events(run(duel(["ember", "ember"], 4000, 6400), presses(60, [1, I("up", "right"), 0], [12, 0, SPECIAL2])))).toEqual(["24 hit 1 rising-flare"]);
+    const inputs = presses(80, [1, 0, SPECIAL2]);
+    for (let frame = 16; frame <= 22; frame++) inputs[frame - 1] = [I("right"), 0];
+    inputs[22] = [HEAVY, 0];
+    expect(events(run(duel(["ember", "ember"], 4000, 5600), inputs))).toEqual(["41 hit 0 heavy-mid"]);
+  });
+});
+
+describe("Smoke vs Smoke", () => {
+  it("a feint cancelled into a jab reaches from outside jab range; its reappearance is punished by the other's jab", () => {
+    expect(events(run(duel(["smoke", "smoke"], 4000, 6000), presses(50, [1, U, 0], [25, LIGHT, 0])))).toEqual(["32 hit 0 jab"]);
+    expect(events(run(duel(["smoke", "smoke"], 4000, 5600), presses(40, [1, U, 0], [13, 0, LIGHT])))).toEqual(["20 hit 1 jab"]);
+  });
+
+  it("two screens mark both fighters, and neither deals damage", () => {
+    const trace = run(duel(["smoke", "smoke"], 4000, 5600), presses(60, [1, SPECIAL2, SPECIAL2]));
+    expect(trace[13]!.fighters.map((fighter) => [fighter.obscured, fighter.zone !== null])).toEqual([
+      [true, true],
+      [true, true],
+    ]);
+    expect(events(trace)).toEqual([]);
+  });
+});
+
+/**
+ * A seeded random fight for kits: movement and guard (back, down-back), normals, and each kit's specials often enough
+ * that bolts fly, screens stand and feints are cancelled.
+ */
+function randomKitInputs(seed: number, frames: number): DuelInputs[] {
+  let rng = seed;
+  const draw = (bound: number) => {
+    const drawn = nextInt(rng, bound);
+    rng = drawn.state;
+    return drawn.value;
+  };
+  const held = [0, 0];
+  const left = [0, 0];
+  const inputs: DuelInputs[] = [];
+  for (let frame = 0; frame < frames; frame++) {
+    for (const player of [0, 1] as const) {
+      if (left[player] === 0) {
+        const back = player === 0 ? I("left") : I("right");
+        const forward = player === 0 ? I("right") : I("left");
+        const moves = [0, back, back, back | I("down"), forward, forward, forward, I("down"), I("up"), I("up") | forward, I("up") | back, I("dash"), back | I("dash")];
+        const attacks = [LIGHT, LIGHT, HEAVY, I("down", "heavy"), forward | HEAVY, I("down", "light"), U, U, SPECIAL2, SPECIAL2, I("light", "heavy")];
+        const attack = draw(100) < 25;
+        held[player] = attack ? attacks[draw(attacks.length)]! : moves[draw(moves.length)]!;
+        left[player] = attack ? 1 + draw(2) : 1 + draw(20);
+      }
+      left[player]!--;
+    }
+    inputs.push([held[0]!, held[1]!]);
+  }
+  return inputs;
+}
+
+const PROPERTY_FRAMES = 2400;
+
+/** The moves every kit shares: all the commands but the Duelist's specials. */
+const { special1: _special1, special2: _special2, ...normalCommands } = config.moveset.commands;
+const NORMALS = Object.values(normalCommands);
+
+/** What the step must keep true on every frame (§7, §9). */
+function checkInvariants(state: DuelState): void {
+  for (const fighter of state.fighters) {
+    const kit = config.moveset.kits[fighter.kit];
+    expect(fighter.health).toBeGreaterThanOrEqual(0);
+    expect(fighter.health).toBeLessThanOrEqual(rules.maxHealth);
+    expect(fighter.stamina).toBeGreaterThanOrEqual(0);
+    expect(fighter.stamina).toBeLessThanOrEqual(rules.maxStamina);
+    // One action, and a move exactly while attacking, from the kit or the shared normals.
+    expect(fighter.action === "attack").toBe(fighter.moveId !== null);
+    if (fighter.moveId !== null) expect([...NORMALS, kit.special1, kit.special2]).toContain(fighter.moveId);
+    // At most one bolt and one screen, each from the fighter's own kit.
+    if (fighter.bolt !== null) expect(fighter.kit).toBe("ember");
+    if (fighter.zone !== null) expect(fighter.kit).toBe("smoke");
+  }
+}
+
+/** The frames every property run must stay in play (no result) for. */
+const LIVE_FRAMES = 1800;
+
+/**
+ * Each pair's seed: 11 + 3 × the first kit's index + the second's, except Duelist vs Smoke, whose formula seed (13)
+ * ends in a KO on frame 1,482; seed 14 stays live through all 2,400 frames.
+ */
+const propertySeed = (kit0: KitId, kit1: KitId): number =>
+  kit0 === "duelist" && kit1 === "smoke" ? 14 : 11 + KIT_IDS.indexOf(kit0) * 3 + KIT_IDS.indexOf(kit1);
+
+describe.each(PAIRS)("%s vs %s over random play", (kit0, kit1) => {
+  const kits = [kit0, kit1] as const;
+  const seed = propertySeed(kit0, kit1);
+  const inputs = randomKitInputs(seed, PROPERTY_FRAMES);
+  const start = createDuelState(config, { seed, kits });
+  const trace = traceDuel(config, start, inputs);
+
+  it(`keeps the duel invariants for ${PROPERTY_FRAMES} frames, stays live for ${LIVE_FRAMES} and uses the kits`, () => {
+    expect(trace.length).toBe(PROPERTY_FRAMES + 1);
+    for (const state of trace) checkInvariants(state);
+    // The duel stays in play for at least LIVE_FRAMES frames: after a result the step only counts frames.
+    for (const state of trace.slice(0, LIVE_FRAMES + 1)) expect(state.result, `frame ${state.frame}`).toBeNull();
+    const moves = new Set(trace.flatMap((state) => state.fighters.map((fighter) => fighter.moveId)));
+    for (const kit of kits) {
+      for (const id of [config.moveset.kits[kit].special1, config.moveset.kits[kit].special2]) expect(moves, id).toContain(id);
+    }
+    if (kits.includes("ember")) expect(trace.some((state) => state.events.some((event) => event.moveId === "flame-bolt"))).toBe(true);
+    if (kits.includes("smoke")) expect(trace.some((state) => state.fighters.some((fighter) => fighter.obscured))).toBe(true);
+  });
+
+  it("replays to the same hash", () => {
+    const log = createDuelInputLog(config, 0, inputs);
+    const first = replayDuel(config, start, log);
+    expect(first.hash).toBe(hashState(trace[PROPERTY_FRAMES]));
+    expect(replayDuel(config, createDuelState(config, { seed, kits }), JSON.parse(JSON.stringify(log))).hash).toBe(first.hash);
+  });
+
+  it("round-trips every state through a JSON snapshot to the same hash, bolt-contact frames included", () => {
+    for (const state of trace) expect(hashState(restoreDuel(config, JSON.parse(JSON.stringify(snapshotDuel(state)))))).toBe(hashState(state));
+    if (kits.includes("ember")) {
+      const contact = trace.find((state) => state.events.some((event) => event.moveId === "flame-bolt"))!;
+      expect(hashState(restoreDuel(config, JSON.parse(JSON.stringify(contact))))).toBe(hashState(contact));
+    }
+  });
+});
+
+describe("rollback with kits", () => {
+  const inputs = [
+    ...presses(40, [1, 0, U], [2, SPECIAL2, 0]),
+    ...presses(40, [1, U, 0], [25, LIGHT, 0]),
+    ...randomKitInputs(5, 400),
+  ];
+  const start = createDuelState(config, { seed: 3, kits: ["smoke", "ember"], x: [4000, 7000] });
+  const log = createDuelInputLog(config, 0, inputs);
+  const trace = traceDuel(config, start, inputs);
+  const full = replayDuel(config, start, log);
+
+  it("restores a snapshot taken mid-projectile and mid-smoke-screen, and replays to the straight run's hash", () => {
+    const frames = trace.flatMap((state, frame) => (state.fighters[1].bolt !== null && state.fighters[0].zone !== null ? [frame] : []));
+    expect(frames.length).toBeGreaterThan(5);
+    for (const frame of [frames[0]!, frames[Math.floor(frames.length / 2)]!, frames[frames.length - 1]!]) {
+      const restored = restoreDuel(config, JSON.parse(JSON.stringify(snapshotDuel(trace[frame]!))));
+      expect(restored.fighters[1].bolt).not.toBeNull();
+      expect(restored.fighters[0].zone).not.toBeNull();
+      expect(replayDuel(config, restored, sliceDuelInputLog(log, frame)).hash).toBe(full.hash);
+    }
+  });
+});
+
+describe("symmetry with kits", () => {
+  const width = arena.width;
+
+  function mirrorFighter(fighter: FighterState): FighterState {
+    return {
+      ...fighter,
+      x: width - fighter.x,
+      vx: -fighter.vx,
+      facing: fighter.facing === 1 ? -1 : 1,
+      held: mirrorDuelInput(fighter.held),
+      bolt: fighter.bolt === null ? null : { ...fighter.bolt, x: width - fighter.bolt.x, vx: -fighter.bolt.vx },
+      zone: fighter.zone === null ? null : { ...fighter.zone, x: width - fighter.zone.x, facing: fighter.zone.facing === 1 ? -1 : 1 },
+    };
+  }
+
+  const swapEvent = (event: DuelEvent): DuelEvent => ({ ...event, attacker: event.attacker === 0 ? 1 : 0 });
+  const sortedEvents = (events: readonly DuelEvent[]) => [...events].sort((a, b) => a.attacker - b.attacker || a.kind.localeCompare(b.kind));
+
+  function mirrorState(state: DuelState): DuelState {
+    const winner = state.result?.winner;
+    return {
+      ...state,
+      fighters: [mirrorFighter(state.fighters[1]), mirrorFighter(state.fighters[0])],
+      events: sortedEvents(state.events.map(swapEvent)),
+      result: state.result === null ? null : { ...state.result, winner: winner === null || winner === undefined ? null : winner === 0 ? 1 : 0 },
+    };
+  }
+
+  const normal = (state: DuelState) => JSON.parse(canonicalize({ ...state, events: sortedEvents(state.events) })) as unknown;
+
+  function expectMirrored(start: DuelState, inputs: readonly DuelInputs[]): DuelState[] {
+    const a = traceDuel(config, start, inputs);
+    const b = traceDuel(config, mirrorState(start), inputs.map(([p1, p2]) => [mirrorDuelInput(p2), mirrorDuelInput(p1)] as const));
+    for (let frame = 0; frame < a.length; frame++) expect(normal(b[frame]!), `frame ${frame}`).toEqual(normal(mirrorState(a[frame]!)));
+    return a;
+  }
+
+  it("mirrors bolt exchanges: hits, blocks, a jump over, two bolts meeting", () => {
+    const a = expectMirrored(duel(["ember", "ember"], 3000, 7000), [
+      ...presses(90, [1, U, U]),
+      ...presses(90, [1, U, 0]),
+      [U, I("right")],
+      ...hold(89, 0, I("right")),
+      ...presses(90, [1, 0, U], [8, I("up", "right"), 0]),
+      ...randomKitInputs(21, 600),
+    ]);
+    const kinds = new Set(events(a).map((event) => event.split(" ").slice(1).join(" ")));
+    expect([...kinds]).toEqual(expect.arrayContaining(["hit 0 flame-bolt", "block 0 flame-bolt"]));
+  });
+
+  it("mirrors a bolt against a grab and a strike on the same frame", () => {
+    const start = duel(["ember", "duelist"], 5000, 5600);
+    const tied: DuelState = {
+      ...start,
+      fighters: [
+        { ...start.fighters[0], action: "attack", moveId: "jab", actionFrame: 7, timer: 15, bolt: { moveId: "flame-bolt-cast", x: 5500, y: 640, vx: 96, life: 50 } },
+        { ...start.fighters[1], action: "attack", moveId: "throw", actionFrame: 12, timer: 26 },
+      ],
+    };
+    expectMirrored(tied, hold(40));
+  });
+
+  it("mirrors smoke screens and feints, cancelled or not", () => {
+    const a = expectMirrored(duel(["smoke", "ember"], 3000, 6000), [
+      ...presses(60, [1, SPECIAL2, 0], [20, 0, U]),
+      ...presses(40, [1, U, 0], [25, LIGHT, 0]),
+      ...presses(40, [1, U, SPECIAL2]),
+      ...randomKitInputs(22, 600),
+    ]);
+    expect(a.some((state) => state.fighters[0].obscured)).toBe(true);
+    expect(a.some((state) => state.fighters[0].moveId === "feint-dash")).toBe(true);
+    expectMirrored(duel(["smoke", "smoke"], 4000, 5600), [...presses(60, [1, U, SPECIAL2], [25, LIGHT, 0]), ...randomKitInputs(23, 600)]);
+  });
+});
+
+describe("creating and restoring duels with kits", () => {
+  it("gives each fighter a kit, the Duelist's by default, and refuses an unknown kit", () => {
+    expect(createDuelState(config).fighters.map((fighter) => fighter.kit)).toEqual(["duelist", "duelist"]);
+    expect(createDuelState(config, { kits: ["ember", "smoke"] }).fighters.map((fighter) => fighter.kit)).toEqual(["ember", "smoke"]);
+    expect(() => createDuelState(config, { kits: ["ember", "gale" as KitId] })).toThrow(/unknown kit/);
+  });
+
+  // A frame on which player two's bolt was blocked, with the bolt of player one still flying.
+  const inputs = presses(80, [1, U, U], [2, 0, 0]);
+  const base = run(duel(["ember", "ember"], 2000, 8000), inputs)[30]!;
+  const wire = (state: unknown) => JSON.parse(JSON.stringify(state)) as DuelState;
+  const withFighter = (index: 0 | 1, patch: Partial<FighterState> | Record<string, unknown>): unknown => {
+    const copy = wire(base);
+    return { ...copy, fighters: copy.fighters.map((fighter, slot) => (slot === index ? { ...fighter, ...patch } : fighter)) };
+  };
+
+  it("accepts a bolt, a smoke screen and an event naming the attacker's own bolt", () => {
+    expect(base.fighters[0].bolt).not.toBeNull();
+    const evented = { ...wire(base), events: [{ kind: "hit", attacker: 1, moveId: "flame-bolt", damage: 90 }] };
+    expect(hashState(restoreDuel(config, evented))).toBe(hashState(evented));
+    const smoky = run(duel(["smoke", "duelist"], 3000, 7000), presses(20, [1, SPECIAL2, 0]))[20]!;
+    expect(hashState(restoreDuel(config, wire(smoky)))).toBe(hashState(smoky));
+  });
+
+  it.each([
+    ["an unknown kit", 0, { kit: "gale" }],
+    ["a move outside the fighter's kit", 0, { action: "attack", moveId: "feint-dash", actionFrame: 3, timer: 20 }],
+    ["another kit's special", 1, { kit: "duelist" }],
+    ["a bolt on a kit without one", 0, { kit: "smoke", action: "idle", moveId: null, timer: 0, bolt: base.fighters[0].bolt }],
+    ["a bolt at the wrong speed", 0, { bolt: { ...base.fighters[0].bolt!, vx: 95 } }],
+    ["a bolt past its life", 0, { bolt: { ...base.fighters[0].bolt!, life: 91 } }],
+    ["a bolt naming a move without one", 0, { bolt: { ...base.fighters[0].bolt!, moveId: "rising-flare" } }],
+    ["a smoke screen on an Ember", 0, { zone: { moveId: "smoke-screen", x: 3000, facing: 1, life: 10 } }],
+    ["a non-boolean mark", 0, { obscured: 1 }],
+  ] as const)("refuses %s", (_label, index, patch) => {
+    expect(() => restoreDuel(config, withFighter(index, patch))).toThrow(/not a duel state/);
+  });
+
+  it("accepts the same fighter without the bolt", () => {
+    const idle = withFighter(0, { kit: "smoke", action: "idle", moveId: null, timer: 0, bolt: null });
+    expect(() => restoreDuel(config, idle)).not.toThrow();
+  });
+
+  it("refuses an event naming a bolt of another kit, or a bolt id as a fighter's move", () => {
+    const duelists = run(duel(["duelist", "duelist"], 3000, 7000), hold(1))[1]!;
+    expect(() => restoreDuel(config, { ...wire(duelists), events: [{ kind: "hit", attacker: 0, moveId: "flame-bolt", damage: 90 }] })).toThrow(/not a duel state/);
+    expect(() => restoreDuel(config, withFighter(0, { action: "attack", moveId: "flame-bolt", actionFrame: 3, timer: 20 }))).toThrow(/not a duel state/);
+  });
+});

@@ -1,0 +1,465 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { RubbingMessageType } from "@pirate-sea-race/protocol";
+import { dockCentre, nearestDockBySea, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { createEncounterConfig } from "@pirate-sea-race/simulation/encounters";
+import { cacheRubbings, defaultTheftType, eligibleTheftTypes, objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { AHEAD, HeadlessClient, ImpairmentProxy, sleep } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, holds, HOST_SEAT, lastDuel, ledgerOf, ledgerPlayer, pair, placePair, quickEncounters, tuned } from "./rubbingsSetup.js";
+import { brawler, collectAt, containsText, dockFor, EAST, grapple, HOLD_E, HUB_X, OPEN_ROW, playersAt, roomOf, tracker, until, WEST } from "./seaDuelSetup.js";
+
+/**
+ * Rubbings in the match room (§4, §11, §12, §16): collecting at an island's dock, stealing after a won duel at sea,
+ * disconnects and quits through the ledger, claiming from a recovery cache, and what each client may see. Every test's
+ * rooms check `checkLedger` and "no ship removed while the ledger counts its player" after every world tick
+ * (`tracker`). The ledger keeps the rules' own timings here (six-second holds, the five-second theft window, the 60 s
+ * seat); the encounter timings are shortened (`quickEncounters`). Expiries are in `rubbingsExpiry.test.ts`, Colyseus'
+ * outer bound in `rubbingsOuterBound.test.ts`: one matchmaker per process means one set of timings per file.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+const encounters = createEncounterConfig({ rules: quickEncounters });
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning: tuned({}) });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+describe.concurrent("collecting at an island's dock (§4)", () => {
+  it("collects the island's rubbing after six seconds of holding E, never a second of a type, and shows the island's types only while moored", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [HOST_SEAT], track)) as [HeadlessClient];
+    const dock = dockFor("sun");
+    await player.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+    // On the dock's tile but not moored: the island's types are not the player's to see.
+    await player.waitFor(() => player.objectives() !== undefined);
+    expect(player.objectives()).toMatchObject({ gold: 50, rubbings: [], islandTypes: [], target: "", channel: "" });
+
+    // One gesture: E moors, and the same hold collects the island's first Sun.
+    let startTick = -1;
+    const seen = { islandTypes: new Set<string>(), targets: new Set<string>(), totals: new Set<number>() };
+    await player.holdUntil(
+      HOLD_E,
+      () => {
+        const channel = ledgerPlayer(player)?.channel;
+        if (channel != null) startTick = channel.startTick;
+        const status = player.objectives()!;
+        seen.islandTypes.add(status.islandTypes.join(","));
+        seen.targets.add(status.target);
+        if (status.channel !== "") seen.totals.add(status.channelTotal);
+        return player.rubbings().includes("sun");
+      },
+      12_000,
+    );
+    const status = player.objectives()!;
+    expect(status.channelResult).toBe("collected:sun");
+    // Exactly the rule's six seconds (120 world ticks) of holding, from the tick the hold started.
+    expect(objectiveRules.collectTicks).toBe(120);
+    expect(status.channelResultAt - startTick).toBe(objectiveRules.collectTicks);
+    expect(seen.islandTypes).toContain("sun,sun");
+    expect(seen.targets).toContain("collect:sun");
+    expect([...seen.totals]).toEqual([120]);
+    expect(player.ship()?.dock).toBe(dock.id);
+
+    // Holding on collects nothing more: the island's other Sun stays sealed, and E has no target here.
+    await player.hold(HOLD_E, 1500);
+    expect(holds(player, player.sessionId)).toEqual(["sun"]);
+    expect(player.objectives()).toMatchObject({ rubbings: ["sun"], islandTypes: ["sun"], target: "", channel: "" });
+    expect(ledgerOf(player).rubbings.filter((rubbing) => rubbing.location.kind === "player")).toHaveLength(1);
+
+    // Cast off: at sea the island's types are gone from the HUD again.
+    await player.holdUntil(AHEAD, () => player.ship()?.dock === -1, 3000);
+    await player.waitFor(() => player.objectives()!.islandTypes.length === 0);
+  }, 30_000);
+
+  it("resets the hold when E is released or the ship casts off, and starts again from zero", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [player] = (await playersAt(endpoint, [HOST_SEAT], track)) as [HeadlessClient];
+    const dock = dockFor("moon");
+    await player.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+    await player.hold(HOLD_E, 1500);
+    const first = ledgerPlayer(player)?.channel;
+    // Released: the ledger drops the hold and its progress.
+    await until(() => ledgerPlayer(player)?.channel === null, 2000, "the released hold cancelled");
+    expect(player.rubbings()).toEqual([]);
+    await player.waitFor(() => player.objectives()!.channel === "" && player.objectives()!.channelHeld === 0);
+
+    // Holding again counts from zero, from a later tick.
+    await player.holdUntil(HOLD_E, () => (ledgerPlayer(player)?.channel?.heldTicks ?? 0) >= 10, 3000);
+    const second = ledgerPlayer(player)?.channel ?? null;
+    expect(second).not.toBeNull();
+    if (first !== undefined && first !== null) expect(second!.startTick).toBeGreaterThan(first.startTick);
+    // Casting off (E let go, throttle ahead) ends it too; the ship is back at sea with nothing collected.
+    await player.holdUntil(AHEAD, () => player.ship()?.dock === -1, 3000);
+    await until(() => ledgerPlayer(player)?.channel === null, 2000, "the hold cancelled on casting off");
+    expect(player.rubbings()).toEqual([]);
+    expect(player.objectives()!.channelResult).toBe("");
+  }, 30_000);
+
+  it("resets the hold when a grapple reserves the collector for a duel", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const dock = dockFor("sun");
+    // The collector at Palm Key's west dock; the attacker five tiles west of it on open water, facing it.
+    const [collector, attacker] = (await playersAt(
+      endpoint,
+      [
+        { tileX: dock.tileX, tileY: dock.tileY, heading: 0 },
+        { tileX: dock.tileX - 5, tileY: dock.tileY, heading: EAST },
+      ],
+      track,
+    )) as [HeadlessClient, HeadlessClient];
+    const holding = collector.holdUntil(HOLD_E, () => collector.status()?.mode === "duel", 8000);
+    await until(() => (ledgerPlayer(collector)?.channel?.heldTicks ?? 0) >= 20, 4000, "the collection under way");
+    attacker.tapGrapple();
+    await holding;
+    // The reservation cancelled the hold: nothing collected, no hold left, the ledger holds the duel.
+    expect(ledgerPlayer(collector)?.channel).toBeNull();
+    expect(collector.rubbings()).toEqual([]);
+    expect(lastDuel(collector)).toMatchObject({ phase: "fighting", players: [attacker.sessionId, collector.sessionId] });
+    expect(ledgerOf(collector).rubbings.every((rubbing) => rubbing.location.kind === "source")).toBe(true);
+  }, 30_000);
+});
+
+describe.concurrent("disconnects in the world (§12)", () => {
+  it("resets a hold on a disconnect, and a reconnect within the seat's reservation resumes the same player, ship and rubbings", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    const [player] = (await playersAt(endpoint, [HOST_SEAT], track, { endpoints: [proxy.endpoint] })) as [HeadlessClient];
+    // A Sun first (six seconds: the SDK reconnects only a room joined five seconds ago).
+    await collectAt(player, endpoint, dockFor("sun"), "sun");
+    const dock = dockFor("moon");
+    await player.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+    const holding = player.hold(HOLD_E, 1500);
+    await until(() => (ledgerPlayer(player)?.channel?.heldTicks ?? 0) >= 10, 3000, "the Moon hold under way");
+    proxy.sever({ refuse: true });
+    await holding;
+    // The ledger has the player disconnected at once, hold cancelled, seat reserved for 60 s; the ship stays moored.
+    await until(() => ledgerPlayer(player)?.status === "disconnected", 3000, "the disconnect");
+    const away = ledgerPlayer(player)!;
+    expect(away.channel).toBeNull();
+    expect(away.reservationDeadline! - roomOf(player).matchState.worldTick).toBeGreaterThan(objectiveRules.seatReservationTicks - 40);
+    expect(roomOf(player).matchState.ships.find((ship) => ship.id === player.sessionId)?.dock).toBe(dock.id);
+    await sleep(500);
+    proxy.restore();
+    await player.waitFor(() => player.connected && ledgerPlayer(player)?.status === "connected", 10_000);
+    // The same player: same id, rubbings and gold; the hold starts again from zero.
+    expect(holds(player, player.sessionId)).toEqual(["sun"]);
+    expect(player.objectives()).toMatchObject({ gold: 50, rubbings: ["sun"] });
+    const back = roomOf(player).matchState.worldTick;
+    await player.holdUntil(HOLD_E, () => player.rubbings().includes("moon"), 10_000);
+    expect(player.objectives()!.channelResultAt - back).toBeGreaterThanOrEqual(objectiveRules.collectTicks);
+  }, 45_000);
+
+
+  it("puts a quitter's rubbings in a cache at the dock nearest by sea, a marker seen only within sight, whose contents only a player moored there sees", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const east = seaMap.docks[1]!;
+    expect(east).toMatchObject({ tileX: 93, tileY: 21 });
+    // The quitter four tiles east of Ember Rock's east dock; a near watcher in its sight; a far one out of it.
+    const [quitter, near, far] = (await playersAt(
+      endpoint,
+      [
+        { tileX: 97, tileY: 21, heading: EAST },
+        { tileX: 99, tileY: 26, heading: WEST },
+        { ...HOST_SEAT },
+      ],
+      track,
+    )) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    await collectAt(quitter, endpoint, dockFor("sun"), "sun");
+    await quitter.placeShip(endpoint, { tileX: 97, tileY: 21, heading: EAST });
+    const marks = { near: near.frameCount, far: far.frameCount };
+    const quitTick = roomOf(near).matchState.worldTick;
+    await quitter.leave();
+    await near.waitFor(() => near.caches().length === 1, 3000);
+    // The cache is at the dock nearest the quitter by sea, holding exactly the Sun, and the ship is gone.
+    expect(nearestDockBySea(seaMap, (97 * 256) + 128, (21 * 256) + 128)).toBe(east.id);
+    const [marker] = near.caches();
+    expect(marker).toMatchObject({ ...dockCentre(seaMap, east.id), dock: east.id });
+    const ledger = ledgerOf(near);
+    expect(ledger.caches[0]!.createdTick - quitTick).toBeLessThanOrEqual(2);
+    expect(cacheRubbings(ledger, ledger.caches[0]!.id).map((rubbing) => rubbing.type)).toEqual(["sun"]);
+    expect(near.ship(quitter.sessionId)).toBeUndefined();
+    expect(near.playerCount).toBe(2);
+    // Out of sight, no marker; the marker carries no contents, and nobody at sea got them.
+    await sleep(300);
+    expect(far.caches()).toEqual([]);
+    for (const [name, client] of [["near", near], ["far", far]] as const) {
+      expect(client.framesSince(marks[name]).some((frame) => containsText(frame, "sun")), name).toBe(false);
+    }
+    // A player moored at that dock who holds every type in the cache sees the contents but cannot claim: E has no target.
+    await collectAt(near, endpoint, dockFor("sun", 1), "sun");
+    await near.placeShip(endpoint, { tileX: east.tileX, tileY: east.tileY, heading: 0 });
+    await near.hold(HOLD_E, 1200);
+    expect(near.ship()?.dock).toBe(east.id);
+    expect(near.objectives()).toMatchObject({ cacheTypes: ["sun"], islandTypes: ["moon", "moon"], target: "collect:moon" });
+    // It collects the island's Moon first (sources before caches), then has nothing left to do here.
+    await near.holdUntil(HOLD_E, () => near.rubbings().includes("moon"), 10_000);
+    await near.hold(HOLD_E, 1200);
+    expect(near.objectives()).toMatchObject({ rubbings: ["sun", "moon"], cacheTypes: ["sun"], target: "", channel: "" });
+    expect(ledgerOf(near).caches).toHaveLength(1);
+  }, 45_000);
+
+});
+
+describe.concurrent("theft after a duel at sea (§4, §11)", () => {
+  it("offers the winner the loser's type for five seconds, takes the chosen one with the gold, and returns the players only then", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pair(endpoint, track);
+    await Promise.all([collectAt(host, endpoint, dockFor("sun"), "sun"), collectAt(guest, endpoint, dockFor("moon"), "moon")]);
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    host.fighter.play(brawler(0));
+    await host.waitFor(() => (host.objectives()?.theftOptions.length ?? 0) > 0, 25_000);
+    // Only the winner has the choice: the Moon, for the theft window.
+    const duel = lastDuel(host)!;
+    expect(duel).toMatchObject({ phase: "choosing", result: { outcome: "win", winner: host.sessionId, loser: guest.sessionId } });
+    expect(duel.choiceDeadline! - duel.result!.tick).toBe(objectiveRules.theftChoiceTicks);
+    expect(host.objectives()).toMatchObject({ theftOptions: ["moon"], theftDeadline: duel.choiceDeadline });
+    expect(guest.objectives()).toMatchObject({ theftOptions: [], theftDuel: "" });
+    // Nobody returns before the settlement: both still in the duel, the fight ended in the rules.
+    await sleep(500);
+    for (const client of [host, guest]) expect(client.status()?.mode).toBe("duel");
+    expect(roomOf(host).encounterState.duels[0]).toMatchObject({ phase: "ended" });
+    // The loser cannot choose, nor can a malformed choice do anything.
+    const key = host.objectives()!.theftDuel;
+    guest.chooseTheft("moon", key);
+    host.chooseTheft("tide", key);
+    host.sendRaw(RubbingMessageType.ChooseTheft, { duel: key, type: "moon", extra: 1 });
+    await sleep(300);
+    expect(lastDuel(host)?.phase).toBe("choosing");
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "sun,moon", 2000);
+    expect(lastDuel(host)?.settlement).toMatchObject({ choice: "winner", stolenType: "moon", gold: 10, goldSuppressed: false });
+    await host.waitFor(() => host.objectives()!.settledChoice === "winner");
+    await guest.waitFor(() => guest.objectives()!.settledRole === "loser");
+    expect(host.objectives()).toMatchObject({ gold: 60, settledRole: "winner", stolen: "moon", goldChange: 10 });
+    expect(guest.objectives()).toMatchObject({ gold: 40, rubbings: [], settledRole: "loser", stolen: "moon", goldChange: -10 });
+    // Then, and only then, the return: the winner protected at sea, the loser waiting to respawn.
+    await host.waitFor(() => host.status()?.protection === "win", 2000);
+    await guest.waitFor(() => guest.status()?.mode === "respawning", 2000);
+    expect(host.status()!.protectedUntil).toBe(lastDuel(host)!.settlement!.tick + encounters.winProtectionTicks);
+  }, 45_000);
+
+  it("applies the default theft at the deadline when the winner does not choose", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pair(endpoint, track, { autoReady: false });
+    await Promise.all([collectAt(host, endpoint, dockFor("sun"), "sun"), collectAt(guest, endpoint, dockFor("moon"), "moon")]);
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    // The guest never readies: it forfeits at the ready check, and the host has five seconds to choose.
+    await until(() => lastDuel(host)?.phase === "choosing", 8000, "the choice window");
+    const deadline = lastDuel(host)!.choiceDeadline!;
+    await until(() => lastDuel(host)?.phase === "settled", 8000, "the default");
+    expect(lastDuel(host)!.settlement).toMatchObject({ tick: deadline, choice: "default", stolenType: "moon", gold: 10 });
+    await host.waitFor(() => host.rubbings().join(",") === "sun,moon");
+    // The choice window outlasted the (shortened) respawn wait, so the loser respawns on the settlement tick.
+    await guest.waitFor(() => guest.status()?.protection === "respawn");
+    expect(guest.objectives()).toMatchObject({ rubbings: [], gold: 40, settledRole: "loser", stolen: "moon", settledChoice: "default", choiceDeadline: deadline });
+    expect(host.objectives()).toMatchObject({ settledRole: "winner", stolen: "moon", settledChoice: "default", choiceDeadline: deadline });
+  }, 30_000);
+
+  it("takes the winner's pick of two types when it is not the one the default would take", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pair(endpoint, track, { autoReady: false });
+    // The guest holds both types, the host neither: two options.
+    await collectAt(guest, endpoint, dockFor("sun"), "sun");
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    // The guest never readies and forfeits: the host wins and chooses.
+    await host.waitFor(() => (host.objectives()?.theftOptions.length ?? 0) === 2, 8000);
+    const duel = lastDuel(host)!;
+    const options = eligibleTheftTypes(ledgerOf(host), duel.id);
+    expect(options).toEqual(["sun", "moon"]);
+    expect(host.objectives()!.theftOptions).toEqual(options);
+    const fallback = defaultTheftType(ledgerOf(host), options)!;
+    const pick = options.find((type) => type !== fallback)!;
+    expect(pick).toBeDefined();
+    host.chooseTheft(pick);
+    await host.waitFor(() => host.rubbings().join(",") === pick, 2000);
+    // The winner's pick moved, not the default's; the loser keeps the other type.
+    const settled = lastDuel(host)!;
+    expect(settled.settlement).toMatchObject({ choice: "winner", stolenType: pick, gold: 10 });
+    expect(settled.settlement!.tick).toBeLessThan(settled.choiceDeadline!);
+    expect(holds(host, host.sessionId)).toEqual([pick]);
+    expect(holds(host, guest.sessionId)).toEqual([fallback]);
+    // Both notices say the winner chose it.
+    await guest.waitFor(() => guest.objectives()!.settledChoice === "winner");
+    expect(host.objectives()).toMatchObject({ settledRole: "winner", stolen: pick, settledChoice: "winner", choiceDeadline: settled.choiceDeadline });
+    expect(guest.objectives()).toMatchObject({ settledRole: "loser", stolen: pick, settledChoice: "winner", rubbings: [fallback] });
+  }, 45_000);
+
+  it("moves only the gold when the loser holds nothing the winner lacks, and settles at once; collecting then ends the winner's protection", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pair(endpoint, track, { autoReady: false });
+    await Promise.all([collectAt(host, endpoint, dockFor("sun"), "sun"), collectAt(guest, endpoint, dockFor("sun", 1), "sun")]);
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await until(() => lastDuel(host)?.result !== null, 8000, "the forfeit");
+    const duel = lastDuel(host)!;
+    // A ready-check forfeit settles on its own tick when nothing is eligible: no choice window, gold only.
+    expect(duel.phase).toBe("settled");
+    expect(duel.settlement).toMatchObject({ tick: duel.result!.tick, choice: "none", stolenRubbingId: null, gold: 10 });
+    await host.waitFor(() => host.gold() === 60 && host.status()?.protection === "win");
+    expect(host.objectives()!.theftOptions).toEqual([]);
+    expect(host.rubbings()).toEqual(["sun"]);
+    expect(guest.rubbings()).toEqual(["sun"]);
+    expect(guest.gold()).toBe(40);
+
+    // §6: starting a collection ends the winner's protection before it runs out.
+    const { protectedUntil } = host.status()!;
+    const moon = dockFor("moon");
+    await host.placeShip(endpoint, { tileX: moon.tileX, tileY: moon.tileY, heading: 0 });
+    await host.holdUntil(HOLD_E, () => host.status()?.protection === "", 3000);
+    expect(host.worldTick).toBeLessThan(protectedUntil);
+    expect(ledgerPlayer(host)?.channel?.kind ?? "collect").toBe("collect");
+  }, 30_000);
+
+  it("moves nothing when neither fighter is ready and the duel is cancelled", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const [host, guest] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { clients: [{ autoReady: false }, { autoReady: false }] })) as [HeadlessClient, HeadlessClient];
+    await Promise.all([collectAt(host, endpoint, dockFor("sun"), "sun"), collectAt(guest, endpoint, dockFor("moon"), "moon")]);
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await until(() => lastDuel(host)?.phase === "settled", 8000, "the cancellation");
+    expect(lastDuel(host)).toMatchObject({ result: { outcome: "cancelled" }, settlement: { choice: "none", gold: 0 } });
+    for (const client of [host, guest]) await client.waitFor(() => client.status()?.protection === "draw");
+    expect(host.objectives()).toMatchObject({ rubbings: ["sun"], gold: 50, settledRole: "draw" });
+    expect(guest.objectives()).toMatchObject({ rubbings: ["moon"], gold: 50, settledRole: "draw" });
+  }, 30_000);
+
+  it("suppresses the gold of a second win over the same opponent within three minutes, but not the theft", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pair(endpoint, track, { autoReady: false });
+    await collectAt(guest, endpoint, dockFor("sun"), "sun");
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    // First win: the host takes the Sun and 10 gold.
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => (host.objectives()?.theftOptions.length ?? 0) === 2, 8000);
+    host.chooseTheft("sun");
+    await host.waitFor(() => host.rubbings().join(",") === "sun" && host.gold() === 60, 2000);
+    // The guest respawns and its protection runs out; they meet again.
+    await guest.waitFor(() => guest.status()?.mode === "sea" && guest.status()?.protection === "", 12_000);
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => host.objectives()?.theftOptions.join(",") === "moon", 8000);
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "sun,moon", 2000);
+    const second = lastDuel(host)!;
+    expect(second.result!.tick - ledgerOf(host).duels[0]!.result!.tick).toBeLessThan(objectiveRules.repeatWinWindowTicks);
+    expect(second.settlement).toMatchObject({ stolenType: "moon", gold: 0, goldSuppressed: true });
+    expect(host.gold()).toBe(60);
+    await guest.waitFor(() => guest.objectives()!.settledAt === second.settlement!.tick);
+    expect(guest.objectives()).toMatchObject({ gold: 40, rubbings: [], goldChange: 0, stolen: "moon" });
+  }, 45_000);
+
+
+});
+
+describe.concurrent("recovery caches (§12)", () => {
+  it("lets a player missing a type claim it from a cache in the claim time, which ends protection, and the empty cache disappears", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const west = dockFor("sun");
+    // A third player, seated in the lobby with the others, carries a Moon to Palm Key's west dock and quits there: a
+    // cache with the Moon at that dock.
+    const [host, guest, quitter] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT, { tileX: HUB_X - 6, tileY: OPEN_ROW + 4, heading: EAST }], track, {
+      clients: [{}, { autoReady: false }, {}],
+    })) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    await collectAt(quitter, endpoint, dockFor("moon"), "moon");
+    await quitter.placeShip(endpoint, { tileX: west.tileX, tileY: west.tileY, heading: 0 });
+    await quitter.leave();
+    await until(() => ledgerOf(host).caches.length === 1, 3000, "the cache");
+    expect(ledgerOf(host).caches[0]).toMatchObject(dockCentre(seaMap, west.id));
+    // The host holds a Sun (so Palm Key has nothing for it) and wins a duel: protected.
+    await collectAt(host, endpoint, dockFor("sun", 1), "sun");
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => host.status()?.protection === "win", 8000);
+    const { protectedUntil } = host.status()!;
+    // Moored at the cache's dock: it sees the Moon there; E claims it, which ends the protection at once.
+    await host.placeShip(endpoint, { tileX: west.tileX, tileY: west.tileY, heading: 0 });
+    let claimStart = -1;
+    await host.holdUntil(
+      HOLD_E,
+      () => {
+        const channel = ledgerPlayer(host)?.channel;
+        if (channel?.kind === "claim") claimStart = channel.startTick;
+        return host.rubbings().includes("moon");
+      },
+      10_000,
+    );
+    expect(host.objectives()).toMatchObject({ channelResult: "claimed:moon", rubbings: ["sun", "moon"] });
+    expect(host.objectives()!.channelResultAt - claimStart).toBe(objectiveRules.cacheClaimTicks);
+    expect(host.status()!.protection).toBe("");
+    expect(claimStart).toBeLessThan(protectedUntil);
+    // Empty, the cache is gone from the ledger and from every view.
+    expect(ledgerOf(host).caches).toEqual([]);
+    await host.waitFor(() => host.caches().length === 0 && host.objectives()!.cacheTypes.length === 0);
+  }, 45_000);
+});
+
+describe.concurrent("hidden information on the wire (§16)", () => {
+  it("never sends a player another's rubbings, gold or theft options, an island's types before mooring there, or a cache's contents before mooring at it", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const west = dockFor("sun");
+    // The host and guest fight on the open row; a watcher sits in sight of Palm Key's west dock, never moored.
+    const [host, guest, onlooker] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT, { tileX: west.tileX - 7, tileY: west.tileY + 3, heading: EAST }], track, {
+      clients: [{}, { autoReady: false }, {}],
+    })) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const marks = { onlooker: onlooker.frameCount, guest: guest.frameCount };
+    await collectAt(host, endpoint, west, "sun");
+    // The onlooker saw the host collect in plain sight, yet got neither the island's types nor the host's rubbings.
+    expect(onlooker.ship(host.sessionId)).toBeDefined();
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, host, guest);
+    await onlooker.placeShip(endpoint, { tileX: HUB_X - 3, tileY: OPEN_ROW + 4, heading: EAST });
+    await grapple(host, guest);
+    await host.waitFor(() => host.objectives()?.theftOptions.join(",") === "moon", 8000);
+    // The loser (the guest) and the onlooker never get the winner's options, and the onlooker never any status but its own.
+    await sleep(300);
+    const guestFrames = guest.framesSince(marks.guest);
+    expect(guest.objectives()!.theftOptions).toEqual([]);
+    expect([...(onlooker.room.state.status?.keys() ?? [])]).toEqual([onlooker.sessionId]);
+    expect([...(guest.room.state.status?.keys() ?? [])]).toEqual([guest.sessionId]);
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "sun,moon");
+    await sleep(300);
+    const onlookerFrames = onlooker.framesSince(marks.onlooker);
+    expect(onlookerFrames.length).toBeGreaterThan(20);
+    for (const type of ["sun", "moon"]) expect(onlookerFrames.some((frame) => containsText(frame, type)), `onlooker ${type}`).toBe(false);
+    // The guest's own status named its Moon, but never the host's Sun: no type it did not hold, and no island's.
+    expect(guestFrames.some((frame) => containsText(frame, "sun"))).toBe(false);
+  }, 45_000);
+
+  it("blanks a telegraph's target for a viewer who sees the attacker but not the target", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    // Attacker and target six tiles apart; the watcher eight tiles west of the attacker, fourteen from the target.
+    const [host, guest, watcher] = (await playersAt(
+      endpoint,
+      [HOST_SEAT, GUEST_SEAT, { tileX: HOST_SEAT.tileX - 8, tileY: OPEN_ROW, heading: EAST }],
+      track,
+    )) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    await watcher.waitFor(() => watcher.ship(host.sessionId) !== undefined);
+    expect(watcher.ship(guest.sessionId)).toBeUndefined();
+    const mark = watcher.frameCount;
+    const telegraphs: string[] = [];
+    watcher.room.onStateChange(() => {
+      for (const grapple of watcher.grapples()) telegraphs.push(`${grapple.attackerId}>${grapple.defenderId}`);
+    });
+    host.tapGrapple();
+    await guest.waitFor(() => guest.grapples().length === 1, 2000);
+    // The target sees the full telegraph, aimed at it.
+    expect(guest.grapples()[0]).toMatchObject({ attackerId: host.sessionId, defenderId: guest.sessionId });
+    await watcher.waitFor(() => telegraphs.length > 0, 2000);
+    await host.waitFor(() => host.status()?.mode === "duel", 3000);
+    // The watcher saw the telegraph with no target, and its raw frames never carried the target's id.
+    expect(new Set(telegraphs)).toEqual(new Set([`${host.sessionId}>`]));
+    expect(watcher.framesSince(mark).some((frame) => containsText(frame, guest.sessionId))).toBe(false);
+  }, 30_000);
+});

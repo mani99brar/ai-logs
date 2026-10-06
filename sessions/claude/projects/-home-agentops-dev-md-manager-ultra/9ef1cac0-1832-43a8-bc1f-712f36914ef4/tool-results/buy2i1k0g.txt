@@ -1,0 +1,433 @@
+diff --git a/workflow/test_pipeline.py b/workflow/test_pipeline.py
+index 51e8b1c..e61d131 100644
+--- a/workflow/test_pipeline.py
++++ b/workflow/test_pipeline.py
+@@ -13,31 +13,88 @@ from unittest.mock import patch
+ from langgraph.checkpoint.sqlite import SqliteSaver
+ from langgraph.types import Command
+ 
+-from .checks import execute
+-from .pipeline import Pipeline, build_pipeline, digest_file, report, validate_pipeline_policy
++from .checks import execute, now
++from .pipeline import Pipeline, build_pipeline, check_review, digest_file, report, validate_pipeline_policy
+ from .sessions import git, prepare, read_json, save_json
+ from .verification import CONTRACTS, policy_digest
+ 
+ 
+ class FakeSessions:
++    """Offline stand-in for InteractiveSessions. Receipts on disk are its only cross-process state."""
++
++    REVIEWER_UUID = "33333333-3333-4333-8333-333333333333"
++
+     def __init__(self, directory, plan):
+         self.directory, self.plan = directory, plan
+         self.starts = []
++        self.reviewer_verdict_file = None  # A file whose text is the fake reviewer's verdict (default approved).
++        self.reviewer_findings = []        # Findings the fake reviewer reports.
++        self.reviewer_mutate = None        # Callable applied to the completion payload before it is written.
++        self.reviewer_writes_file = True   # False: the reviewer idles without ever writing a completion file.
+ 
+-    def run(self, node):
++    def record(self, node):
+         self.starts.append(node)
++        with (self.directory / "fake-launches.log").open("a") as log:
++            log.write(node + "\n")
++
++    def run(self, node):
++        self.record(node)
+         cwd = Path(self.plan["nodes"][node]["worktree"])
+         (cwd / ("ui.txt" if node == "ui" else "backend.py")).write_text("after" if node == "ui" else "VALUE = 2\n")
+-        receipt = {"session_id": self.plan["nodes"][node]["session_id"], "status": "fake-worker-completed"}
++        receipt = {"node_id": node, "session_id": self.plan["nodes"][node]["session_id"], "launch_token": self.plan["nodes"][node]["session_id"],
++                   "background_id": f"fake-{node}", "status": "fake-worker-completed", "attempt": 1, "launcher_invocations": 1,
++                   "launch_requested_at": now(), "observed_state": "idle", "native_started_at": None}
+         save_json(self.directory / f"{node}.interactive.json", receipt)
+         save_json(self.directory / f"{node}.handoff.json", {"summary": "Synthetic implementation for offline test", "open_assumptions": []})
+         return receipt
+ 
++    def run_reviewer(self, prompt, launch_token, candidate_commit):
++        self.record("review")
++        receipt = {"node_id": "review", "session_id": self.REVIEWER_UUID, "launch_token": launch_token, "background_id": self.REVIEWER_UUID[:8],
++                   "worktree": str(self.directory / "review-worktree"), "candidate_commit": candidate_commit,
++                   "status": "attached_session_available", "attempt": 1, "launcher_invocations": 1,
++                   "launch_requested_at": now(), "observed_state": "idle", "native_started_at": None}
++        save_json(self.directory / "review.interactive.json", receipt)
++        (self.directory / "review.prompt.txt").write_text(prompt)
++        if self.reviewer_writes_file:
++            verdict = Path(self.reviewer_verdict_file).read_text().strip() if self.reviewer_verdict_file else "approved"
++            completion = {"version": "1.0.0", "run_id": self.plan["run_id"], "node_id": "review", "launch_token": launch_token,
++                          "bundle_sha256": digest_file(self.directory / "review-bundle.json"), "candidate_commit": candidate_commit,
++                          "verdict": verdict, "findings": copy.deepcopy(self.reviewer_findings)}
++            if self.reviewer_mutate:
++                completion = self.reviewer_mutate(completion)
++            save_json(self.directory / "review.completion.json", completion)
++        return receipt
++
++    def inventory(self):
++        rows = []
++        for node in ("ui", "adapter", "review"):
++            path = self.directory / f"{node}.interactive.json"
++            if path.exists():
++                receipt = read_json(path)
++                rows.append({"id": receipt.get("background_id"), "sessionId": receipt["session_id"], "state": "idle",
++                             "pid": os.getpid(), "kind": "background"})
++        return rows
++
++    def locate(self, node, rows):
++        path = self.directory / f"{node}.interactive.json"
++        if not path.exists():
++            return None
++        session_id = read_json(path)["session_id"]
++        return next((row for row in rows if row["sessionId"] == session_id), None)
++
+ 
+ class OfflinePipeline(Pipeline):
+     def stop_workers(self):
+         self.event("freeze", "stopped", "Fake workers have no background processes")
+ 
++    def stop_reviewer(self):
++        # Fake sessions have no process to stop; record the intent the real path would persist.
++        receipt = read_json(self.directory / "review.interactive.json")
++        save_json(self.directory / "review.stop.json", {"background_id": receipt["background_id"], "session_id": receipt["session_id"],
++                                                        "pid": None, "stopped": True, "synthetic": True})
++        self.event("review", "stopped", "Fake reviewer has no background process")
++
+ 
+ class PipelineTests(unittest.TestCase):
+     def setUp(self):
+@@ -144,7 +201,12 @@ test('[scenario:ready] shows the worker change', async ({{page}}, testInfo) => {
+ '''
+             code, _, _ = execute(["node", "-e", script], self.directory, self.directory / "report-browser.log", 30, dict(os.environ))
+             self.assertEqual(code, 0, (self.directory / "report-browser.log").read_text())
+-            self.assertEqual(sorted(self.sessions.starts), ["adapter", "ui"])
++            self.assertEqual(sorted(self.sessions.starts), ["adapter", "ui"])  # Manual review: no reviewer session.
++            exported = read_json(self.directory / "run-state.json")
++            self.assertEqual(exported["version"], "1.2.0")
++            self.assertEqual((exported["review"]["transport"], exported["review"]["reviewer_session_id"]), ("manual", "synthetic-test-reviewer"))
++            self.assertEqual(exported["inputs"]["mode"], "manual")
++            self.assertEqual(exported["inputs"]["workers"]["ui"]["launch"]["session_id"], self.plan["nodes"]["ui"]["session_id"])
+             screenshots = list((self.directory / "verification").glob("**/screenshot-*"))
+             self.assertGreaterEqual(len(screenshots), 2)  # Worker + combined candidate.
+             self.assertTrue(all(path.read_bytes().startswith(b"\x89PNG") for path in screenshots))
+@@ -230,9 +292,37 @@ test('[scenario:ready] shows the worker change', async ({{page}}, testInfo) => {
+             with self.assertRaisesRegex(ValueError, "ui/frontend"):
+                 validate_pipeline_policy(policy)
+ 
++    def test_check_review_accepts_finding_links_and_blocked_verdicts_only_when_asked(self):
++        bundle = {"run_id": "run", "candidate_commit": "c" * 40, "snapshots": {"ui": {"session_id": "ui-session"}, "adapter": {"session_id": "adapter-session"}}}
++        digest = "b" * 64
++        base = {"run_id": "run", "bundle_sha256": digest, "candidate_commit": "c" * 40, "reviewer": "reviewer-session", "independent": True}
++        plain = {"severity": "P2", "message": "Legacy finding", "disposition": "open"}
++        linked = {"severity": "P2", "message": "Linked finding", "disposition": "accepted", "worker": "ui", "requirement": "Show every finding"}
++        unlinked = {"severity": "P1", "message": "Cross-cutting", "disposition": "resolved", "worker": "none", "requirement": None}
++        check_review({**base, "verdict": "approved", "findings": [plain, linked, unlinked]}, bundle, digest)
++        for bad in ({**linked, "worker": "reviewer"}, {**linked, "requirement": ""}, {**linked, "requirement": 3}, {**linked, "extra": True},
++                    {**linked, "worker": None}, {**plain, "severity": "P3"}, {**plain, "message": " "}):
++            with self.assertRaisesRegex(ValueError, "finding"):
++                check_review({**base, "verdict": "approved", "findings": [bad]}, bundle, digest)
++        open_p1 = {**unlinked, "disposition": "open"}
++        with self.assertRaisesRegex(ValueError, "Unresolved blocking"):
++            check_review({**base, "verdict": "approved", "findings": [open_p1]}, bundle, digest)
++        with self.assertRaisesRegex(ValueError, "not approved"):
++            check_review({**base, "verdict": "blocked", "findings": [open_p1]}, bundle, digest)
++        check_review({**base, "verdict": "blocked", "findings": [open_p1]}, bundle, digest, require_approved=False)
++        # Export-time validation still enforces identity, shape and the approved/blocking rule.
++        with self.assertRaisesRegex(ValueError, "Unresolved blocking"):
++            check_review({**base, "verdict": "approved", "findings": [open_p1]}, bundle, digest, require_approved=False)
++        with self.assertRaisesRegex(ValueError, "Independent"):
++            check_review({**base, "reviewer": "ui-session", "verdict": "blocked", "findings": []}, bundle, digest, require_approved=False)
++        with self.assertRaisesRegex(ValueError, "verdict"):
++            check_review({**base, "verdict": "maybe", "findings": []}, bundle, digest, require_approved=False)
++        with self.assertRaisesRegex(ValueError, "exact run"):
++            check_review({**base, "candidate_commit": "d" * 40, "verdict": "blocked", "findings": []}, bundle, digest, require_approved=False)
++
+     def native_rows(self):
+         return {node: {"id": f"id-{node}", "sessionId": f"session-{node}", "pid": 90000 + index}
+-                for index, node in enumerate(("ui", "adapter"))}
++                for index, node in enumerate(("ui", "adapter", "review"))}
+ 
+     def set_native(self, live):
+         self.runtime.sessions = SimpleNamespace(executable="claude", inventory=lambda: list(live.values()),
+@@ -260,6 +350,32 @@ test('[scenario:ready] shows the worker change', async ({{page}}, testInfo) => {
+             Pipeline.stop_workers(self.runtime)
+             command.assert_not_called()
+ 
++    def test_native_reviewer_stop_rechecks_identity_and_records_intent(self):
++        live = self.native_rows()
++        self.set_native(live)
++        def stop(argv, **_kwargs):
++            live.pop(argv[-1].removeprefix("id-"))
++            return subprocess.CompletedProcess(argv, 0)
++        with patch("workflow.pipeline.subprocess.run", side_effect=stop) as command, patch("workflow.pipeline.pid_alive", return_value=False):
++            Pipeline.stop_reviewer(self.runtime)
++            self.assertEqual(command.call_args.args[0], ["claude", "stop", "id-review"])
++            Pipeline.stop_reviewer(self.runtime)  # Completed intent: no second stop command.
++            self.assertEqual(command.call_count, 1)
++        intent = read_json(self.directory / "review.stop.json")
++        self.assertEqual((intent["session_id"], intent["stopped"]), ("session-review", True))
++        self.assertTrue(all(row["sessionId"] != "session-review" for row in live.values()))
++        self.assertFalse((self.directory / "ui.stop.json").exists())
++        events = [json.loads(line) for line in (self.directory / "events.jsonl").read_text().splitlines()]
++        self.assertEqual([event["status"] for event in events if event["node"] == "review"], ["stopped", "stopped"])
++        # A reviewer whose identity changed after the stop intent is never signalled.
++        (self.directory / "review.stop.json").unlink()
++        live["review"] = self.native_rows()["review"]
++        save_json(self.directory / "review.stop.json", {"background_id": "id-review", "session_id": "session-review", "pid": 1, "stopped": False})
++        with patch("workflow.pipeline.subprocess.run") as command:
++            with self.assertRaisesRegex(RuntimeError, "identity changed"):
++                Pipeline.stop_reviewer(self.runtime)
++            command.assert_not_called()
++
+     def test_failed_stop_and_lingering_pid_block_freeze(self):
+         live = self.native_rows()
+         self.set_native(live)
+===== test_export.py =====
+     1	"""Export version 1.2.0: review/inputs sections from a run directory, stability, and the export CLI."""
+     2	import contextlib
+     3	import io
+     4	import json
+     5	import os
+     6	import subprocess
+     7	import sys
+     8	import tempfile
+     9	import unittest
+    10	from datetime import datetime, timezone
+    11	from pathlib import Path
+    12	from types import SimpleNamespace
+    13	from unittest.mock import patch
+    14	
+    15	from .export_state import EXPORT_VERSION, export_state, inputs_section, review_section
+    16	from .pipeline import ExportRuntime, digest_file, export_run
+    17	from .sessions import read_json, save_json
+    18	from .verification import policy_digest
+    19	
+    20	REPO = Path(__file__).resolve().parents[1]
+    21	REVIEWER = "dd7bdcd1-adec-4efe-bcd4-bbadc3525d95"
+    22	
+    23	
+    24	def legacy_run(root: Path, *, with_policy: bool = True, automatic: bool = True) -> Path:
+    25	    """A finished run directory shaped like the first live 1.0.0 run, whose worktrees no longer exist."""
+    26	    directory = root / "legacy-001"
+    27	    directory.mkdir()
+    28	    policy = read_json(REPO / "features/project-workflows/policy.json")
+    29	    plan = {"run_id": "legacy-001", "repository": str(root / "gone-repo"), "base_commit": "c" * 40, "allow_edits": True,
+    30	            "nodes": {node: {"worktree": str(directory / f"worktree-{node}"), "task": f"# {node} task\n\nDo the {node} work.\n\nApproved ownership and checks:\n{{}}",
+    31	                             "session_id": f"{node[0] * 8}-0000-4000-8000-000000000000", "observed_start_commit": "c" * 40} for node in ("ui", "adapter")},
+    32	            "mode": "interactive", "policy_sha256": policy_digest(policy), "created_at": "2026-09-21T14:33:23.528543Z",
+    33	            "source_branch": "feature/project-workflows/legacy-001"}
+    34	    if automatic:
+    35	        # Pinned before reviewer_transport existed: four keys only.
+    36	        plan["automatic"] = {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions",
+    37	                             "worker_timeout_seconds": 3600, "review_timeout_seconds": 1800}
+    38	    save_json(directory / "plan.json", plan)
+    39	    if with_policy:
+    40	        save_json(directory / "policy.json", policy)
+    41	    for node in ("ui", "adapter"):
+    42	        save_json(directory / f"{node}.interactive.json", {
+    43	            "node_id": node, "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111", "launch_token": plan["nodes"][node]["session_id"],
+    44	            "plan_digest": "x" * 64, "worktree": plan["nodes"][node]["worktree"], "base_commit": "c" * 40, "status": "attached_session_available",
+    45	            "attempt": 1, "launcher_invocations": 1, "launch_requested_at": "2026-09-21T14:33:25.331982+00:00",
+    46	            "background_id": node[0] * 8, "observed_state": "working", "native_started_at": 1790001207771})
+    47	        save_json(directory / f"{node}.completion.json", {"version": "1.0.0", "run_id": "legacy-001", "node_id": node,
+    48	                                                          "launch_token": plan["nodes"][node]["session_id"], "status": "completed",
+    49	                                                          "summary": f"{node} implemented", "open_assumptions": ["assumed"]})
+    50	        save_json(directory / f"{node}.handoff.json", {"summary": f"{node} implemented", "open_assumptions": ["assumed"]})
+    51	        save_json(directory / f"{node}.stop.json", {"background_id": node[0] * 8, "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111", "pid": 1, "stopped": True})
+    52	    bundle = {"run_id": "legacy-001", "base_commit": "c" * 40, "candidate_commit": "d" * 40, "policy_sha256": policy_digest(policy),
+    53	              "snapshots": {node: {"commit": "d" * 40, "changed_files": [], "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111"} for node in ("ui", "adapter")},
+    54	              "packets": []}
+    55	    save_json(directory / "review-bundle.json", bundle)
+    56	    review = {"run_id": "legacy-001", "bundle_sha256": digest_file(directory / "review-bundle.json"), "candidate_commit": "d" * 40,
+    57	              "reviewer": REVIEWER, "independent": True, "verdict": "approved",
+    58	              "findings": [{"severity": "P2", "message": "Stale task error overrides verified success", "disposition": "open"},
+    59	                           {"severity": "P2", "message": "Root Playwright suite is not in the policy", "disposition": "accepted"}]}
+    60	    save_json(directory / "review.json", review)
+    61	    save_json(directory / "automatic-review.json", {"session_id": REVIEWER, "bundle_sha256": review["bundle_sha256"], "candidate_commit": "d" * 40,
+    62	                                                    "status": "succeeded", "patch_sha256": "0" * 64, "pid": 1, "review": review})
+    63	    (directory / "review.diff").write_text("diff --git a/ui.txt b/ui.txt\n--- a/ui.txt\n+++ b/ui.txt\n@@ -1 +1 @@\n-before\n+after\n")
+    64	    events = [{"sequence": 1, "time": "2026-09-21T14:33:25.000000Z", "node": "ui", "status": "running", "message": "Launching"},
+    65	              {"sequence": 2, "time": "2026-09-21T15:42:27.848828Z", "node": "review", "status": "approved", "message": REVIEWER},
+    66	              {"sequence": 3, "time": "2026-09-21T15:52:04.611348Z", "node": "controller", "status": "running", "message": "PID 1"}]
+    67	    (directory / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+    68	    old = {"version": "1.0.0", "run_id": "legacy-001", "base_commit": "c" * 40, "created_at": plan["created_at"],
+    69	           "definition": {"name": "Feature implementation", "nodes": []}, "values": {"run_id": "legacy-001", "review": review},
+    70	           "next": [], "tasks": [], "events": events, "verification_packets": [], "updated_at": "2026-09-21T15:52:04.675731Z"}
+    71	    save_json(directory / "run-state.json", old)
+    72	    return directory
+    73	
+    74	
+    75	class ExportSectionTests(unittest.TestCase):
+    76	    def setUp(self):
+    77	        self.temp = tempfile.TemporaryDirectory()
+    78	        self.addCleanup(self.temp.cleanup)
+    79	        self.root = Path(self.temp.name)
+    80	
+    81	    def test_review_section_derives_transport_time_and_diff_from_files(self):
+    82	        directory = legacy_run(self.root)
+    83	        section = review_section(directory)
+    84	        self.assertEqual((section["attempt"], section["transport"], section["reviewer_session_id"], section["independent"]), (1, "print", REVIEWER, True))
+    85	        self.assertEqual((section["verdict"], section["candidate_commit"]), ("approved", "d" * 40))
+    86	        self.assertEqual(section["reviewed_at"], "2026-09-21T15:42:27.848828Z")  # Last review event; the old receipt has no accepted_at.
+    87	        self.assertEqual(section["diff"], {"path": "review.diff", "sha256": digest_file(directory / "review.diff"), "bytes": (directory / "review.diff").stat().st_size})
+    88	        self.assertEqual([(finding["worker"], finding["requirement"]) for finding in section["findings"]], [(None, None), (None, None)])
+    89	        self.assertEqual(section["findings"][0]["message"], "Stale task error overrides verified success")
+    90	        # Native receipts win over print receipts; accepted_at wins over events; no diff → null.
+    91	        save_json(directory / "review.interactive.json", {"node_id": "review"})
+    92	        receipt = read_json(directory / "automatic-review.json")
+    93	        receipt["accepted_at"] = "2026-09-21T16:00:00.000000Z"
+    94	        save_json(directory / "automatic-review.json", receipt)
+    95	        (directory / "review.diff").unlink()
+    96	        section = review_section(directory)
+    97	        self.assertEqual((section["transport"], section["reviewed_at"], section["diff"]), ("native", "2026-09-21T16:00:00.000000Z", None))
+    98	        # Manual reviews: no receipts at all, time from the review file itself when no event exists.
+    99	        (directory / "review.interactive.json").unlink()
+   100	        (directory / "automatic-review.json").unlink()
+   101	        (directory / "events.jsonl").unlink()
+   102	        section = review_section(directory)
+   103	        expected = datetime.fromtimestamp((directory / "review.json").stat().st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
+   104	        self.assertEqual((section["transport"], section["reviewed_at"]), ("manual", expected))
+   105	        (directory / "review.json").unlink()
+   106	        self.assertIsNone(review_section(directory))
+   107	
+   108	    def test_inputs_section_pins_plan_policy_and_receipts(self):
+   109	        directory = legacy_run(self.root)
+   110	        plan, policy = read_json(directory / "plan.json"), read_json(directory / "policy.json")
+   111	        (directory / "ui.prompt.txt").write_text("You are a workflow worker.\n\n# ui task")
+   112	        section = inputs_section(directory, plan, policy)
+   113	        self.assertEqual((section["feature"], section["policy_version"], section["base_commit"], section["source_branch"], section["mode"]),
+   114	                         (policy["feature"], "1.1.0", "c" * 40, "feature/project-workflows/legacy-001", "automatic"))
+   115	        self.assertEqual(section["automatic"], {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions",
+   116	                                                "worker_timeout_seconds": 3600, "review_timeout_seconds": 1800, "reviewer_transport": "native"})
+   117	        self.assertEqual(section["setup"], [{"argv": ["npm", "ci"], "command": "npm ci", "timeout_seconds": 600}])
+   118	        self.assertEqual((section["max_verification_attempts"], section["failure_drill"]), (3, {"node_id": "adapter", "phase": "worker", "attempt": 1}))
+   119	        self.assertEqual(list(section["workers"]), ["ui", "adapter"])
+   120	        ui = section["workers"]["ui"]
+   121	        self.assertEqual((ui["role"], ui["task"], ui["prompt"]), ("frontend", plan["nodes"]["ui"]["task"], "You are a workflow worker.\n\n# ui task"))
+   122	        self.assertIsNone(section["workers"]["adapter"]["prompt"])
+   123	        self.assertEqual(ui["owned_paths"], policy["workers"][0]["owned_paths"])
+   124	        browser = next(check for check in ui["checks"] if check["kind"] == "browser")
+   125	        self.assertEqual(browser["command"], "npx --no-install playwright test --config=tests/project-workflows/playwright.config.ts")
+   126	        self.assertEqual(len(browser["scenarios"]), 6)
+   127	        self.assertEqual(ui["launch"], {"session_id": "uuuuuuuu-1111-4111-8111-111111111111", "launch_token": plan["nodes"]["ui"]["session_id"],
+   128	                                        "launch_requested_at": "2026-09-21T14:33:25.331982Z", "native_started_at": 1790001207771,
+   129	                                        "observed_state": "working", "status": "attached_session_available", "launcher_invocations": 1, "background_id": "uuuuuuuu"})
+   130	        self.assertEqual(ui["completion"], {"status": "completed", "summary": "ui implemented", "open_assumptions": ["assumed"]})
+   131	        self.assertEqual(ui["handoff"], {"summary": "ui implemented", "open_assumptions": ["assumed"]})
+   132	        stop = directory / "ui.stop.json"
+   133	        self.assertEqual(ui["stop"], {"stopped": True, "confirmed_at": datetime.fromtimestamp(stop.stat().st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")})
+   134	        # Absent or malformed receipts are null, a manual plan has no automatic block, an unconfirmed stop has no time.
+   135	        (directory / "adapter.completion.json").write_text("{not json")
+   136	        (directory / "adapter.handoff.json").unlink()
+   137	        (directory / "adapter.interactive.json").unlink()
+   138	        save_json(directory / "adapter.stop.json", {"stopped": False})
+   139	        del plan["automatic"]
+   140	        section = inputs_section(directory, plan, policy)
+   141	        adapter = section["workers"]["adapter"]
+   142	        self.assertEqual((section["mode"], section["automatic"]), ("manual", None))
+   143	        self.assertEqual((adapter["completion"], adapter["handoff"], adapter["launch"], adapter["stop"]), (None, None, None, {"stopped": False, "confirmed_at": None}))
+   144	        plan["automatic"] = {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions", "worker_timeout_seconds": 1,
+   145	                             "review_timeout_seconds": 1, "reviewer_transport": "print"}
+   146	        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "print")
+   147	
+   148	
+   149	class ExportRunTests(unittest.TestCase):
+   150	    def setUp(self):
+   151	        self.temp = tempfile.TemporaryDirectory()
+   152	        self.addCleanup(self.temp.cleanup)
+   153	        self.root = Path(self.temp.name)
+   154	
+   155	    def test_legacy_run_directory_re_exports_to_current_version_and_stays_stable(self):
+   156	        directory = legacy_run(self.root)
+   157	        # The checkpoint of a finished run: no pending work, integrated commit recorded.
+   158	        from langgraph.checkpoint.sqlite import SqliteSaver
+   159	        from .pipeline import build_pipeline
+   160	        runtime = ExportRuntime(directory)
+   161	        self.assertFalse(Path(runtime.plan["repository"]).exists())  # Worktrees and repository are gone.
+   162	        with SqliteSaver.from_conn_string(str(directory / "pipeline.sqlite")) as saver:
+   163	            graph = build_pipeline(saver, runtime)
+   164	            graph.update_state({"configurable": {"thread_id": "legacy-001"}}, {"run_id": "legacy-001", "integrated_commit": "d" * 40}, as_node="integrate")
+   165	        before = read_json(directory / "run-state.json")
+   166	        exported = export_run(runtime)
+   167	        self.assertEqual(exported["version"], EXPORT_VERSION)
+   168	        self.assertEqual(exported["version"], "1.2.0")
+   169	        self.assertNotEqual(exported["updated_at"], before["updated_at"])
+   170	        self.assertEqual(exported["created_at"], before["created_at"])
+   171	        self.assertEqual(exported["values"]["integrated_commit"], "d" * 40)
+   172	        self.assertEqual(exported["next"], [])
+   173	        self.assertEqual((exported["review"]["transport"], exported["review"]["reviewer_session_id"], exported["review"]["verdict"]), ("print", REVIEWER, "approved"))
+   174	        self.assertEqual(exported["inputs"]["mode"], "automatic")
+   175	        self.assertEqual(exported["inputs"]["workers"]["ui"]["launch"]["launch_requested_at"], "2026-09-21T14:33:25.331982Z")
+   176	        self.assertEqual(len(exported["definition"]["nodes"]), 9)
+   177	        written = (directory / "run-state.json").read_bytes()
+   178	        self.assertEqual(export_run(ExportRuntime(directory)), exported)
+   179	        self.assertEqual((directory / "run-state.json").read_bytes(), written)  # Unchanged content does not bump updated_at.
+   180	        self.assertFalse((directory / "review-worktree").exists())
+   181	        self.assertFalse(any(path.name.endswith(".launch.log") for path in directory.iterdir()))
+   182	
+   183	    def test_prepared_run_without_checkpoint_exports_the_prepare_shape(self):
+   184	        directory = legacy_run(self.root)
+   185	        (directory / "run-state.json").unlink()
+   186	        exported = export_run(ExportRuntime(directory))
+   187	        self.assertEqual((exported["values"], exported["next"], exported["tasks"]), ({}, ["launch_ui", "launch_adapter"], []))
+   188	        self.assertFalse((directory / "pipeline.sqlite").exists())
+   189	
+   190	    def test_run_without_policy_exports_null_inputs(self):
+   191	        directory = legacy_run(self.root, with_policy=False)
+   192	        exported = export_run(ExportRuntime(directory))
+   193	        self.assertIsNone(exported["inputs"])
+   194	        self.assertIsNotNone(exported["review"])
+   195	
+   196	    def test_malformed_or_contradictory_runs_are_refused(self):
+   197	        directory = legacy_run(self.root)
+   198	        review = read_json(directory / "review.json")
+   199	        review["findings"][0]["worker"] = "reviewer"
+   200	        save_json(directory / "review.json", review)
+   201	        with self.assertRaisesRegex(ValueError, "finding"):
+   202	            ExportRuntime(directory)
+   203	        review["findings"][0]["worker"] = "ui"
+   204	        review["findings"][0]["requirement"] = "Do the ui work."
+   205	        review["verdict"] = "blocked"
+   206	        save_json(directory / "review.json", review)
+   207	        exported = export_run(ExportRuntime(directory))  # A blocked review exports; only approval is not required.
+   208	        self.assertEqual(exported["review"]["verdict"], "blocked")
+   209	        self.assertEqual(exported["review"]["findings"][0]["requirement"], "Do the ui work.")
+   210	        review["candidate_commit"] = "e" * 40
+   211	        save_json(directory / "review.json", review)
+   212	        with self.assertRaisesRegex(ValueError, "exact run"):
+   213	            ExportRuntime(directory)
+   214	        (directory / "review-bundle.json").unlink()
+   215	        with self.assertRaisesRegex(ValueError, "contradictory"):
+   216	            ExportRuntime(directory)
+   217	        (directory / "review.json").unlink()
+   218	        policy = read_json(directory / "policy.json")
+   219	        policy["feature"] = "edited after pinning"
+   220	        save_json(directory / "policy.json", policy)
+   221	        with self.assertRaisesRegex(ValueError, "policy changed"):
+   222	            ExportRuntime(directory)
+   223	        plan = read_json(directory / "plan.json")
+   224	        plan["automatic"]["reviewer_transport"] = "stdio"
+   225	        save_json(directory / "plan.json", plan)
+   226	        with self.assertRaisesRegex(ValueError, "reviewer transport"):
+   227	            ExportRuntime(directory)
+   228	
+   229	    def test_export_cli_takes_the_lock_and_launches_nothing(self):
+   230	        directory = legacy_run(self.root)
+   231	        result = subprocess.run([sys.executable, "-m", "workflow", "export", str(directory)], cwd=REPO, capture_output=True, text=True, timeout=60)
+   232	        self.assertEqual(result.returncode, 0, result.stderr)
+   233	        self.assertIn("version 1.2.0", result.stdout)
+   234	        self.assertIn("No agents launched", result.stdout)
+   235	        exported = read_json(directory / "run-state.json")
+   236	        self.assertEqual((exported["version"], exported["review"]["reviewer_session_id"]), ("1.2.0", REVIEWER))
+   237	        self.assertTrue((directory / "controller.lock").exists())
+   238	        self.assertFalse((directory / "review.interactive.json").exists())
+   239	        review = read_json(directory / "review.json")
+   240	        review["reviewer"] = "uuuuuuuu-1111-4111-8111-111111111111"  # A worker reviewing itself is not independent.
+   241	        save_json(directory / "review.json", review)
+   242	        result = subprocess.run([sys.executable, "-m", "workflow", "export", str(directory)], cwd=REPO, capture_output=True, text=True, timeout=60)
+   243	        self.assertEqual(result.returncode, 1)
+   244	        self.assertIn("Independent reviewer identity required", result.stderr)
+   245	        self.assertEqual(read_json(directory / "run-state.json"), exported)  # A refused export leaves the previous file untouched.
+   246	
+   247	
+   248	if __name__ == "__main__":
+   249	    unittest.main()

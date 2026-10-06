@@ -1,0 +1,188 @@
+import { expect, test } from "@playwright/test";
+import { DOCK_COLOR, FOG_COLOR, LAND_COLORS, SEA_COLOR, SHOAL_COLOR } from "../../apps/web/src/palette.js";
+import { dockLabel, isNavigable, seaMap, SIGHT_RADIUS_TILES, Terrain, terrainAt } from "../../packages/content/src/index.js";
+import {
+  attachScreenshot,
+  colourAt,
+  createMatch,
+  drawnIds,
+  fogRevealed,
+  joinMatch,
+  listedIds,
+  minimapShows,
+  ownColour,
+  ownDrawnPosition,
+  place,
+  readout,
+  sailTo,
+  selfId,
+  shipsOnCanvas,
+  tileColourShare,
+  TILE,
+} from "./helpers.js";
+
+// Sailing with the keyboard takes real time, and a software-rendered browser on a busy machine reads the HUD slowly.
+test.describe.configure({ timeout: 120_000 });
+
+const centre = (tileX: number, tileY: number) => ({ x: tileX * TILE + TILE / 2, y: tileY * TILE + TILE / 2 });
+const SIGHT = SIGHT_RADIUS_TILES * TILE;
+
+test("sail around a shoal to an island dock and dock there [scenario:sail-and-dock]", async ({ page, request }, testInfo) => {
+  // Palm Key's south dock, with a shoal bar across the water south of it.
+  const palm = seaMap.islands.findIndex((island) => island.name === "Palm Key");
+  const dock = seaMap.docks.find((each) => each.island === palm && each.side === "S")!;
+  const start = { tileX: dock.tileX, tileY: dock.tileY + 10 };
+  // The straight course from the start to the dock runs over the shoal.
+  const shoalOnCourse = Array.from({ length: start.tileY - dock.tileY }, (_, step) => terrainAt(seaMap, dock.tileX, dock.tileY + 1 + step));
+  expect(shoalOnCourse).toContain(Terrain.Shoal);
+  const shoalRows = shoalOnCourse.flatMap((kind, step) => (kind === Terrain.Shoal ? [dock.tileY + 1 + step] : []));
+  let shoalEnd = dock.tileX;
+  while (terrainAt(seaMap, shoalEnd + 1, shoalRows[0]!) === Terrain.Shoal) shoalEnd++;
+
+  const code = await createMatch(page);
+  await place(request, page, code, start.tileX, start.tileY, 48);
+  await expect(page.getByTestId("hud-dock")).toHaveText("at sea");
+  const waypoints = [
+    { tileX: shoalEnd + 3, tileY: shoalRows.at(-1)! + 2 },
+    { tileX: shoalEnd + 3, tileY: shoalRows[0]! - 2 },
+    { tileX: dock.tileX, tileY: dock.tileY },
+  ];
+
+  // The minimap's fog before sailing. Wait until the ship is drawn at the start: the jump from the spawn slot is drawn
+  // as a fast glide that clears fog on its way, so only what is still fogged now can be cleared by sailing. The
+  // candidates are open-sea tiles out of sight of the start but well within sight of a waypoint (so their minimap
+  // pixel, which blends a tile with its neighbours, turns wholly to sea); the ones still fogged must all clear. Some
+  // always are: even a glide that cleared everything along its line would leave one.
+  await expect.poll(() => ownDrawnPosition(page)).toEqual(centre(start.tileX, start.tileY));
+  const fogAtStart = await fogRevealed(page);
+  const beside: { tileX: number; tileY: number }[] = [];
+  for (let tileY = dock.tileY - 8; tileY <= start.tileY; tileY++) {
+    for (let tileX = dock.tileX - 8; tileX <= shoalEnd + 12; tileX++) {
+      const openSea = [-1, 0, 1].every((dy) => [-1, 0, 1].every((dx) => terrainAt(seaMap, tileX + dx, tileY + dy) === Terrain.Sea));
+      const outOfSightAtStart = (tileX - start.tileX) ** 2 + (tileY - start.tileY) ** 2 > (SIGHT_RADIUS_TILES + 1) ** 2;
+      const nearRoute = waypoints.some((point) => (tileX - point.tileX) ** 2 + (tileY - point.tileY) ** 2 <= 7 * 7);
+      const offTheBerth = (tileX - dock.tileX) ** 2 + (tileY - dock.tileY) ** 2 >= 5 * 5;
+      if (openSea && outOfSightAtStart && nearRoute && offTheBerth) beside.push({ tileX, tileY });
+    }
+  }
+  const foggedAtStart = await minimapShows(page, beside, FOG_COLOR);
+  const stillFogged = beside.filter((_, index) => foggedAtStart[index]);
+  expect(stillFogged.length).toBeGreaterThan(0);
+
+  // Round the east end of the shoal with the keyboard, then run in to the dock.
+  const visited: { x: number; y: number }[] = [];
+  const record = (ship: { x: number; y: number }) => visited.push(ship);
+  const fogAlong = [fogAtStart];
+  for (const point of waypoints) {
+    await sailTo(page, centre(point.tileX, point.tileY), { within: TILE, onReadout: record });
+    fogAlong.push(await fogRevealed(page));
+  }
+  const berth = centre(dock.tileX, dock.tileY);
+
+  // Close in: no throttle, E held, until the server moors the ship.
+  await page.keyboard.down("KeyE");
+  await expect(page.getByTestId("hud-dock")).toHaveText(dockLabel(seaMap, dock.id), { timeout: 10_000 });
+  await page.keyboard.up("KeyE");
+  expect(dockLabel(seaMap, dock.id)).toBe("Palm Key, south dock");
+
+  // The ship stops at the dock and stays there.
+  const self = await selfId(page);
+  const moored = (await readout(page, self))!;
+  expect(moored).toMatchObject({ ...berth, speed: 0, dock: dock.id });
+  await page.waitForTimeout(500);
+  expect(await readout(page, self)).toEqual(moored);
+  // It went round the shoal, never over it.
+  expect(visited.length).toBeGreaterThan(10);
+  for (const point of visited) expect(isNavigable(seaMap, Math.floor(point.x / TILE), Math.floor(point.y / TILE))).toBe(true);
+  expect(visited.some((point) => Math.floor(point.x / TILE) > shoalEnd)).toBe(true);
+  await expect.poll(() => shipsOnCanvas(page)).toEqual([self]);
+
+  // The tile map is on the canvas: land, the shoal bar, the island's other dock and open sea each show their
+  // placeholder colour, sampled at the tile through the camera's scroll.
+  const island = seaMap.islands[palm]!;
+  const otherDock = seaMap.docks.find((each) => each.island === palm && each.id !== dock.id)!;
+  const tiles = [
+    { name: "land", tileX: dock.tileX, tileY: dock.tileY - 4, kind: Terrain.Land, color: LAND_COLORS[island.theme] },
+    { name: "shoal", tileX: dock.tileX, tileY: shoalRows[0]!, kind: Terrain.Shoal, color: SHOAL_COLOR },
+    { name: "dock", tileX: otherDock.tileX, tileY: otherDock.tileY, kind: Terrain.Dock, color: DOCK_COLOR },
+    { name: "sea", tileX: dock.tileX, tileY: dock.tileY + 2, kind: Terrain.Sea, color: SEA_COLOR },
+  ];
+  for (const each of tiles) {
+    expect(terrainAt(seaMap, each.tileX, each.tileY), each.name).toBe(each.kind);
+    await expect.poll(() => tileColourShare(page, each.tileX, each.tileY, each.color), { message: `${each.name} tile` }).toBeGreaterThan(0.75);
+  }
+  // And not by accident: land is not drawn in the shoal colour, nor the shoal in the sea colour.
+  expect(await tileColourShare(page, tiles[0]!.tileX, tiles[0]!.tileY, SHOAL_COLOR)).toBe(0);
+  expect(await tileColourShare(page, tiles[1]!.tileX, tiles[1]!.tileY, SEA_COLOR)).toBe(0);
+
+  // The fog cleared along the sailed path: the revealed count grew leg by leg, and every candidate tile that was still
+  // fogged at the start now shows the sea on the minimap.
+  expect(fogAlong).toEqual([...fogAlong].sort((a, b) => a - b));
+  expect(fogAlong.at(-1)!).toBeGreaterThan(fogAtStart);
+  expect(await minimapShows(page, stillFogged, SEA_COLOR)).toEqual(stillFogged.map(() => true));
+
+  await attachScreenshot(page, testInfo, "sail-and-dock");
+
+  // Any throttle casts off.
+  await page.keyboard.down("ArrowDown");
+  await expect(page.getByTestId("hud-dock")).toHaveText("at sea");
+  await page.keyboard.up("ArrowDown");
+});
+
+test("ships out of sight are neither listed nor drawn until one sails within sight [scenario:out-of-sight]", async ({ browser, request }, testInfo) => {
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+    const code = await createMatch(host);
+    await joinMatch(guest, code);
+    await expect(guest.getByTestId("hud-players")).toHaveText("2");
+
+    // Sixteen tiles apart on open sea, the guest facing the host: out of sight, but on each other's screen.
+    const row = 76;
+    await place(request, host, code, 100, row, 0);
+    await place(request, guest, code, 116, row, 32);
+    const hostId = await selfId(host);
+    const guestId = await selfId(guest);
+    const hostShip = (await readout(host, hostId))!;
+    const [hostColour, guestColour] = [await ownColour(host), await ownColour(guest)];
+
+    const expectApart = async () => {
+      await expect.poll(() => listedIds(guest)).toEqual([guestId]);
+      await expect.poll(() => listedIds(host)).toEqual([hostId]);
+      await expect.poll(() => drawnIds(guest)).toEqual([guestId]);
+      await expect.poll(() => drawnIds(host)).toEqual([hostId]);
+      // Nothing of the other ship's colour where it actually is, on either canvas.
+      const guestShip = (await readout(guest, guestId))!;
+      expect(await colourAt(guest, hostShip.x, hostShip.y, hostColour)).toBe(false);
+      expect(await colourAt(host, guestShip.x, guestShip.y, guestColour)).toBe(false);
+      // Both still know there are two players.
+      await expect(host.getByTestId("hud-players")).toHaveText("2");
+    };
+    await expectApart();
+
+    // The guest sails toward the host with the keyboard until the host comes into sight.
+    await guest.keyboard.down("ArrowUp");
+    await expect.poll(() => listedIds(guest), { timeout: 15_000 }).toEqual([hostId, guestId].sort());
+    await guest.keyboard.up("ArrowUp");
+    const closing = (await readout(guest, guestId))!;
+    expect(Math.hypot(closing.x - hostShip.x, closing.y - hostShip.y)).toBeLessThanOrEqual(SIGHT + 3 * 64);
+    await expect.poll(() => listedIds(host)).toEqual([hostId, guestId].sort());
+    await expect.poll(() => shipsOnCanvas(guest)).toEqual([hostId, guestId].sort());
+    await expect.poll(() => shipsOnCanvas(host)).toEqual([hostId, guestId].sort());
+
+    // It turns about and sails away east until the host drops out of sight again.
+    await sailTo(guest, { x: 140 * TILE, y: hostShip.y }, { until: async () => !(await listedIds(guest)).includes(hostId) });
+    const away = (await readout(guest, guestId))!;
+    expect(Math.hypot(away.x - hostShip.x, away.y - hostShip.y)).toBeGreaterThan(SIGHT - 3 * 64);
+    // Let it coast to a stop out of sight before checking both views.
+    await expect.poll(async () => (await readout(guest, guestId))!.speed, { timeout: 10_000 }).toBe(0);
+    await expectApart();
+
+    await attachScreenshot(guest, testInfo, "out-of-sight");
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});

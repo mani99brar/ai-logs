@@ -1,0 +1,295 @@
+import { pvpGoldTransfer, rubbingTypeSchema, type RubbingType } from "@pirate-sea-race/content/objectives";
+import {
+  atTick,
+  isPlayerId,
+  moveRubbings,
+  noEffects,
+  playerRejection,
+  releaseTo,
+  tickRejection,
+  updatePlayer,
+  type Effects,
+  type LedgerRejection,
+  type LedgerStep,
+  type Transfer,
+} from "./internal.js";
+import {
+  activeDuelOf,
+  byTypeOrder,
+  defaultTheftType,
+  eligibleTheftTypes,
+  findDuel,
+  findPlayer,
+  reservedIn,
+  type DuelResultRecord,
+  type DuelSettlement,
+  type LedgerDuel,
+  type LedgerState,
+} from "./state.js";
+
+export interface DuelResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** The duel as it now stands (its current result for a rejected request), or null for an unknown duel. */
+  readonly duel: LedgerDuel | null;
+  readonly transfers: readonly Transfer[];
+  readonly cacheIds: readonly string[];
+}
+
+function rejected(state: LedgerState, rejection: LedgerRejection, duelId: unknown): LedgerStep<DuelResult> {
+  const duel = typeof duelId === "string" ? (findDuel(state, duelId) ?? null) : null;
+  return { state, result: { ok: false, rejection, duel, transfers: [], cacheIds: [] } };
+}
+
+function applied(state: LedgerState, duelId: string, effects: Effects): LedgerStep<DuelResult> {
+  return {
+    state,
+    result: { ok: true, rejection: null, duel: findDuel(state, duelId) ?? null, ...effects },
+  };
+}
+
+function replaceDuel(state: LedgerState, duel: LedgerDuel): LedgerState {
+  return { ...state, duels: state.duels.map((existing) => (existing.id === duel.id ? duel : existing)) };
+}
+
+export interface ReserveDuelRequest {
+  /** Created by the server for the encounter. */
+  readonly duelId: string;
+  readonly players: readonly [string, string];
+  readonly tick: number;
+}
+
+/**
+ * Reserves both players' rubbings inside the duel (§4, §16), so none of them can be collected, stolen or abandoned
+ * twice while it runs, and cancels both players' channels. A disconnected player can be challenged (§12).
+ */
+export function reserveDuel(state: LedgerState, request: ReserveDuelRequest): LedgerStep<DuelResult> {
+  const { duelId, players, tick } = request;
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(state, bad, duelId);
+  if (!isPlayerId(duelId) || !Array.isArray(players) || players.length !== 2) return rejected(state, "invalid-request", duelId);
+  if (findDuel(state, duelId)) return rejected(state, "duplicate", duelId);
+  const [a, b] = players;
+  if (a === b) return rejected(state, "same-player", duelId);
+  for (const playerId of players) {
+    const refusal = playerRejection(state, playerId) ?? (activeDuelOf(state, playerId) ? "player-in-duel" : null);
+    if (refusal) return rejected(state, refusal, duelId);
+  }
+  const effects = noEffects();
+  const duel: LedgerDuel = {
+    id: duelId,
+    players: [a, b],
+    startTick: tick,
+    phase: "fighting",
+    result: null,
+    choiceDeadline: null,
+    settlement: null,
+  };
+  let next: LedgerState = { ...atTick(state, tick), duels: [...state.duels, duel] };
+  for (const playerId of players) next = updatePlayer(next, playerId, (player) => ({ ...player, channel: null }));
+  next = moveRubbings(
+    next,
+    next.rubbings.flatMap((rubbing) =>
+      rubbing.location.kind === "player" && players.includes(rubbing.location.playerId)
+        ? [{ rubbingId: rubbing.id, to: { kind: "duel", duelId, playerId: rubbing.location.playerId } as const }]
+        : [],
+    ),
+    effects,
+  );
+  return applied(next, duelId, effects);
+}
+
+export interface ReportDuelResultRequest {
+  readonly duelId: string;
+  readonly tick: number;
+  /** `cancelled`: both players forfeited on the same tick (§12), which settles like a draw. */
+  readonly outcome: "win" | "draw" | "cancelled";
+  /** The winner, for `win` only. */
+  readonly winner?: string;
+}
+
+/**
+ * Records the fight's result once. A draw or cancellation settles at once with nothing moving. A win opens the
+ * winner's theft choice window, or settles at once (gold only) when no type is eligible. Any later result message
+ * for the duel, even a different one, changes nothing and returns the current result.
+ */
+export function reportDuelResult(state: LedgerState, request: ReportDuelResultRequest): LedgerStep<DuelResult> {
+  const { duelId, tick, outcome, winner } = request;
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(state, bad, duelId);
+  const duel = typeof duelId === "string" ? findDuel(state, duelId) : undefined;
+  if (!duel) return rejected(state, "unknown-duel", duelId);
+  if (duel.phase !== "fighting") return rejected(state, "already-resolved", duelId);
+  if (outcome === "win") {
+    if (winner === undefined || !duel.players.includes(winner)) return rejected(state, "not-a-participant", duelId);
+  } else if ((outcome !== "draw" && outcome !== "cancelled") || winner !== undefined) {
+    return rejected(state, "invalid-request", duelId);
+  }
+  const effects = noEffects();
+  const next = recordResult(atTick(state, tick), duel, outcome, winner ?? null, false, tick, effects);
+  return applied(next, duelId, effects);
+}
+
+/** Records a result for a duel still fighting; shared with a forfeit by a player who leaves. */
+export function recordResult(
+  state: LedgerState,
+  duel: LedgerDuel,
+  outcome: DuelResultRecord["outcome"],
+  winner: string | null,
+  forfeit: boolean,
+  tick: number,
+  effects: Effects,
+): LedgerState {
+  if (outcome !== "win") {
+    const result: DuelResultRecord = { outcome, winner: null, loser: null, forfeit: false, tick };
+    const settlement: DuelSettlement = {
+      tick,
+      stolenRubbingId: null,
+      stolenType: null,
+      choice: "none",
+      gold: 0,
+      goldSuppressed: false,
+    };
+    let next = replaceDuel(state, { ...duel, phase: "settled", result, settlement });
+    for (const playerId of duel.players) {
+      next = releaseTo(next, playerId, reservedIn(next, duel.id, playerId).map((rubbing) => rubbing.id), tick, effects);
+    }
+    return next;
+  }
+  const loser = duel.players[0] === winner ? duel.players[1] : duel.players[0];
+  const decided: LedgerDuel = { ...duel, result: { outcome, winner, loser, forfeit, tick } };
+  const next = replaceDuel(state, decided);
+  if (eligibleTheftTypes(next, duel.id).length === 0) return commitWin(next, decided, tick, null, effects);
+  return replaceDuel(next, { ...decided, phase: "choosing", choiceDeadline: tick + state.rules.theftChoiceTicks });
+}
+
+/**
+ * Commits a decided duel, once: validates eligibility again, moves the stolen rubbing (the winner's valid choice, or
+ * the default), transfers gold unless suppressed, grants the loser a fresh rumor for the lost type, and returns every
+ * other reserved rubbing to its owner (or to a cache where its owner left). A winner who has left takes nothing.
+ */
+export function commitWin(
+  state: LedgerState,
+  duel: LedgerDuel,
+  tick: number,
+  choice: RubbingType | null,
+  effects: Effects,
+): LedgerState {
+  const result = duel.result;
+  if (duel.phase === "settled" || result?.outcome !== "win" || result.winner === null || result.loser === null) {
+    throw new Error(`duel ${duel.id} has no win to commit`);
+  }
+  const { winner, loser } = result;
+  const winnerPlayer = findPlayer(state, winner);
+  const loserPlayer = findPlayer(state, loser);
+  if (!winnerPlayer || !loserPlayer) throw new Error(`duel ${duel.id} names an unknown player`);
+  const winnerPresent = winnerPlayer.status !== "left";
+
+  const eligible = eligibleTheftTypes(state, duel.id);
+  const chosen = choice !== null && eligible.includes(choice) ? choice : null;
+  const stolenType = chosen ?? defaultTheftType(state, eligible);
+  const stolen = stolenType === null ? undefined : reservedIn(state, duel.id, loser).find((rubbing) => rubbing.type === stolenType);
+
+  const previous = state.wins.find((win) => win.winner === winner && win.loser === loser);
+  const goldSuppressed =
+    winnerPresent && previous !== undefined && result.tick - previous.tick < state.rules.repeatWinWindowTicks;
+  const gold = winnerPresent && !goldSuppressed ? pvpGoldTransfer(state.rules, loserPlayer.gold) : 0;
+
+  const settlement: DuelSettlement = {
+    tick,
+    stolenRubbingId: stolen?.id ?? null,
+    stolenType: stolen ? stolen.type : null,
+    choice: stolen === undefined ? "none" : chosen !== null ? "winner" : "default",
+    gold,
+    goldSuppressed,
+  };
+  let next = replaceDuel(state, { ...duel, phase: "settled", settlement });
+  if (stolen) {
+    next = moveRubbings(next, [{ rubbingId: stolen.id, to: { kind: "player", playerId: winner } }], effects);
+    const lost = stolen.type;
+    next = updatePlayer(next, loser, (player) => ({
+      ...player,
+      freshRumors: player.freshRumors.includes(lost) ? player.freshRumors : [...player.freshRumors, lost].sort(byTypeOrder),
+    }));
+  }
+  if (gold > 0) {
+    next = updatePlayer(next, loser, (player) => ({ ...player, gold: player.gold - gold }));
+    next = updatePlayer(next, winner, (player) => ({ ...player, gold: player.gold + gold }));
+  }
+  if (winnerPresent) {
+    const record = { winner, loser, tick: result.tick };
+    next = {
+      ...next,
+      wins: previous ? next.wins.map((win) => (win === previous ? record : win)) : [...next.wins, record],
+    };
+  }
+  for (const playerId of [winner, loser]) {
+    next = releaseTo(next, playerId, reservedIn(next, duel.id, playerId).map((rubbing) => rubbing.id), tick, effects);
+  }
+  return next;
+}
+
+export interface ChooseTheftRequest {
+  /** The server-created duel result the choice refers to (§16). */
+  readonly duelId: string;
+  readonly playerId: string;
+  readonly type: RubbingType;
+  readonly tick: number;
+}
+
+/** The winner's theft choice, before the deadline and for an eligible type; it commits the settlement at once. */
+export function chooseTheft(state: LedgerState, request: ChooseTheftRequest): LedgerStep<DuelResult> {
+  const { duelId, playerId, type, tick } = request;
+  const bad = tickRejection(state, tick);
+  if (bad) return rejected(state, bad, duelId);
+  const duel = typeof duelId === "string" ? findDuel(state, duelId) : undefined;
+  if (!duel) return rejected(state, "unknown-duel", duelId);
+  if (duel.phase === "settled") return rejected(state, "already-resolved", duelId);
+  if (duel.phase !== "choosing" || duel.result === null || duel.choiceDeadline === null) {
+    return rejected(state, "not-choosing", duelId);
+  }
+  if (playerId !== duel.result.winner) return rejected(state, "not-winner", duelId);
+  if (tick >= duel.choiceDeadline) return rejected(state, "choice-window-closed", duelId);
+  if (!rubbingTypeSchema.safeParse(type).success || !eligibleTheftTypes(state, duelId).includes(type)) {
+    return rejected(state, "ineligible-type", duelId);
+  }
+  const effects = noEffects();
+  const next = commitWin(atTick(state, tick), duel, tick, type, effects);
+  return applied(next, duelId, effects);
+}
+
+export interface AdvanceRequest {
+  readonly tick: number;
+}
+
+export interface AdvanceResult {
+  readonly ok: boolean;
+  readonly rejection: LedgerRejection | null;
+  /** Duels whose choice window closed at this tick, settled with the default theft. */
+  readonly settled: readonly LedgerDuel[];
+  readonly transfers: readonly Transfer[];
+  readonly cacheIds: readonly string[];
+}
+
+/**
+ * Moves the ledger's clock to `tick` and settles every duel whose choice window has closed with the default theft,
+ * in reservation order. Call it once per world tick before that tick's requests.
+ */
+export function advanceLedger(state: LedgerState, request: AdvanceRequest): LedgerStep<AdvanceResult> {
+  const bad = tickRejection(state, request.tick);
+  if (bad) return { state, result: { ok: false, rejection: bad, settled: [], transfers: [], cacheIds: [] } };
+  const { tick } = request;
+  const effects = noEffects();
+  let next = atTick(state, tick);
+  const settled: string[] = [];
+  for (const duel of state.duels) {
+    if (duel.phase === "choosing" && duel.choiceDeadline !== null && tick >= duel.choiceDeadline) {
+      next = commitWin(next, findDuel(next, duel.id)!, tick, null, effects);
+      settled.push(duel.id);
+    }
+  }
+  return {
+    state: next,
+    result: { ok: true, rejection: null, settled: settled.map((id) => findDuel(next, id)!), ...effects },
+  };
+}

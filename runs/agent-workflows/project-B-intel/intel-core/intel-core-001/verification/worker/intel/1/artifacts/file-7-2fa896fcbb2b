@@ -1,0 +1,529 @@
+import { describe, expect, it } from "vitest";
+import {
+  createIntelConfig,
+  createIntelState,
+  hashState,
+  intelRules,
+  replayIntel,
+  stepIntel,
+  targetedRumorAvailability,
+  type IntelConfig,
+  type IntelMessage,
+  type IntelMessageBody,
+  type IntelPoint,
+  type IntelRubbing,
+  type IntelState,
+  type IntelStepResult,
+  type IntelWorldView,
+  type RubbingType,
+  type TargetedRumorRequest,
+} from "./index.js";
+
+const T = 256;
+const tile = (x: number, y: number): IntelPoint => ({ x: x * T + 128, y: y * T + 128 });
+/** A 30 × 30 test sea: sector bands are tiles 0–9, 10–19 and 20–29. Islands sit in the four corner sectors. */
+const MAP = {
+  widthTiles: 30,
+  heightTiles: 30,
+  subUnitsPerTile: T,
+  islands: [{ name: "Palm Key" }, { name: "Ash Isle" }, { name: "Mist Rock" }, { name: "Old Ruin" }],
+};
+const ISLAND_AT = [tile(4, 4), tile(25, 4), tile(4, 25), tile(25, 25)];
+const ISLAND_SECTOR = [0, 2, 6, 8];
+/** A point in each of the nine sectors. */
+const S = [tile(2, 2), tile(15, 2), tile(27, 2), tile(2, 15), tile(15, 15), tile(27, 15), tile(2, 27), tile(15, 27), tile(27, 27)] as const;
+const FINAL = { x: 15 * T + 7, y: 16 * T + 3 };
+const START = 100;
+
+/** Real reveal times and a 100-tick (5 s) carrier interval, so carrier scenarios stay short. */
+const quick = createIntelConfig({
+  preset: "slice",
+  finalIsland: FINAL,
+  controlStartTick: START,
+  map: MAP,
+  rules: { ...intelRules, carrierIntervalTicks: 100, sightingDelayTicks: 100, sectorRevealTicks: 1_000, carrierRevealTicks: 2_000 },
+});
+const real = createIntelConfig({ preset: "slice", finalIsland: FINAL, controlStartTick: START, map: MAP });
+
+const typeOf = (id: string) => id.slice(0, id.indexOf("-")) as RubbingType;
+const source = (id: string, island: number): IntelRubbing => ({ id, type: typeOf(id), place: { kind: "source", island, ...ISLAND_AT[island]! } });
+const cached = (id: string, at: IntelPoint): IntelRubbing => ({ id, type: typeOf(id), place: { kind: "cache", ...at } });
+const carried = (id: string, playerId: string): IntelRubbing => ({ id, type: typeOf(id), place: { kind: "carried", playerId } });
+const reserved = (id: string, playerId: string): IntelRubbing => ({ id, type: typeOf(id), place: { kind: "duel", playerId } });
+
+interface World {
+  readonly players: Readonly<Record<string, IntelPoint>>;
+  readonly rubbings: readonly IntelRubbing[];
+}
+
+/** Recursively frozen, so a step that mutated its input would throw. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+function viewOf(tick: number, world: World): IntelWorldView {
+  return { tick, players: Object.entries(world.players).map(([id, at]) => ({ id, ...at })), rubbings: world.rubbings };
+}
+
+/** Steps with frozen input and state, checking neither changes. */
+class Run {
+  state: IntelState;
+  constructor(
+    readonly config: IntelConfig,
+    seed = 1,
+  ) {
+    this.state = createIntelState(config, seed);
+  }
+
+  step(tick: number, world: World, requests: TargetedRumorRequest[] = []): IntelStepResult {
+    const view = deepFreeze(viewOf(tick, world));
+    const before = hashState(deepFreeze(this.state));
+    const stepped = stepIntel(this.config, this.state, view, deepFreeze(requests));
+    expect(hashState(this.state)).toBe(before);
+    this.state = stepped.state;
+    return stepped;
+  }
+
+  available(tick: number, world: World, playerId: string, type: RubbingType) {
+    return targetedRumorAvailability(this.config, this.state, viewOf(tick, world), playerId, type);
+  }
+}
+
+function to(result: IntelStepResult, playerId: string): IntelMessageBody[] {
+  return result.messages.filter((message) => message.to.kind === "player" && message.to.playerId === playerId).map((message) => message.body);
+}
+
+function everyone(result: IntelStepResult): IntelMessageBody[] {
+  return result.messages.filter((message) => message.to.kind === "everyone").map((message) => message.body);
+}
+
+function only<K extends IntelMessageBody["kind"]>(bodies: IntelMessageBody[], kind: K): Extract<IntelMessageBody, { kind: K }> {
+  const found = bodies.filter((body) => body.kind === kind);
+  expect(found).toHaveLength(1);
+  return found[0] as Extract<IntelMessageBody, { kind: K }>;
+}
+
+const request = (requestId: string, playerId: string, type: RubbingType): TargetedRumorRequest => ({ requestId, playerId, type });
+
+describe("control start and starting rumors (§2)", () => {
+  it("say nothing before control start, then give each player a rumor toward a type they lack", () => {
+    const run = new Run(quick);
+    const world: World = {
+      players: { A: S[4], B: S[0], C: S[8] },
+      rubbings: [carried("sun-1", "A"), carried("moon-1", "A"), source("sun-2", 0), source("moon-2", 1), carried("moon-3", "C")],
+    };
+    for (const tick of [0, 50, START - 1]) {
+      const stepped = run.step(tick, world, [request(`early-${tick}`, "B", "sun")]);
+      expect(stepped.messages).toEqual([]);
+      expect(stepped.outcomes).toEqual([{ requestId: `early-${tick}`, result: "none" }]);
+      expect(run.state.started).toBe(false);
+    }
+    const start = run.step(START, world);
+    expect(run.state.started).toBe(true);
+    // A already holds a full set: the final sector and route instead of a rumor.
+    expect(to(start, "A").map((body) => body.kind)).toEqual(["final-route"]);
+    expect(everyone(start)).toEqual([{ kind: "final-sector", tick: START, sector: 4, name: "Central Waters" }]);
+    // B lacks both: a rumor for either type, pointing at the island holding it.
+    const b = only(to(start, "B"), "rumor");
+    expect(b).toMatchObject({ entry: 1, reason: "start" });
+    expect(b.target).toEqual(b.type === "sun" ? { kind: "island", island: 0, name: "Palm Key" } : { kind: "island", island: 1, name: "Ash Isle" });
+    // C holds moon: sun only.
+    expect(only(to(start, "C"), "rumor")).toEqual({ kind: "rumor", tick: START, entry: 1, type: "sun", reason: "start", target: { kind: "island", island: 0, name: "Palm Key" } });
+    // A player first seen after control start gets a starting rumor then.
+    const late = run.step(START + 30, { ...world, players: { ...world.players, D: S[2] } });
+    expect(only(to(late, "D"), "rumor")).toMatchObject({ reason: "start", tick: START + 30 });
+    expect(to(late, "B")).toEqual([]);
+  });
+
+  it("give the same rumor for the same seed, and a seed decides between equal targets", () => {
+    const world: World = { players: { A: S[4] }, rubbings: [source("sun-1", 0), source("sun-2", 1), source("moon-1", 2), source("moon-2", 3)] };
+    const targetFor = (seed: number) => {
+      const stepped = new Run(quick, seed).step(START, world);
+      return only(to(stepped, "A"), "rumor");
+    };
+    expect(targetFor(42)).toEqual(targetFor(42));
+    const seen = new Set(Array.from({ length: 24 }, (_, seed) => JSON.stringify(targetFor(seed))));
+    expect(seen.size).toBe(4);
+  });
+});
+
+describe("rumor targets (§3, §11)", () => {
+  it("prefer a sealed source, then a cache, then a carrier sighting", () => {
+    const players = { A: S[4], B: S[2] };
+    const world: World = { players, rubbings: [carried("sun-1", "A"), source("moon-1", 3), cached("moon-2", S[1]), carried("moon-3", "B")] };
+    let run = new Run(quick);
+    // The sealed source first…
+    expect(only(to(run.step(START, world), "A"), "rumor").target).toEqual({ kind: "island", island: 3, name: "Old Ruin" });
+    // …then, with that island already in the journal, the cache's sector…
+    const cache = run.step(START + 10, world, [request("r1", "A", "moon")]);
+    expect(cache.outcomes).toEqual([{ requestId: "r1", result: "rumor" }]);
+    expect(only(to(cache, "A"), "rumor").target).toEqual({ kind: "sector", sector: 1, name: "Northern Waters" });
+    // …and no carrier sighting while some copy is not carried.
+    expect(run.step(START + 20, world, [request("r2", "A", "moon")]).outcomes).toEqual([{ requestId: "r2", result: "none" }]);
+
+    run = new Run(quick);
+    const carrierWorld = (at: IntelPoint): World => ({ players: { A: S[4], B: at }, rubbings: [carried("sun-1", "A"), carried("moon-3", "B")] });
+    // Every moon is carried: the starting lead is a sighting, which needs a previous snapshot, so it waits a beat.
+    expect(to(run.step(START, carrierWorld(S[2])), "A")).toEqual([]);
+    const first = run.step(START + 100, carrierWorld(S[8]));
+    // The previous snapshot (control start, B in the north-east), not the latest one nor the present.
+    expect(to(first, "A")).toEqual([
+      { kind: "carrier-sighting", tick: START + 100, type: "moon", reason: "start", sector: 2, name: "North-East Reach", seenTick: START },
+    ]);
+    expect(run.step(START + 150, carrierWorld(S[7]), [request("r3", "A", "moon")]).outcomes).toEqual([{ requestId: "r3", result: "capped" }]);
+    const bought = run.step(START + 250, carrierWorld(S[7]), [request("r4", "A", "moon")]);
+    expect(bought.outcomes).toEqual([{ requestId: "r4", result: "sighting" }]);
+    expect(only(to(bought, "A"), "carrier-sighting")).toMatchObject({ reason: "targeted", sector: 8, seenTick: START + 100 });
+  });
+
+  it("never give a rumor for a held type, nor point a player at their own former copy", () => {
+    for (let seed = 0; seed < 12; seed++) {
+      const run = new Run(quick, seed);
+      const players = { A: S[0], B: S[4], C: S[8] };
+      // Only two moons: A's and C's. B then steals A's.
+      const before: World = { players, rubbings: [carried("sun-1", "B"), carried("sun-2", "A"), carried("moon-1", "A"), carried("moon-2", "C")] };
+      run.step(START, before);
+      const held = run.step(START + 10, before, [
+        request("held", "A", "moon"),
+      ]);
+      expect(held.outcomes).toEqual([{ requestId: "held", result: "none" }]);
+      expect(to(held, "A")).toEqual([]);
+      const stolen: World = { players: { ...players, B: S[2] }, rubbings: [carried("sun-1", "B"), carried("sun-2", "A"), carried("moon-1", "B"), carried("moon-2", "C")] };
+      // The fresh rumor finds every moon carried and no previous snapshot yet: it waits for the next boundary.
+      expect(to(run.step(START + 50, stolen), "A")).toEqual([{ kind: "final-route-inactive", tick: START + 50 }]);
+      const delivered = run.step(START + 100, stolen);
+      // The previous snapshot (tick 100) has A's own moon in the north-west and C's in the south-east: never A's own.
+      expect(only(to(delivered, "A"), "carrier-sighting")).toMatchObject({ type: "moon", reason: "fresh", sector: 8, seenTick: START });
+    }
+  });
+});
+
+describe("losses (§11)", () => {
+  it("give a free fresh rumor when a type is stolen, and nothing when a rubbing is only reserved in a duel", () => {
+    const run = new Run(quick);
+    const players = { A: S[4], B: S[5] };
+    const others = [source("sun-2", 0), source("moon-1", 1)];
+    const start = run.step(START, { players, rubbings: [carried("sun-1", "A"), ...others] });
+    expect(only(to(start, "B"), "rumor")).toBeDefined();
+    const duel = run.step(START + 5, { players, rubbings: [reserved("sun-1", "A"), ...others] });
+    expect(duel.messages).toEqual([]);
+    const theft = run.step(START + 6, { players, rubbings: [carried("sun-1", "B"), ...others] });
+    expect(only(to(theft, "A"), "rumor")).toEqual({
+      kind: "rumor",
+      tick: START + 6,
+      entry: 2,
+      type: "sun",
+      reason: "fresh",
+      target: { kind: "island", island: 0, name: "Palm Key" },
+    });
+  });
+
+  it("keep a fresh sighting waiting while no snapshot shows another carrier, and send a no-lead when no copy is left", () => {
+    // After the theft only the thief carries sun, and the thief was not carrying it at any snapshot: the fresh
+    // rumor waits, and at the next boundary the previous snapshot still lacks the thief, so it keeps waiting.
+    const run = new Run(quick);
+    const players = { A: S[4], B: S[5] };
+    run.step(START, { players, rubbings: [carried("sun-1", "A")] });
+    run.step(START + 20, { players, rubbings: [carried("sun-1", "B")] });
+    expect(to(run.step(START + 100, { players, rubbings: [carried("sun-1", "B")] }), "A")).toEqual([]);
+    expect(run.state.players.find((player) => player.id === "A")!.pending).toEqual([{ type: "sun", reason: "fresh", tick: START + 20 }]);
+    const later = run.step(START + 200, { players, rubbings: [carried("sun-1", "B")] });
+    expect(only(to(later, "A"), "carrier-sighting")).toMatchObject({ type: "sun", sector: 5, seenTick: START + 100 });
+    // With no copy of a type left in the view at all, a stale rumor's replacement is a no-lead.
+    const empty = new Run(quick);
+    empty.step(START, { players, rubbings: [source("moon-1", 1), carried("sun-1", "A")] });
+    const gone = empty.step(START + 5, { players, rubbings: [carried("sun-1", "A")] });
+    expect(to(gone, "A").map((body) => body.kind)).toEqual(["rumor-stale", "no-lead"]);
+  });
+});
+
+describe("staleness and the journal (§3)", () => {
+  it("mark an island rumor stale when another player collects its source, and offer a remaining source", () => {
+    const run = new Run(quick, 3);
+    const players = { A: S[4], B: S[1] };
+    const moons = [source("moon-1", 1), source("moon-2", 3)];
+    const start = only(to(run.step(START, { players, rubbings: [carried("sun-1", "A"), ...moons] }), "A"), "rumor");
+    expect(start.target.kind).toBe("island");
+    const island = start.target.kind === "island" ? start.target.island : -1;
+    const taken = island === 1 ? "moon-1" : "moon-2";
+    const rest = moons.filter((rubbing) => rubbing.id !== taken);
+    const collected = run.step(START + 40, { players, rubbings: [carried("sun-1", "A"), carried(taken, "B"), ...rest] });
+    expect(to(collected, "A")).toEqual([
+      { kind: "rumor-stale", tick: START + 40, entry: 1, type: "moon" },
+      {
+        kind: "rumor",
+        tick: START + 40,
+        entry: 2,
+        type: "moon",
+        reason: "replacement",
+        target: { kind: "island", island: island === 1 ? 3 : 1, name: island === 1 ? "Old Ruin" : "Ash Isle" },
+      },
+    ]);
+    expect(run.state.players.find((player) => player.id === "A")!.journal.map((rumor) => [rumor.entry, rumor.status, rumor.closedTick])).toEqual([
+      [1, "stale", START + 40],
+      [2, "active", null],
+    ]);
+  });
+
+  it("keep an island rumor while another copy of its type is still sealed there", () => {
+    const run = new Run(quick);
+    const players = { A: S[4], B: S[1] };
+    run.step(START, { players, rubbings: [carried("sun-1", "A"), source("moon-1", 1), source("moon-2", 1)] });
+    expect(to(run.step(START + 1, { players, rubbings: [carried("sun-1", "A"), carried("moon-1", "B"), source("moon-2", 1)] }), "A")).toEqual([]);
+  });
+
+  it("mark a cache rumor stale when its cache is claimed, and offer the remaining cache", () => {
+    const run = new Run(quick, 5);
+    const players = { A: S[4], C: S[0] };
+    const caches = [cached("sun-1", S[1]), cached("sun-2", S[7])];
+    const start = only(to(run.step(START, { players, rubbings: [carried("moon-1", "A"), ...caches] }), "A"), "rumor");
+    const sector = start.target.kind === "sector" ? start.target.sector : -1;
+    expect([1, 7]).toContain(sector);
+    const claimed = sector === 1 ? "sun-1" : "sun-2";
+    const claim = run.step(START + 60, { players, rubbings: [carried("moon-1", "A"), carried(claimed, "C"), ...caches.filter((rubbing) => rubbing.id !== claimed)] });
+    expect(to(claim, "A")).toEqual([
+      { kind: "rumor-stale", tick: START + 60, entry: 1, type: "sun" },
+      { kind: "rumor", tick: START + 60, entry: 2, type: "sun", reason: "replacement", target: { kind: "sector", sector: sector === 1 ? 7 : 1, name: sector === 1 ? "Southern Waters" : "Northern Waters" } },
+    ]);
+  });
+
+  it("resolve a rumor quietly when its holder obtains the type, by collection or by theft", () => {
+    const players = { A: S[4], B: S[3] };
+    // Collection: A empties the very island the rumor names; that is resolved, not stale.
+    let run = new Run(quick);
+    run.step(START, { players, rubbings: [carried("sun-1", "A"), source("moon-1", 1)] });
+    expect(to(run.step(START + 120, { players, rubbings: [carried("sun-1", "A"), carried("moon-1", "A")] }), "A")).toEqual([
+      { kind: "rumor-resolved", tick: START + 120, entry: 1, type: "moon" },
+      { kind: "final-route", tick: START + 120, x: FINAL.x, y: FINAL.y, restored: false },
+    ]);
+    // Theft: A wins B's moon while B, on the same tick, collects the island A's rumor names.
+    run = new Run(quick);
+    run.step(START, { players, rubbings: [carried("sun-1", "A"), carried("moon-2", "B"), source("moon-1", 1)] });
+    const stolen = run.step(START + 9, { players, rubbings: [carried("sun-1", "A"), carried("moon-2", "A"), carried("moon-1", "B")] });
+    expect(to(stolen, "A").filter((body) => body.kind.startsWith("rumor"))).toEqual([{ kind: "rumor-resolved", tick: START + 9, entry: 1, type: "moon" }]);
+    expect(run.state.players.find((player) => player.id === "A")!.journal[0]!.status).toBe("resolved");
+  });
+
+  it("replace a stale rumor with a sighting from the previous snapshot when every remaining copy is carried", () => {
+    const run = new Run(quick, 9);
+    const world = (tick: number, c: IntelPoint, b: IntelPoint, bHasMoon: boolean): World => ({
+      players: { A: S[4], B: b, C: c },
+      rubbings: [carried("sun-1", "A"), carried("moon-2", "C"), bHasMoon ? carried("moon-1", "B") : source("moon-1", 1)],
+    });
+    expect(only(to(run.step(START, world(START, S[3], S[0], false)), "A"), "rumor").target).toMatchObject({ kind: "island", island: 1 });
+    run.step(START + 100, world(START + 100, S[6], S[0], false));
+    run.step(START + 200, world(START + 200, S[7], S[0], false));
+    const emptied = run.step(START + 250, world(START + 250, S[8], S[2], true));
+    expect(to(emptied, "A")).toEqual([
+      { kind: "rumor-stale", tick: START + 250, entry: 1, type: "moon" },
+      // C was in the south-west at the previous snapshot (tick 200 is the latest; tick 100 the previous one), never now.
+      { kind: "carrier-sighting", tick: START + 250, type: "moon", reason: "replacement", sector: 6, name: "South-West Reach", seenTick: START + 100 },
+    ]);
+    // A carrier sighting is one-shot: C moving on, or B's moon moving, never makes it stale.
+    const moved = run.step(START + 260, { players: { A: S[4], B: S[5], C: S[1] }, rubbings: [carried("sun-1", "A"), carried("moon-2", "B"), carried("moon-1", "C")] });
+    expect(to(moved, "A")).toEqual([]);
+  });
+
+  it("defer a capped free sighting to the next snapshot boundary instead of dropping it", () => {
+    const run = new Run(quick, 2);
+    const world = (sunAtSource: boolean, cAt: IntelPoint = S[1]): World => ({
+      players: { A: S[4], B: S[0], C: cAt, D: S[5] },
+      rubbings: [carried("sun-1", "C"), sunAtSource ? source("sun-2", 0) : carried("sun-2", "B"), carried("moon-1", "D")],
+    });
+    // A lacks both; only sun has a source, so the start rumor names Palm Key.
+    expect(only(to(run.step(START, world(true)), "A"), "rumor")).toMatchObject({ type: "sun", target: { kind: "island", island: 0 } });
+    run.step(START + 100, world(true, S[3]));
+    const bought = run.step(START + 150, world(true, S[3]), [request("moon-buy", "A", "moon")]);
+    expect(bought.outcomes).toEqual([{ requestId: "moon-buy", result: "sighting" }]);
+    expect(only(to(bought, "A"), "carrier-sighting")).toMatchObject({ type: "moon", sector: 5, seenTick: START });
+    // B collects the last sealed sun: the rumor goes stale, every sun is carried, and A's sighting for this snapshot is spent.
+    const stale = run.step(START + 160, world(false, S[3]));
+    expect(to(stale, "A")).toEqual([{ kind: "rumor-stale", tick: START + 160, entry: 1, type: "sun" }]);
+    expect(run.state.players.find((player) => player.id === "A")!.pending).toEqual([{ type: "sun", reason: "replacement", tick: START + 160 }]);
+    expect(run.step(START + 170, world(false, S[3]), [request("sun-buy", "A", "sun")]).outcomes).toEqual([{ requestId: "sun-buy", result: "capped" }]);
+    expect(to(run.step(START + 199, world(false, S[8])), "A")).toEqual([]);
+    const next = run.step(START + 200, world(false, S[8]));
+    // Delivered at the boundary from the previous snapshot (tick 100): C was in the west; B had not collected yet.
+    expect(to(next, "A")).toEqual([
+      { kind: "carrier-sighting", tick: START + 200, type: "sun", reason: "replacement", sector: 3, name: "Western Waters", seenTick: START + 100 },
+    ]);
+    expect(run.state.players.find((player) => player.id === "A")!.pending).toEqual([]);
+  });
+});
+
+describe("targeted rumors (§11)", () => {
+  it("answer rumor, sighting, capped, none and duplicate, matching the availability shown beforehand", () => {
+    const run = new Run(quick, 4);
+    const world: World = { players: { A: S[4], B: S[8], C: S[0] }, rubbings: [source("sun-1", 2), source("sun-2", 0), carried("moon-1", "B")] };
+    run.step(START, world);
+    run.step(START + 100, world);
+    const t = START + 110;
+    const asks: [TargetedRumorRequest, string][] = [
+      [request("a-sun", "A", "sun"), "rumor"],
+      [request("b-sun", "B", "sun"), "rumor"],
+    ];
+    for (const [ask, expected] of asks) expect(run.available(t, world, ask.playerId, ask.type)).toBe(expected);
+    expect(run.available(t, world, "A", "moon")).toBe("sighting");
+    expect(run.available(t, world, "B", "moon")).toBe("none");
+    const first = run.step(t, world, [request("c1", "A", "moon"), request("c0", "C", "sun")]);
+    expect(first.outcomes).toEqual([
+      { requestId: "c1", result: "sighting" },
+      { requestId: "c0", result: "rumor" },
+    ]);
+    expect(run.available(t + 1, world, "A", "moon")).toBe("capped");
+    const after = run.state;
+    const second = run.step(t + 1, world, [
+      request("c2", "A", "moon"),
+      request("c3", "B", "moon"),
+      request("c4", "Z", "sun"),
+      request("c1", "A", "moon"),
+    ]);
+    expect(second.outcomes).toEqual([
+      { requestId: "c2", result: "capped" },
+      { requestId: "c3", result: "none" },
+      { requestId: "c4", result: "none" },
+      { requestId: "c1", result: "duplicate" },
+    ]);
+    expect(second.messages).toEqual([]);
+    // A repeated id changes nothing and draws nothing: the very same state as a tick without it.
+    const withDuplicate = stepIntel(quick, run.state, viewOf(t + 2, world), [request("c2", "A", "moon")]);
+    const without = stepIntel(quick, run.state, viewOf(t + 2, world), []);
+    expect(withDuplicate.outcomes).toEqual([{ requestId: "c2", result: "duplicate" }]);
+    expect(withDuplicate.state).toEqual(without.state);
+    expect(hashState(withDuplicate.state)).toBe(hashState(without.state));
+    expect(withDuplicate.messages).toEqual(without.messages);
+    expect(after.requestIds).toEqual(["c0", "c1"]);
+    // A rumor is not sold twice: with both sun islands already in C's journal, nothing new is left.
+    const again = run.step(t + 3, world, [request("c5", "C", "sun")]);
+    expect(again.outcomes).toEqual([{ requestId: "c5", result: "none" }]);
+    // A later snapshot lifts the cap.
+    expect(run.step(START + 200, world, [request("c6", "A", "moon")]).outcomes).toEqual([{ requestId: "c6", result: "sighting" }]);
+  });
+
+  it("lift the sighting cap from the carrier reveal on", () => {
+    const run = new Run(quick);
+    const world: World = { players: { A: S[4], B: S[8] }, rubbings: [carried("sun-1", "A"), carried("moon-1", "B")] };
+    run.step(START, world);
+    run.step(quick.carrierRevealTick, world);
+    const stepped = run.step(quick.carrierRevealTick + 1, world, [request("x", "A", "moon"), request("y", "A", "moon")]);
+    expect(stepped.outcomes.map((outcome) => outcome.result)).toEqual(["sighting", "sighting"]);
+  });
+});
+
+describe("reveals (§2, §5)", () => {
+  it("announce the first full set's sector to everyone and route each full-set holder, suspending a broken set", () => {
+    const run = new Run(quick);
+    const players = { A: S[0], B: S[8], C: S[2] };
+    run.step(START, { players, rubbings: [carried("sun-1", "A"), source("moon-1", 1), carried("moon-2", "B"), carried("sun-2", "C")] });
+    const complete = run.step(START + 300, { players, rubbings: [carried("sun-1", "A"), carried("moon-1", "A"), carried("moon-2", "B"), carried("sun-2", "C")] });
+    expect(everyone(complete)).toEqual([{ kind: "final-sector", tick: START + 300, sector: 4, name: "Central Waters" }]);
+    expect(only(to(complete, "A"), "final-route")).toEqual({ kind: "final-route", tick: START + 300, x: FINAL.x, y: FINAL.y, restored: false });
+    // B steals A's moon: A's route goes inactive; B lacks sun, so nothing for B yet.
+    const lost = run.step(START + 400, { players, rubbings: [carried("sun-1", "A"), carried("moon-1", "B"), carried("moon-2", "C"), carried("sun-2", "B")] });
+    expect(to(lost, "A").filter((body) => body.kind.startsWith("final"))).toEqual([{ kind: "final-route-inactive", tick: START + 400 }]);
+    // B completes (moon-1 and sun-2) on the same tick: a route of their own, and no second announcement.
+    expect(only(to(lost, "B"), "final-route")).toMatchObject({ restored: false });
+    expect(everyone(lost)).toEqual([]);
+    // A wins a moon back: the route is restored.
+    const back = run.step(START + 500, { players, rubbings: [carried("sun-1", "A"), carried("moon-2", "A"), carried("moon-1", "B"), carried("sun-2", "B")] });
+    expect(only(to(back, "A"), "final-route")).toEqual({ kind: "final-route", tick: START + 500, x: FINAL.x, y: FINAL.y, restored: true });
+    expect(to(back, "B").filter((body) => body.kind.startsWith("final"))).toEqual([]);
+    expect(everyone(back)).toEqual([]);
+    // Only a full-set holder ever receives the exact point.
+    const all = [complete, lost, back].flatMap((stepped) => stepped.messages);
+    expect(all.filter((message) => "x" in message.body).every((message) => message.to.kind === "player")).toBe(true);
+  });
+
+  const revealWorld: World = {
+    players: { A: S[4], B: S[5] },
+    rubbings: [source("sun-1", 0), source("sun-2", 0), source("moon-1", 3), cached("moon-2", S[1]), carried("sun-3", "B"), reserved("moon-3", "A")],
+  };
+
+  it("reveal source and cache sectors exactly at minute 20, once, also across skipped ticks", () => {
+    const run = new Run(real);
+    run.step(START, revealWorld);
+    const minute20 = START + 20 * 60 * 20;
+    expect(real.sectorRevealTick).toBe(minute20);
+    expect(everyone(run.step(minute20 - 1, revealWorld))).toEqual([]);
+    expect(everyone(run.step(minute20, revealWorld))).toEqual([
+      {
+        kind: "sector-reveal",
+        tick: minute20,
+        sources: [
+          { sector: 0, name: "North-West Reach" },
+          { sector: 8, name: "South-East Reach" },
+        ],
+        caches: [{ sector: 1, name: "Northern Waters" }],
+      },
+    ]);
+    expect(everyone(run.step(minute20 + 1, revealWorld))).toEqual([]);
+    const skipping = new Run(real);
+    skipping.step(START, revealWorld);
+    skipping.step(minute20 - 10, revealWorld);
+    expect(everyone(skipping.step(minute20 + 10, revealWorld)).map((body) => body.kind)).toEqual(["sector-reveal"]);
+  });
+
+  it("publish carrier sectors at minute 28 and every 30 s after, once per crossed boundary run", () => {
+    const run = new Run(real);
+    run.step(START, revealWorld);
+    const minute28 = START + 28 * 60 * 20;
+    expect(real.carrierRevealTick).toBe(minute28);
+    const moved: World = { ...revealWorld, players: { A: S[6], B: S[7] } };
+    run.step(minute28 - 600, revealWorld);
+    expect(everyone(run.step(minute28 - 1, moved))).toEqual([]);
+    const report = [
+      { sector: 6, name: "South-West Reach", type: "moon" },
+      { sector: 7, name: "Southern Waters", type: "sun" },
+    ];
+    // The latest snapshot is taken on the same beat, so the first report is of minute 28 itself.
+    expect(everyone(run.step(minute28, moved))).toEqual([{ kind: "carrier-report", tick: minute28, seenTick: minute28, carriers: report }]);
+    expect(everyone(run.step(minute28 + 599, revealWorld))).toEqual([]);
+    expect(everyone(run.step(minute28 + 600, revealWorld))).toEqual([
+      {
+        kind: "carrier-report",
+        tick: minute28 + 600,
+        seenTick: minute28 + 600,
+        carriers: [
+          { sector: 4, name: "Central Waters", type: "moon" },
+          { sector: 5, name: "Eastern Waters", type: "sun" },
+        ],
+      },
+    ]);
+    // Skipping over two beats sends one report.
+    run.step(minute28 + 601, revealWorld);
+    const skipped = run.step(minute28 + 1_250, moved);
+    expect(everyone(skipped)).toEqual([{ kind: "carrier-report", tick: minute28 + 1_250, seenTick: minute28 + 1_250, carriers: report }]);
+    expect(run.state.lastCarrierBroadcast).toBe(2);
+    // Minute 35 is the claim code's business: nothing new here.
+    expect(everyone(run.step(START + 35 * 60 * 20, revealWorld)).map((body) => body.kind)).toEqual(["carrier-report"]);
+  });
+
+  it("replay a script to the same state hash and messages", () => {
+    const script = [START, START + 100, START + 250, START + 2_000].map((tick) => ({ view: viewOf(tick, revealWorld) }));
+    const first = replayIntel(quick, createIntelState(quick, 11), script);
+    const second = replayIntel(quick, createIntelState(quick, 11), script);
+    expect(second.hash).toBe(first.hash);
+    expect(second.messages).toEqual(first.messages);
+    const kinds = new Set(first.messages.map((message: IntelMessage) => message.body.kind));
+    expect(kinds.has("sector-reveal") && kinds.has("carrier-report")).toBe(true);
+  });
+});
+
+describe("the world view", () => {
+  it("refuse a tick that does not advance, duplicates, an unknown carrier or island and a doubled type", () => {
+    const state = stepIntel(quick, createIntelState(quick, 1), viewOf(START, { players: { A: S[0] }, rubbings: [] })).state;
+    const bad = (world: World, tick = START + 1) => () => stepIntel(quick, state, viewOf(tick, world));
+    expect(bad({ players: { A: S[0] }, rubbings: [] }, START)).toThrow(/expected a tick after/);
+    expect(bad({ players: { A: S[0] }, rubbings: [carried("sun-1", "Z")] })).toThrow(/not in the view/);
+    expect(bad({ players: { A: S[0] }, rubbings: [carried("sun-1", "A"), carried("sun-1", "A")] })).toThrow(/appears twice/);
+    expect(bad({ players: { A: S[0] }, rubbings: [carried("sun-1", "A"), reserved("sun-2", "A")] })).toThrow(/two sun/);
+    expect(bad({ players: { A: S[0] }, rubbings: [{ id: "tide-1", type: "tide", place: { kind: "cache", ...S[0] } }] })).toThrow(/outside the preset/);
+    expect(bad({ players: { A: S[0] }, rubbings: [{ id: "sun-1", type: "sun", place: { kind: "source", island: 4, ...S[0] } }] })).toThrow(/unknown island/);
+    expect(() => stepIntel(quick, state, { tick: START + 1, players: [{ id: "A", ...S[0] }, { id: "A", ...S[1] }], rubbings: [] })).toThrow(/appears twice/);
+    expect(() => createIntelState(quick, 1, START)).toThrow(RangeError);
+  });
+});

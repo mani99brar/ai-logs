@@ -1,0 +1,6 @@
+- [Visible Claude sessions](visible-claude-sessions.md) — every workflow Claude session (challenge, workers, reviewers) in its own Herdr pane
+- [No handoff review subagents](handoff-diff-review.md) — monitor runs from workflow logs only; the operator declined extra subagent reviews
+- [Player-realistic input tests](player-realistic-input-tests.md) — gameplay tests must hold/tap keys like players; docking passed CI but failed first playtest
+- [md-manager hands off](md-manager-hands-off.md) — never edit ~/dev/md-manager without explicit approval; other worktrees work on it
+- [Workflow codes, I maintain](workflow-codes-i-maintain.md) — project-B code goes through workflow runs; I maintain runs and log decisions for the operator
+- [Stale agent state](stale-agent-state.md) — finished workflow session stuck at state "working" stalls the controller; nudge it via herdr send-text + Enter

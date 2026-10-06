@@ -1,0 +1,388 @@
+import { createSeaMap, HEADING_COUNT, isNavigable, seaMap, type SeaMapDefinition } from "@pirate-sea-race/content";
+import { describe, expect, it } from "vitest";
+import { nextInt } from "../random.js";
+import {
+  bearing,
+  createEncounterConfig,
+  createEncounterState,
+  ENCOUNTER_EVENT_KINDS,
+  encounterRules,
+  hashState,
+  stepEncounters,
+  tileCentre,
+  tileOf,
+  type DuelReport,
+  type EncounterConfig,
+  type EncounterEvent,
+  type EncounterMode,
+  type EncounterPlayerInput,
+  type EncounterState,
+  type EncounterTickInput,
+} from "./index.js";
+
+type Draw = (bound: number) => number;
+
+function generator(seed: number): Draw {
+  let rng = seed;
+  return (bound) => {
+    const drawn = nextInt(rng, bound);
+    rng = drawn.state;
+    return drawn.value;
+  };
+}
+
+function shuffled<T>(items: readonly T[], draw: Draw): T[] {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index--) {
+    const other = draw(index + 1);
+    [copy[index], copy[other]] = [copy[other]!, copy[index]!];
+  }
+  return copy;
+}
+
+/** A small synthetic sea: scattered land and shoals, and a dock on each side. */
+function syntheticSea(seed: number, size: number): SeaMapDefinition {
+  const draw = generator(seed);
+  const rows = Array.from({ length: size }, (_, row) =>
+    Array.from({ length: size }, (_, column) => {
+      if ((row === 1 && column === Math.floor(size / 2)) || (row === size - 2 && column === 2) || (column === size - 2 && row === 3)) return "D";
+      const roll = draw(100);
+      return roll < 7 ? "#" : roll < 12 ? "%" : ".";
+    }).join(""),
+  );
+  return createSeaMap({ name: `synthetic-${seed}`, widthTiles: size, heightTiles: size, rows, islands: [], spawnSlots: [], hub: { tileX: size >> 1, tileY: size >> 1 } });
+}
+
+interface Scenario {
+  readonly name: string;
+  readonly map: SeaMapDefinition;
+  readonly config: EncounterConfig;
+  /** Players on foot are allowed (the islands' placeholder rules). */
+  readonly foot: boolean;
+  /** Players start within this many tiles of the map's hub. */
+  readonly spread: number;
+}
+
+const sliceScenario: Scenario = { name: "slice sea", map: seaMap, config: createEncounterConfig(), foot: false, spread: 7 };
+const smallA = syntheticSea(11, 20);
+const smallB = syntheticSea(23, 14);
+const scenarios: readonly Scenario[] = [
+  sliceScenario,
+  { name: "synthetic 20×20", map: smallA, config: createEncounterConfig({ map: smallA }), foot: true, spread: 9 },
+  // A cap of two duels, so a hit meets the cap often.
+  { name: "synthetic 14×14, cap 2", map: smallB, config: createEncounterConfig({ map: smallB, rules: { ...encounterRules, maxDuels: 2 } }), foot: true, spread: 6 },
+  { name: "synthetic 20×20, cap 1", map: smallA, config: createEncounterConfig({ map: smallA, rules: { ...encounterRules, maxDuels: 1 } }), foot: false, spread: 5 },
+];
+
+const ID_POOL = ["p1", "p10", "p2", "P3", "a", "B", "crew", "Z9", "m", "q7", "x"];
+
+interface DuelPlan {
+  readonly readyAt: readonly [number | null, number | null];
+  readonly fightTicks: number;
+  readonly outcome: "win" | "draw" | "cancelled";
+  readonly winner: 0 | 1;
+  readonly settleDelay: number;
+}
+
+interface Run {
+  readonly spawnProtected: readonly string[];
+  readonly inputs: readonly EncounterTickInput[];
+  readonly states: readonly EncounterState[];
+  readonly hashes: readonly string[];
+  readonly events: readonly (readonly EncounterEvent[])[];
+}
+
+/**
+ * A reactive match: players wander (ships over navigable tiles only), turn, press, disconnect, change mode, and
+ * report objective ends; a duel plan decides each reserved duel's readiness, fight, result and settlement, reported
+ * as the caller would; returns move the players. Now and then it sends a stray report the rules must refuse.
+ */
+function play(scenario: Scenario, seed: number, ticks: number): Run {
+  const { map, config } = scenario;
+  const draw = generator(seed);
+  const chance = (perMille: number) => draw(1000) < perMille;
+  const count = 4 + draw(ID_POOL.length - 3);
+  const ids = shuffled(ID_POOL, draw).slice(0, count);
+  const hub = map.hub;
+  const navigableNear = (tileX: number, tileY: number, radius: number) => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const x = tileX + draw(2 * radius + 1) - radius;
+      const y = tileY + draw(2 * radius + 1) - radius;
+      if (isNavigable(map, x, y)) return tileCentre(map, { tileX: x, tileY: y });
+    }
+    return null;
+  };
+  const players = new Map<string, EncounterPlayerInput>();
+  for (const id of ids) {
+    const at = navigableNear(hub.tileX, hub.tileY, scenario.spread)!;
+    players.set(id, { id, mode: "ship", ...at, heading: draw(HEADING_COUNT), connected: true, attack: false, ready: false, protectionEndedBy: null });
+  }
+  const matchOverAt = seed % 5 === 0 ? ticks - 30 - draw(200) : -1;
+  const spawnProtected = ids.filter(() => draw(3) === 0);
+  let state = createEncounterState(config, { spawnProtected });
+  const plans = new Map<string, DuelPlan>();
+  const inputs: EncounterTickInput[] = [];
+  const states: EncounterState[] = [];
+  const events: EncounterEvent[][] = [];
+
+  for (let tick = 1; tick <= ticks; tick++) {
+    // Now and then everyone presses at once, so hits land together and conflict.
+    const volley = chance(25) || (tick >= matchOverAt - 10 && tick < matchOverAt);
+    const inDuel = new Set(state.duels.flatMap((duel) => duel.players));
+    const respawning = new Set(state.players.filter((player) => player.respawn !== null).map((player) => player.id));
+    for (const id of ids) {
+      let player = { ...players.get(id)!, attack: false, protectionEndedBy: null as EncounterPlayerInput["protectionEndedBy"] };
+      if (!inDuel.has(id) && !respawning.has(id)) {
+        if (player.mode === "ship") {
+          if (chance(500)) {
+            const x = player.x + draw(97) - 48;
+            const y = player.y + draw(97) - 48;
+            const tile = tileOf(map, { x, y });
+            if (isNavigable(map, tile.tileX, tile.tileY)) player = { ...player, x, y };
+          }
+          if (chance(30)) {
+            const tile = tileOf(map, player);
+            const jump = navigableNear(tile.tileX, tile.tileY, 3);
+            if (jump !== null) player = { ...player, ...jump };
+          }
+          // Closing in: a jump to within two tiles of someone else.
+          if (chance(15)) {
+            const tile = tileOf(map, players.get(ids[draw(ids.length)]!)!);
+            const jump = navigableNear(tile.tileX, tile.tileY, 2);
+            if (jump !== null) player = { ...player, ...jump };
+          }
+        } else if (chance(500)) {
+          const limit = map.widthTiles * map.subUnitsPerTile - 1;
+          player = { ...player, x: Math.min(limit, Math.max(0, player.x + draw(129) - 64)), y: Math.min(limit, Math.max(0, player.y + draw(129) - 64)) };
+        }
+        if (chance(200)) player = { ...player, heading: (player.heading + draw(9) - 4 + HEADING_COUNT) % HEADING_COUNT };
+        // Chasing: turn towards someone, as a player lining up a grapple would.
+        if (chance(40)) {
+          const other = players.get(ids[draw(ids.length)]!)!;
+          player = { ...player, heading: bearing(player, other) ?? player.heading };
+        }
+        if (chance(20)) player = { ...player, heading: draw(HEADING_COUNT) };
+        if (scenario.foot && chance(4)) {
+          const tile = tileOf(map, player);
+          const mode: EncounterMode = player.mode === "ship" ? "foot" : "ship";
+          if (mode === "foot" || isNavigable(map, tile.tileX, tile.tileY)) player = { ...player, mode };
+        }
+        if (volley || chance(80)) player = { ...player, attack: true };
+      }
+      if (chance(5)) player = { ...player, connected: !player.connected };
+      if (chance(6)) player = { ...player, protectionEndedBy: draw(2) === 0 ? "claim" : "collection" };
+      players.set(id, player);
+    }
+
+    // Readiness, results and settlements, as the room and the ledger would report them.
+    const reports: DuelReport[] = [];
+    for (const duel of state.duels) {
+      let plan = plans.get(duel.id);
+      if (plan === undefined) {
+        const style = draw(10);
+        const soon = () => duel.reservedTick + draw(90);
+        const readyAt: [number | null, number | null] = style < 6 ? [soon(), soon()] : style < 8 ? (draw(2) === 0 ? [soon(), null] : [null, soon()]) : [null, null];
+        const roll = draw(10);
+        plan = { readyAt, fightTicks: 20 + draw(200), outcome: roll < 7 ? "win" : roll < 9 ? "draw" : "cancelled", winner: draw(2) as 0 | 1, settleDelay: draw(10) < 7 ? draw(120) : 280 + draw(120) };
+        plans.set(duel.id, plan);
+      }
+      duel.players.forEach((id, index) => {
+        const readyAt = plan.readyAt[index] ?? null;
+        players.set(id, { ...players.get(id)!, ready: readyAt !== null && tick >= readyAt });
+      });
+      if (duel.phase === "fighting" && tick >= duel.startTick! + plan.fightTicks) {
+        const at = Math.max(duel.startTick!, tick - draw(2));
+        reports.push(plan.outcome === "win" ? { kind: "end", duelId: duel.id, tick: at, outcome: "win", winner: duel.players[plan.winner] } : { kind: "end", duelId: duel.id, tick: at, outcome: plan.outcome });
+      }
+      if (duel.phase === "ended" && tick >= duel.end!.tick + (duel.end!.outcome === "win" ? plan.settleDelay : 1)) {
+        reports.push({ kind: "settled", duelId: duel.id, tick: Math.max(duel.end!.tick, tick - draw(2)) });
+      }
+      if (chance(4)) reports.push({ kind: "end", duelId: duel.id, tick: tick - draw(3), outcome: "draw" });
+      if (chance(3)) reports.push({ kind: "settled", duelId: duel.id, tick });
+      if (chance(2)) reports.push({ kind: "end", duelId: duel.id, tick, outcome: "win", winner: "nobody" });
+    }
+    if (chance(3)) reports.push({ kind: "settled", duelId: "ghost", tick });
+
+    const input: EncounterTickInput = { tick, players: ids.map((id) => players.get(id)!), reports, matchOver: tick >= matchOverAt && matchOverAt > 0 };
+    const stepped = stepEncounters(config, state, input);
+    for (const event of stepped.events) {
+      if (event.kind === "player-returned" || event.kind === "player-respawned") {
+        players.set(event.playerId, { ...players.get(event.playerId)!, x: event.x, y: event.y, ready: false });
+      }
+    }
+    inputs.push(input);
+    states.push(stepped.state);
+    events.push([...stepped.events]);
+    state = stepped.state;
+  }
+  return { spawnProtected, inputs, states, hashes: states.map(hashState), events };
+}
+
+/** Steps recorded inputs without reacting to anything. */
+function replay(config: EncounterConfig, inputs: readonly EncounterTickInput[], spawnProtected: readonly string[]): Run {
+  let state = createEncounterState(config, { spawnProtected });
+  const states: EncounterState[] = [];
+  const events: EncounterEvent[][] = [];
+  for (const input of inputs) {
+    const stepped = stepEncounters(config, state, input);
+    state = stepped.state;
+    states.push(state);
+    events.push([...stepped.events]);
+  }
+  return { spawnProtected, inputs, states, hashes: states.map(hashState), events };
+}
+
+const spawnProtectedOf = (run: Run) => run.spawnProtected;
+
+const TICKS = 1600;
+const SEEDS = Array.from({ length: 40 }, (_, index) => index + 1);
+const cases = SEEDS.map((seed) => ({ seed, scenario: scenarios[seed % scenarios.length]! }));
+const runs = new Map<number, Run>();
+function runFor(seed: number): Run {
+  let run = runs.get(seed);
+  if (run === undefined) {
+    run = play(scenarios[seed % scenarios.length]!, seed, TICKS);
+    runs.set(seed, run);
+  }
+  return run;
+}
+
+function isProtectedOnTick(state: EncounterState, input: EncounterTickInput, id: string): boolean {
+  const protection = state.players.find((player) => player.id === id)?.protection ?? null;
+  const reported = input.players.find((player) => player.id === id)?.protectionEndedBy ?? null;
+  return protection !== null && input.tick < protection.endTick && reported === null;
+}
+
+describe("seeded random matches (§6 invariants)", () => {
+  it.each(cases)("seed $seed ($scenario.name) keeps every invariant after every tick", ({ seed, scenario }) => {
+    const { config, map } = scenario;
+    const run = runFor(seed);
+    let previous = createEncounterState(config, { spawnProtected: spawnProtectedOf(run) });
+    run.states.forEach((state, index) => {
+      const input = run.inputs[index]!;
+      const events = run.events[index]!;
+      const inDuels = state.duels.flatMap((duel) => duel.players);
+      // No player in two duels; never more than the cap, itself at most four.
+      expect(new Set(inDuels).size).toBe(inDuels.length);
+      expect(state.duels.length).toBeLessThanOrEqual(config.maxDuels);
+      expect(config.maxDuels).toBeLessThanOrEqual(4);
+      // No attempt belongs to a reserved or respawning attacker, and each attacker has one.
+      for (const attempt of state.attempts) {
+        expect(inDuels).not.toContain(attempt.attackerId);
+        expect(state.players.find((player) => player.id === attempt.attackerId)?.respawn ?? null).toBeNull();
+      }
+      expect(new Set(state.attempts.map((attempt) => attempt.attackerId)).size).toBe(state.attempts.length);
+      const wasInDuel = new Set(previous.duels.flatMap((duel) => duel.players));
+      for (const event of events) {
+        if (event.kind === "duel-reserved") {
+          // No hit on a protected, reserved or respawning defender; nor by one.
+          for (const id of event.players) {
+            expect(wasInDuel.has(id)).toBe(false);
+            expect(previous.players.find((player) => player.id === id)?.respawn ?? null).toBeNull();
+          }
+          expect(isProtectedOnTick(previous, input, event.players[1])).toBe(false);
+          expect(state.players.find((player) => player.id === event.players[1])?.protection ?? null).toBeNull();
+          expect(input.players.find((player) => player.id === event.players[0])?.connected).toBe(true);
+        }
+        // Every ship-mode return point is navigable; a draw's two are apart and near the encounter.
+        if (event.kind === "player-returned") {
+          const duel = previous.duels.find((candidate) => candidate.id === event.duelId)!;
+          if (duel.mode === "ship") {
+            const tile = tileOf(map, event);
+            expect(isNavigable(map, tile.tileX, tile.tileY)).toBe(true);
+          }
+        }
+        if (event.kind === "player-respawned") {
+          const respawn = previous.players.find((player) => player.id === event.playerId)?.respawn;
+          const mode = respawn?.mode ?? state.duels.find((duel) => duel.players.includes(event.playerId))?.mode;
+          if (mode === "ship" || respawn === undefined) {
+            const tile = tileOf(map, event);
+            expect(isNavigable(map, tile.tileX, tile.tileY)).toBe(true);
+            expect(event.dockId).not.toBeNull();
+          }
+        }
+      }
+      const returns = events.filter((event) => event.kind === "player-returned");
+      for (const duelId of new Set(returns.map((event) => event.duelId))) {
+        const pair = returns.filter((event) => event.duelId === duelId);
+        const duel = previous.duels.find((candidate) => candidate.id === duelId)!;
+        if (pair.length !== 2 || duel.mode !== "ship") continue;
+        const [p, q] = pair as [(typeof pair)[0], (typeof pair)[0]];
+        const tile = map.subUnitsPerTile;
+        expect((p.x - q.x) ** 2 + (p.y - q.y) ** 2).toBeGreaterThanOrEqual((3 * tile) ** 2);
+        for (const point of pair) expect((point.x - duel.x) ** 2 + (point.y - duel.y) ** 2).toBeLessThanOrEqual((6 * tile) ** 2);
+      }
+      previous = state;
+    });
+  });
+
+  it.each(cases.slice(0, 12))("seed $seed ($scenario.name) replays to the same hashState on every tick", ({ seed, scenario }) => {
+    const run = runFor(seed);
+    const again = replay(scenario.config, JSON.parse(JSON.stringify(run.inputs)) as EncounterTickInput[], spawnProtectedOf(run));
+    expect(again.hashes).toEqual(run.hashes);
+    expect(again.events).toEqual(run.events);
+  });
+
+  it("EXERCISED: every event kind and every reason occurs across the seeds", () => {
+    const seen = new Set<string>();
+    for (const { seed } of cases) {
+      for (const event of runFor(seed).events.flat()) {
+        seen.add(event.kind);
+        if ("reason" in event) seen.add(`${event.kind}:${event.reason}`);
+      }
+    }
+    const EXERCISED = [
+      ...ENCOUNTER_EVENT_KINDS,
+      ...["expired", "attack", "claim", "collection"].map((reason) => `protection-ended:${reason}`),
+      ...["unknown-duel", "already-ended", "not-ended", "invalid"].map((reason) => `report-refused:${reason}`),
+      ...["attacker-ineligible", "match-over"].map((reason) => `attempt-cancelled:${reason}`),
+      ...["defender-ineligible", "out-of-range", "out-of-aim", "no-line-of-sight"].map((reason) => `attempt-missed:${reason}`),
+      ...["conflict", "duel-cap"].map((reason) => `attempt-preempted:${reason}`),
+    ];
+    expect(EXERCISED.filter((entry) => !seen.has(entry))).toEqual([]);
+  });
+});
+
+/** Renames player ids, and the player ids inside duel ids, everywhere in a value. */
+function renamer(rename: (id: string) => string, ids: ReadonlySet<string>) {
+  const renameString = (value: string): string => {
+    if (ids.has(value)) return rename(value);
+    const match = /^duel:(\d+):(\d+):(.*)$/.exec(value);
+    if (match === null) return value;
+    const length = Number(match[2]);
+    const attacker = match[3]!.slice(0, length);
+    const defender = match[3]!.slice(length + 1);
+    const renamed = rename(attacker);
+    return `duel:${match[1]}:${renamed.length}:${renamed}:${rename(defender)}`;
+  };
+  const walk = (value: unknown): unknown => {
+    if (typeof value === "string") return renameString(value);
+    if (Array.isArray(value)) return value.map(walk);
+    if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, walk(inner)]));
+    return value;
+  };
+  return walk;
+}
+
+describe("symmetry (§5 ordering)", () => {
+  it.each(cases.slice(0, 12))("seed $seed: the order of players and reports in each tick never matters", ({ seed, scenario }) => {
+    const run = runFor(seed);
+    const draw = generator(seed * 7919);
+    const reordered = run.inputs.map((input) => ({ ...input, players: shuffled(input.players, draw), reports: shuffled(input.reports, draw) }));
+    const again = replay(scenario.config, reordered, spawnProtectedOf(run));
+    expect(again.hashes).toEqual(run.hashes);
+    expect(again.events).toEqual(run.events);
+  });
+
+  it.each(cases.slice(0, 12))("seed $seed: relabelling players in an order-preserving way relabels the outcome and nothing else", ({ seed, scenario }) => {
+    const run = runFor(seed);
+    const ids = new Set(run.inputs[0]!.players.map((player) => player.id));
+    const sorted = [...ids].sort();
+    for (const rename of [(id: string) => `crew-${id}`, (id: string) => `n${String(sorted.indexOf(id)).padStart(2, "0")}`]) {
+      const walk = renamer(rename, ids);
+      const relabelled = replay(scenario.config, walk(run.inputs) as EncounterTickInput[], spawnProtectedOf(run).map(rename));
+      expect(relabelled.events).toEqual(walk(run.events));
+      expect(relabelled.states).toEqual(walk(run.states));
+    }
+  });
+});

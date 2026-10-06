@@ -1,0 +1,103 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { claimRules } from "@pirate-sea-race/content/claim";
+import { startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import type { HeadlessClient, ResultLineView } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, HOST_SEAT, ledgerOf, placePair } from "./rubbingsSetup.js";
+import { CLAIM_SEAT, flowTuning } from "./matchFlowSetup.js";
+import { brawler, collectAt, dockFor, EAST, grapple, HOLD_E, HUB_X, OPEN_ROW, playersAt, resultOf, tracker, until } from "./seaDuelSetup.js";
+
+/**
+ * §2's results columns that need a settled draw and a recovery cache, through the real room: a quitter leaves a
+ * Moon in a cache at Palm Key, the host and the guest fight the mirrored duel to a double KO, then the host
+ * collects Palm Key's Sun, claims the cache's Moon and wins by a claim. With `endings.test.ts`, every one of the
+ * nine accomplishment columns is non-zero for some player in some ending. The mirrored fight needs both fighters'
+ * inputs on time, so this file runs with the harness files, alone. Test-only timings: a two-second channel.
+ */
+const CHANNEL = 40;
+let server: RunningGameServer;
+let endpoint: string;
+
+beforeAll(async () => {
+  const matchTuning = flowTuning({ claim: { ...claimRules, channelTicks: CHANNEL } });
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+/** A results line with nothing accomplished: the starting gold, and `seat` as given. */
+const line = (seat: number, change: Partial<ResultLineView> = {}): ResultLineView => ({
+  seat,
+  winner: false,
+  left: false,
+  rubbingsHeld: 0,
+  collected: 0,
+  thefts: 0,
+  lost: 0,
+  duelsWon: 0,
+  duelsLost: 0,
+  duelsDrawn: 0,
+  gold: 50,
+  cachesClaimed: 0,
+  islandsVisited: 0,
+  ...change,
+});
+
+describe("the results of a draw and a cache claim (§2, §12)", () => {
+  it("counts a settled draw for both fighters and a cache claim for its claimer, and ends by a claim", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const palmKey = dockFor("sun");
+    const [host, guest, quitter] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT, { tileX: HUB_X - 6, tileY: OPEN_ROW + 4, heading: EAST }], track)) as [
+      HeadlessClient,
+      HeadlessClient,
+      HeadlessClient,
+    ];
+    const seats = { host: host.seat, guest: guest.seat, quitter: quitter.seat };
+
+    // The quitter collects a Moon at Ember Rock, sails to Palm Key's west dock and quits: a cache with the Moon there.
+    await collectAt(quitter, endpoint, dockFor("moon"), "moon");
+    await quitter.placeShip(endpoint, { tileX: palmKey.tileX, tileY: palmKey.tileY, heading: 0 });
+    await quitter.leave();
+    await until(() => ledgerOf(host).caches.length === 1, 3000, "the cache");
+    // The lobby's roster drops a player who quits the running match.
+    await host.waitFor(() => host.room.state.roster.size === 2);
+    expect([...host.room.state.roster.values()].map((entry) => entry.seat).sort()).toEqual([seats.host, seats.guest].sort());
+
+    // The mirrored fight: both swing on the same frames, so both fall on the same frame. The ledger settles a draw.
+    await placePair(endpoint, host, guest);
+    host.fighter.play(brawler(0));
+    guest.fighter.play(brawler(1));
+    await grapple(host, guest);
+    expect(await resultOf(host, guest)).toEqual({ phase: "over", winner: -1, reason: "double-ko" });
+    await until(() => ledgerOf(host).duels[0]?.phase === "settled", 3000, "the settlement");
+    expect(ledgerOf(host).duels[0]).toMatchObject({ result: { outcome: "draw" }, settlement: { choice: "none", gold: 0 } });
+    for (const client of [host, guest]) await client.waitFor(() => client.status()?.mode === "sea" && client.status()?.protection === "draw", 3000);
+
+    // At Palm Key the host collects its Sun (sources before caches), then claims the cache's Moon: a full set.
+    await collectAt(host, endpoint, palmKey, "sun");
+    await collectAt(host, endpoint, palmKey, "moon");
+    expect(host.objectives()).toMatchObject({ channelResult: "claimed:moon", rubbings: ["sun", "moon"] });
+    expect(ledgerOf(host).caches).toEqual([]);
+
+    // The claim ends the match.
+    await host.placeShip(endpoint, CLAIM_SEAT);
+    await host.holdUntil(HOLD_E, () => host.results() !== undefined, 8000);
+    await guest.waitFor(() => guest.results() !== undefined, 5000);
+    const results = host.results()!;
+    expect(guest.results()).toEqual(results);
+    expect(results).toMatchObject({ reason: "claim", winnerSeat: seats.host });
+    const bySeat = [...results.players].sort((a, b) => a.seat - b.seat);
+    expect(bySeat).toEqual(
+      [
+        line(seats.host, { winner: true, rubbingsHeld: 2, collected: 1, cachesClaimed: 1, duelsDrawn: 1, islandsVisited: 1 }),
+        line(seats.guest, { duelsDrawn: 1 }),
+        // The quitter's Moon went into the cache: collected, then lost. Placed on Palm Key's dock tile, it never moored there.
+        line(seats.quitter, { left: true, collected: 1, lost: 1, islandsVisited: 1 }),
+      ].sort((a, b) => a.seat - b.seat),
+    );
+    // The winner's line comes first.
+    expect(results.players[0]!.seat).toBe(seats.host);
+  }, 60_000);
+});

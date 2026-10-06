@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.28;
+
+import {VRFConsumerBaseV2Plus, IVRFCoordinatorV2Plus} from "./ChainlinkConsumerBaseV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+
+import "./IRNG.sol";
+
+/// @title Random Number Generator that uses Chainlink VRF v2.5
+/// @dev https://blog.chain.link/introducing-vrf-v2-5/
+contract ChainlinkRNG is IRNG, VRFConsumerBaseV2Plus {
+    // ************************************* //
+    // *             Storage               * //
+    // ************************************* //
+
+    address public consumer; // The address that can request random numbers.
+    bytes32 public keyHash; // The gas lane key hash value - Defines the maximum gas price you are willing to pay for a request in wei (ID of the off-chain VRF job).
+    uint256 public subscriptionId; // The unique identifier of the subscription used for funding requests.
+    uint16 public requestConfirmations; // How many confirmations the Chainlink node should wait before responding.
+    // 22 bytes remaining in slot
+    uint32 public callbackGasLimit; // Gas limit for the Chainlink callback.
+    uint256 public lastRequestId; // The last request ID.
+    mapping(uint256 requestId => uint256 number) public randomNumbers; // randomNumbers[requestID] is the random number for this request id, 0 otherwise.
+
+    // ************************************* //
+    // *              Events               * //
+    // ************************************* //
+
+    /// @notice Emitted when a request is sent to the VRF Coordinator
+    /// @param _requestId The ID of the request
+    event RequestSent(uint256 indexed _requestId);
+
+    /// Emitted when a request has been fulfilled.
+    /// @param _requestId The ID of the request
+    /// @param _randomWord The random value answering the request.
+    event RequestFulfilled(uint256 indexed _requestId, uint256 _randomWord);
+
+    // ************************************* //
+    // *        Function Modifiers         * //
+    // ************************************* //
+
+    modifier onlyByOwner() {
+        require(owner == msg.sender, OwnerOnly());
+        _;
+    }
+
+    modifier onlyByConsumer() {
+        require(consumer == msg.sender, ConsumerOnly());
+        _;
+    }
+
+    // ************************************* //
+    // *            Constructor            * //
+    // ************************************* //
+
+    /// @notice Constructor, initializing the implementation to reduce attack surface.
+    /// @param _owner The owner of the contract.
+    /// @param _consumer The address that can request random numbers.
+    /// @param _vrfCoordinator The address of the VRFCoordinator contract.
+    /// @param _keyHash The gas lane key hash value - Defines the maximum gas price you are willing to pay for a request in wei (ID of the off-chain VRF job).
+    /// @param _subscriptionId The unique identifier of the subscription used for funding requests.
+    /// @param _requestConfirmations How many confirmations the Chainlink node should wait before responding.
+    /// @param _callbackGasLimit The limit for how much gas to use for the callback request to the contract's fulfillRandomWords() function.
+    /// @dev https://docs.chain.link/vrf/v2-5/subscription/get-a-random-number
+    constructor(
+        address _owner,
+        address _consumer,
+        address _vrfCoordinator,
+        bytes32 _keyHash,
+        uint256 _subscriptionId,
+        uint16 _requestConfirmations,
+        uint32 _callbackGasLimit
+    ) VRFConsumerBaseV2Plus(_owner, _vrfCoordinator) {
+        consumer = _consumer;
+        keyHash = _keyHash;
+        subscriptionId = _subscriptionId;
+        requestConfirmations = _requestConfirmations;
+        callbackGasLimit = _callbackGasLimit;
+    }
+
+    // ************************************* //
+    // *             Governance            * //
+    // ************************************* //
+
+    /// @notice Changes the owner of the contract.
+    /// @param _owner The new owner.
+    function changeOwner(address _owner) external onlyByOwner {
+        owner = _owner;
+    }
+
+    /// @notice Changes the consumer of the RNG.
+    /// @param _consumer The new consumer.
+    function changeConsumer(address _consumer) external onlyByOwner {
+        consumer = _consumer;
+    }
+
+    /// @notice Changes the VRF Coordinator of the contract.
+    /// @param _vrfCoordinator The new VRF Coordinator.
+    function changeVrfCoordinator(address _vrfCoordinator) external onlyByOwner {
+        s_vrfCoordinator = IVRFCoordinatorV2Plus(_vrfCoordinator);
+        emit CoordinatorSet(_vrfCoordinator);
+    }
+
+    /// @notice Changes the key hash of the contract.
+    /// @param _keyHash The new key hash.
+    function changeKeyHash(bytes32 _keyHash) external onlyByOwner {
+        keyHash = _keyHash;
+    }
+
+    /// @notice Changes the subscription ID of the contract.
+    /// @param _subscriptionId The new subscription ID.
+    function changeSubscriptionId(uint256 _subscriptionId) external onlyByOwner {
+        subscriptionId = _subscriptionId;
+    }
+
+    /// @notice Changes the request confirmations of the contract.
+    /// @param _requestConfirmations The new request confirmations.
+    function changeRequestConfirmations(uint16 _requestConfirmations) external onlyByOwner {
+        requestConfirmations = _requestConfirmations;
+    }
+
+    /// @notice Changes the callback gas limit of the contract.
+    /// @param _callbackGasLimit The new callback gas limit.
+    function changeCallbackGasLimit(uint32 _callbackGasLimit) external onlyByOwner {
+        callbackGasLimit = _callbackGasLimit;
+    }
+
+    // ************************************* //
+    // *         State Modifiers           * //
+    // ************************************* //
+
+    /// @notice Request a random number.
+    /// @dev Ensure that the subscription is set and funded.
+    /// @dev Consumer only.
+    function requestRandomness() external override onlyByConsumer {
+        uint256 requestId = s_vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: keyHash,
+                subId: subscriptionId,
+                requestConfirmations: requestConfirmations,
+                callbackGasLimit: callbackGasLimit,
+                numWords: 1,
+                extraArgs: VRFV2PlusClient._argsToBytes(
+                    // Set nativePayment to true to pay for VRF requests with ETH instead of LINK
+                    VRFV2PlusClient.ExtraArgsV1({nativePayment: true})
+                )
+            })
+        );
+        lastRequestId = requestId;
+        emit RequestSent(requestId);
+    }
+
+    /// @notice Callback function called by the VRF Coordinator when the random value is generated.
+    /// @param _requestId The ID of the request.
+    /// @param _randomWords The random values answering the request.
+    function fulfillRandomWords(uint256 _requestId, uint256[] calldata _randomWords) internal override {
+        // Access control is handled by the parent VRFCoordinator.rawFulfillRandomWords()
+        randomNumbers[_requestId] = _randomWords[0];
+        emit RequestFulfilled(_requestId, _randomWords[0]);
+    }
+
+    // ************************************* //
+    // *           Public Views            * //
+    // ************************************* //
+
+    /// @notice Return the random number.
+    /// @return randomNumber The random number or 0 if it is not ready or has not been requested.
+    function receiveRandomness() external view override returns (uint256 randomNumber) {
+        randomNumber = randomNumbers[lastRequestId];
+    }
+}

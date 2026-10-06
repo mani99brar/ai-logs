@@ -1,0 +1,425 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { isNavigable, seaMap } from "@pirate-sea-race/content";
+import { encounterRules } from "@pirate-sea-race/content/encounters";
+import { defaultDuelConfig, DUEL_INPUT, findMove } from "@pirate-sea-race/simulation/duel";
+import { checkFruitState, fruitRules, kitDescriptions } from "@pirate-sea-race/simulation/fruits";
+import { Buttons, FruitMessageType, MAX_INSPECT_FRUIT_PER_SECOND } from "@pirate-sea-race/protocol";
+import { startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { HeadlessClient, ImpairmentProxy, sleep, type Movement } from "@pirate-sea-race/test-tools";
+import { containsText, HOLD_E, openWater, playersAt, roomOf, startThroughLobby, tracker, until, type Seat } from "./seaDuelSetup.js";
+import { tuned } from "./rubbingsSetup.js";
+
+/**
+ * §9's fruit in the match room: four pedestals, one at each regular island's highest-id dock, dealt from the fruit's
+ * own seed (pinned here, test-only: Ember on Palm Key and Mist Cay, Smoke on Ember Rock and Old Stones). A player
+ * moored there inspects (F) and holds F for three seconds to eat; releasing, casting off, a grapple's reservation or a
+ * disconnect interrupts it; the kit then goes into every duel at sea the player fights. Players drive it as a browser
+ * does: E to moor, the input's fruit button held, the inspect message, J to grapple. Every test's rooms check the
+ * ledger's and the room's invariants after every world tick (`tracker`), and the fruit state's own here.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+
+const FRUITS = ["ember", "smoke", "smoke", "ember"] as const;
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning: tuned({ testFruits: FRUITS, testHooks: true }) });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+/** Each island's pedestal dock: its highest-id dock. */
+const pedestalDock = (island: number) => seaMap.docks.filter((dock) => dock.island === island).at(-1)!;
+const PALM = pedestalDock(0);
+const EMBER_ROCK = pedestalDock(1);
+const MIST = pedestalDock(3);
+const EAT_TICKS = fruitRules.eatTicks;
+/** Holding F (the input's fruit button), no throttle. */
+const HOLD_F: Movement = { moveX: 0, moveY: 0, buttons: Buttons.Fruit };
+
+/** A heading of 64 (0 east, clockwise) from one tile toward another. */
+function headingToward(from: Seat, to: { tileX: number; tileY: number }): number {
+  return (Math.round((Math.atan2(to.tileY - from.tileY, to.tileX - from.tileX) / (2 * Math.PI)) * 64) + 64) % 64;
+}
+
+/** Open water `distance` tiles from a dock, in a straight clear line from it, facing the dock (a grapple's aim). */
+function seatOff(dock: { tileX: number; tileY: number }, distance: number): Seat {
+  for (const [dx, dy] of [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ] as const) {
+    const at = { tileX: dock.tileX + dx * distance, tileY: dock.tileY + dy * distance, heading: 0 };
+    if (!isNavigable(seaMap, at.tileX, at.tileY) || !openWater(at, { ...dock, heading: 0 })) continue;
+    return { ...at, heading: headingToward(at, dock) };
+  }
+  throw new Error(`no open water ${distance} tiles off dock ${dock.tileX},${dock.tileY}`);
+}
+
+/** Moors a player at a dock: placed on it, then E held until the ship is moored. */
+async function moor(client: HeadlessClient, dock: { id: number; tileX: number; tileY: number }): Promise<void> {
+  await client.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+  await client.holdUntil(HOLD_E, () => client.ship()?.dock === dock.id, 5000);
+}
+
+/** Inspects the pedestal where the player is moored and resolves with the inspection it received. */
+async function inspect(client: HeadlessClient) {
+  const before = client.inspections.length;
+  client.inspectFruit();
+  await client.waitFor(() => client.inspections.length > before, 3000);
+  return client.inspections.at(-1)!;
+}
+
+/** Keeps sending a movement until `predicate` holds, without letting go after (unlike `holdUntil`). */
+async function keepUntil(client: HeadlessClient, movement: Movement, predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs} ms`);
+    client.sendInput(movement);
+    await sleep(50);
+  }
+}
+
+/** A fruit tracker too: every room dealt the pinned fruit (test-only), and its fruit state stays consistent. */
+function fruitTracker(onTestFinished: (fn: () => Promise<void>) => void) {
+  const track = tracker(onTestFinished);
+  const rooms = new Set<ReturnType<typeof roomOf>>();
+  onTestFinished(async () => {
+    for (const room of rooms) {
+      expect(room.fruitState.pedestals.map((pedestal) => pedestal.kit)).toEqual([...FRUITS]);
+      expect(checkFruitState(room.fruitState)).toEqual([]);
+    }
+  });
+  return (client: HeadlessClient) => {
+    track(client);
+    rooms.add(roomOf(client));
+  };
+}
+
+/** Holds F until the player's kit is `kit`, and resolves with the world ticks the channel took (start to meal). */
+async function eat(client: HeadlessClient, kit: string): Promise<number> {
+  const room = roomOf(client);
+  let startTick: number | undefined;
+  const watch = setInterval(() => {
+    startTick ??= room.fruitState.channels.find((channel) => channel.playerId === client.sessionId)?.startTick;
+  }, 2);
+  try {
+    await client.holdUntil(HOLD_F, () => client.fruitView()?.kit === kit, 8000);
+  } finally {
+    clearInterval(watch);
+  }
+  const meal = room.fruitState.meals.find((each) => each.playerId === client.sessionId)!;
+  return meal.tick - startTick! + 1;
+}
+
+describe.concurrent("the fruit in the match room (§9)", () => {
+  it("eats the fruit after three seconds of F at a full pedestal: the kit is the player's, and the pedestal is empty for everyone", async ({ onTestFinished }) => {
+    const track = fruitTracker(onTestFinished);
+    const watchSeat = seatOff(PALM, 4);
+    const [eater, watcher] = (await playersAt(endpoint, [watchSeat, { ...watchSeat, tileY: watchSeat.tileY + 1 }], track)) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(eater);
+    expect(room.pedestalSites.map((site) => site.dock)).toEqual([0, 1, 2, 3].map((island) => pedestalDock(island).id));
+    // The watcher, at sea in sight of Palm Key's pedestal dock, sees its marker full, and no other island's.
+    await watcher.waitFor(() => watcher.pedestalMarkers().some((marker) => marker.island === 0));
+    expect(watcher.pedestalMarkers()).toEqual([{ id: "pedestal-0", island: 0, dock: PALM.id, full: true }]);
+    expect(watcher.fruitView()).toMatchObject({ kit: "duelist", pedestal: "" });
+
+    await moor(eater, PALM);
+    await eater.waitFor(() => eater.fruitView()?.pedestal === "full");
+    expect(eater.fruitView()).toMatchObject({ kit: "duelist", fruitHeld: 0, fruitTotal: EAT_TICKS, fruitResult: "" });
+    const { name, specials, advantage, vulnerability } = kitDescriptions.ember;
+    expect(await inspect(eater)).toEqual({ island: 0, full: true, kit: "ember", name, specials: [...specials], advantage, vulnerability });
+    // Inspecting is not eating: nothing is held, nothing changes.
+    expect(room.fruitState.channels).toEqual([]);
+
+    // Halfway through, the status shows the progress.
+    const halfway = eater.holdUntil(HOLD_F, () => (eater.fruitView()?.fruitHeld ?? 0) >= EAT_TICKS / 2, 5000);
+    await halfway;
+    const took = await eat(eater, "ember");
+    // One continuous hold from the halfway point on would be 60 ticks; this one restarted after the release above.
+    expect(took).toBe(EAT_TICKS);
+    expect(eater.fruitView()).toMatchObject({ kit: "ember", pedestal: "empty", fruitHeld: 0, fruitResult: "eaten:ember" });
+    expect(room.fruitState.meals).toEqual([expect.objectContaining({ playerId: eater.sessionId, pedestalId: "pedestal-0", kit: "ember" })]);
+    // F kept down after the meal, at the pedestal just emptied: the meal stays the last result.
+    await eater.hold(HOLD_F, 500);
+    expect(eater.fruitView()?.fruitResult).toBe("eaten:ember");
+    await watcher.waitFor(() => watcher.pedestalMarkers()[0]?.full === false);
+    // Inspecting again says only that it is empty.
+    expect(await inspect(eater)).toEqual({ island: 0, full: false });
+    // Eating does not end protection or touch the ledger: the watcher, who ate nothing, is still the Duelist.
+    expect(watcher.fruitView()?.kit).toBe("duelist");
+  }, 40_000);
+
+  it("interrupts eating on release, casting off, a grapple's reservation and a disconnect, with the reason", async ({ onTestFinished }) => {
+    const track = fruitTracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    const grappleSeat = seatOff(EMBER_ROCK, 4);
+    const [eater, attacker, dropper] = (await playersAt(endpoint, [seatOff(PALM, 4), grappleSeat, seatOff(MIST, 4)], track, {
+      endpoints: [endpoint, endpoint, proxy.endpoint],
+    })) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const room = roomOf(eater);
+    const status = (client: HeadlessClient) => room.state.status.get(client.sessionId)!;
+
+    // Releasing F part-way: the channel resets, and says so.
+    await moor(eater, PALM);
+    await eater.holdUntil(HOLD_F, () => (eater.fruitView()?.fruitHeld ?? 0) >= 10, 5000);
+    await eater.waitFor(() => eater.fruitView()?.fruitResult === "interrupted:released" && eater.fruitView()?.fruitHeld === 0);
+    expect(room.fruitState.meals).toEqual([]);
+    // So does an input stream that stops with F held (§12: the held input lapses after 250 ms).
+    await keepUntil(eater, HOLD_F, () => (eater.fruitView()?.fruitHeld ?? 0) >= 10);
+    const lapsedFrom = eater.fruitView()!.fruitResultAt;
+    await eater.waitFor(() => eater.fruitView()!.fruitResultAt > lapsedFrom && eater.fruitView()?.fruitResult === "interrupted:released", 3000);
+    expect(room.fruitState.channels).toEqual([]);
+
+    // Casting off while holding F: the ship leaves the pedestal's dock, and the channel goes with it. Eating again first
+    // clears the last result: a new attempt is under way.
+    await keepUntil(eater, HOLD_F, () => (eater.fruitView()?.fruitHeld ?? 0) >= 10);
+    expect(eater.fruitView()?.fruitResult).toBe("");
+    const start = eater.fruitView()!.fruitResultAt;
+    await keepUntil(eater, { ...HOLD_F, moveY: -1 }, () => eater.ship()?.dock === -1);
+    // F still held at sea: no pedestal there, so the channel is gone.
+    await keepUntil(eater, HOLD_F, () => (eater.fruitView()?.fruitResultAt ?? 0) > start && eater.fruitView()?.pedestal === "");
+    expect(eater.fruitView()).toMatchObject({ fruitResult: "interrupted:released", fruitHeld: 0 });
+    expect(room.fruitState.channels).toEqual([]);
+    eater.sendInput({ moveX: 0, moveY: 0 });
+
+    // A grapple's reservation: the attacker grapples the eater, moored at Ember Rock's pedestal, mid-meal.
+    await moor(eater, EMBER_ROCK);
+    await attacker.waitFor(() => attacker.ship(eater.sessionId) !== undefined);
+    let landed = false;
+    const holding = keepUntil(eater, HOLD_F, () => landed, 15_000);
+    await until(() => room.fruitState.channels.some((channel) => channel.playerId === eater.sessionId && channel.held >= 5), 3000, "the eater eating");
+    // J pressed while the world is held, so the grapple's one-second windup starts on the next tick, inside the meal.
+    room.pauseAfterTick(room.matchState.worldTick + 1);
+    await until(() => room.worldPaused, 2000, "the pause");
+    const held = room.fruitState.channels.find((channel) => channel.playerId === eater.sessionId)!.held;
+    expect(held).toBeLessThan(EAT_TICKS - encounterRules.grapple.windupTicks - 5);
+    attacker.tapGrapple();
+    await sleep(150);
+    room.resumeWorld();
+    await until(() => room.encounterState.attempts.some((attempt) => attempt.attackerId === attacker.sessionId), 3000, "the grapple's windup");
+    // The world held again right after the tick the grapple lands on: the reservation interrupted the meal on it.
+    const landTick = room.encounterState.attempts.find((attempt) => attempt.attackerId === attacker.sessionId)!.landTick;
+    room.pauseAfterTick(landTick);
+    await until(() => room.worldPaused, 3000, "the landing");
+    expect(room.encounterState.duels.some((duel) => duel.players.includes(eater.sessionId))).toBe(true);
+    expect(status(eater)).toMatchObject({ fruitResult: "interrupted:reserved", fruitResultAt: landTick, fruitHeld: 0 });
+    room.resumeWorld();
+    landed = true;
+    await holding;
+    eater.sendInput({ moveX: 0, moveY: 0 });
+    expect(room.fruitState.meals).toEqual([]);
+    expect(room.encounterState.duels.some((duel) => duel.players.includes(eater.sessionId))).toBe(true);
+    // Still at the pedestal's dock, but in a duel: the status offers no pedestal, and an inspection gets nothing.
+    await eater.waitFor(() => eater.fruitView()?.pedestal === "");
+    expect(eater.ship()?.dock).toBe(EMBER_ROCK.id);
+    const inspected = eater.inspections.length;
+    eater.inspectFruit();
+    await sleep(300);
+    expect(eater.inspections).toHaveLength(inspected);
+
+    // A disconnect: the dropper's channel is cancelled as a disconnect, which its status records for its return.
+    await moor(dropper, MIST);
+    let dropped = false;
+    const dropping = keepUntil(dropper, HOLD_F, () => dropped, 30_000).catch(() => undefined);
+    await until(() => room.fruitState.channels.some((channel) => channel.playerId === dropper.sessionId && channel.held >= 5), 3000, "the dropper eating");
+    // The world held while the connection drops, so the drop is on record before the held input could lapse (§12: a
+    // stream that stops is released after 250 ms, as above; a drop the room sees first is a disconnect).
+    room.pauseAfterTick(room.matchState.worldTick + 1);
+    await until(() => room.worldPaused, 2000, "the pause");
+    proxy.sever({ refuse: true });
+    await until(() => room.ledgerState.players.find((player) => player.id === dropper.sessionId)?.status === "disconnected", 3000, "the drop");
+    room.resumeWorld();
+    await until(() => status(dropper).fruitResult === "interrupted:disconnected", 3000, "the disconnect interrupting");
+    expect(room.fruitState.channels.some((channel) => channel.playerId === dropper.sessionId)).toBe(false);
+    dropped = true;
+    await dropping;
+    expect(room.fruitState.meals).toEqual([]);
+  }, 45_000);
+
+  it("gives a contested fruit to the lowest id when both finish on one tick; the other is interrupted as taken", async ({ onTestFinished }) => {
+    const track = fruitTracker(onTestFinished);
+    const [a, b] = (await playersAt(endpoint, [seatOff(PALM, 4), seatOff(PALM, 5)], track)) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(a);
+    await moor(a, PALM);
+    await moor(b, PALM);
+    // Both press F while the world is held after one tick, so both start on the next one and finish together.
+    const paused = room.matchState.worldTick + 1;
+    room.pauseAfterTick(paused);
+    await until(() => room.worldPaused, 2000, "the pause");
+    const [first, second] = a.sessionId < b.sessionId ? [a, b] : [b, a];
+    let done = false;
+    const holds = [first, second].map((client) => keepUntil(client, HOLD_F, () => done, 15_000));
+    await sleep(300);
+    // Held again right after the tick both finish on.
+    room.pauseAfterTick(paused + EAT_TICKS);
+    room.resumeWorld();
+    await until(() => room.worldPaused && room.matchState.worldTick === paused + EAT_TICKS, 8000, "the finishing tick");
+    const status = (client: HeadlessClient) => room.state.status.get(client.sessionId)!;
+    expect(room.fruitState.meals).toEqual([expect.objectContaining({ playerId: first.sessionId, pedestalId: "pedestal-0", kit: "ember", tick: paused + EAT_TICKS })]);
+    expect(status(first)).toMatchObject({ kit: "ember", fruitResult: "eaten:ember", fruitResultAt: paused + EAT_TICKS });
+    expect(status(second)).toMatchObject({ kit: "duelist", fruitResult: "interrupted:taken", fruitResultAt: paused + EAT_TICKS });
+    room.resumeWorld();
+    done = true;
+    await Promise.all(holds);
+    for (const client of [first, second]) client.sendInput({ moveX: 0, moveY: 0 });
+    await first.waitFor(() => first.fruitView()?.kit === "ember");
+  }, 30_000);
+
+  it("refuses a fed player's further attempts and an empty pedestal, and keeps the kit through a lost duel", async ({ onTestFinished }) => {
+    const track = fruitTracker(onTestFinished);
+    // The eater never readies its arena: it loses the duel it is grappled into by forfeit.
+    const [eater, other] = (await playersAt(endpoint, [seatOff(PALM, 4), seatOff(EMBER_ROCK, 4)], track, { clients: [{ autoReady: false }, {}] })) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(eater);
+    await moor(eater, PALM);
+    await eat(eater, "ember");
+    // At Ember Rock's full pedestal, holding F is refused: this player has eaten.
+    await moor(eater, EMBER_ROCK);
+    await eater.holdUntil(HOLD_F, () => eater.fruitView()?.fruitResult === "refused:already-eaten", 5000);
+    expect(eater.fruitView()?.kit).toBe("ember");
+    expect(room.fruitState.pedestals.find((pedestal) => pedestal.id === "pedestal-1")!.eatenBy).toBeNull();
+    // The other player at Palm Key's eaten pedestal: refused, it is empty.
+    await moor(other, PALM);
+    await other.holdUntil(HOLD_F, () => other.fruitView()?.fruitResult === "refused:empty", 5000);
+    expect(other.fruitView()?.kit).toBe("duelist");
+
+    // The other grapples the eater; the eater forfeits by never readying, and waits to respawn: still Ember.
+    await other.placeShip(endpoint, seatOff(EMBER_ROCK, 4));
+    await other.waitFor(() => other.ship(eater.sessionId) !== undefined);
+    other.tapGrapple();
+    await eater.waitFor(() => eater.fruitView()?.kit === "ember" && eater.status()?.mode === "respawning", 15_000);
+    expect(room.ledgerState.duels.at(-1)?.result).toMatchObject({ outcome: "win", winner: other.sessionId });
+    // Out of the world while it waits, though its ship is still at Ember Rock's pedestal dock: F there does nothing.
+    expect(room.matchState.ships.find((ship) => ship.id === eater.sessionId)?.dock).toBe(EMBER_ROCK.id);
+    const last = room.state.status.get(eater.sessionId)!.fruitResultAt;
+    await eater.hold(HOLD_F, 400);
+    expect(room.state.status.get(eater.sessionId)!.fruitResultAt).toBe(last);
+    expect(room.fruitState.channels).toEqual([]);
+    await eater.waitFor(() => eater.status()?.mode === "sea", 10_000);
+    expect(eater.fruitView()?.kit).toBe("ember");
+    expect(room.fruitState.meals.map((meal) => meal.playerId)).toEqual([eater.sessionId]);
+    // A player who leaves is no longer stepped: the match runs on, and the meal stays.
+    await other.leave();
+    const tick = room.matchState.worldTick;
+    await until(() => room.matchState.worldTick > tick + 10, 3000, "the world ticking on");
+    expect(room.flowState.end).toBeNull();
+    expect(room.fruitState.meals.map((meal) => meal.playerId)).toEqual([eater.sessionId]);
+  }, 45_000);
+
+  it("starts a sea duel with both kits on the server and both clients, the hashes agree, and the Ember player's flame bolt deals its damage", async ({ onTestFinished }) => {
+    const track = fruitTracker(onTestFinished);
+    const [ember, duelist] = (await playersAt(endpoint, [seatOff(PALM, 4), seatOff(PALM, 3)], track)) as [HeadlessClient, HeadlessClient];
+    const room = roomOf(ember);
+    await moor(ember, PALM);
+    await eat(ember, "ember");
+    // Back at sea, in grapple range of the Duelist, facing it.
+    const at = seatOff(PALM, 4);
+    const toward = seatOff(PALM, 3);
+    await ember.placeShip(endpoint, { ...at, heading: headingToward(at, toward) });
+    await duelist.placeShip(endpoint, toward);
+    await ember.waitFor(() => ember.ship(duelist.sessionId) !== undefined);
+    ember.tapGrapple();
+    for (const client of [ember, duelist]) await client.waitFor(() => client.fighter.phase === "countdown", 5000);
+    // The attacker's kit first, in the lobby both fighters read and in the server's frame-0 state.
+    expect(room.seaDuelDiagnostics(ember.sessionId)!.kits).toEqual(["ember", "duelist"]);
+    for (const client of [ember, duelist]) {
+      expect(client.fighter.lobby?.kits).toBe("ember,duelist");
+      expect(client.fighter.duel!.confirmedState.fighters.map((fighter) => fighter.kit)).toEqual(["ember", "duelist"]);
+    }
+
+    // Ember presses U (special one) once the fight is on; the Duelist stands still.
+    const cast = findMove(defaultDuelConfig.moveset, "flame-bolt-cast");
+    const damage = cast.projectile!.damage;
+    ember.fighter.play((frame) => (frame >= 20 && frame < 24 ? DUEL_INPUT.special1 : 0));
+    const maxHealth = defaultDuelConfig.moveset.rules.maxHealth;
+    for (const client of [ember, duelist]) await client.fighter.waitFor(() => client.fighter.confirmedState?.fighters[1].health === maxHealth - damage, 15_000);
+    await until(() => room.seaDuelDiagnostics(ember.sessionId)!.frame > 150, 5000, "the fight going on");
+    const server = room.seaDuelDiagnostics(ember.sessionId)!;
+    expect(server.kits).toEqual(["ember", "duelist"]);
+    // Both clients checked the server's per-frame hashes all along, with no desync.
+    for (const client of [ember, duelist]) {
+      expect(client.fighter.stats!.hashChecks).toBeGreaterThan(10);
+      expect(client.fighter.stats!.desyncs).toBe(0);
+    }
+    expect(ember.fighter.confirmedState!.fighters[0].health).toBe(maxHealth);
+  }, 45_000);
+
+  it("sends a pedestal's kit only to the player moored there who inspects it; other players see only full or empty, in sight; a kit reaches the opponent only in the duel's lobby (§16)", async ({ onTestFinished }) => {
+    const track = fruitTracker(onTestFinished);
+    const near = seatOff(PALM, 4);
+    const [eater, onlooker, far] = (await playersAt(endpoint, [near, { ...near, tileY: near.tileY + 1 }, seatOff(MIST, 4)], track)) as [HeadlessClient, HeadlessClient, HeadlessClient];
+    const room = roomOf(eater);
+    const marks = { onlooker: onlooker.frameCount, far: far.frameCount, eater: eater.frameCount };
+    await moor(eater, PALM);
+    await inspect(eater);
+    // An inspection at sea gets nothing: no pedestal there.
+    onlooker.inspectFruit();
+    await eat(eater, "ember");
+    await onlooker.waitFor(() => onlooker.pedestalMarkers()[0]?.full === false);
+    await sleep(300);
+    expect(onlooker.inspections).toEqual([]);
+    expect(eater.framesSince(marks.eater).some((frame) => containsText(frame, FruitMessageType.Inspected))).toBe(true);
+    for (const [name, frames] of [
+      ["onlooker", onlooker.framesSince(marks.onlooker)],
+      ["far", far.framesSince(marks.far)],
+    ] as const) {
+      for (const text of [FruitMessageType.Inspected, "ember", "smoke", "Flame bolt", "Smoke screen", "Controls space"]) {
+        expect(frames.some((frame) => containsText(frame, text)), `${name}: ${text}`).toBe(false);
+      }
+    }
+    // The onlooker sees Palm Key's pedestal (in sight), empty now; the far player sees only Mist Cay's.
+    expect(onlooker.pedestalMarkers().map((marker) => marker.id)).toEqual(["pedestal-0"]);
+    expect(far.pedestalMarkers()).toEqual([{ id: "pedestal-3", island: 3, dock: MIST.id, full: true }]);
+    expect(room.state.pedestals.get("pedestal-0")!.full).toBe(false);
+
+    // The duel's start: the onlooker, grappled by the eater, receives the eater's kit in its duel's lobby, and only then.
+    const beforeDuel = onlooker.frameCount;
+    await eater.placeShip(endpoint, { ...near, heading: headingToward(near, { tileX: near.tileX, tileY: near.tileY + 1 }) });
+    await eater.waitFor(() => eater.ship(onlooker.sessionId) !== undefined);
+    eater.tapGrapple();
+    await onlooker.waitFor(() => onlooker.fighter.lobby?.kits === "ember,duelist", 5000);
+    // A fighter sees no pedestal.
+    await onlooker.waitFor(() => onlooker.pedestalMarkers().length === 0);
+    expect(onlooker.framesSince(beforeDuel).some((frame) => containsText(frame, "ember,duelist"))).toBe(true);
+    // The far player, out of it, still never received a kit.
+    expect(far.framesSince(marks.far).some((frame) => containsText(frame, "ember"))).toBe(false);
+  }, 45_000);
+
+  it("drops malformed and excess inspections, and inspects nothing before the match starts", async ({ onTestFinished }) => {
+    const track = fruitTracker(onTestFinished);
+    const host = await HeadlessClient.create(endpoint);
+    track(host);
+    // In the lobby: nothing.
+    host.inspectFruit();
+    await sleep(300);
+    expect(host.inspections).toEqual([]);
+    const bench = await startThroughLobby(endpoint, [host]);
+    track(bench!);
+    await host.placeShip(endpoint, seatOff(PALM, 4));
+    await moor(host, PALM);
+    for (const payload of [{ pedestal: "pedestal-0" }, "inspect", null]) host.sendRaw(FruitMessageType.Inspect, payload);
+    await sleep(1100);
+    expect(host.inspections).toEqual([]);
+    // A burst: at most MAX_INSPECT_FRUIT_PER_SECOND are read in a second.
+    for (let index = 0; index < 20; index++) host.inspectFruit();
+    await sleep(500);
+    expect(host.inspections.length).toBe(MAX_INSPECT_FRUIT_PER_SECOND);
+    // After the second has passed, one more is read.
+    await sleep(1100);
+    expect((await inspect(host)).full).toBe(true);
+    // Once the match has ended, nothing: the room reads no inspection.
+    const room = roomOf(host);
+    room.injectFault();
+    await host.waitFor(() => host.phase === "ended");
+    await sleep(1100);
+    const inspected = host.inspections.length;
+    host.inspectFruit();
+    await sleep(500);
+    expect(host.inspections).toHaveLength(inspected);
+  }, 30_000);
+});

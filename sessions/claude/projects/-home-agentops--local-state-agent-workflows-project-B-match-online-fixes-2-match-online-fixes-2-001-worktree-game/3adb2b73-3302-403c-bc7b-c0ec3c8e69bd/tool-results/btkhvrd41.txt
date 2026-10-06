@@ -1,0 +1,999 @@
+diff --git a/apps/server/src/MatchRoom.ts b/apps/server/src/MatchRoom.ts
+index 47172bf..121390a 100644
+--- a/apps/server/src/MatchRoom.ts
++++ b/apps/server/src/MatchRoom.ts
+@@ -1,8 +1,10 @@
+-import { randomInt } from "node:crypto";
+ import { StateView } from "@colyseus/schema";
+ import { ErrorCode, matchMaker, Room, ServerError, type AuthContext, type Client, type Deferred } from "colyseus";
+ import { privateMatch } from "@pirate-sea-race/content";
++import { claimRules as defaultClaimRules, type ClaimRules } from "@pirate-sea-race/content/claim";
+ import { encounterRules, type EncounterRules } from "@pirate-sea-race/content/encounters";
++import { intelRules as defaultIntelRules, type IntelRules } from "@pirate-sea-race/content/intel";
++import { matchRules as defaultMatchRules, type MatchRules } from "@pirate-sea-race/content/match";
+ import {
+   createMatchOptionsSchema,
+   DUEL_RECONNECT_SECONDS,
+@@ -12,7 +14,10 @@ import {
+   joinMatchOptionsSchema,
+   MATCH_CODE_REQUIRED_MESSAGE,
+   MATCH_ROOM,
++  MATCH_STARTED_MESSAGE,
+   MATCH_UNAVAILABLE_MESSAGE,
++  MatchMessageType,
++  MAX_START_MATCH_PER_SECOND,
+   matchFullMessage,
+   MAX_CHOOSE_THEFT_PER_SECOND,
+   MAX_INPUT_MESSAGES_PER_SECOND,
+@@ -21,6 +26,9 @@ import {
+   PROTOCOL_VERSION,
+   RubbingMessageType,
+   validateChooseTheftMessage,
++  validateStartMatchMessage,
++  type RevealMessage,
++  type StartRefusedMessage,
+ } from "@pirate-sea-race/protocol";
+ import {
+   addShip,
+@@ -45,6 +53,7 @@ import {
+   type Placement,
+   type PlayerInput,
+ } from "@pirate-sea-race/simulation";
++import { createClaimState, insideTreasureCircle, stepClaim, type ClaimConfig, type ClaimEvent, type ClaimPlayer, type ClaimPoint, type ClaimState } from "@pirate-sea-race/simulation/claim";
+ import type { PlayerIndex } from "@pirate-sea-race/simulation/duel";
+ import {
+   createEncounterConfig,
+@@ -57,6 +66,25 @@ import {
+   type EncounterPlayerInput,
+   type EncounterState,
+ } from "@pirate-sea-race/simulation/encounters";
++import {
++  createIntelState,
++  stepIntel,
++  type IntelConfig,
++  type IntelMessageBody,
++  type IntelRubbing,
++  type IntelState,
++  type IntelWorldView,
++} from "@pirate-sea-race/simulation/intel";
++import {
++  createMatchState as createFlowState,
++  remaining,
++  stepMatch,
++  type MatchConfig as FlowConfig,
++  type MatchEvent as FlowEvent,
++  type MatchReport as FlowReport,
++  type MatchResults,
++  type MatchState as FlowState,
++} from "@pirate-sea-race/simulation/match";
+ import type { DuelAuthority } from "@pirate-sea-race/simulation/netcode";
+ import {
+   addPlayer,
+@@ -70,7 +98,9 @@ import {
+   expireReservation,
+   findDuel,
+   findPlayer,
++  heldRubbings,
+   heldTypes,
++  holdsAllTypes,
+   objectiveRules,
+   progressChannel,
+   quitPlayer,
+@@ -83,11 +113,14 @@ import {
+   type LedgerDuel,
+   type LedgerState,
+   type ObjectiveRules,
++  type RubbingLocation,
+ } from "@pirate-sea-race/simulation/objectives";
+ import { admitSeat, authorizePrivateEntry, type AdmissionRules } from "./admission.js";
+ import { DuelMachine, type DuelDiagnostics, type DuelOutcome } from "./duelMachine.js";
+ import { InputGate } from "./inputGate.js";
+ import { generateMatchCode } from "./matchCode.js";
++import { claimConfigFor, finalIslandOf, intelConfigFor, matchConfigFor } from "./matchFlow.js";
++import { deriveSeed, drawMasterSecret, type SeedSystem } from "./matchSeeds.js";
+ import { cachedTypesAt, cacheDock, createMatchLedger, dockCentre, interactTarget, nearestDockBySea, sealedTypesAt, type InteractTarget } from "./objectives.js";
+ import {
+   CacheMarkerSchema,
+@@ -95,6 +128,8 @@ import {
+   GrappleSchema,
+   MatchStateSchema,
+   PlayerStatusSchema,
++  ResultLineSchema,
++  RosterEntrySchema,
+   SeaDuelSchema,
+   ShipSchema,
+ } from "./schema.js";
+@@ -106,6 +141,8 @@ import {
+ export interface MatchMetadata {
+   code: string;
+   custom: boolean;
++  /** The match has left its lobby: admission refuses every join (§2: late arrivals wait for another match). */
++  started?: boolean;
+   /** A `filterBy` field that is never set: no listing holds a token, so no token-carrying request matches one. */
+   createToken?: never;
+ }
+@@ -131,12 +168,6 @@ export const RECONNECTION_OUTER_BOUND_SECONDS = 70;
+ /** The key suffix of a grapple's blanked twin, the entry for viewers who see the attacker but not the defender (§16). */
+ export const BLANK_GRAPPLE_SUFFIX = "~";
+ 
+-/** A source of randomness with `randomInt`'s shape: an integer in [min, max). */
+-export type RandomSource = (min: number, max: number) => number;
+-
+-/** The production randomness: `node:crypto`'s `randomInt`, private to the server (§3, §16). */
+-export const cryptoRandom: RandomSource = (min, max) => randomInt(min, max);
+-
+ /**
+  * A match's timings and test-only settings. Production uses `DEFAULT_MATCH_TUNING`; tests shorten the timings through
+  * `startGameServer({ matchTuning })` (never read by the production entry), and assert in world ticks.
+@@ -150,13 +181,23 @@ export interface MatchTuning {
+   readonly duelAbsenceTicks: number;
+   /** Colyseus' reconnection window, the outer bound (70 s). */
+   readonly reconnectionSeconds: number;
++  /** §2's lobby and ready countdown (`readyTicks`); the departure is the encounter rules' spawn protection. */
++  readonly match: MatchRules;
++  /** §5's claim channel and circle, and §2's deadline: the timer's duration is this `deadlineTicks`. */
++  readonly claim: ClaimRules;
++  /** §2's minute-20 and minute-28 reveals. */
++  readonly intel: IntelRules;
+   /** Test-only: deal the sources in this layout (types per island) instead of the private shuffle. */
+   readonly sourceLayout: readonly (readonly string[])[] | undefined;
+   /**
+-   * The room's randomness: the world, ledger and duel seeds. Production uses `cryptoRandom`; tests inject their own to
+-   * show the ledger's deal follows it (and never the public match code).
++   * The match's one private master secret (§3, §16), from which every system's seed is derived (`deriveSeed`):
++   * production draws it from `node:crypto` (`drawMasterSecret`); tests inject their own to show what follows it.
+    */
+-  readonly random: RandomSource;
++  readonly masterSecret: () => Uint8Array;
++  /** Test-only: the final-socket secret instead of the one derived from the master secret, so a test knows the island. */
++  readonly finalSocketSecret: number | undefined;
++  /** Test-only: the room's `injectFault` and `pauseAfterTick` hooks work (off by default; they throw otherwise). */
++  readonly testHooks: boolean;
+   /** Check `checkLedger` and the room's own invariant after every world tick (development and tests). */
+   readonly checkInvariants: boolean;
+ }
+@@ -166,11 +207,30 @@ export const DEFAULT_MATCH_TUNING: MatchTuning = {
+   encounters: encounterRules,
+   duelAbsenceTicks: DUEL_RECONNECT_SECONDS * WORLD_TICKS_PER_SECOND,
+   reconnectionSeconds: RECONNECTION_OUTER_BOUND_SECONDS,
++  match: defaultMatchRules,
++  claim: defaultClaimRules,
++  intel: defaultIntelRules,
+   sourceLayout: undefined,
+-  random: cryptoRandom,
++  masterSecret: drawMasterSecret,
++  finalSocketSecret: undefined,
++  testHooks: false,
+   checkInvariants: true,
+ };
+ 
++/** A finished match as the process recorded it (§16's result: the match, its end reason, winner and summaries). */
++export interface MatchOutcome {
++  readonly code: string;
++  readonly results: MatchResults;
++}
++
++/** Every match this process has finished, oldest first (the first release stores final outcomes only, §12). */
++const outcomes: MatchOutcome[] = [];
++
++/** The outcomes this process recorded so far, for tests and diagnostics. */
++export function recordedOutcomes(): readonly MatchOutcome[] {
++  return outcomes;
++}
++
+ /** A duel at sea: the encounter rules' duel, its synced lobby and marker, and the duel machine the fighters play. */
+ interface SeaDuel {
+   /** The encounter rules' duel id, also the ledger's. */
+@@ -208,6 +268,16 @@ interface Notices {
+   settledAt: number;
+   settledChoice: string;
+   choiceDeadline: number;
++  /** §5: why this player's last claim channel reset, and on which world tick. */
++  claimInterrupt: string;
++  claimInterruptAt: number;
++}
++
++/** A player's final-island route (§5), as the reveals gave it: known once, inactive while the set is broken. */
++interface Route {
++  active: boolean;
++  readonly x: number;
++  readonly y: number;
+ }
+ 
+ /** What tests and diagnostics read about a duel at sea. */
+@@ -232,8 +302,31 @@ const MATCH_ADMISSION: AdmissionRules = {
+   noSuchMessage: NO_SUCH_MATCH_MESSAGE,
+   codeRequiredMessage: MATCH_CODE_REQUIRED_MESSAGE,
+   fullMessage: matchFullMessage,
++  startedMessage: MATCH_STARTED_MESSAGE,
+ };
+ 
++/** Who holds a rubbing at a location: its owner, or the player a duel reserves it for; nobody at a source or a cache. */
++const holderOf = (location: RubbingLocation): string | undefined => (location.kind === "player" || location.kind === "duel" ? location.playerId : undefined);
++
++/** An intel message body as the reveal the room delivers, or undefined for the kinds it does not deliver yet. */
++function revealOf(body: IntelMessageBody): RevealMessage | undefined {
++  switch (body.kind) {
++    case "final-sector":
++      return { kind: body.kind, tick: body.tick, sector: body.sector, name: body.name };
++    case "final-route":
++      return { kind: body.kind, tick: body.tick, x: body.x, y: body.y, restored: body.restored };
++    case "final-route-inactive":
++      return { kind: body.kind, tick: body.tick };
++    case "sector-reveal":
++      return { kind: body.kind, tick: body.tick, sources: body.sources.map(({ sector, name }) => ({ sector, name })), caches: body.caches.map(({ sector, name }) => ({ sector, name })) };
++    case "carrier-report":
++      return { kind: body.kind, tick: body.tick, seenTick: body.seenTick, carriers: body.carriers.map(({ sector, name, type }) => ({ sector, name, type })) };
++    default:
++      // Rumors, sightings and the journal are `intel-online`'s.
++      return undefined;
++  }
++}
++
+ const sameTarget = (channel: LedgerChannel | null, target: InteractTarget): boolean =>
+   channel !== null &&
+   (target.kind === "collect"
+@@ -244,6 +337,13 @@ const sameTarget = (channel: LedgerChannel | null, target: InteractTarget): bool
+  * One private match (§14): the only writer of its state. It runs the shared simulation on a 60 Hz fixed step,
+  * applies validated client intent, and mirrors the simulation into the synced schema after every world step.
+  *
++ * The match flow (§2, §5): the match module (`stepMatch`) runs the lobby, the host's start, the ready countdown and
++ * control start, then the end and the results; ships take input only between control start and the end. From control
++ * start each world tick runs §5's order: the encounters (reservations first), the ledger's holds, the claim channel
++ * (`stepClaim`), the flow (with the tick's accomplishments and the claim's end), then the reveals (`stepIntel`, whose
++ * reveal messages go to exactly their recipients). A world tick that throws aborts the match (§12). Every system's
++ * seed is derived from one private master secret per match (`deriveSeed`), never from the match code.
++ *
+  * Encounters (§6): each world step the room builds the tick's snapshot for `stepEncounters` (every ship, whether its
+  * player is connected, pressed the grapple, or has a loaded arena) and applies the events: a landed grapple stops both
+  * ships and opens a duel at sea, a `DuelMachine` (the standalone duel room's own) whose fight starts when the rules
+@@ -289,8 +389,8 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   private nextDuelKey = 1;
+   /** Players whose connection dropped and who have not come back or left. */
+   private readonly away = new Map<string, Away>();
+-  /** Players who started a collection or cache claim this tick: their protection ends on the next (§6). */
+-  private protectionEndedNext = new Set<string>();
++  /** Players who started a collection, a cache claim or a treasure claim this tick: their protection ends on the next (§6). */
++  private protectionEndedNext = new Map<string, "claim" | "collection">();
+   private readonly notices = new Map<string, Notices>();
+   /** Ledger duels whose settlement is already in the players' notices. */
+   private readonly noticed = new Set<string>();
+@@ -305,6 +405,37 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   /** The creator's one-time token; cleared once the creator's seat is taken. */
+   private createToken: string | undefined;
+ 
++  /** The match's private master secret (§3, §16): every system's seed is derived from it, never from the code. */
++  private secret: Uint8Array = new Uint8Array(32);
++  /** Duels at sea opened so far, for their derived seeds. */
++  private duelsOpened = 0;
++  /** The final island (§3, §5): its socket and its claim point, the treasure circle's centre. Never synced to everyone. */
++  private finalIsland: { readonly socket: number; readonly claimPoint: ClaimPoint } = { socket: 0, claimPoint: { x: 0, y: 0 } };
++  /** §2's match flow: the lobby, the ready countdown, control start, the timer, the end and the results. */
++  private flowConfig: FlowConfig = matchConfigFor(DEFAULT_MATCH_TUNING);
++  private flow: FlowState = createFlowState(this.flowConfig);
++  /** Reports for the flow's next step: joins, leaves and start requests between ticks, accomplishments on a tick. */
++  private flowReports: FlowReport[] = [];
++  /** §5's claim channel, from control start. */
++  private claimConfig: ClaimConfig | undefined;
++  private claim: ClaimState | undefined;
++  /** §2 and §5's reveals, from control start. */
++  private intelConfig: IntelConfig | undefined;
++  private intel: IntelState | undefined;
++  /** Each player's route to the final island, once revealed to them. */
++  private readonly routes = new Map<string, Route>();
++  /** The (player, island) pairs already reported as visited, and each player's last reported gold. */
++  private readonly visited = new Set<string>();
++  private readonly reportedGold = new Map<string, number>();
++  /** Start requests per session in the current second, for the rate cap. */
++  private readonly startRate = new Map<string, { windowStart: number; count: number }>();
++  /** Where each rubbing was at the last world tick, for the results' accomplishments. */
++  private readonly lastLocations = new Map<string, RubbingLocation>();
++  /** Test-only hooks (`testHooks`): a fault injected into the next world tick, and a world tick to pause after. */
++  private faultNext = false;
++  private pauseAt: number | undefined;
++  private paused = false;
++
+   static override async onAuth(_token: string, options: unknown, _context: AuthContext): Promise<true> {
+     return authorizeEntry(options);
+   }
+@@ -324,15 +455,27 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     this.tuning = this.matchTuning();
+     this.encounterConfig = createEncounterConfig({ map: this.config.map, rules: this.tuning.encounters });
+     this.encounters = createEncounterState(this.encounterConfig);
+-    this.simulation = createMatchState(this.tuning.random(0, 2 ** 32));
+-    // The ledger's seed is the room's own private randomness, never the public match code (§3, §16).
+-    this.ledger = createMatchLedger({ map: this.config.map, seed: this.tuning.random(0, 2 ** 32), rules: this.tuning.objectives, layout: this.tuning.sourceLayout });
++    // One private master secret per match; each system gets its own seed derived from it, never the match code (§3, §16).
++    this.secret = this.tuning.masterSecret();
++    this.simulation = createMatchState(this.seedOf("world"));
++    this.ledger = createMatchLedger({ map: this.config.map, seed: this.seedOf("ledger"), rules: this.tuning.objectives, layout: this.tuning.sourceLayout });
++    this.finalIsland = finalIslandOf(this.config.map, this.tuning.finalSocketSecret ?? this.seedOf("final-socket"));
++    this.flowConfig = matchConfigFor(this.tuning);
++    this.flow = createFlowState(this.flowConfig);
+     this.state.code = code;
+     this.state.protocolVersion = PROTOCOL_VERSION;
+     this.state.custom = privateMatch.custom;
++    this.state.minPlayers = this.flowConfig.minPlayers;
++    this.state.durationTicks = this.flowConfig.durationTicks;
++    this.state.readyTicks = this.flowConfig.readyTicks;
++    this.state.treasureRadius = this.tuning.claim.circleRadiusTiles * this.config.map.subUnitsPerTile;
++    this.state.finalSector = "";
++    this.state.finalSectorIndex = -1;
++    this.state.endReason = "";
++    this.state.phase = this.flow.phase;
+     // Colyseus copied the filterBy fields of the create request, the token among them, into the listing's metadata.
+     // Replacing the metadata drops the token before the listing is first stored.
+-    await this.setMatchmaking({ metadata: { code, custom: privateMatch.custom } });
++    await this.setMatchmaking({ metadata: { code, custom: privateMatch.custom, started: false } });
+ 
+     this.onMessage(MessageType.Input, (client, message: unknown) => {
+       this.gates.get(client.sessionId)?.receive(message, this.simulation.frame);
+@@ -344,6 +487,7 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+       if (duelReadyMessageSchema.safeParse(message).success) this.duelOfSession(client.sessionId)?.machine.markReady(client.sessionId);
+     });
+     this.onMessage(RubbingMessageType.ChooseTheft, (client, message: unknown) => this.receiveTheftChoice(client.sessionId, message));
++    this.onMessage(MatchMessageType.Start, (client, message: unknown) => this.receiveStart(client.sessionId, message));
+     // Unknown message types are dropped, not answered: Colyseus would otherwise disconnect the sender.
+     this.onMessage("*", () => undefined);
+     this.setFixedTimestep(() => this.advance(), STEPS_PER_SECOND);
+@@ -355,6 +499,9 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+    */
+   override onJoin(client: Client, options: unknown): void {
+     this.admit(options);
++    // §2: a match that has left its lobby takes no one new, whatever path the request took.
++    if (this.flow.phase !== "lobby") throw new ServerError(JoinRefusal.MatchFull, MATCH_STARTED_MESSAGE);
++    this.flowReports.push({ kind: "join", playerId: client.sessionId });
+     this.simulation = addShip(this.config, this.simulation, client.sessionId);
+     this.ledgerStep("addPlayer", addPlayer(this.ledger, { playerId: client.sessionId, tick: this.simulation.worldTick }));
+     this.gates.set(client.sessionId, new InputGate());
+@@ -398,7 +545,10 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   override onLeave(client: Client): void {
+     const id = client.sessionId;
+     const player = findPlayer(this.ledger, id);
+-    if (player !== undefined && player.status !== "left") this.quit(id);
++    if (player !== undefined && player.status !== "left") {
++      this.quit(id);
++      this.flowReports.push({ kind: "leave", playerId: id });
++    }
+     this.removePlayer(id);
+     client.view?.dispose();
+     client.view = undefined;
+@@ -479,13 +629,20 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     return stepped.result;
+   }
+ 
++  /**
++   * One frame of the room's clock (60 Hz). Ships sail only while the match runs (§2: player control starts after the
++   * ready countdown and stops at the end); before and after, every helm is neutral. On every third frame the world
++   * tick runs in §5's order (`worldTick`), and a fault inside it aborts the match (§12).
++   */
+   private advance(): void {
++    if (this.paused) return;
+     const frame = this.simulation.frame + 1;
+     const inputs: Record<string, PlayerInput> = {};
++    const playing = this.inPlay();
+     const held = this.heldPlayers();
+     for (const [sessionId, gate] of this.gates) {
+-      // A reserved or respawning ship ignores its player's helm (§6).
+-      if (held.has(sessionId)) inputs[sessionId] = NEUTRAL_INPUT;
++      // No control before the start or after the end; a reserved or respawning ship ignores its player's helm (§6).
++      if (!playing || held.has(sessionId)) inputs[sessionId] = NEUTRAL_INPUT;
+       // A lapsed client gets no entry: its ship sails as neutral, but keeps its mooring throttle until real input.
+       else if (!gate.lapsedAt(frame)) inputs[sessionId] = gate.inputAt(frame);
+     }
+@@ -493,15 +650,54 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     for (const duel of this.seaDuels.values()) duel.machine.advance();
+     if (!isWorldStep(this.simulation.frame)) return;
+     const tick = this.simulation.worldTick;
++    try {
++      this.worldTick(frame, tick, held, playing);
++    } catch (error) {
++      this.fault(tick, error);
++    }
++    for (const gate of this.gates.values()) gate.worldStepTaken();
++    this.checkInvariants(tick);
++    this.mirror();
++    if (this.pauseAt !== undefined && tick >= this.pauseAt) {
++      this.pauseAt = undefined;
++      this.paused = true;
++    }
++  }
++
++  /**
++   * One world tick (20 Hz), in a fixed order. While the match runs: the ledger's clock (closed theft windows settle),
++   * the §12 timers, then §5's order: the encounters (accepted reservations first), the ledger's holds, the claim
++   * channel, the match flow (with this tick's claim end and accomplishments), and the reveals. Before control start
++   * only the timers and the flow run (the lobby and the ready countdown); once the match has ended nothing changes but
++   * the settled duels' lobbies leaving their fighters' views.
++   */
++  private worldTick(frame: number, tick: number, held: ReadonlySet<string>, playing: boolean): void {
++    if (this.flow.end !== null) {
++      this.closeShownDuels(tick);
++      return;
++    }
++    if (this.faultNext) {
++      this.faultNext = false;
++      throw new Error("test-only fault injected into the world tick");
++    }
+     // The ledger's clock first: choice windows that closed settle with the default theft.
+     this.ledgerStep("advanceLedger", advanceLedger(this.ledger, { tick }));
+     this.runAbsences(tick);
+-    this.stepEncounters(frame, held);
+-    this.stepChannels(frame, tick);
+-    for (const gate of this.gates.values()) gate.worldStepTaken();
++    let claimEnd: FlowReport | undefined;
++    if (playing) {
++      this.stepEncounters(frame, held);
++      this.stepChannels(frame, tick);
++      claimEnd = this.stepClaim(frame, tick);
++    }
+     this.noteSettlements();
+-    this.checkInvariants(tick);
+-    this.mirror();
++    if (playing) this.reportAccomplishments(tick);
++    this.stepFlow(tick, claimEnd);
++    if (this.flow.controlStartTick !== null && this.flow.end === null) this.stepReveals(tick);
++  }
++
++  /** Player control has started and the match has not ended (§2's departure and exploration). */
++  private inPlay(): boolean {
++    return this.flow.phase === "departure" || this.flow.phase === "exploration";
+   }
+ 
+   /** Players whose ship is reserved for a duel (until it is settled) or waits out of the world to respawn. */
+@@ -543,6 +739,8 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+       if (player.status !== "disconnected" || player.reservationDeadline === null || tick < player.reservationDeadline) continue;
+       const position = this.respawnDockOf(player.id);
+       this.ledgerStep("expireReservation", expireReservation(this.ledger, { playerId: player.id, tick, position }));
++      // §12: an expired reservation releases the seat, which the flow counts as leaving.
++      this.flowReports.push({ kind: "leave", playerId: player.id });
+       const duel = this.duelOfSession(player.id);
+       if (duel !== undefined && duel.machine.outcome === undefined) duel.machine.leave(player.id);
+       const away = this.away.get(player.id);
+@@ -589,7 +787,7 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   private stepEncounters(frame: number, held: ReadonlySet<string>): void {
+     const tick = this.simulation.worldTick;
+     const endedBy = this.protectionEndedNext;
+-    this.protectionEndedNext = new Set();
++    this.protectionEndedNext = new Map();
+     const players: EncounterPlayerInput[] = this.simulation.ships.map((ship) => {
+       const gate = this.gates.get(ship.id);
+       const duel = this.duelOfSession(ship.id);
+@@ -602,13 +800,18 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+         connected: this.clients.get(ship.id) !== undefined,
+         attack: !held.has(ship.id) && gate !== undefined && !gate.lapsedAt(frame) && (gate.inputAt(frame).buttons & GRAPPLE_BUTTON) !== 0,
+         ready: duel?.machine.isReady(ship.id) === true,
+-        // §6: last tick's collection or cache claim ended this player's protection.
+-        protectionEndedBy: endedBy.has(ship.id) ? "collection" : null,
++        // §6: last tick's collection, cache claim or treasure claim ended this player's protection.
++        protectionEndedBy: endedBy.get(ship.id) ?? null,
+       };
+     });
+     const stepped = stepEncounters(this.encounterConfig, this.encounters, { tick, players, reports: this.duelReports(tick), matchOver: false });
+     this.encounters = stepped.state;
+     for (const event of stepped.events) this.apply(event);
++    this.closeShownDuels(tick);
++  }
++
++  /** Settled duels whose result has been shown long enough leave their fighters' views. */
++  private closeShownDuels(tick: number): void {
+     for (const duel of [...this.seaDuels.values()]) if (duel.removeAfterTick !== undefined && tick > duel.removeAfterTick) this.closeSeaDuel(duel);
+   }
+ 
+@@ -713,7 +916,7 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     this.state.duels.set(key, lobby);
+     const machine = new DuelMachine({
+       lobby,
+-      seed: this.tuning.random(0, 2 ** 32),
++      seed: this.seedOf(`duel:${++this.duelsOpened}`),
+       start: "called",
+       send: (sessionId, type, message) => this.clients.get(sessionId)?.send(type, message),
+     });
+@@ -769,10 +972,361 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+         target.kind === "collect"
+           ? this.ledgerStep("startCollect", startCollect(this.ledger, { playerId: id, sourceId: target.sourceId, tick }))
+           : this.ledgerStep("startCacheClaim", startCacheClaim(this.ledger, { playerId: id, cacheId: target.cacheId, rubbingId: target.rubbingId, tick }));
+-      if (started.ok) this.protectionEndedNext.add(id);
++      if (started.ok && !this.protectionEndedNext.has(id)) this.protectionEndedNext.set(id, "collection");
++    }
++  }
++
++  /**
++   * §5's claim channel, one world tick, after the encounters (so a reservation accepted on this tick resets a channel
++   * first) and the ledger's holds: every ship whose player is in the match, whether it holds every type (the ledger),
++   * holds E, is connected and protected, and every duel the encounter rules hold reserved. Returns the claim's
++   * `match-ended`, for the flow's step on the same tick.
++   */
++  private stepClaim(frame: number, tick: number): FlowReport | undefined {
++    if (this.claimConfig === undefined || this.claim === undefined) return undefined;
++    const held = this.heldPlayers();
++    const records = new Map(this.encounters.players.map((player) => [player.id, player]));
++    const players: ClaimPlayer[] = [];
++    for (const ship of this.simulation.ships) {
++      const player = findPlayer(this.ledger, ship.id);
++      if (player === undefined || player.status === "left") continue;
++      const gate = this.gates.get(ship.id);
++      players.push({
++        id: ship.id,
++        x: ship.x,
++        y: ship.y,
++        speed: ship.speed,
++        holdsAllTypes: holdsAllTypes(this.ledger, ship.id),
++        interact: !held.has(ship.id) && gate !== undefined && !gate.lapsedAt(frame) && (gate.inputAt(frame).buttons & INTERACT_BUTTON) !== 0,
++        connected: player.status === "connected" && this.clients.get(ship.id) !== undefined,
++        protected: (records.get(ship.id)?.protection ?? null) !== null,
++      });
++    }
++    const encounters = this.encounters.duels.map((duel) => ({ id: duel.id, playerIds: duel.players }));
++    const stepped = stepClaim(this.claimConfig, this.claim, { tick, players, encounters });
++    this.claim = stepped.state;
++    let end: FlowReport | undefined;
++    for (const event of stepped.events) end = this.applyClaimEvent(event) ?? end;
++    return end;
++  }
++
++  private applyClaimEvent(event: ClaimEvent): FlowReport | undefined {
++    switch (event.kind) {
++      case "claim-interrupted": {
++        const notice = this.noticesOf(event.playerId);
++        notice.claimInterrupt = event.reason;
++        notice.claimInterruptAt = event.tick;
++        return undefined;
++      }
++      case "claim-started":
++        this.noticesOf(event.playerId).claimInterrupt = "";
++        return undefined;
++      case "protection-ended":
++        // §6: claiming ends protection; the encounter rules hear it on the next tick.
++        this.protectionEndedNext.set(event.playerId, "claim");
++        return undefined;
++      case "match-ended":
++        return { kind: "match-ended", tick: event.tick, reason: event.reason, winner: event.winner };
++      default:
++        // `claim-completed` shows in the results; `duel-ended-without-theft` is applied when the match ends.
++        return undefined;
++    }
++  }
++
++  /**
++   * The accomplishments of this tick (§2's results), read from the ledger, which alone moves rubbings and gold: each
++   * rubbing that changed hands since the last tick (from a source: collected; from a cache: a cache claimed; from one
++   * player to another: a theft and a loss; from a player into a cache: a loss), each balance that changed, and each
++   * island a player first moors at.
++   */
++  private reportAccomplishments(_tick: number): void {
++    const known = new Set(this.flow.players.map((player) => player.id));
++    const report = (entry: FlowReport & { readonly playerId: string }) => {
++      if (known.has(entry.playerId)) this.flowReports.push(entry);
++    };
++    for (const rubbing of this.ledger.rubbings) {
++      const before = this.lastLocations.get(rubbing.id);
++      this.lastLocations.set(rubbing.id, rubbing.location);
++      if (before === undefined) continue;
++      const from = holderOf(before);
++      const to = holderOf(rubbing.location);
++      if (from === to) continue;
++      if (from === undefined && to !== undefined) {
++        if (before.kind === "source") report({ kind: "collected", playerId: to });
++        else if (before.kind === "cache") report({ kind: "cache-claimed", playerId: to });
++      } else if (from !== undefined && to !== undefined) {
++        report({ kind: "stole", playerId: to });
++        report({ kind: "lost", playerId: from });
++      } else if (from !== undefined) {
++        report({ kind: "lost", playerId: from });
++      }
++    }
++    for (const player of this.ledger.players) {
++      if (this.reportedGold.get(player.id) === player.gold) continue;
++      this.reportedGold.set(player.id, player.gold);
++      report({ kind: "gold", playerId: player.id, gold: player.gold });
++    }
++    for (const ship of this.simulation.ships) {
++      const island = ship.dock === NOT_DOCKED ? -1 : (this.config.map.docks[ship.dock]?.island ?? -1);
++      if (island < 0 || this.visited.has(`${ship.id}:${island}`)) continue;
++      this.visited.add(`${ship.id}:${island}`);
++      report({ kind: "island-visited", playerId: ship.id, island: String(island) });
++    }
++  }
++
++  /**
++   * §2's match flow, one world tick: the joins, leaves and start requests since the last tick, this tick's
++   * accomplishments and the claim's end, in that order. Reports naming a player the flow does not know are dropped
++   * first (the match module refuses them).
++   */
++  private stepFlow(tick: number, claimEnd?: FlowReport): void {
++    const reports = this.flowReports;
++    this.flowReports = [];
++    if (claimEnd !== undefined) reports.push(claimEnd);
++    this.stepFlowWith(tick, reports);
++  }
++
++  private stepFlowWith(tick: number, reports: readonly FlowReport[]): void {
++    const known = new Set(this.flow.players.map((player) => player.id));
++    const valid: FlowReport[] = [];
++    for (const report of reports) {
++      if (report.kind === "join") known.add(report.playerId);
++      else if (report.kind === "duel-ended" && !report.playerIds.every((id) => known.has(id))) continue;
++      else if (report.kind === "match-ended" && report.winner !== null && !known.has(report.winner)) continue;
++      else if ("playerId" in report && report.kind !== "leave" && report.kind !== "start" && !known.has(report.playerId)) continue;
++      valid.push(report);
++    }
++    const stepped = stepMatch(this.flowConfig, this.flow, { tick, reports: valid });
++    this.flow = stepped.state;
++    for (const event of stepped.events) this.applyFlowEvent(event);
++  }
++
++  private applyFlowEvent(event: FlowEvent): void {
++    switch (event.kind) {
++      case "start-refused":
++        this.clients.get(event.playerId)?.send(MatchMessageType.StartRefused, { reason: event.reason } satisfies StartRefusedMessage);
++        return;
++      case "join-refused":
++        // The room refuses joins after the lobby itself; this is the backstop.
++        this.clients.get(event.playerId)?.leave(4409, MATCH_STARTED_MESSAGE);
++        return;
++      case "phase-changed":
++        // §2: once the ready countdown starts, admission refuses late arrivals; back in the lobby, it admits again.
++        if (event.to === "ready" || event.to === "lobby") void this.setMatchmaking({ metadata: { code: this.state.code, custom: privateMatch.custom, started: event.to === "ready" } });
++        return;
++      case "control-started":
++        this.startControl(event.tick);
++        return;
++      case "match-ended":
++        this.endMatch(event.results);
++        return;
++      default:
++        return;
+     }
+   }
+ 
++  /**
++   * §2's control start: every ship present gets the encounter rules' departure protection from this tick, the claim
++   * config's deadline counts from it (the timer's end), and the reveals' clocks start.
++   */
++  private startControl(tick: number): void {
++    const ids = this.simulation.ships.map((ship) => ship.id).filter((id) => findPlayer(this.ledger, id)?.status !== "left");
++    this.encounters = createEncounterState(this.encounterConfig, { tick, spawnProtected: ids });
++    this.claimConfig = claimConfigFor(this.tuning, this.finalIsland.claimPoint, tick, this.config.map);
++    this.claim = createClaimState(this.claimConfig, tick);
++    this.intelConfig = intelConfigFor(this.tuning, this.finalIsland.claimPoint, tick, this.config.map);
++    this.intel = createIntelState(this.intelConfig, this.seedOf("intel"), tick - 1);
++    for (const rubbing of this.ledger.rubbings) this.lastLocations.set(rubbing.id, rubbing.location);
++    for (const player of this.ledger.players) this.reportedGold.set(player.id, player.gold);
++  }
++
++  /**
++   * The match is over (§2, §5): outcomes freeze. A duel still running ends without theft (§2), each fighter's lobby
++   * showing the cancellation for a moment; the ships stop taking input; the results are the flow's, recorded once.
++   */
++  private endMatch(results: MatchResults): void {
++    const tick = results.tick;
++    for (const duel of this.seaDuels.values()) {
++      if (findDuel(this.ledger, duel.id)?.phase === "fighting" && tick >= this.ledger.tick) {
++        this.ledgerStep("reportDuelResult", reportDuelResult(this.ledger, { duelId: duel.id, tick, outcome: "cancelled" }));
++      }
++      if (duel.machine.outcome === undefined) duel.machine.end(null, "cancelled");
++      duel.ended = true;
++      duel.endedByRules = true;
++      duel.removeAfterTick ??= tick + DUEL_RESULT_TICKS;
++      this.state.markers.delete(duel.key);
++    }
++    outcomes.push({ code: this.state.code, results });
++    console.log(`match ${this.state.code} ended at tick ${tick}: ${results.reason}${results.winner === null ? ", no winner" : `, won by ${results.winner}`}`);
++  }
++
++  /**
++   * §2 and §5's reveals, one world tick after the flow: the intel module reads the ledger's rubbings and the ships,
++   * and the room delivers only its reveal messages, each to exactly its recipients (§16): the final island's sector to
++   * everyone, its exact claim point only to a full-set holder. Rumors and the journal come with `intel-online`.
++   */
++  private stepReveals(tick: number): void {
++    if (this.intelConfig === undefined || this.intel === undefined) return;
++    const stepped = stepIntel(this.intelConfig, this.intel, this.intelView(tick));
++    this.intel = stepped.state;
++    for (const { to, body } of stepped.messages) {
++      const reveal = revealOf(body);
++      if (reveal === undefined) continue;
++      if (reveal.kind === "final-sector") {
++        this.state.finalSector = reveal.name;
++        this.state.finalSectorIndex = reveal.sector;
++      }
++      const recipients = to.kind === "everyone" ? [...this.clients].map((client) => client.sessionId) : to.kind === "player" ? [to.playerId] : [...to.playerIds];
++      for (const id of recipients) {
++        if (reveal.kind === "final-route") this.routes.set(id, { active: true, x: reveal.x, y: reveal.y });
++        if (reveal.kind === "final-route-inactive") {
++          const route = this.routes.get(id);
++          if (route !== undefined) route.active = false;
++        }
++        this.clients.get(id)?.send(MatchMessageType.Reveal, reveal);
++      }
++    }
++  }
++
++  /**
++   * The world as the intel module reads it: every player in the match at their ship, and every rubbing where the
++   * ledger has it. A player who left while a duel still reserves their rubbings stays in the view, at the position
++   * they left from, until that duel settles.
++   */
++  private intelView(tick: number): IntelWorldView {
++    const ships = new Map(this.simulation.ships.map((ship) => [ship.id, ship]));
++    const holding = new Set(this.ledger.rubbings.flatMap((rubbing) => (rubbing.location.kind === "duel" ? [rubbing.location.playerId] : [])));
++    const players = this.ledger.players.flatMap((player) => {
++      const ship = ships.get(player.id);
++      if (player.status !== "left" && ship !== undefined) return [{ id: player.id, x: ship.x, y: ship.y }];
++      if (holding.has(player.id)) return [{ id: player.id, x: player.exit?.x ?? 0, y: player.exit?.y ?? 0 }];
++      return [];
++    });
++    const rubbings: IntelRubbing[] = this.ledger.rubbings.map((rubbing) => {
++      const location = rubbing.location;
++      switch (location.kind) {
++        case "source": {
++          const source = this.ledger.sources.find((each) => each.id === location.sourceId)!;
++          return { id: rubbing.id, type: rubbing.type, place: { kind: "source", island: source.island, x: source.x, y: source.y } };
++        }
++        case "cache": {
++          const cache = this.ledger.caches.find((each) => each.id === location.cacheId)!;
++          return { id: rubbing.id, type: rubbing.type, place: { kind: "cache", x: cache.x, y: cache.y } };
++        }
++        case "player":
++          return { id: rubbing.id, type: rubbing.type, place: { kind: "carried", playerId: location.playerId } };
++        case "duel":
++          return { id: rubbing.id, type: rubbing.type, place: { kind: "duel", playerId: location.playerId } };
++      }
++    });
++    return { tick, players, rubbings };
++  }
++
++  /** §12's server fault: a world tick threw. The match is aborted with no winner and no competitive penalty. */
++  private fault(tick: number, error: unknown): void {
++    console.error(`match ${this.state.code} fault at world tick ${tick} (aborting):`, error);
++    if (this.flow.end !== null) return;
++    this.flowReports = [];
++    this.stepFlowWith(Math.max(tick, this.flow.tick + 1), [{ kind: "fault" }]);
++  }
++
++  /** The private host's start request (§2): rate-capped and validated, then judged by the flow on the next tick. */
++  private receiveStart(sessionId: string, message: unknown): void {
++    const frame = this.simulation.frame;
++    const rate = this.startRate.get(sessionId) ?? { windowStart: frame, count: 0 };
++    if (frame - rate.windowStart >= STEPS_PER_SECOND) {
++      rate.windowStart = frame;
++      rate.count = 0;
++    }
++    rate.count++;
++    this.startRate.set(sessionId, rate);
++    if (rate.count > MAX_START_MATCH_PER_SECOND) return;
++    if (validateStartMatchMessage(message) === undefined) return;
++    if (findPlayer(this.ledger, sessionId) === undefined) return;
++    this.flowReports.push({ kind: "start", playerId: sessionId });
++  }
++
++  /** Every player gone: a match that left its lobby ends abandoned (§12), stepped once more before the room closes. */
++  override onDispose(): void {
++    if (this.flow.end !== null || this.flowReports.length === 0) return;
++    const tick = Math.max(this.simulation.worldTick + 1, this.flow.tick + 1);
++    // The leavers' rubbings went into caches since the last tick: those losses count before the end.
++    if (this.inPlay()) this.reportAccomplishments(tick);
++    const reports = this.flowReports;
++    this.flowReports = [];
++    this.stepFlowWith(tick, reports);
++  }
++
++  /** A player's seat: their join order in the flow, from 1 (0 before the flow has seen them join). */
++  seatOf(id: string): number {
++    const player = this.flow.players.find((each) => each.id === id);
++    return player === undefined ? 0 : player.order + 1;
++  }
++
++  /** A system's seed, derived from the match's master secret (`deriveSeed`). */
++  private seedOf(system: SeedSystem): number {
++    return deriveSeed(this.secret, system);
++  }
++
++  private requireTestHooks(): void {
++    if (!this.tuning.testHooks) throw new Error("the room's test hooks are off (MatchTuning.testHooks)");
++  }
++
++  /** Test-only (`testHooks`): the next world tick throws inside the room, as a server fault would (§12: aborted). */
++  injectFault(): void {
++    this.requireTestHooks();
++    this.faultNext = true;
++  }
++
++  /**
++   * Test-only (`testHooks`): the room's clock stops right after world tick `tick` (patches still go out, messages are
++   * still received) until `resumeWorld`, so a test can line an input up with an exact tick.
++   */
++  pauseAfterTick(tick: number): void {
++    this.requireTestHooks();
++    this.pauseAt = tick;
++  }
++
++  resumeWorld(): void {
++    this.requireTestHooks();
++    this.paused = false;
++  }
++
++  /** Whether the test-only pause holds the clock now. */
++  get worldPaused(): boolean {
++    return this.paused;
++  }
++
++  /** The match flow's state (phase, host, control start, end, results), for tests. */
++  get flowState(): FlowState {
++    return this.flow;
++  }
++
++  /** The claim config once control has started (its deadline is the timer's end), for tests. */
++  get claimConfiguration(): ClaimConfig | undefined {
++    return this.claimConfig;
++  }
++
++  /** The claim channel's state once control has started, for tests. */
++  get claimState(): ClaimState | undefined {
++    return this.claim;
++  }
++
++  /** The intel module's state once control has started, for tests. */
++  get intelState(): IntelState | undefined {
++    return this.intel;
++  }
++
++  /** The final island this match's secret picked, for tests (never synced to everyone). */
++  get finalIslandChoice(): { readonly socket: number; readonly claimPoint: ClaimPoint } {
++    return this.finalIsland;
++  }
++
++  /** The derived seeds of the systems seeded so far, for tests: each differs, and none reads the match code. */
++  derivedSeeds(): Record<"world" | "ledger" | "final-socket" | "intel", number> {
++    return { world: this.seedOf("world"), ledger: this.seedOf("ledger"), "final-socket": this.seedOf("final-socket"), intel: this.seedOf("intel") };
++  }
++
+   /** §4's theft choice from a client: the winner of a duel at sea, in its window, for an eligible type. */
+   private receiveTheftChoice(sessionId: string, message: unknown): void {
+     const frame = this.simulation.frame;
+@@ -797,7 +1351,18 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   private noticesOf(id: string): Notices {
+     let notices = this.notices.get(id);
+     if (notices === undefined) {
+-      notices = { channelResult: "", channelResultAt: 0, settledRole: "", stolen: "", goldChange: 0, settledAt: 0, settledChoice: "", choiceDeadline: 0 };
++      notices = {
++        channelResult: "",
++        channelResultAt: 0,
++        settledRole: "",
++        stolen: "",
++        goldChange: 0,
++        settledAt: 0,
++        settledChoice: "",
++        choiceDeadline: 0,
++        claimInterrupt: "",
++        claimInterruptAt: 0,
++      };
+       this.notices.set(id, notices);
+     }
+     return notices;
+@@ -815,6 +1380,9 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   private noteSettlement(duel: LedgerDuel): void {
+     const settlement = duel.settlement!;
+     const result = duel.result!;
++    // §2's results count a settled win or draw for both fighters; a cancelled duel (both gone, or the match's end)
++    // counts for neither. The rubbing and gold it moved are counted from the ledger with the tick's accomplishments.
++    if (result.outcome !== "cancelled") this.flowReports.push({ kind: "duel-ended", playerIds: duel.players, winner: result.outcome === "win" ? result.winner : null });
+     for (const id of duel.players) {
+       const notice = this.noticesOf(id);
+       notice.settledAt = settlement.tick;
+@@ -857,6 +1425,7 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     this.state.frame = this.simulation.frame;
+     this.state.worldTick = this.simulation.worldTick;
+     this.state.players = this.simulation.ships.length;
++    this.mirrorFlow();
+     const present = new Set<string>();
+     for (const ship of this.simulation.ships) {
+       present.add(ship.id);
+@@ -872,6 +1441,10 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+       synced.heading = ship.heading;
+       synced.speed = ship.speed;
+       synced.dock = ship.dock;
++      // §5: "warn nearby players": a ship channelling the claim shows it to whoever sees that ship.
++      const channel = this.claim?.channel ?? null;
++      synced.claiming = channel?.playerId === ship.id;
++      synced.claimHeld = synced.claiming ? channel!.progress : 0;
+     }
+     for (const id of [...this.state.ships.keys()]) if (!present.has(id)) this.state.ships.delete(id);
+     this.mirrorEncounters(present);
+@@ -879,6 +1452,57 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     this.updateViews();
+   }
+ 
++  /**
++   * §2's flow into the synced state, for everyone: the phase, the host, the players in the lobby, the ready countdown's
++   * end, control start, the timer (`remaining`) and deadline, the final island's sector once announced (never its
++   * position), and the results once the match has ended.
++   */
++  private mirrorFlow(): void {
++    const flow = this.flow;
++    this.state.phase = flow.phase;
++    this.state.hostSeat = flow.host === null ? 0 : this.seatOf(flow.host);
++    this.state.readyEndsAt = flow.readyTick === null ? 0 : flow.readyTick + this.flowConfig.readyTicks;
++    this.state.controlStartTick = flow.controlStartTick ?? 0;
++    this.state.deadlineTick = this.claimConfig?.deadlineTick ?? 0;
++    this.state.remainingTicks = remaining(flow, Math.max(flow.tick, this.simulation.worldTick));
++    const present = new Set<string>();
++    for (const player of flow.players) {
++      if (player.left) continue;
++      const key = String(player.order + 1);
++      present.add(key);
++      if (!this.state.roster.has(key)) {
++        const entry = new RosterEntrySchema();
++        entry.seat = player.order + 1;
++        this.state.roster.set(key, entry);
++      }
++    }
++    for (const id of [...this.state.roster.keys()]) if (!present.has(id)) this.state.roster.delete(id);
++    const results = flow.results;
++    if (results !== null && this.state.endReason === "") {
++      this.state.endReason = results.reason;
++      this.state.winnerSeat = results.winner === null ? 0 : this.seatOf(results.winner);
++      this.state.endTick = results.tick;
++      this.state.elapsedTicks = results.elapsedTicks;
++      for (const line of results.players) {
++        const synced = new ResultLineSchema();
++        synced.seat = this.seatOf(line.id);
++        synced.winner = line.winner;
++        synced.left = line.left;
++        synced.rubbingsHeld = line.rubbingsHeld;
++        synced.collected = line.collected;
++        synced.thefts = line.thefts;
++        synced.lost = line.lost;
++        synced.duelsWon = line.duelsWon;
++        synced.duelsLost = line.duelsLost;
++        synced.duelsDrawn = line.duelsDrawn;
++        synced.gold = line.gold;
++        synced.cachesClaimed = line.cachesClaimed;
++        synced.islandsVisited = line.islandsVisited;
++        this.state.results.push(synced);
++      }
++    }
++  }
++
+   /** The rules' telegraphs and each player's status into the synced state (markers change only on events). */
+   private mirrorEncounters(present: ReadonlySet<string>): void {
+     const keys = new Set<string>();
+@@ -958,6 +1582,7 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+       status.settledAt = notice.settledAt;
+       status.settledChoice = notice.settledChoice;
+       status.choiceDeadline = notice.choiceDeadline;
++      this.mirrorClaim(id, status, ship, player === undefined ? false : holdsAllTypes(this.ledger, id), notice);
+     }
+     const caches = new Set<string>();
+     for (const cache of this.ledger.caches) {
+@@ -975,6 +1600,29 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     for (const id of [...this.state.caches.keys()]) if (!caches.has(id)) this.state.caches.delete(id);
+   }
+ 
++  /**
++   * A player's own view of the final island (§5, §16): their route once the reveals gave it (inactive while their set
++   * is broken), whether they hold every type, and their claim: channelling (with the ticks held and needed), waiting
++   * for another claimer to finish, and why their last channel reset.
++   */
++  private mirrorClaim(id: string, status: PlayerStatusSchema, ship: { x: number; y: number }, fullSet: boolean, notice: Notices): void {
++    const route = this.routes.get(id);
++    status.seat = this.seatOf(id);
++    status.fullSet = fullSet;
++    status.routeKnown = route !== undefined;
++    status.routeActive = route?.active === true;
++    status.routeX = route?.x ?? 0;
++    status.routeY = route?.y ?? 0;
++    const channel = this.claim?.channel ?? null;
++    const config = this.claimConfig;
++    const inCircle = route !== undefined && config !== undefined && insideTreasureCircle(config, ship.x, ship.y);
++    status.claim = channel?.playerId === id ? "channel" : channel !== null && fullSet && inCircle ? "waiting" : "";
++    status.claimHeld = channel?.playerId === id ? channel.progress : 0;
++    status.claimTotal = config?.channelTicks ?? this.tuning.claim.channelTicks;
++    status.claimInterrupt = notice.claimInterrupt;
++    status.claimInterruptAt = notice.claimInterruptAt;
++  }
++
+   /**
+    * Each client's view (§3, §6, §12, §16): its own ship unless it waits to respawn, the ships it can see that are not
+    * in a duel or waiting to respawn, the grapples whose attacker it sees or that aim at it (with the target blanked

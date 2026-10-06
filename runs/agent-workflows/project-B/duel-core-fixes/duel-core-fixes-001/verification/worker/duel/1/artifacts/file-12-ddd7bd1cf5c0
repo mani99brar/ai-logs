@@ -1,0 +1,171 @@
+import { duelistMoveset, movesetVersion, type DuelButton, type DuelMove, type DuelMoveset } from "@pirate-sea-race/content/moves";
+import type { Facing } from "./boxes.js";
+
+/** Static duel data the step reads; it never changes during a duel. */
+export interface DuelConfig {
+  readonly moveset: DuelMoveset;
+}
+
+export const defaultDuelConfig: DuelConfig = { moveset: duelistMoveset };
+
+/**
+ * What a fighter is doing. `idle`, `walk` and `crouch` are free: the fighter can start anything on the next frame.
+ * `jump` lasts until landing. The others are timed by `timer`.
+ */
+export type FighterAction =
+  | "idle"
+  | "walk"
+  | "crouch"
+  | "jump"
+  | "dash"
+  | "backdash"
+  | "attack"
+  | "hitstun"
+  | "blockstun"
+  | "stagger"
+  | "thrown"
+  | "throw-break"
+  | "knockdown";
+
+export type Stance = "standing" | "crouching" | "airborne";
+
+/** Frames each button press stays usable (0 = no press waiting). */
+export type InputBuffer = Readonly<Record<DuelButton, number>>;
+
+/**
+ * One fighter. Every number is an integer: positions in sub-pixels (x from the left wall, y up from the floor, the
+ * origin in the middle of the feet), velocities in sub-pixels per frame, durations in frames.
+ */
+export interface FighterState {
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+  readonly facing: Facing;
+  readonly health: number;
+  readonly stamina: number;
+  /** Frames since stamina was last spent or a block was taken. */
+  readonly staminaIdle: number;
+  readonly action: FighterAction;
+  /** Frames spent in the current action, counting the frame that started it. For an attack, the move's frame. */
+  readonly actionFrame: number;
+  /** Frames of the current timed action still to come; the fighter is free on the frame after it reaches 0. */
+  readonly timer: number;
+  /** The move being performed, while `action` is `attack`. */
+  readonly moveId: string | null;
+  /** The current move already connected (hit, block or grab); a move connects once. */
+  readonly moveHit: boolean;
+  /** Crouching stance while grounded (crouch, a crouching move, a crouching block or hit). */
+  readonly crouching: boolean;
+  /** Damaging hits taken in the current combo. */
+  readonly combo: number;
+  /** Last frame's input bits, to find newly pressed buttons. */
+  readonly held: number;
+  readonly buffer: InputBuffer;
+}
+
+export type DuelPhase = "round" | "overtime" | "over";
+
+export type PlayerIndex = 0 | 1;
+
+export type DuelEventKind = "hit" | "block" | "guard-break" | "grab" | "throw" | "throw-escape" | "throw-clash";
+
+/** Something that happened on the frame that produced the state; `attacker` is the fighter whose move it was. */
+export interface DuelEvent {
+  readonly kind: DuelEventKind;
+  readonly attacker: PlayerIndex;
+  readonly moveId: string;
+  /** Health taken by this event, after combo scaling. */
+  readonly damage: number;
+}
+
+export interface DuelResult {
+  /** `null` is a draw. */
+  readonly winner: PlayerIndex | null;
+  readonly reason: "ko" | "double-ko" | "timeout" | "overtime";
+  readonly frame: number;
+}
+
+/** The complete duel: plain, serializable data, all of it covered by `hashState`. */
+export interface DuelState {
+  /** `movesetVersion()` of the move data this duel runs on; stepping, restoring or replaying on other data is refused. */
+  readonly movesetVersion: string;
+  /** Frames stepped since the duel began (the round's clock is `roundFrames - frame`). */
+  readonly frame: number;
+  readonly phase: DuelPhase;
+  /** A seeded generator state (see `random.ts`), carried in every snapshot; no current rule draws from it. */
+  readonly rng: number;
+  readonly fighters: readonly [FighterState, FighterState];
+  /** What happened on the last frame. */
+  readonly events: readonly DuelEvent[];
+  readonly result: DuelResult | null;
+}
+
+export interface DuelStartOptions {
+  readonly seed?: number;
+  /** Both fighters' starting x; by default `startGap` apart about the arena's centre. */
+  readonly x?: readonly [number, number];
+}
+
+const EMPTY_BUFFER: InputBuffer = { light: 0, heavy: 0, special1: 0, special2: 0, dash: 0 };
+
+/** Both fighters grounded, facing each other, with full health and stamina (§6). */
+export function createDuelState(config: DuelConfig, options: DuelStartOptions = {}): DuelState {
+  const { arena, rules, fighter } = config.moveset;
+  const seed = options.seed ?? 0;
+  if (!Number.isInteger(seed)) throw new RangeError(`seed must be an integer, got ${seed}`);
+  const centre = arena.width / 2;
+  const [x0, x1] = options.x ?? [centre - arena.startGap / 2, centre + arena.startGap / 2];
+  for (const x of [x0, x1]) {
+    if (!Number.isSafeInteger(x) || x < fighter.pushbox.halfWidth || x > arena.width - fighter.pushbox.halfWidth) {
+      throw new RangeError(`start position ${x} is not an integer inside the walls`);
+    }
+  }
+  const create = (x: number, facing: Facing): FighterState => ({
+    x,
+    y: 0,
+    vx: 0,
+    vy: 0,
+    facing,
+    health: rules.maxHealth,
+    stamina: rules.maxStamina,
+    staminaIdle: 0,
+    action: "idle",
+    actionFrame: 0,
+    timer: 0,
+    moveId: null,
+    moveHit: false,
+    crouching: false,
+    combo: 0,
+    held: 0,
+    buffer: EMPTY_BUFFER,
+  });
+  const facing0: Facing = x1 >= x0 ? 1 : -1;
+  return {
+    movesetVersion: movesetVersion(config.moveset),
+    frame: 0,
+    phase: "round",
+    rng: seed >>> 0,
+    fighters: [create(x0, facing0), create(x1, facing0 === 1 ? -1 : 1)],
+    events: [],
+    result: null,
+  };
+}
+
+const TIMED: ReadonlySet<FighterAction> = new Set(["dash", "backdash", "attack", "hitstun", "blockstun", "stagger", "throw-break", "knockdown"]);
+
+/** Whether the fighter can start something on the next frame: free, or at the end of a timed action on the ground. */
+export function canAct(fighter: FighterState): boolean {
+  if (fighter.action === "idle" || fighter.action === "walk" || fighter.action === "crouch") return true;
+  return TIMED.has(fighter.action) && fighter.timer === 0 && fighter.y === 0 && fighter.vy === 0;
+}
+
+export function findMove(moveset: DuelMoveset, id: string): DuelMove {
+  const move = moveset.moves.find((candidate) => candidate.timing.id === id);
+  if (move === undefined) throw new Error(`unknown move "${id}"`);
+  return move;
+}
+
+export function moveDuration(move: DuelMove): number {
+  return move.timing.startup + move.timing.active + move.timing.recovery;
+}

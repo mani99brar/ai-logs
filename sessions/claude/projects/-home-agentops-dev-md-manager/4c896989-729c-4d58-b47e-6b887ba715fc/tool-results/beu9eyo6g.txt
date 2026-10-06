@@ -1,0 +1,806 @@
+     1	"""Offline automatic-controller tests: synthetic Claude, real Git/checkpoints/checks."""
+     2	import json
+     3	import subprocess
+     4	import sys
+     5	import tempfile
+     6	import time
+     7	import unittest
+     8	from pathlib import Path
+     9	from types import SimpleNamespace
+    10	from unittest.mock import patch
+    11	
+    12	from langgraph.checkpoint.sqlite import SqliteSaver
+    13	
+    14	from .automatic import DEFAULTS, automatic_settings, drive, read_completion, review_candidate, validate_automatic, wait_handoffs, supervise
+    15	from .pipeline import build_pipeline
+    16	from .sessions import git, read_json, save_json
+    17	from .verification import policy_digest
+    18	from . import test_pipeline as fixtures
+    19	
+    20	
+    21	class CompletionTests(unittest.TestCase):
+    22	    def setUp(self):
+    23	        self.temp = tempfile.TemporaryDirectory()
+    24	        self.addCleanup(self.temp.cleanup)
+    25	        self.root = Path(self.temp.name)
+    26	        self.plan = {"run_id": "test", "source_branch": "feature/test", "automatic": dict(DEFAULTS),
+    27	                     "nodes": {node: {"session_id": node + "-token"} for node in ("ui", "adapter")}}
+    28	        sessions = SimpleNamespace(inventory=lambda: [], locate=lambda node, rows: {"state": "idle"})
+    29	        self.runtime = SimpleNamespace(directory=self.root, plan=self.plan, sessions=sessions)
+    30	        for node in self.plan["nodes"]:
+    31	            save_json(self.root / f"{node}.interactive.json", {"launch_requested_at": "1970-01-01T00:00:00+00:00"})
+    32	
+    33	    def completion(self, node):
+    34	        return {"version": "1.0.0", "run_id": "test", "node_id": node, "launch_token": node + "-token",
+    35	                "status": "completed", "summary": "Synthetic work", "open_assumptions": []}
+    36	
+    37	    def test_idle_without_signal_times_out_not_completes(self):
+    38	        ticks = iter([1, 1, DEFAULTS["worker_timeout_seconds"] + 1])
+    39	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+    40	            wait_handoffs(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
+    41	        self.assertFalse((self.root / "ui.handoff.json").exists())
+    42	
+    43	    def test_both_explicit_signals_create_handoffs(self):
+    44	        for node in self.plan["nodes"]:
+    45	            save_json(self.root / f"{node}.completion.json", self.completion(node))
+    46	        wait_handoffs(self.runtime, clock=lambda: 1, sleep=lambda _: self.fail("Unexpected wait"))
+    47	        self.assertEqual(read_json(self.root / "ui.handoff.json")["summary"], "Synthetic work")
+    48	
+    49	    def test_foreign_and_blocked_signals_fail_closed(self):
+    50	        item = self.completion("ui")
+    51	        item["launch_token"] = "foreign"
+    52	        save_json(self.root / "ui.completion.json", item)
+    53	        with self.assertRaisesRegex(ValueError, "foreign"):
+    54	            read_completion(self.runtime, "ui")
+    55	        item = self.completion("ui")
+    56	        item["status"] = "blocked"
+    57	        save_json(self.root / "ui.completion.json", item)
+    58	        with self.assertRaisesRegex(RuntimeError, "explicitly blocked"):
+    59	            read_completion(self.runtime, "ui")
+    60	
+    61	    def test_completion_while_working_is_not_accepted(self):
+    62	        for node in self.plan["nodes"]:
+    63	            save_json(self.root / f"{node}.completion.json", self.completion(node))
+    64	        self.runtime.sessions.locate = lambda node, rows: {"state": "working"}
+    65	        ticks = iter([1, 1, DEFAULTS["worker_timeout_seconds"] + 1])
+    66	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+    67	            wait_handoffs(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
+    68	        self.assertFalse((self.root / "ui.handoff.json").exists())
+    69	
+    70	    def test_stop_intent_recovery_uses_existing_validated_handoffs(self):
+    71	        for node in self.plan["nodes"]:
+    72	            save_json(self.root / f"{node}.completion.json", self.completion(node))
+    73	            save_json(self.root / f"{node}.handoff.json", read_completion(self.runtime, node))
+    74	        save_json(self.root / "ui.stop.json", {"stopped": True})
+    75	        self.runtime.sessions.inventory = lambda: self.fail("Must not locate a stopped worker")
+    76	        wait_handoffs(self.runtime)
+    77	
+    78	    def test_supervisor_restarts_only_for_checkpoint_continuation(self):
+    79	        save_json(self.root / "plan.json", self.plan)
+    80	        with patch("workflow.automatic.subprocess.run", side_effect=[subprocess.CompletedProcess([], 75), subprocess.CompletedProcess([], 0)]) as run:
+    81	            supervise(self.root)
+    82	        self.assertEqual(run.call_count, 2)
+    83	        self.assertEqual(run.call_args.args[0][3:], ["automatic-step", str(self.root), "--live"])
+    84	        with patch("workflow.automatic.subprocess.run", return_value=subprocess.CompletedProcess([], 1)) as run:
+    85	            with self.assertRaisesRegex(RuntimeError, "controller blocked"):
+    86	                supervise(self.root)
+    87	        self.assertEqual(run.call_count, 1)
+    88	
+    89	    def test_supervisor_interrupt_reports_resume_without_stopping_workers(self):
+    90	        save_json(self.root / "plan.json", self.plan)
+    91	        with patch("workflow.automatic.subprocess.run", side_effect=KeyboardInterrupt) as run:
+    92	            with self.assertRaisesRegex(RuntimeError, "NOT stopped.*resume with"):
+    93	                supervise(self.root)
+    94	        self.assertEqual(run.call_count, 1)
+    95	
+    96	    def test_deadlines_are_configurable_and_bounded(self):
+    97	        self.assertEqual(automatic_settings()["worker_timeout_seconds"], 4 * 3600)
+    98	        custom = automatic_settings(7200, 600)
+    99	        self.assertEqual((custom["worker_timeout_seconds"], custom["review_timeout_seconds"]), (7200, 600))
+   100	        self.assertEqual(custom["permission_mode"], DEFAULTS["permission_mode"])
+   101	        for bad in (0, -1, 86401):
+   102	            with self.assertRaisesRegex(ValueError, "bounded"):
+   103	                automatic_settings(worker_timeout_seconds=bad)
+   104	        with self.assertRaises(ValueError):
+   105	            automatic_settings(review_timeout_seconds=90000)
+   106	        self.plan["automatic"] = automatic_settings(7200)
+   107	        validate_automatic(self.plan)
+   108	
+   109	    def test_identical_failures_are_not_retried(self):
+   110	        from .automatic import advance_failed_checks
+   111	        policy = {"max_verification_attempts": 3}
+   112	        attempts = {"worker:adapter": 2}
+   113	        bumped = []
+   114	        runtime = SimpleNamespace(directory=self.root, policy=policy,
+   115	                                  attempt=lambda phase, node: attempts.get(f"{phase}:{node}", 1),
+   116	                                  retry_check=lambda phase, node: bumped.append((phase, node)))
+   117	        state = SimpleNamespace(next=("verify_adapter",), tasks=[SimpleNamespace(name="verify_adapter", error="blocked")])
+   118	        reasons = ["backend-unit: exit 1", "backend-unit: no passing test evidence or failed tests"]
+   119	        for attempt in (1, 2):
+   120	            (self.root / "verification" / "worker" / "adapter" / str(attempt)).mkdir(parents=True)
+   121	            save_json(self.root / "verification" / "worker" / "adapter" / str(attempt) / "packet.json",
+   122	                      {"gate": {"status": "blocked", "reasons": list(reasons)}})
+   123	        with self.assertRaisesRegex(RuntimeError, "failed identically on attempts 1 and 2"):
+   124	            advance_failed_checks(runtime, state)
+   125	        self.assertEqual(bumped, [])
+   126	        # A different failure on the latest attempt is still retried within the cap.
+   127	        save_json(self.root / "verification" / "worker" / "adapter" / "2" / "packet.json",
+   128	                  {"gate": {"status": "blocked", "reasons": ["browser: Playwright reported global errors"]}})
+   129	        self.assertTrue(advance_failed_checks(runtime, state))
+   130	        self.assertEqual(bumped, [("worker", "adapter")])
+   131	
+   132	    def test_stale_error_on_a_completed_sibling_does_not_block_retry(self):
+   133	        from .automatic import advance_failed_checks
+   134	        attempts = {}
+   135	        bumped = []
+   136	        runtime = SimpleNamespace(directory=self.root, policy={"max_verification_attempts": 3},
+   137	                                  attempt=lambda phase, node: attempts.get(f"{phase}:{node}", 1),
+   138	                                  retry_check=lambda phase, node: bumped.append((phase, node)))
+   139	        for node, status, reasons in (("ui", "passed", []), ("adapter", "blocked", ["Intentional lab drill"])):
+   140	            (self.root / "verification" / "worker" / node / "1").mkdir(parents=True)
+   141	            save_json(self.root / "verification" / "worker" / node / "1" / "packet.json", {"gate": {"status": status, "reasons": reasons}})
+   142	        # verify_ui carries an error from an earlier attempt but has since succeeded: it is not pending.
+   143	        state = SimpleNamespace(next=("verify_adapter",),
+   144	                                tasks=[SimpleNamespace(name="verify_ui", error="CalledProcessError(128, git worktree add)"),
+   145	                                       SimpleNamespace(name="verify_adapter", error="blocked")])
+   146	        self.assertTrue(advance_failed_checks(runtime, state))
+   147	        self.assertEqual(bumped, [("worker", "adapter")])
+   148	
+   149	    def test_reviewer_transport_defaults_to_native_and_legacy_plans_still_validate(self):
+   150	        from .automatic import reviewer_transport
+   151	        self.assertEqual(automatic_settings()["reviewer_transport"], "native")
+   152	        self.assertEqual(automatic_settings(reviewer_transport="print")["reviewer_transport"], "print")
+   153	        with self.assertRaisesRegex(ValueError, "reviewer transport"):
+   154	            automatic_settings(reviewer_transport="stdio")
+   155	        # Plans pinned before this slice have no reviewer_transport and mean native.
+   156	        legacy = {"run_id": "test", "source_branch": "feature/test",
+   157	                  "automatic": {key: value for key, value in DEFAULTS.items() if key != "reviewer_transport"}}
+   158	        validate_automatic(legacy)
+   159	        self.assertEqual(reviewer_transport(legacy), "native")
+   160	        self.assertEqual(reviewer_transport(self.plan), "native")
+   161	        self.plan["automatic"]["reviewer_transport"] = "print"
+   162	        validate_automatic(self.plan)
+   163	        self.assertEqual(reviewer_transport(self.plan), "print")
+   164	        for bad in ("stdio", None, 1):
+   165	            self.plan["automatic"]["reviewer_transport"] = bad
+   166	            with self.assertRaises(ValueError):
+   167	                validate_automatic(self.plan)
+   168	        self.plan["automatic"] = dict(DEFAULTS, extra=True)
+   169	        with self.assertRaises(ValueError):
+   170	            validate_automatic(self.plan)
+   171	
+   172	    def test_main_and_unbounded_authority_rejected(self):
+   173	        self.plan["source_branch"] = "main"
+   174	        with self.assertRaises(ValueError):
+   175	            validate_automatic(self.plan)
+   176	        self.plan["source_branch"] = "feature/test"
+   177	        self.plan["automatic"]["worker_timeout_seconds"] = 0
+   178	        with self.assertRaises(ValueError):
+   179	            validate_automatic(self.plan)
+   180	
+   181	
+   182	class ReviewCompletionTests(unittest.TestCase):
+   183	    """Unit-level acceptance of the reviewer's completion file and of the wait loop."""
+   184	
+   185	    TOKEN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+   186	
+   187	    def setUp(self):
+   188	        self.temp = tempfile.TemporaryDirectory()
+   189	        self.addCleanup(self.temp.cleanup)
+   190	        self.root = Path(self.temp.name)
+   191	        self.bundle = {"run_id": "test", "candidate_commit": "c" * 40, "snapshots": {"ui": {"session_id": "ui-session"}, "adapter": {"session_id": "adapter-session"}}}
+   192	        self.digest = "b" * 64
+   193	        plan = {"run_id": "test", "source_branch": "feature/test", "automatic": dict(DEFAULTS)}
+   194	        self.rows = [{"sessionId": "33333333-3333-4333-8333-333333333333", "state": "idle"}]
+   195	        sessions = SimpleNamespace(inventory=lambda: list(self.rows), locate=lambda node, rows: rows[0] if rows else None)
+   196	        self.events = []
+   197	        self.runtime = SimpleNamespace(directory=self.root, plan=plan, sessions=sessions, validate_bundle=lambda: (self.bundle, self.digest),
+   198	                                       event=lambda node, status, message: self.events.append((node, status, message)))
+   199	        save_json(self.root / "automatic-review.json", {"transport": "native", "launch_token": self.TOKEN, "bundle_sha256": self.digest,
+   200	                                                         "candidate_commit": "c" * 40, "status": "running"})
+   201	        save_json(self.root / "review.interactive.json", {"launch_requested_at": "1970-01-01T00:00:00+00:00"})
+   202	
+   203	    def completion(self, **updates):
+   204	        item = {"version": "1.0.0", "run_id": "test", "node_id": "review", "launch_token": self.TOKEN, "bundle_sha256": self.digest,
+   205	                "candidate_commit": "c" * 40, "verdict": "approved",
+   206	                "findings": [{"severity": "P2", "message": "Finding", "disposition": "open", "worker": "ui", "requirement": "Read UI"}]}
+   207	        item.update(updates)
+   208	        return item
+   209	
+   210	    def test_completion_prompt_spells_out_every_enum_the_schema_enforces(self):
+   211	        # Seen live: a reviewer given only an example invented severity "P3" and its whole file was
+   212	        # rejected; the prompt must name every allowed value rather than rely on one example.
+   213	        from .automatic import completion_protocol_prompt
+   214	        prompt = completion_protocol_prompt(self.runtime, self.TOKEN, self.digest, "c" * 40)
+   215	        for value in ("P0, P1 or P2", "no P3", "open, resolved or accepted", "ui, adapter, both or none", "approved or blocked", "no other keys"):
+   216	            self.assertIn(value, prompt)
+   217	        self.assertIn(self.TOKEN, prompt)
+   218	        self.assertIn(self.digest, prompt)
+   219	
+   220	    def test_valid_completion_is_reduced_to_the_decision(self):
+   221	        from .automatic import read_review_completion
+   222	        save_json(self.root / "review.completion.json", self.completion())
+   223	        self.assertEqual(read_review_completion(self.runtime), {"verdict": "approved", "findings": self.completion()["findings"]})
+   224	
+   225	    def test_stale_foreign_or_malformed_completions_fail_closed(self):
+   226	        from .automatic import read_review_completion
+   227	        cases = {"wrong bundle": {"bundle_sha256": "0" * 64}, "wrong token": {"launch_token": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+   228	                 "wrong candidate": {"candidate_commit": "d" * 40}, "wrong run": {"run_id": "other"}, "wrong node": {"node_id": "ui"},
+   229	                 "wrong version": {"version": "2.0.0"}, "extra key": {"extra": True}, "bad verdict": {"verdict": "maybe"},
+   230	                 "bad worker": {"findings": [{"severity": "P2", "message": "x", "disposition": "open", "worker": "reviewer", "requirement": None}]},
+   231	                 "missing finding link": {"findings": [{"severity": "P2", "message": "x", "disposition": "open"}]},
+   232	                 "empty requirement": {"findings": [{"severity": "P2", "message": "x", "disposition": "open", "worker": "ui", "requirement": ""}]}}
+   233	        for name, updates in cases.items():
+   234	            with self.subTest(name):
+   235	                save_json(self.root / "review.completion.json", self.completion(**updates))
+   236	                with self.assertRaises(RuntimeError):
+   237	                    read_review_completion(self.runtime)
+   238	        item = self.completion()
+   239	        del item["findings"]
+   240	        save_json(self.root / "review.completion.json", item)
+   241	        with self.assertRaises(RuntimeError):
+   242	            read_review_completion(self.runtime)
+   243	        (self.root / "review.completion.json").write_text("{not json")
+   244	        with self.assertRaises(RuntimeError):
+   245	            read_review_completion(self.runtime)
+   246	        (self.root / "review.completion.json").unlink()
+   247	        (self.root / "review.completion.json").symlink_to(self.root / "automatic-review.json")
+   248	        with self.assertRaises(RuntimeError):
+   249	            read_review_completion(self.runtime)
+   250	
+   251	    def test_wait_accepts_only_an_idle_reviewer_with_a_file_and_never_relaunches(self):
+   252	        from .automatic import wait_review
+   253	        ticks = iter([1, 1, 1, DEFAULTS["review_timeout_seconds"] + 1])
+   254	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted; no second reviewer"):
+   255	            wait_review(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
+   256	        save_json(self.root / "review.completion.json", self.completion())
+   257	        self.rows[0]["state"] = "working"
+   258	        ticks = iter([1, 1, DEFAULTS["review_timeout_seconds"] + 1])
+   259	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+   260	            wait_review(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
+   261	        # `blocked` means the session needs a human (a question in its pane): the wait continues
+   262	        # until the deadline, recorded once, and never treated as a verdict or a failure.
+   263	        self.rows[0]["state"] = "blocked"
+   264	        ticks = iter([1, 1, 1, DEFAULTS["review_timeout_seconds"] + 1])
+   265	        with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+   266	            wait_review(self.runtime, clock=lambda: next(ticks), sleep=lambda _: None)
+   267	        self.assertEqual([event[1] for event in self.events], ["interactive"])
+   268	        self.assertIn("needs attention", self.events[0][2])
+   269	        # Answered in the pane, the reviewer finishes: the file is accepted once the session is idle.
+   270	        states = iter(["blocked", "blocked", "idle"])
+   271	        self.rows[0]["state"] = "blocked"
+   272	        def settle(_seconds):
+   273	            self.rows[0]["state"] = next(states)
+   274	        self.assertEqual(wait_review(self.runtime, clock=lambda: 1, sleep=settle)["verdict"], "approved")
+   275	        self.rows[0]["state"] = "done"
+   276	        self.assertEqual(wait_review(self.runtime, clock=lambda: 1, sleep=lambda _: self.fail("Unexpected wait"))["verdict"], "approved")
+   277	        self.rows.clear()
+   278	        with self.assertRaisesRegex(RuntimeError, "missing; reconciliation"):
+   279	            wait_review(self.runtime, clock=lambda: 1, sleep=lambda _: None)
+   280	
+   281	
+   282	class GraphFixture(unittest.TestCase):
+   283	    """Automatic graph over the offline pipeline fixture; subclasses pick the reviewer transport."""
+   284	
+   285	    transport = "native"
+   286	
+   287	    def setUp(self):
+   288	        self.fixture = fixtures.PipelineTests()
+   289	        self.fixture.setUp()
+   290	        self.addCleanup(self.fixture.doCleanups)
+   291	        f = self.fixture
+   292	        self.original_branch = f.plan["source_branch"]
+   293	        git(f.repo, "switch", "-c", "feature/automatic-test")
+   294	        f.policy.update(version="1.1.0", max_verification_attempts=3,
+   295	                        failure_drill={"node_id": "adapter", "phase": "worker", "attempt": 1})
+   296	        f.plan.update(source_branch="feature/automatic-test", automatic=automatic_settings(reviewer_transport=self.transport),
+   297	                      policy_sha256=policy_digest(f.policy))
+   298	        save_json(f.directory / "plan.json", f.plan)
+   299	        save_json(f.directory / "policy.json", f.policy)
+   300	        f.runtime = fixtures.OfflinePipeline(f.directory, f.sessions)
+   301	        self.counter = f.root / "review-count"
+   302	        self.verdict = f.root / "review-verdict"
+   303	        self.verdict.write_text("approved")
+   304	        self.findings = f.root / "review-findings.json"  # Optional: the findings the fake print reviewer reports.
+   305	        f.sessions.reviewer_verdict_file = self.verdict
+   306	        executable = f.root / "fake-reviewer"
+   307	        executable.write_text(f'''#!/usr/bin/env python3
+   308	import json, sys
+   309	from pathlib import Path
+   310	args = sys.argv
+   311	assert args[args.index('--tools') + 1] == 'Read,Glob,Grep'
+   312	assert '--dangerously-skip-permissions' not in args
+   313	assert '--bg' not in args
+   314	counter = Path({str(self.counter)!r})
+   315	counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')
+   316	verdict = Path({str(self.verdict)!r}).read_text()
+   317	findings_file = Path({str(self.findings)!r})
+   318	findings = json.loads(findings_file.read_text()) if findings_file.exists() else []
+   319	print(json.dumps({{"session_id": args[args.index('--session-id') + 1], "is_error": False, "subtype": "success",
+   320	                  "structured_output": {{"verdict": verdict, "findings": findings}}}}))
+   321	''')
+   322	        executable.chmod(0o700)
+   323	        f.sessions.executable = str(executable)
+   324	        with SqliteSaver.from_conn_string(str(f.directory / "pipeline.sqlite")) as saver:
+   325	            graph = build_pipeline(saver, f.runtime)
+   326	            first = graph.invoke({"run_id": "run"}, f.config)
+   327	            self.assertEqual(first["__interrupt__"][0].value["kind"], "worker_handoff")
+   328	
+   329	    def reviewer_launches(self) -> int:
+   330	        if self.transport == "print":
+   331	            return int(self.counter.read_text()) if self.counter.exists() else 0
+   332	        log = self.fixture.directory / "fake-launches.log"
+   333	        return log.read_text().split().count("review") if log.exists() else 0
+   334	
+   335	    def expected_starts(self) -> list:
+   336	        return sorted(["ui", "adapter"] + (["review"] if self.transport == "native" else []))
+   337	
+   338	    def events(self) -> list:
+   339	        return [json.loads(line) for line in (self.fixture.directory / "events.jsonl").read_text().splitlines()]
+   340	
+   341	
+   342	class SharedGraphTests:
+   343	    """Behaviour that must hold for both reviewer transports."""
+   344	
+   345	    def test_automatic_drill_review_and_feature_only_finish(self):
+   346	        f = self.fixture
+   347	        # Completion protocol has separate tests; FakeSessions already supplied handoffs.
+   348	        with patch("workflow.automatic.wait_handoffs"):
+   349	            commit = drive(f.runtime)
+   350	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   351	        self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
+   352	        self.assertEqual(git(f.repo, "symbolic-ref", "--short", "HEAD"), "feature/automatic-test")
+   353	        self.assertEqual(sorted(f.sessions.starts), self.expected_starts())
+   354	        self.assertEqual(self.reviewer_launches(), 1)
+   355	        self.assertEqual(read_json(f.directory / "failure-report.json")["verification_attempts"], {"ui": [1], "adapter": [1, 2]})
+   356	        receipt = read_json(f.directory / "automatic-review.json")
+   357	        self.assertEqual((receipt["transport"], receipt["status"]), (self.transport, "succeeded"))
+   358	        self.assertIn("accepted_at", receipt)
+   359	        self.assertEqual(read_json(f.directory / "review.json")["reviewer"], receipt["session_id"])
+   360	        self.assertEqual(drive(f.runtime), commit)
+   361	        self.assertEqual(self.reviewer_launches(), 1)
+   362	        self.assertFalse(git(f.repo, "remote"))
+   363	
+   364	    def test_recovery_in_actual_new_controller_processes(self):
+   365	        f = self.fixture
+   366	        script = '''import sys
+   367	from pathlib import Path
+   368	from workflow import automatic
+   369	from workflow.sessions import read_json
+   370	from workflow.test_pipeline import OfflinePipeline, FakeSessions
+   371	directory = Path(sys.argv[1])
+   372	sessions = FakeSessions(directory, read_json(directory / 'plan.json'))
+   373	sessions.executable = sys.argv[2]
+   374	runtime = OfflinePipeline(directory, sessions)
+   375	automatic.wait_handoffs = lambda runtime: None
+   376	commit = automatic.drive(runtime, single_step=True)
+   377	assert not [node for node in sessions.starts if node != 'review'], 'Restart launched workers again'
+   378	sys.exit(0 if commit else 75)
+   379	'''
+   380	        codes = []
+   381	        for _ in range(4):
+   382	            result = subprocess.run([sys.executable, "-c", script, str(f.directory), f.sessions.executable],
+   383	                                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=90)
+   384	            codes.append(result.returncode)
+   385	            self.assertIn(result.returncode, (0, 75), result.stderr)
+   386	            if result.returncode == 0:
+   387	                break
+   388	        self.assertEqual(codes, [75, 75, 0])
+   389	        self.assertEqual(len({event["message"] for event in self.events() if event["node"] == "controller"}), 3)
+   390	        self.assertEqual(read_json(f.directory / "failure-report.json")["verification_attempts"], {"ui": [1], "adapter": [1, 2]})
+   391	        self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
+   392	        self.assertEqual(self.reviewer_launches(), 1)
+   393	
+   394	    def test_interrupt_during_worker_wait_keeps_workers_and_resumes(self):
+   395	        f = self.fixture
+   396	        with patch("workflow.automatic.wait_handoffs", side_effect=KeyboardInterrupt), patch.object(f.runtime, "stop_workers") as stop:
+   397	            with self.assertRaises(KeyboardInterrupt):
+   398	                drive(f.runtime)
+   399	        stop.assert_not_called()
+   400	        self.assertTrue(any(event["status"] == "interrupted" and "resume with" in event["message"] for event in self.events()))
+   401	        self.assertFalse((f.directory / "ui.stop.json").exists())
+   402	        # The same run resumes from the persisted checkpoint without relaunching anything.
+   403	        with patch("workflow.automatic.wait_handoffs"):
+   404	            commit = drive(f.runtime)
+   405	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   406	        self.assertEqual(sorted(f.sessions.starts), self.expected_starts())
+   407	
+   408	    def test_deadline_or_blocked_worker_stops_workers(self):
+   409	        f = self.fixture
+   410	        with patch("workflow.automatic.wait_handoffs", side_effect=RuntimeError("Worker ui deadline exhausted; no automatic relaunch")), \
+   411	                patch.object(f.runtime, "stop_workers") as stop:
+   412	            with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+   413	                drive(f.runtime)
+   414	        stop.assert_called_once()
+   415	        self.assertEqual(self.reviewer_launches(), 0)
+   416	
+   417	    def test_reviewer_block_preserves_branch_and_does_not_relaunch(self):
+   418	        f = self.fixture
+   419	        self.verdict.write_text("blocked")
+   420	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   421	            drive(f.runtime)
+   422	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+   423	        receipt = read_json(f.directory / "automatic-review.json")
+   424	        self.assertEqual(receipt["status"], "blocked")
+   425	        self.assertIn("blocked the candidate", receipt["error"])
+   426	        review = read_json(f.directory / "review.json")
+   427	        self.assertEqual((review["verdict"], review["reviewer"]), ("blocked", receipt["session_id"]))
+   428	        with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   429	            drive(f.runtime)
+   430	        self.assertEqual(self.reviewer_launches(), 1)
+   431	
+   432	
+   433	class AutomaticGraphTests(SharedGraphTests, GraphFixture):
+   434	    transport = "native"
+   435	
+   436	
+   437	class PrintReviewerGraphTests(SharedGraphTests, GraphFixture):
+   438	    transport = "print"
+   439	
+   440	    def test_print_mode_never_starts_a_native_reviewer(self):
+   441	        f = self.fixture
+   442	        with patch("workflow.automatic.wait_handoffs"):
+   443	            drive(f.runtime)
+   444	        self.assertFalse((f.directory / "review.interactive.json").exists())
+   445	        self.assertFalse((f.directory / "review.completion.json").exists())
+   446	        self.assertTrue((f.directory / "review.stdout.json").exists())
+   447	        self.assertEqual(f.sessions.starts.count("review"), 0)
+   448	
+   449	    def test_print_findings_carry_worker_and_requirement_into_review_and_export(self):
+   450	        f = self.fixture
+   451	        findings = [{"severity": "P2", "message": "Table lacks a disposition column", "disposition": "open", "worker": "ui", "requirement": "UI"},
+   452	                    {"severity": "P1", "message": "Fixed during review", "disposition": "resolved", "worker": "adapter", "requirement": None},
+   453	                    {"severity": "P2", "message": "Policy scoping", "disposition": "accepted", "worker": "none", "requirement": None}]
+   454	        self.findings.write_text(json.dumps(findings))
+   455	        with patch("workflow.automatic.wait_handoffs"):
+   456	            commit = drive(f.runtime)
+   457	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   458	        review = read_json(f.directory / "review.json")
+   459	        self.assertEqual((review["verdict"], review["findings"]), ("approved", findings))
+   460	        self.assertEqual([(item["worker"], item["requirement"]) for item in review["findings"]], [("ui", "UI"), ("adapter", None), ("none", None)])
+   461	        receipt = read_json(f.directory / "automatic-review.json")
+   462	        self.assertEqual((receipt["transport"], receipt["status"], receipt["decision"]["findings"]), ("print", "succeeded", findings))
+   463	        exported = read_json(f.directory / "run-state.json")
+   464	        self.assertEqual(exported["review"]["transport"], "print")
+   465	        self.assertEqual(exported["review"]["findings"], findings)
+   466	        self.assertEqual(exported["inputs"]["automatic"]["reviewer_transport"], "print")
+   467	        self.assertEqual(self.reviewer_launches(), 1)
+   468	
+   469	    def test_print_finding_without_worker_is_rejected_by_the_schema_without_relaunch(self):
+   470	        f = self.fixture
+   471	        self.findings.write_text(json.dumps([{"severity": "P2", "message": "Legacy finding shape", "disposition": "open"}]))
+   472	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   473	            drive(f.runtime)
+   474	        receipt = read_json(f.directory / "automatic-review.json")
+   475	        self.assertEqual((receipt["transport"], receipt["status"]), ("print", "blocked"))
+   476	        self.assertIn("'worker' is a required property", receipt["error"])
+   477	        self.assertNotIn("decision", receipt)
+   478	        self.assertFalse((f.directory / "review.json").exists())
+   479	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+   480	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   481	            drive(f.runtime)
+   482	        self.assertEqual(self.reviewer_launches(), 1)
+   483	        self.assertEqual(f.sessions.starts.count("review"), 0)
+   484	
+   485	
+   486	class NativeReviewerGraphTests(GraphFixture):
+   487	    transport = "native"
+   488	
+   489	    def test_native_reviewer_session_findings_and_stop_are_recorded(self):
+   490	        f = self.fixture
+   491	        f.sessions.reviewer_findings = [
+   492	            {"severity": "P2", "message": "Table lacks a disposition column", "disposition": "open", "worker": "ui", "requirement": "UI"},
+   493	            {"severity": "P1", "message": "Fixed during review", "disposition": "resolved", "worker": "adapter", "requirement": None},
+   494	            {"severity": "P2", "message": "Policy scoping", "disposition": "accepted", "worker": "none", "requirement": None}]
+   495	        with patch("workflow.automatic.wait_handoffs"):
+   496	            commit = drive(f.runtime)
+   497	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   498	        receipt = read_json(f.directory / "review.interactive.json")
+   499	        self.assertEqual((receipt["node_id"], receipt["session_id"]), ("review", fixtures.FakeSessions.REVIEWER_UUID))
+   500	        completion = read_json(f.directory / "review.completion.json")
+   501	        self.assertEqual(completion["launch_token"], receipt["launch_token"])
+   502	        review = read_json(f.directory / "review.json")
+   503	        self.assertEqual(review["reviewer"], fixtures.FakeSessions.REVIEWER_UUID)
+   504	        self.assertEqual(review["verdict"], "approved")
+   505	        self.assertEqual([(item["worker"], item["requirement"]) for item in review["findings"]], [("ui", "UI"), ("adapter", None), ("none", None)])
+   506	        self.assertEqual(review["findings"], f.sessions.reviewer_findings)
+   507	        automatic_receipt = read_json(f.directory / "automatic-review.json")
+   508	        self.assertEqual((automatic_receipt["transport"], automatic_receipt["status"], automatic_receipt["session_id"], automatic_receipt["launch_token"]),
+   509	                         ("native", "succeeded", fixtures.FakeSessions.REVIEWER_UUID, receipt["launch_token"]))
+   510	        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
+   511	        prompt = (f.directory / "review.prompt.txt").read_text()
+   512	        for expected in (str(f.directory / "review.completion.json"), receipt["launch_token"], completion["bundle_sha256"],
+   513	                         completion["candidate_commit"], '"worker"', '"requirement"', "nodes.<worker>.task", "human"):
+   514	            self.assertIn(expected, prompt)
+   515	        review_events = [event for event in self.events() if event["node"] == "review"]
+   516	        self.assertTrue(any(fixtures.FakeSessions.REVIEWER_UUID in event["message"] and event["status"] == "interactive" for event in review_events))
+   517	        self.assertEqual([event["status"] for event in review_events][-2:], ["stopped", "approved"])
+   518	        exported = read_json(f.directory / "run-state.json")
+   519	        self.assertEqual((exported["review"]["transport"], exported["review"]["reviewer_session_id"], exported["review"]["reviewed_at"]),
+   520	                         ("native", fixtures.FakeSessions.REVIEWER_UUID, automatic_receipt["accepted_at"]))
+   521	        self.assertEqual(exported["inputs"]["automatic"]["reviewer_transport"], "native")
+   522	
+   523	    def test_interrupted_reviewer_wait_keeps_the_reviewer_and_resumes_in_a_new_process(self):
+   524	        f = self.fixture
+   525	        marker = f.root / "interrupt-once"
+   526	        marker.touch()
+   527	        script = '''import sys
+   528	from pathlib import Path
+   529	from workflow import automatic
+   530	from workflow.sessions import read_json
+   531	from workflow.test_pipeline import OfflinePipeline, FakeSessions
+   532	directory, marker = Path(sys.argv[1]), Path(sys.argv[2])
+   533	sessions = FakeSessions(directory, read_json(directory / 'plan.json'))
+   534	runtime = OfflinePipeline(directory, sessions)
+   535	automatic.wait_handoffs = lambda runtime: None
+   536	real_wait = automatic.wait_review
+   537	def interrupted_once(runtime, **kwargs):
+   538	    if marker.exists():
+   539	        marker.unlink()
+   540	        raise KeyboardInterrupt
+   541	    return real_wait(runtime, **kwargs)
+   542	automatic.wait_review = interrupted_once
+   543	try:
+   544	    commit = automatic.drive(runtime, single_step=True)
+   545	except KeyboardInterrupt:
+   546	    sys.exit(130)
+   547	assert not [node for node in sessions.starts if node != 'review'], 'Restart launched workers again'
+   548	sys.exit(0 if commit else 75)
+   549	'''
+   550	        codes = []
+   551	        for _ in range(5):
+   552	            result = subprocess.run([sys.executable, "-c", script, str(f.directory), str(marker)],
+   553	                                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=90)
+   554	            codes.append(result.returncode)
+   555	            self.assertIn(result.returncode, (0, 75, 130), result.stderr)
+   556	            if result.returncode == 130:
+   557	                # The interrupted controller left the reviewer running: receipt still running, no stop, no error.
+   558	                receipt = read_json(f.directory / "automatic-review.json")
+   559	                self.assertEqual((receipt["transport"], receipt["status"]), ("native", "running"))
+   560	                self.assertNotIn("error", receipt)
+   561	                self.assertFalse((f.directory / "review.stop.json").exists())
+   562	                self.assertFalse((f.directory / "review.json").exists())
+   563	                self.assertTrue(any(event["node"] == "review" and event["status"] == "interrupted" and "NOT stopped" in event["message"] for event in self.events()))
+   564	                self.assertTrue(f.runtime.sessions.locate("review", f.runtime.sessions.inventory()))
+   565	            if result.returncode == 0:
+   566	                break
+   567	        self.assertEqual(codes, [75, 130, 75, 0])
+   568	        self.assertEqual(self.reviewer_launches(), 1)
+   569	        self.assertEqual(read_json(f.directory / "review.json")["verdict"], "approved")
+   570	        self.assertEqual(read_json(f.directory / "automatic-review.json")["status"], "succeeded")
+   571	        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
+   572	        self.assertEqual(git(f.repo, "rev-parse", self.original_branch), f.plan["base_commit"])
+   573	
+   574	    def assert_rejected(self, mutate, error):
+   575	        f = self.fixture
+   576	        f.sessions.reviewer_mutate = mutate
+   577	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "stop_reviewer", wraps=f.runtime.stop_reviewer) as stop:
+   578	            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   579	                drive(f.runtime)
+   580	            stop.assert_called_once()
+   581	        receipt = read_json(f.directory / "automatic-review.json")
+   582	        self.assertEqual(receipt["status"], "blocked")
+   583	        self.assertIn(error, receipt["error"])
+   584	        self.assertTrue((f.directory / "review.stop.json").exists())
+   585	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+   586	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   587	            drive(f.runtime)
+   588	        self.assertEqual(self.reviewer_launches(), 1)
+   589	
+   590	    def test_completion_with_wrong_bundle_hash_fails_closed(self):
+   591	        self.assert_rejected(lambda item: {**item, "bundle_sha256": "0" * 64}, "Stale or foreign")
+   592	        self.assertFalse((self.fixture.directory / "review.json").exists())
+   593	
+   594	    def test_completion_with_wrong_launch_token_fails_closed(self):
+   595	        self.assert_rejected(lambda item: {**item, "launch_token": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}, "Stale or foreign")
+   596	
+   597	    def test_completion_with_wrong_candidate_fails_closed(self):
+   598	        self.assert_rejected(lambda item: {**item, "candidate_commit": "d" * 40}, "Stale or foreign")
+   599	
+   600	    def test_completion_with_unknown_or_missing_keys_fails_closed(self):
+   601	        self.assert_rejected(lambda item: {**item, "surprise": 1}, "schema")
+   602	
+   603	    def test_blocked_verdict_ends_the_run_with_review_recorded(self):
+   604	        self.assert_rejected(lambda item: {**item, "verdict": "blocked"}, "blocked the candidate")
+   605	        self.assertEqual(read_json(self.fixture.directory / "review.json")["verdict"], "blocked")
+   606	
+   607	    def test_unresolved_p1_blocks_even_when_the_reviewer_says_approved(self):
+   608	        finding = {"severity": "P1", "message": "Unresolved defect", "disposition": "open", "worker": "adapter", "requirement": None}
+   609	        self.assert_rejected(lambda item: {**item, "findings": [finding]}, "blocked the candidate")
+   610	        review = read_json(self.fixture.directory / "review.json")
+   611	        self.assertEqual((review["verdict"], review["findings"]), ("blocked", [finding]))
+   612	        self.assertEqual(read_json(self.fixture.directory / "automatic-review.json")["decision"]["verdict"], "approved")
+   613	
+   614	    # ---- Launch window and post-acceptance stop -----------------------------------------------------
+   615	
+   616	    def assert_launch_window_interrupt_resumes(self, bound):
+   617	        """Ctrl-C after `claude --bg` returned: the reviewer exists and keeps running; resume accepts its file."""
+   618	        f = self.fixture
+   619	        uuid, background = fixtures.FakeSessions.REVIEWER_UUID, fixtures.FakeSessions.REVIEWER_UUID[:8]
+   620	        real_launch = f.runtime.launch_reviewer
+   621	        def launch_then_interrupt(prompt, launch_token, candidate_commit):
+   622	            real_launch(prompt, launch_token, candidate_commit)  # The launch command returned: the session exists.
+   623	            if not bound:
+   624	                # Ctrl-C inside the settle poll: the launcher journaled its intent but never bound the row.
+   625	                receipt = read_json(f.directory / "review.interactive.json")
+   626	                receipt.update(session_id=None, background_id=None, status="needs_reconciliation", error="")
+   627	                save_json(f.directory / "review.interactive.json", receipt)
+   628	            raise KeyboardInterrupt  # Ctrl-C in the settle poll or the pane attach.
+   629	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "launch_reviewer", side_effect=launch_then_interrupt), \
+   630	                patch.object(f.runtime, "stop_reviewer") as stop:
+   631	            with self.assertRaises(KeyboardInterrupt):
+   632	                drive(f.runtime)
+   633	        stop.assert_not_called()
+   634	        receipt = read_json(f.directory / "automatic-review.json")
+   635	        self.assertEqual((receipt["transport"], receipt["status"]), ("native", "running"))
+   636	        self.assertNotIn("error", receipt)
+   637	        if bound:
+   638	            self.assertEqual((receipt["session_id"], receipt["background_id"]), (uuid, background))
+   639	        else:
+   640	            self.assertNotIn("session_id", receipt)
+   641	            self.assertNotIn("background_id", receipt)
+   642	        self.assertFalse((f.directory / "review.stop.json").exists())
+   643	        self.assertFalse((f.directory / "review.json").exists())
+   644	        self.assertTrue(any(event["node"] == "review" and event["status"] == "interrupted" and "NOT stopped" in event["message"]
+   645	                            and "resume with" in event["message"] for event in self.events()))
+   646	        self.assertEqual(self.reviewer_launches(), 1)
+   647	        # Resume: the same session's file is accepted; nothing is launched again.
+   648	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
+   649	            commit = drive(f.runtime)
+   650	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   651	        self.assertEqual(self.reviewer_launches(), 1)
+   652	        receipt = read_json(f.directory / "automatic-review.json")
+   653	        self.assertEqual((receipt["status"], receipt["session_id"], receipt["background_id"]), ("succeeded", uuid, background))
+   654	        interactive = read_json(f.directory / "review.interactive.json")
+   655	        self.assertEqual((interactive["status"], interactive["session_id"], interactive["background_id"]), ("attached_session_available", uuid, background))
+   656	        self.assertNotIn("error", interactive)
+   657	        self.assertEqual(read_json(f.directory / "review.json")["reviewer"], uuid)
+   658	        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
+   659	        reconciled = [event for event in self.events() if event["node"] == "review" and "reconcil" in event["message"]]
+   660	        self.assertEqual(bool(reconciled), not bound)
+   661	        if reconciled:
+   662	            self.assertIn(uuid, reconciled[-1]["message"])
+   663	
+   664	    def test_interrupt_after_launch_with_a_bound_session_resumes_the_same_reviewer(self):
+   665	        self.assert_launch_window_interrupt_resumes(bound=True)
+   666	
+   667	    def test_interrupt_inside_the_settle_poll_reconciles_the_reviewer_then_resumes(self):
+   668	        self.assert_launch_window_interrupt_resumes(bound=False)
+   669	
+   670	    def test_interrupt_before_the_launch_was_issued_needs_reconciliation(self):
+   671	        f = self.fixture
+   672	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=KeyboardInterrupt), \
+   673	                patch.object(f.runtime, "stop_reviewer") as stop:
+   674	            with self.assertRaises(KeyboardInterrupt):
+   675	                drive(f.runtime)
+   676	        stop.assert_not_called()
+   677	        receipt = read_json(f.directory / "automatic-review.json")
+   678	        self.assertEqual((receipt["transport"], receipt["status"]), ("native", "needs_reconciliation"))
+   679	        self.assertFalse((f.directory / "review.interactive.json").exists())
+   680	        self.assertFalse(any(event["status"] == "interrupted" for event in self.events()))
+   681	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
+   682	            with self.assertRaisesRegex(RuntimeError, "needs reconciliation; no automatic relaunch"):
+   683	                review_candidate(f.runtime)
+   684	        self.assertEqual(self.reviewer_launches(), 0)
+   685	
+   686	    def test_failed_reviewer_launch_needs_reconciliation_and_never_relaunches(self):
+   687	        f = self.fixture
+   688	        error = "Claude background launch exited 1; inspect launch log"
+   689	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=RuntimeError(error)), \
+   690	                patch.object(f.runtime, "stop_reviewer") as stop:
+   691	            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   692	                drive(f.runtime)
+   693	        stop.assert_not_called()
+   694	        receipt = read_json(f.directory / "automatic-review.json")
+   695	        self.assertEqual((receipt["transport"], receipt["status"], receipt["error"]), ("native", "needs_reconciliation", error))
+   696	        self.assertNotIn("session_id", receipt)
+   697	        self.assertEqual(receipt["patch_sha256"], fixtures.digest_file(f.directory / "review.diff"))
+   698	        self.assertTrue(any(event["node"] == "review" and event["status"] == "blocked" and event["message"] == error for event in self.events()))
+   699	        self.assertFalse((f.directory / "review.interactive.json").exists())
+   700	        self.assertFalse((f.directory / "review.stop.json").exists())
+   701	        self.assertFalse((f.directory / "review.json").exists())
+   702	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+   703	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
+   704	            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   705	                drive(f.runtime)
+   706	            with self.assertRaisesRegex(RuntimeError, "needs reconciliation; no automatic relaunch"):
+   707	                review_candidate(f.runtime)
+   708	        self.assertEqual(self.reviewer_launches(), 0)
+   709	
+   710	    def test_unconfirmed_stop_after_acceptance_keeps_the_verdict_and_is_retried_on_resume(self):
+   711	        f = self.fixture
+   712	        real_stop = f.runtime.stop_reviewer
+   713	        attempts = []
+   714	        def stop_failing_once():
+   715	            attempts.append(1)
+   716	            if len(attempts) == 1:
+   717	                raise RuntimeError("Stop failed for review; inspect native session before retrying")
+   718	            real_stop()
+   719	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "stop_reviewer", side_effect=stop_failing_once):
+   720	            with self.assertRaisesRegex(RuntimeError, "Reviewer stop not confirmed.*resume"):
+   721	                drive(f.runtime)
+   722	        self.assertEqual(len(attempts), 1)
+   723	        receipt = read_json(f.directory / "automatic-review.json")
+   724	        self.assertEqual((receipt["transport"], receipt["status"], receipt["session_id"]), ("native", "succeeded", fixtures.FakeSessions.REVIEWER_UUID))
+   725	        self.assertNotIn("error", receipt)
+   726	        self.assertFalse((f.directory / "review.stop.json").exists())
+   727	        self.assertEqual(read_json(f.directory / "review.json")["verdict"], "approved")
+   728	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), f.plan["base_commit"])
+   729	        last = [event for event in self.events() if event["node"] == "review"][-1]
+   730	        self.assertEqual(last["status"], "running")
+   731	        self.assertIn("Could not confirm reviewer stop: Stop failed for review", last["message"])
+   732	        self.assertIn("resume retries the stop", last["message"])
+   733	        # Resume: the accepted verdict is reused, the stop is retried and confirmed, nothing is relaunched.
+   734	        with patch("workflow.automatic.wait_handoffs"), patch.object(f.runtime, "stop_reviewer", side_effect=stop_failing_once), \
+   735	                patch.object(f.sessions, "run_reviewer", side_effect=AssertionError("relaunched")):
+   736	            commit = drive(f.runtime)
+   737	        self.assertEqual(len(attempts), 2)
+   738	        self.assertEqual(git(f.repo, "rev-parse", "HEAD"), commit)
+   739	        self.assertTrue(read_json(f.directory / "review.stop.json")["stopped"])
+   740	        self.assertEqual(read_json(f.directory / "automatic-review.json")["status"], "succeeded")
+   741	        self.assertEqual(self.reviewer_launches(), 1)
+   742	        self.assertEqual([event["status"] for event in self.events() if event["node"] == "review"][-2:], ["stopped", "approved"])
+   743	
+   744	    # ---- Re-checks between the accepted file and the verdict --------------------------------------
+   745	
+   746	    def assert_refused_after_wait(self, error):
+   747	        """The file was accepted by the wait; the re-check refuses it: blocked, stopped once, no verdict, no relaunch."""
+   748	        self.assert_rejected(None, error)
+   749	        self.assertFalse((self.fixture.directory / "review.json").exists())
+   750	        self.assertNotIn("decision", read_json(self.fixture.directory / "automatic-review.json"))
+   751	
+   752	    def test_reviewer_identity_changed_after_the_file_is_refused(self):
+   753	        self.fixture.sessions.reviewer_row_after_file = {"sessionId": "44444444-4444-4444-8444-444444444444"}
+   754	        self.assert_refused_after_wait("Reviewer identity changed or is not independent")
+   755	
+   756	    def test_reviewer_that_is_a_worker_session_is_not_independent(self):
+   757	        f = self.fixture
+   758	        f.sessions.reviewer_session_id = f.plan["nodes"]["ui"]["session_id"]  # The bundle snapshots carry the workers' UUIDs.
+   759	        self.assert_refused_after_wait("Reviewer identity changed or is not independent")
+   760	
+   761	    def test_reviewer_missing_after_the_file_is_refused(self):
+   762	        from . import automatic
+   763	        f = self.fixture
+   764	        real_wait = automatic.wait_review
+   765	        def wait_then_vanish(runtime, **kwargs):
+   766	            decision = real_wait(runtime, **kwargs)
+   767	            f.sessions.reviewer_row_after_file = "missing"  # The session exits right after the wait accepted its file.
+   768	            return decision
+   769	        with patch("workflow.automatic.wait_review", side_effect=wait_then_vanish):
+   770	            self.assert_refused_after_wait("Reviewer identity changed or is not independent")
+   771	
+   772	    def test_reviewer_worktree_change_is_refused(self):
+   773	        f = self.fixture
+   774	        f.sessions.reviewer_after_file = lambda: (f.directory / "review-worktree" / "ui.txt").write_text("edited during review")
+   775	        self.assert_refused_after_wait("Reviewer worktree changed")
+   776	
+   777	    def test_evidence_change_during_review_is_refused(self):
+   778	        f = self.fixture
+   779	        f.sessions.reviewer_after_file = lambda: (f.directory / "review.diff").write_text("rewritten during review\n")
+   780	        self.assert_refused_after_wait("Evidence changed during review")
+   781	
+   782	    def test_reviewer_deadline_without_a_file_stops_the_reviewer_and_launches_no_second(self):
+   783	        f = self.fixture
+   784	        f.sessions.reviewer_writes_file = False
+   785	        clock = SimpleNamespace(value=time.time())  # The deadline counts from the reviewer's real launch time.
+   786	        def tick():
+   787	            clock.value += DEFAULTS["review_timeout_seconds"] / 2 + 1
+   788	            return clock.value
+   789	        with patch("workflow.automatic.wait_handoffs"), patch("workflow.automatic.time") as fake_time, \
+   790	                patch.object(f.runtime, "stop_reviewer", wraps=f.runtime.stop_reviewer) as stop:
+   791	            fake_time.time.side_effect = tick
+   792	            fake_time.sleep.return_value = None
+   793	            with self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   794	                drive(f.runtime)
+   795	            stop.assert_called_once()
+   796	        receipt = read_json(f.directory / "automatic-review.json")
+   797	        self.assertEqual(receipt["status"], "blocked")
+   798	        self.assertIn("deadline exhausted; no second reviewer", receipt["error"])
+   799	        self.assertFalse((f.directory / "review.json").exists())
+   800	        with patch("workflow.automatic.wait_handoffs"), self.assertRaisesRegex(RuntimeError, "Non-retryable"):
+   801	            drive(f.runtime)
+   802	        self.assertEqual(self.reviewer_launches(), 1)
+   803	
+   804	
+   805	if __name__ == "__main__":
+   806	    unittest.main()

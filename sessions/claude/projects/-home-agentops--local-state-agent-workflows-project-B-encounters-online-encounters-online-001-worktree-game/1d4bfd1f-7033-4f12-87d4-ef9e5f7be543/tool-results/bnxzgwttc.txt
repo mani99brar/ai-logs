@@ -1,0 +1,262 @@
+# Architecture
+
+The §14 browser architecture as far as the §3 sea and the §18 combat spike: browsers join a private match on one authoritative Colyseus room, the shared fixed-step simulation sails the ships over an authored tile map, and every browser draws what the server lets it see. Separately, two browsers fight a 1v1 duel in a standalone duel room with §15's prediction and rollback (the netcode is in `docs/duel.md`).
+
+| Workspace | §14 component | What it holds now |
+| --- | --- | --- |
+| `apps/web` | Browser client and web shell | Landing page, HUD, keyboard helm, input sender, snapshot interpolation, Phaser scene (tile map, following camera, ships, fogged minimap); the duel client (keyboard with tap latch, `DuelClientSession` loop, arena scene, duel HUD, dev-only latency setting) |
+| `apps/server` | Match process | `MatchRoom` (one Colyseus room per match), the Schema mirror of the simulation, per-client views, input gate, entry points; `DuelRoom` and its input gate; the shared private admission |
+| `packages/simulation` | Shared fixed-step functions | Integer match state, heading table, sailing, collisions, docking, visibility rule, seeded generator, `hashState`; the duel (`/duel`) and its netcode (`/netcode`: `DuelAuthority`, `DuelRollback`, `DuelClock`, `DuelClientSession`, the input-delay policy) |
+| `packages/protocol` | Data contracts (§16) | Protocol version (4), create and join options, the input schemas and validation, the duel messages, refusal messages, the test-placement request |
+| `packages/content` | Content and tuning (§17) | The slice sea (generated from Tiled), the Tiled converter, map validators, ship tuning, sight and engagement ranges, rules presets, frame budgets |
+| `packages/test-tools` | Test harness (§17) | `HeadlessClient`: a browserless player on the real Colyseus SDK that also records the raw frames it receives; `HeadlessDuelClient` (the browser's `DuelClientSession` on the SDK, driven by a script), `ImpairmentProxy`, and `replayRecordedDuel` |
+
+The HTTP service, PostgreSQL, static hosting and monitoring are not built yet (`infra/` is a placeholder).
+
+## The sea
+
+- **Map format and pipeline.** The map is `assets/source/maps/slice-sea.tmj`, in a documented subset of Tiled's JSON format (`packages/content/src/tiledMap.ts`): orthogonal, finite, 24 px tiles (`TILE_PIXELS`, as drawn); one imageless tileset whose tiles carry a `type` of `sea`, `land`, `shoal` or `dock`; a `terrain` layer as a plain gid array; an `objects` layer with a named `island` rectangle per island (property `theme`), a `spawn` point per slot (properties `slot` and `facing`) and one `hub` point. Nothing else is accepted. `npm run map:build -- --from-sketch` writes it from one mirrored ASCII quarter (`sliceSeaSketch.ts`; a unit test fails when they differ). `npm run map:build` (`scripts/build-map.ts`) converts it into `packages/content/src/maps/sliceSea.ts` (terrain rows and objects) if it passes the validators; a unit test fails when that module is stale (it reads the `.tmj` as a Vite `?raw` import).
+- **Validators.** `validateSeaMap` checks §2 and §3: four small islands, each land tile inside one island rectangle, each island with a dock beside its land and open sea; shoals; eight spawn slots on open sea outside the islands' bounding box and pairwise beyond `ENGAGEMENT_RANGE_TILES` (6); every dock and slot reachable by sea; and, by eight-way shortest paths (no cut corners) at full speed: each island's nearest neighbour 20–40 s away, no dock-or-slot crossing over 90 s, a dock within 40 s of every slot. No empty stretches: every navigable tile is within the sight radius of land, a shoal or a dock (not the edge). Routes meet: closing the disc around the hub (open sea near the centre; radius half the sight radius, so ships in it see each other) lengthens or cuts every shortest path between docks of different islands. At most 112 tiles a side. The slice sea (111 × 111 tiles, midline shoal walls open only in the hub's disc): neighbours 26 s apart, longest crossing 39 s, water within 9.9 tiles of an obstacle, 91 % open sea.
+- **Sailing.** Positions are integer sub-units (256 a tile); headings are 64 directions, 0 east, clockwise (y grows down), unit vectors from a literal cosine table. Each world step the throttle (`-moveY`) accelerates towards 39 sub-units a step (3.05 tiles a second), brakes, or reverses slowly from a stop; `moveX` turns a heading a step (3.2 s a circle); none coasts to a stop. On 24 px tiles that handles like the old five tiles a second on 16 px (unit tests hold it within 25 %). The hull is a square of half-size 80. A move sweeps each axis in turn through the tile columns or rows its leading edge enters and stops flush at the first land, shoal or map edge: a ship slides along an obstacle met at an angle, runs aground head-on, and never tunnels.
+- **Docking.** Hold E near a dock to moor, at any speed and throttle: with the hull on or beside the berth tile (unless pinched), or within reach with a clear run, it moves to the dock's centre, stops and records the dock, so no arrival slides past or grounds beside it (pinched: a diagonal tile whose two shared tiles are blocked). It stays moored while E or the throttle it moored with (`mooredThrottle`) is held; pressing a throttle after releasing that one, or the other direction, casts off. An input stall does not: the server gives a lapsed client no input, keeping the latch. The keyboard keeps a tap of E until its next read (not past a blur), the server until its next step; then the HUD says "Press E to dock".
+- **Visibility boundary (§16).** The room's `ships` map is tagged `.view()`. Each client gets a `StateView`; after every mirror the room puts into it the client's own ship and each ship within `SIGHT_RADIUS_TILES` (10, `visibleShipIds`) and takes out the rest, so Colyseus encodes no other ship into that client's patches (an integration test checks the decoded state and the raw frames). `players` in the state is the public player count. Terrain is static content every client bundles, never synced; the minimap fog is client-side presentation, not a security boundary.
+- **Test placement.** Tests place ships through `POST /__test/place` (code, session id, tile, heading); its tile bounds come from the map. Only the dev and test entry (`apps/server/src/dev.ts`) offers it, when `PIRATE_SEA_RACE_TEST_PLACEMENT=1`; the production entry (`main.ts`) never reads that, which the build smoke test checks. It only moves a ship: admission and views are unchanged.
+
+## The duel (combat spike)
+
+- **Duel room.** `DuelRoom` (room name `duel`) holds one duel: two players, or one in practice against a server-side dummy (player two, `idle` or `guard`). It is admitted like a match, by the same code in `admission.ts`: a one-time create token, `onAuth` before any seat, the room's own check, `filterBy(['code', 'createToken'])`, no token in the listing. The countdown (180 frames) starts once every seat is taken; the room probes round trips during it, chooses the shared input delay 30 frames before the end, then steps `DuelAuthority` at 60 Hz with `setFixedTimestep`. Inputs go through `DuelInputGate`, which admits them through the same `InputAdmission` as the world's `InputGate` (the rate window and the protocol validation: 128 bytes, 60 a second of room ticks, increasing sequence, 30 frames of lead), so the two cannot drift, and counts its drops. Frame bundles and probes are Colyseus messages; the lobby is a small Schema state. A drop keeps the seat for 10 s (`allowReconnection`); leaving, or staying away, forfeits, decided at the next frame boundary (two forfeits on one frame: no winner). The rules and rates are in `docs/duel.md`.
+- **One rollback core.** The browser's `DuelClient` and `HeadlessDuelClient` both run `DuelClientSession` from `@pirate-sea-race/simulation/netcode`; they differ only in transport and input (keyboard or script). The arena draws the predicted state; the HUD shows the confirmed one (server-equal health, stamina and clock) and the room's result. `window.__duel` exposes the session's counters and tagged inputs, read-only, for the browser tests.
+- **Impairment harness.** `ImpairmentProxy` is a TCP proxy (Node's `net`, no new dependency) between a client and the server. It forwards HTTP untouched in content and splits the WebSocket stream into frames; each frame waits half the round trip plus a uniform ±jitter/2 in its direction, never overtaking the frame before it, and a lost frame (seeded draw) waits a further retransmission timeout (200 ms), stalling everything behind it as TCP does. `sever()` cuts every connection (optionally refusing new ones) for the reconnect tests. `tests/integration/duelHarness.test.ts` runs a scripted duel between two headless clients through it, with no impairment and at 80 ms, 20 ms jitter and 1 % loss, and requires no desync at any of the ~180 hash checks per client, no rate-limited input, and corrections at most one per change of the opponent's applied input plus one per own substituted input, and at most 8 a second; it prints and annotates the counts. `replayRecordedDuel` replays a log (for example the pairs a client received) with `replayDuel`.
+- **Dev latency.** Only in `npm run dev` (`import.meta.env.DEV`), `?rtt=80&jitter=20` on the page delays that browser's duel socket both ways, probes and pings included; the build smoke test checks the production bundle does not contain it. The browser checks run the production build, so the setting is tested below the browser: `apps/web/src/devLatency.ts` has no DOM dependency, unit tests with fake timers check its delay, jitter bound and order on a real SDK room, and `tests/integration/devLatency.test.ts` wraps two headless duel clients in it and checks that the room's measured round trip and chosen input delay rise above the same duel without it.
+
+## Rules the code keeps
+
+- **Purity.** `simulation`, `protocol` and `content` import no Phaser, Colyseus, DOM, timers, wall-clock time or `Math.random`, and call no floating-point transcendental `Math` function. Their tsconfig leaves out the DOM library, and `tests/unit/purity.test.ts` fails on a violation.
+- **Integers.** Every number in the simulation state is an integer, so `hashState` (64-bit FNV-1a over a canonical serialization) does not depend on the JavaScript engine; a determinism test replays an input log.
+- **One clock.** The room steps the simulation 60 times a second with Colyseus `setFixedTimestep`. World logic runs on frames divisible by 3 (20 Hz); the room then mirrors the plain state into its Schema and updates the views, and Colyseus patches clients at 20 Hz. Integration tests measure both rates, also with eight sailing ships in one cluster.
+- **The server alone writes state.** At sea, clients send only `input` messages, `{seq, frame, buttons, moveX, moveY}`, validated with zod. `InputGate` drops, and counts, messages over the rate cap (60 per second of match time) or over 128 bytes, malformed ones (axes outside [-1, 1] are rejected, not clamped), ones whose sequence number is not higher than the last, and ones tagged more than 30 frames ahead. A held input lapses to neutral after 15 frames. An accepted world input applies from the server's next step whatever frame it names, since sea clients do not predict; a duel input applies to exactly the frame it names (`docs/duel.md`). Unknown message types are dropped. Colyseus's own limits sit above these: WebSocket frames over 4 KiB and more than 240 messages a second disconnect.
+- **Joining.** Matches and duels share the admission code (`apps/server/src/admission.ts`). Colyseus serves `create`, `join`, `joinOrCreate` and `joinById` over HTTP and reserves a seat before any room check, so a private match is guarded in three layers. The static `onAuth` runs before any seat is reserved: it refuses a mismatched protocol version (426), a request with neither or both of `code` and `createToken` or a malformed token (400), an unknown code (404) and a full match (409). A `create` carries a one-time 128-bit `createToken`; the room is registered with `filterBy(['code', 'createToken'])` and `onCreate` replaces the listing's metadata with `{code, custom}`, so no listing holds a token and a token-carrying request can only create. The room's `onJoin` is the backstop, and the only check `joinById` meets after `onAuth`: one seat with the creator's token, then only seats with the match's code (404 for another code, 403 otherwise). Refusal messages stay under 100 bytes. A caller who knows a room id can still hold seats with `joinById` until each reservation expires (15 s).
+- **Rendering.** The client draws the ships the server sent 100 ms in the past, interpolating between patches; the HUD lists their latest decoded state. The camera follows the player's ship over a Phaser tile map at 24 px a tile (the 480 px sight circle fits the 800 × 560 view) that leaves open sea to the background colour, keeping a software renderer fast. The sea does not predict; the duel arena does (above), and uses Phaser's canvas renderer so a machine without a GPU keeps its main thread free for the 4 ms client tick.
+
+## Toolchain
+
+npm workspaces, TypeScript 7.0.2 (`tsc` for typechecks and package builds), Vite 8.3.0 (web build), Vitest 5.0.1 (`unit` and `integration` projects), tsx (map script and dev server), Phaser 4.2.1, `colyseus` 0.18.8 with `@colyseus/schema` 5.0.34, `@colyseus/sdk` 0.18.4, zod 4.6.5, Playwright 1.63.0. Workspace packages export a `@pirate-sea-race/source` condition that points at `src/`, so development and tests need no build. `npm run build` compiles each package to `dist/` in dependency order, then `scripts/smoke-build.ts` loads every workspace export from `dist/`, starts the built server on a free port, creates a match through the SDK, waits for the creator's ship and checks that no test-placement route answers, with every wait bounded. `colyseus` brings `uWebSockets.js` in from GitHub, so `npm ci` needs github.com as well as the npm registry. The duel added no dependency: `packages/test-tools` now also depends on the workspace's `@pirate-sea-race/simulation`, and the smoke test also loads `@pirate-sea-race/simulation/netcode` from `dist/`, checks the web bundle for the dev-only latency setting, and plays the first frames of a practice duel on the built server.
+# Duel simulation
+
+The pure 1v1 duel of §7 and §8 with the Duelist kit. `@pirate-sea-race/simulation/duel` has the step, snapshots and replay. `@pirate-sea-race/content/moves` has the move data, rules, validators and the input log schema. The code has no clocks, no `Math.random` and uses integer maths only.
+
+## Units
+
+- **Time:** 60 Hz frames. `startup` frames come before the first active frame. Blockstun and hitstun count the contact frame, so block advantage is `blockstun − active − recovery` (heavy mid: 16 − 4 − 24 = −12).
+- **Space:** integer sub-pixels, 16 per pixel. x runs from the left wall (0) to `arena.width`, and y goes up from the floor. The origin is the middle of the feet.
+- **Boxes:** half-open `[x, x + w) × [y, y + h)`, drawn facing right. Facing left mirrors `[x, x + w)` to `[−x − w, −x)`. There is one hitbox per move and one hurtbox per stance.
+- **Input:** one integer per player per frame: left 1, right 2, up 4, down 8, light 16, heavy 32, special one 64, special two 128, dash 256. Directions are absolute; throw is light + heavy, pressed together or within the **throw chord window** (below).
+
+## State
+
+`DuelState` is plain data, and `hashState` covers all of it. Each fighter also carries its kit and its bolt and smoke-screen slots; see `docs/fruit-kits.md` for the Ember and Smoke kits, their state and their data:
+
+- `movesetVersion` (`movesetVersion(moveset)`, below), `frame`, and `phase` (`round`, `overtime` or `over`);
+- `rng`: a seeded generator that no current rule draws from, kept so snapshots stay complete;
+- `fighters[2]`;
+- `events`: the last frame's hits, blocks, guard breaks, grabs, throws, escapes and throw clashes;
+- `result`: `winner` (0, 1 or null for a draw) and `reason` (`ko`, `double-ko`, `timeout` or `overtime`).
+
+Each fighter holds:
+
+- position, velocity, `facing`, `health`, `stamina` and `staminaIdle`;
+- `action`, `actionFrame` (counts up; for an attack, the move's frame) and `timer` (counts down; the fighter is free on the frame after 0);
+- `moveId`, `moveHit` (a move connects once), `crouching` and `combo`;
+- `held` (last frame's bits) and `buffer` (frames left per button press).
+
+`canAct(fighter)` tells whether the fighter can start something on the next frame.
+
+## One frame: `stepDuel(config, state, [p1, p2])`
+
+The kits add bolt and zone resolution to this order; `docs/fruit-kits.md` ("Step-order changes") lists exactly where.
+
+1. **Inputs.** Left + right and up + down are neutral. A new press stays usable for 4 frames.
+2. **Detection**, against the start-of-frame state of both fighters.
+   - A fighter guards when it can act (or is in blockstun), is grounded and holds away from the attacker.
+   - Standing guard blocks highs and mids. Crouching guard blocks lows. A crouching fighter is never hit by a high.
+   - Throws ignore guard but cannot take a fighter who is airborne, in hitstun or blockstun, being thrown, recovering from a throw break, or knocked down.
+   - Knocked-down and held fighters cannot be struck, nor can a fighter in its move's `strikeInvulnerable` frames (the counter slash's whole 8-frame startup).
+3. **Same-frame interactions.** Two grabs on one frame break each other with no damage. A grab fails against a strike that hits or is blocked on that frame; a hitbox that misses does not. A throw still in startup is simply struck.
+4. **Apply.** All results land together.
+   - Damage is scaled by the defender's start-of-frame combo count (100/80/65/50/40 %). The fifth damaging hit forces a 40-frame knockdown that cannot be hit.
+   - A block that costs more than the start-of-frame stamina breaks the guard: 30 frames of stagger, and 30 stamina is added, up to the maximum.
+   - Pushback that meets a wall moves the attacker instead.
+   - A grabbed fighter escapes by pressing light + heavy within the ten frames after the grab; otherwise the throw lands on the eleventh frame.
+   - Other fighters advance their action. A free fighter first turns to face the opponent, then starts, in priority order: throw, special one, special two, heavy (down: low sweep; forward: launcher), light (down: anti-air), dash or backdash, jump, crouch, walk.
+   - **Throw chord window** (`rules.throwChordFrames`, 2), for keyboard rollover: a light or heavy move that a free fighter started becomes the throw when the other button is pressed up to 2 frames after the move started, before its first active frame. The throw keeps the frames spent, so it is active when a simultaneous press would be. A lone light or heavy is not delayed (the jab still hits 7 frames after the press).
+5. **Movement.** Velocity, gravity and landing, then walls. Overlapping pushboxes are separated, each fighter moving half the overlap, rounded up. The lower x goes left, then (on a tie) the lower start-of-frame x, the lower velocity, the one facing right. These all flip in a mirrored arena, so the slot never decides; a tie on all of them stays put.
+6. **Stamina and result.**
+   - Stamina regenerates 1 point per 3 frames after 60 frames without spending or blocking.
+   - A KO is judged from both fighters' final health, so a double KO is a draw and beats the clock.
+   - At frame 3600, higher health wins. Equal health goes to overtime until frame 4200, where an exact tie is a draw. After that the step only advances `frame`.
+
+Nothing computed for one fighter reads the other fighter's result from the same frame. A test swaps slots and mirrors the arena, then checks the mirrored outcome on every frame.
+
+**Punish tuning:** the heavy mid hits a standing hurtbox up to 80 px away, and its block pushback is **4 px**, so it leaves at most 84 px − 1 sub-pixel. The jab reaches **64 px** (84 px against a standing hurtbox). The defender's jab, started on its first free frame, lands with 5 frames of the heavy's recovery left.
+
+## Snapshots, restore and replay (for `duel-online`)
+
+- `snapshotDuel(state)`: an independent, JSON-safe deep copy. Keep two seconds of these along with the inputs sent (§15).
+- `restoreDuel(config, snapshot)`: takes a checkpoint, for example one parsed from JSON. It refuses another moveset version (so does `stepDuel`) and any field a duel state cannot hold: missing or extra fields, wrong types, integers out of range, unknown actions or move ids, a move outside an attack, a result without `over`.
+- On a mismatch, restore the authoritative frame N and step the unacknowledged inputs from N + 1. `replayDuel(config, state, log)` does the same from a log and returns `{ state, hash }`. `sliceDuelInputLog(log, N)` starts a log at a snapshot's frame.
+- Log JSON: `{ "format": "pirate-sea-race/duel-input-log", "version": 1, "movesetVersion": "a32af270c3979db5", "startFrame": N, "inputs": [[p1, p2], …] }`, where `inputs[i]` is frame N + i + 1. `duelInputLogSchema` validates it. A replay is refused for a malformed log, another moveset version, or a `startFrame` that is not the state's frame.
+- The version is the data's hash: `movesetVersion(moveset)` equals `hashState(moveset)`, and `MOVESET_VERSION` is the Duelist's. Changed data changes it, so states, snapshots and logs from old data are refused. A test pins the Duelist's value so data changes are deliberate.
+- The throw chord window re-timed recorded inputs: `duelist-1` logs and snapshots (duel-core-001) are refused, and the determinism fixture and version pin were re-recorded.
+
+## Netcode (`duel-online`)
+
+§15's server-authoritative prediction and rollback, in `@pirate-sea-race/simulation/netcode` (pure: the caller passes the time). `DuelAuthority` is the server's half, `DuelClientSession` (the clock, the input stream and `DuelRollback`) the client's; the browser and the headless test client run the same session.
+
+**Timeline.** One frame counter: the countdown is frames −180 to 0, the fight starts at frame 1, and `inputs[i]` of any message is for consecutive frames ending with its `frame`.
+
+**Messages** (Colyseus messages on the room's WebSocket, validated with zod in `packages/protocol`, protocol v4):
+
+| Direction | Type | Content | Rate |
+| --- | --- | --- | --- |
+| client → server | `duel-input` | `{seq, frame, inputs}`: the input bits of the last 4 tagged frames, the newest last | one every 2nd frame, never more than 30 a second |
+| server → client | `duel-frames` | `{frame, inputs, substituted, snapshot \| hash}`: the pairs the server applied since the last bundle (bit `2k + p` of `substituted` marks a repeated or neutral input), then the state after `frame` | every 3rd frame; a snapshot in every 2nd bundle (every 6 frames), the `hashState` otherwise |
+| server → client | `duel-probe` | `{id, frame, rtt}`: the server's frame and the client's last measured round trip | every 6 frames in the countdown, every 30 in the fight |
+| client → server | `duel-probe` | `{id}`, echoed at once | — |
+| client → server | `duel-practice` | `{dummy: "idle" \| "guard"}` (practice rooms) | — |
+
+Each frame travels in two input messages, so one lost message costs nothing. The world input gate's limits apply unchanged: 128 bytes, 60 messages a second, increasing `seq`, `frame` at most 30 frames past the server's. The lobby (code, phase, countdown, seed, input delay, seats, result) is the room's Schema state.
+
+**Server** (`DuelAuthority`, stepped by `DuelRoom` at 60 Hz). A frame's input is the first copy received; a copy for a frame already stepped is ignored (late input never rewrites a frame). With no input for a frame, the player's last input repeats for 15 frames (250 ms) after their last received frame, then neutral. The fight starts with a frame-0 snapshot bundle; the step's result ends it (the last bundle carries a snapshot) and the room's state announces it.
+
+**Input delay.** The input held at client frame `c` is tagged for `c + delay`, for both players. `DELAY_DECISION_FRAMES` (30) before the countdown ends the server picks `ceil((rtt / 2 + 2 × jitter) / 16.7 ms) + 2`, clamped to 3–8, from the slower player's probes (`inputDelayFromSamples`): `rtt` is the median and `jitter` the interquartile range of up to 25 round trips (a stall behind a lost packet does not count as jitter). No samples means 8. The HUD shows it. Unit tests pin its exact values; live tests only check that it stays within 3–8 and rises with latency.
+
+**Client clock.** Every bundle and probe that left the server after frame F and arrived at local time T suggests the server's frame 0 was at `T − rtt/2 − F × 16.7 ms`; the earliest suggestion of the last two seconds is the estimate (delays only add). Every 4 ms tick moves the client's frame towards it, at most 4 frames per tick; a gap over 30 frames (a stall or a hidden tab) restarts from the latest snapshot instead. The display's frame rate plays no part.
+
+**Rollback loop** (`DuelRollback`, two seconds of states and inputs):
+
+1. Predict each frame past the last confirmed one with the local input as sent and the opponent's last confirmed input repeated; stop 120 frames past it.
+2. On a bundle, record the applied pairs. If one differs from the pair its frame was predicted with, restore the last confirmed state and step every frame to the head again: confirmed frames with the server's pairs (never the client's own record), later frames with local and predicted inputs. That is one correction.
+3. Advance the confirmed frame over frames stepped with confirmed pairs. At each bundle's frame, hash the client's own state before restoring anything and compare it with the server's hash; a mismatch is a desync, and the snapshot (every second bundle) replaces the state.
+4. A gap in the confirmed frames (a rejoin) waits for a snapshot and restarts from it.
+5. Prediction stops at a frame with a result (KO, double KO or the clock); a correction that takes the result back lets it go on. Once the room's phase is `over`, the client tags and sends nothing more and steps only up to the last bundle's frame (`DuelClientSession.finish`), so the HUD ends on the server's final frame and never passes it.
+
+Events carry stable ids (`frame:kind:attacker:move`, and `frame:result:reason` for the end), so a re-stepped hit, throw or KO is reported once. The browser's pending-event buffer and the arena's flashes (`apps/web/src/duelEvents.ts`) keep that: each id is drawn once.
+
+**Reconnect** (§12). A player who drops keeps their seat for 10 seconds (Colyseus `allowReconnection`); meanwhile the server substitutes their input as above, so they fall to neutral after 250 ms. The SDK reconnects on its own; the room sends the returning client a snapshot bundle, from which it continues. Absent past 10 seconds, or quitting once the countdown has begun, forfeits. Forfeits are decided together at the next frame boundary, so the order the room processes two leaves in never picks a winner (§7): one forfeit is the opponent's win by `forfeit`, even when the opponent is away but still inside their own window; both on the same frame is a result with no winner (`winner` −1, reason `forfeit`, "Both forfeit: no winner"), so nothing is awarded.
+
+**Practice.** One player against a server-side dummy (player two) whose input is scripted, not received: `idle`, or `guard`, which holds back while player one strikes and while in blockstun (so it neither backs off nor escapes a throw).
+# Encounters
+
+§6's rules for starting and leaving duels, as pure code: `@pirate-sea-race/simulation/encounters` (`stepEncounters`), with the tuning in `@pirate-sea-race/content/encounters` (`encounterRules`, validated by `validateEncounterRules`). They decide who can attack whom, the telegraphed attempt and its escape, same-tick reservation, the ready check and the return to the world. They move no ship, run no duel and touch no inventory. The caller (the match room, `encounters-online`) does those things and reports back. Like `stepClaim`, `stepEncounters(config, state, input) → { state, events }` reads one tick's snapshot, never mutates its input, and uses only integers. Players, attempts and reports are read as sets, so their order in the input never matters.
+
+## Attacks
+
+| | Sea grapple (`ship`) | Island challenge (`foot`) |
+| --- | --- | --- |
+| Windup | 20 ticks (1 s) | 12 ticks (0.6 s) |
+| Range | 6 tiles (`ENGAGEMENT_RANGE_TILES`) | 2 tiles |
+| Target cone at the start / hit area at landing | ±8 / ±4 headings | ±8 / ±4 headings |
+| Line of sight | supercover line touching no land | placeholder: never blocked |
+| Miss cooldown | 120 ticks (6 s) | 120 ticks (6 s) |
+
+A press starts an attempt only if the rules find a target: the nearest eligible player of the same mode in range, in line of sight and in the ±8 front cone of the attacker's heading, ties to the lower id. Otherwise nothing happens and nothing is spent. The aim locks to the bearing toward the target. At the landing tick the attempt hits if the defender is still eligible, in range, within ±4 of the aim and in line of sight. Otherwise it misses, and the attacker's cooldown starts.
+
+**Eligibility.** The attacker must be in the snapshot, connected, not in a duel, not respawning, out of cooldown and without an attempt already running. The defender must be in the snapshot (it may be disconnected, §12), in the same mode, not in a duel, not respawning and unprotected. Fewer than `maxDuels` (4) duels may be unsettled. An attacker who disconnects, leaves, changes mode or is reserved during the windup loses the attempt (`attempt-cancelled`, no cooldown). A defender who has become ineligible by the landing tick is a miss (`defender-ineligible`), as §6 says.
+
+**Geometry**, defined once in `geometry.ts`. Positions are sub-units (256 a tile), and distances are compared squared: exactly at the range is in range. The *bearing* is the heading (of 64) whose table vector has the largest dot product with the offset, ties to the lower heading. *Within ±N* means a circular heading difference of at most N. Distance 0 has no bearing and is inside every cone. *Line of sight* (sea) is the supercover line between the centres of the two ships' tiles: every tile the segment touches, and both side tiles where it passes exactly through a corner. It is the same set in both directions. A land tile or a tile off the map blocks. Shoals and docks do not.
+
+**Per-mode rules** (`ModeRules` in `modes.ts`: `lineOfSight`, `separateReturn`, `respawnPoint`) come from the config. `seaModeRules(map)` is complete. `footPlaceholderRules` never blocks line of sight and returns every player to where they stood. `objectives-endgame` replaces it through `createEncounterConfig({ modeRules: { foot } })`.
+
+## State
+
+`EncounterState` is plain data that `hashState` covers:
+
+- `tick`: the last tick processed.
+- `closed`: set when the caller reports the match over. The step then ignores every later input.
+- `players`: records only for players with something to remember, sorted by id. Each has `protection` (`{ source: spawn | win | draw | respawn, endTick }`, protected while `tick < endTick`), `cooldownEndTick`, and `respawn` (a loser waiting out of the world until `respawnTick`).
+- `attempts`: one per attacker, with `defenderId`, `mode`, `aim`, `startTick` and `landTick`. These are the telegraphs to draw.
+- `duels`: every duel from reservation to settlement, in reservation order. Each has `id = duel:<tick>:<attacker id length>:<attacker>:<defender>`, `mode`, `players` (attacker, defender), each player's position at the hit, and the encounter position (their midpoint). `phase` is `transition`, `fighting` or `ended`, and the duel also holds `startTick` and `end`.
+
+`duelMarkers(state)` gives other players what §6 allows: `{ x, y, startTick }` for each duel, with no id and no player names. Spawn protection comes from `createEncounterState(config, { tick, spawnProtected: ids })` (45 s, §2).
+
+## One tick, and where the caller runs it
+
+The room runs `stepEncounters` first in each world tick, **before `stepClaim`** (§5: accepted reservations first). It passes the previous tick's claim and ledger outcomes as `protectionEndedBy` (`claim` after a `protection-ended` from `stepClaim`, `collection` after a ledger collection start). A protection ended by an objective therefore reaches the encounter rules one tick (50 ms) late. This lag is accepted. Within the step:
+
+1. **Match over** (`matchOver: true`): every attempt is cancelled (`match-over`), and the state closes.
+2. **Protection** that has run out (`expired`), or that last tick's claim or collection ended, ends.
+3. **Reports**, in a fixed order. An `end` report is accepted once per duel (`duel-ended`), in `transition` or `fighting`, with its tick between the reservation and now. A second end report, an unknown duel, a stranger as winner, a future tick or a settlement before the end each give `report-refused` and change nothing. A `settled` report removes the duel (`duel-settled`) and returns its players:
+   - after a **win**, the winner goes back to their own position at the hit (`player-returned`, `win`, 8 s from the settlement tick). The loser is `player-respawning` until 15 s after the fight's *end* tick, or the settlement tick if that is later, so the theft choice doesn't lengthen the wait;
+   - after a **draw or cancellation**, both players go to the centres of two distinct navigable tiles within 6 tiles of the encounter and at least 3 tiles apart (`player-returned`, `draw`, 8 s). The pair chosen is the one nearest to where each player stood, ties row-major.
+4. **Respawns** that are due take place (`player-respawned`, `respawn`, 20 s). The loser goes to the dock nearest the encounter with no other player (except those still respawning) within `SIGHT_RADIUS_TILES`, ties by dock id. If every dock has an opponent that close, the loser goes to the dock farthest from its nearest opponent. The dock is chosen from positions on the respawn tick.
+5. **Transitions.** A fight starts once the 3 s countdown is over and both clients report `ready` (`duel-started`). If a client is still not ready 10 s after the reservation, it forfeits (`duel-forfeited`, which ends the duel with that tick as its end tick). If both are still not ready, the duel is cancelled (`duel-cancelled`, §12's double forfeit).
+6. **Attempts.** Attempts whose attacker is no longer eligible are cancelled. Every attempt landing on this tick is resolved at once. Misses come first. Hits are sorted by attacker-to-defender distance, then attacker id, then defender id. A hit reserves a duel (`duel-reserved`) if both of its players are still free and the cap allows another duel. If a player is already taken, the hit is `attempt-preempted` (`conflict`). If the cap is reached, the hit is `attempt-preempted` (`duel-cap`). Neither costs a cooldown. Pending attempts by players just reserved are cancelled.
+7. **Presses** start attempts (`attempt-started`, with `protection-ended`/`attack` first if the attacker was protected). Targets are chosen from the state before any of this tick's starts, so a protected player who attacks on this tick becomes a target only from the next tick.
+
+## Mapping onto the ledger and the claim
+
+| Event or report | The caller does |
+| --- | --- |
+| `duel-reserved` | `reserveDuel({ duelId, players, tick })`. Pass `state.duels` as the claim's `encounters` (`{ id, playerIds: players }`). |
+| `duel-forfeited` | `reportDuelResult({ duelId, tick, outcome: "win", winner })`. Do not send an `end` report back. |
+| `duel-cancelled` | `reportDuelResult({ duelId, tick, outcome: "cancelled" })`. Do not send an `end` report back. |
+| A fight that ran ends (or a player quits, or the server faults) | `reportDuelResult` with the result, and an `end` report (`win` + `winner`, `draw` or `cancelled`) with the tick it ended. |
+| The ledger settles the duel (a draw or cancellation at once, a win at `chooseTheft` or `advanceLedger`) | A `settled` report with the ledger's settlement tick. |
+| `player-returned`, `player-respawned` | Move the ship (or player) to `x, y`. `protection` is also the claim's `protected` flag. |
+| `stepClaim` emits `protection-ended`, or the ledger starts a collection | Set `protectionEndedBy` next tick. |
+| `stepClaim` emits `match-ended` (its `duel-ended-without-theft` ends running duels) | Set `matchOver: true` next tick. |
+
+## Open points
+
+- Island walking doesn't exist yet. The island challenge is tested for timing, range, cone and cooldown only, with caller-supplied positions.
+- If a sea has no valid pair of draw points within 6 tiles, both ships stay where they were. The property tests check the spacing on every draw they produce.
+# Pirate Sea Race
+
+A browser multiplayer pirate treasure race. The game is specified in [`docs/spec.md`](docs/spec.md) (the text of `docs/spec.docx`); [`docs/architecture.md`](docs/architecture.md) maps this repository onto it.
+
+Browsers create or join a private match by a six-character code and sail placeholder ships around the slice sea: a compact map with four small islands with docks, reefs and shoal walls that funnel every route between islands through one central crossing, and eight outer-sea spawn slots. Up (or W) sails ahead, down (S) brakes and then reverses, left and right (A, D) turn, and E docks a ship beside a dock, at any speed. The authoritative server decides every position and sends each browser only the ships within its sight radius; the minimap's fog clears where the player has sailed.
+
+The combat spike (§18 stage 1) runs beside it: "Create duel" makes a 1v1 duel whose code the second browser enters under "Join duel", and "Practice" fights a server-side dummy (idle or guarding). After a three-second countdown both browsers predict the fight with the shared duel simulation and roll back to the server's inputs (`docs/duel.md`). Keys (§8): WASD or the arrows move (hold back to guard), J light, K heavy, U and I specials, Shift dash, J and K together throw. The HUD shows both health bars, stamina, the round clock, the connection line (round trip, input delay, corrections) and the result; "Show hitboxes" draws hurtboxes and active hitboxes.
+
+## Requirements
+
+Node 24 and npm 11. The browser tests use Playwright's Chromium for `@playwright/test` 1.63.0, which must already be installed.
+
+## Commands
+
+Run these from the repository root.
+
+| Task | Command |
+| --- | --- |
+| Install | `npm ci` |
+| Develop (server on 2593, web on 5393, both from source) | `npm run dev` |
+| Typecheck every workspace | `npm run typecheck` |
+| Unit tests | `npm run test:unit` |
+| Integration tests (a real server in-process, headless clients) | `npm run test:integration` |
+| Build every package and the web client, then smoke-test the built server | `npm run build` |
+| Convert the Tiled map `assets/source/maps/slice-sea.tmj` into `packages/content/src/maps/sliceSea.ts` (validated first) | `npm run map:build` |
+| Check that the generated map module is up to date (a unit test checks this too) | `npm run map:check` |
+| Run the built server | `npm start` |
+| Browser tests (start the server and web client themselves) | `npx --no-install playwright test --config=tests/e2e/playwright.config.ts` |
+
+Set `VITE_SERVER_URL` when the web client should reach a server other than port 2593 on its own host.
+
+**Simulated latency for duel playtests (development only).** With `npm run dev`, add `?rtt=80&jitter=20` to the page's address (for example `http://localhost:5393/?rtt=80&jitter=20`) before creating or joining a duel: that browser's duel socket is then delayed by half the round trip each way, plus a uniform ±jitter/2, in order, round-trip probes included, so the HUD's round trip and the chosen input delay reflect it. Give both browsers the setting to test §19's 30, 80 or 150 ms. It is read only when `import.meta.env.DEV` is true and is absent from the production build (`npm run build` checks). Loss is simulated only by the test harness (`ImpairmentProxy` in `packages/test-tools`).
+
+The map is generated from an ASCII sketch of one quarter, `assets/source/maps/sliceSeaSketch.ts`: edit it, then run `npm run map:build -- --from-sketch` (details in `assets/source/maps/README.md`). The `.tmj` stays within the Tiled subset documented in `packages/content/src/tiledMap.ts`, so [Tiled](https://www.mapeditor.org/) opens it.
+
+`PIRATE_SEA_RACE_TEST_PLACEMENT=1` is a test-only setting, off by default: the dev and test entry point (`npm run dev`, and the server the browser tests start) then serves `POST /__test/place`, which puts a player's ship on a chosen tile. The production entry (`npm start`) never reads it.
+
+## Layout
+
+| Path | Contents |
+| --- | --- |
+| `apps/web` | Phaser client: landing page, HUD, input, interpolated rendering, the duel arena and HUD |
+| `apps/server` | Colyseus match and duel server |
+| `packages/simulation` | Pure fixed-step simulation shared by client and server, the duel and its rollback netcode |
+| `packages/protocol` | Message schemas, validation and the protocol version |
+| `packages/content` | The generated sea map, the Tiled converter, map validators, tuning, rules presets and frame budgets |
+| `packages/test-tools` | Headless match and duel clients, the network impairment proxy and the duel replay wrapper |
+| `tests/unit`, `tests/integration`, `tests/e2e` | Cross-package unit tests, server integration tests, Playwright scenarios |
+| `assets/source/maps` | The Tiled source map and the sketch it is generated from |
+| `assets/source`, `assets/exported`, `infra` | Placeholders for art sources, runtime assets and deployment |

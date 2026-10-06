@@ -1,0 +1,337 @@
+=== intel-core
+# Task: intel
+
+## Goal
+
+Build the match's information systems as pure, deterministic rules. They tell a player where to go and when the race tightens:
+- rumors that point toward a missing rubbing type;
+- the journal that marks stale leads and offers replacements;
+- coarse, delayed carrier sightings;
+- the sea sectors;
+- the timed reveals of §2 (the final-island sector when a first full set exists, minute-20 reveals, minute-28 carrier sectors every 30 s).
+
+This information is what turns exploring into a race and brings players into conflict, so it must be useful but never a free tracker. Every output is addressed to specific players (§16). `objectives-endgame` wires it into the match room later. This feature only builds and proves the rules.
+
+## Context
+
+- Read `docs/spec.md` §2 (the phase table and "Time limits and results"), §3 ("Exploration activities": rumors, stale rumors, journal), §5 (first full set: the final route to the eligible player, the broad sector to everyone), §11 ("Preventing runaway leaders": a free fresh rumor on loss, the coarse delayed carrier sighting; the targeted rumor costs 25 gold) and §16 (hidden information).
+- Read `docs/architecture.md` and the pure modules this one sits beside and must match in style: `packages/simulation/src/objectives` (the ledger: rubbing locations, `freshRumors`) and `packages/simulation/src/claim` (the step shape and seeded property tests), plus `packages/content/src/seaMap.ts` (map size, islands) and `tests/unit/purity.test.ts`.
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build`.
+- Other features run at the same time and own the sea, server, web, tests, the duel and `packages/*/src/ruins`. Stay inside your owned paths.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Constraints
+
+- Owned paths only: `packages/simulation/src/intel`, `packages/content/src/intel`, `docs/intel.md`, and `packages/simulation/package.json` and `packages/content/package.json` **only to add one subpath export each** (`@pirate-sea-race/simulation/intel`, `@pirate-sea-race/content/intel`, following the existing pattern with the `@pirate-sea-race/source` condition first). Do not change their `postbuild` scripts, dependencies, any existing source file, barrel, tsconfig or root file.
+- Independent of the ledger's code: the caller passes a per-tick **world view** (for each rubbing, its type and where it is: a sealed source with its island, a cache position, a carrier with position, or reserved in a duel; each player's held types and position; which islands are claimed out). Don't import `objectives`, so the two stay decoupled. Gold for bought rumors is the caller's (ledger) business; this module only generates the rumor.
+- Pure and integer: no Phaser, Colyseus, DOM, timers, wall-clock time, `Math.random` or floating-point transcendental functions. Time is the world tick (20 per second). Randomness comes from the seeded generator (`random.ts`). Durations are named content constants in seconds, converted to ticks.
+- The step shape: `stepIntel(config, state, worldView, requests) → { state, messages, outcomes }`. Every message names its recipients: one player, several, or everyone. It never mutates its input.
+- **Targeted rumor requests** are `{ requestId, playerId, type }`. Each gets exactly one outcome, `{ requestId, result: "rumor" | "sighting" | "capped" | "none" | "duplicate" }`, so the caller charges 25 gold only for `rumor` or `sighting`. A repeated `requestId` is answered `duplicate` without changing the state or using the generator. An exported pure `targetedRumorAvailability(config, state, worldView, playerId, type)` lets the UI show whether buying would yield anything.
+
+## Design (settled)
+
+- **Sectors.** The map is divided into a 3 × 3 grid of named sectors (for example "North-West Reach", "Central Waters"), computed from the map size in the config. `sectorOf(position)` is total and deterministic on the boundaries.
+- **Rumors.** A rumor names a missing type and a target: an **island** (a sealed source of that type there) or a **sector** (a cache or a carrier). It never names a rubbing id or an exact position. Generation picks, deterministically from the seed, among the eligible targets for a type the player lacks. It prefers sealed sources, then caches, then a carrier sighting. It never picks a target that is the player's own inventory. Rumors are made in four cases:
+  - a **starting rumor** for each player at control start (§2);
+  - a **fresh rumor** when the world view shows a type was stolen from the player (§11);
+  - a **targeted rumor** on request, gold-gated by the caller (§11);
+  - a **replacement lead** from the journal.
+- **Two kinds of lead.**
+  - **Journal rumors** target only islands (sealed sources) or cache sectors. Only these go stale: when the target no longer holds a copy of that type, the rumor is marked stale (a message to its holder, with the tick), and the journal offers a replacement from the remaining sources and caches.
+  - A **carrier sighting** is a one-shot message: the sector where a carrier of that type was 30 s earlier, never the current one. It is **never** tracked for staleness, so carrier movement can't leak live information. It is sent only on three triggers: a fresh rumor after a loss when every other copy is carried, a targeted rumor under the same condition, or a journal replacement when every remaining copy is carried. At most one carrier sighting per player per carrier interval (30 s) before minute 28.
+  - A rumor whose type its holder has since obtained is retired quietly (a "resolved" message, no replacement).
+- **Carrier snapshots (not a rolling history).** At each 30 s carrier boundary counted from control start (crossing-based), the state takes one snapshot: the sector, type and internal holder of each carried copy. It keeps only the latest two. A carrier sighting reads the **older** snapshot, so it is 30–60 s old and never the current location, by construction. The minute-28 broadcast reads the newer one. Snapshot entries held by the requester themselves are never used for that requester's sighting.
+- **The sighting cap** lines up with the snapshots: at most one sighting per player per snapshot, before minute 28. A **free** trigger (a fresh rumor after a loss, or a journal replacement) that hits the cap is **deferred**, not dropped: it is delivered at the next snapshot boundary (at most one pending per player).
+- **Held types include rubbings reserved in a duel**, as the ledger's `heldTypes` counts them. So entering a duel is never a "loss", and only a settled theft is.
+- **What sightings and broadcasts contain:** a sector and a rubbing type, never a player id, a rubbing id or an exact position.
+- **Losses and completions come from diffing** each player's held types between ticks. The ledger's sticky `freshRumors` flag isn't used as a signal.
+- **Robust to skipped ticks:** reveals and intervals fire when a boundary is crossed since the last processed tick (`>=`), not on equality, so a skipped or batched tick never loses one.
+- **Timed reveals** (§2), counted from control start (`controlStartTick` in the config):
+  - **The first full set:** when a player first holds all the preset's types, everyone gets the final island's sector, and that player gets the exact final-island position (their "route"). If they lose a type, their route becomes inactive until the set is restored. A later completer gets their own route message. The final island's position comes from the config.
+  - **Minute 20:** everyone gets the sectors that contain unclaimed rubbings (sealed sources) and abandoned caches.
+  - **Minute 28 on:** every 30 s, everyone gets the approximate sectors of rubbing carriers.
+  - **Minute 35:** nothing here; the claim code ends the match.
+- **Hidden information.** No message to a player contains another player's exact position, a rubbing id or a source's exact location. The only exact position ever sent is the final island's, and only to a complete-set player. A test asserts this over every message of every property run.
+
+## Acceptance
+
+Each item names the test that proves it. Tests live in `packages/simulation/src/intel` unless noted.
+
+1. **Sectors:** every map cell maps to exactly one of nine sectors; the boundaries are deterministic; the names are unique.
+2. **Rumors:** scripted tests for each of the four cases:
+   - targets prefer sources, then caches, then carriers;
+   - there is never a rumor for a type the player holds, and never one pointing at the player's own inventory;
+   - the same seed gives the same rumor.
+3. **Staleness and the journal:** scripted tests:
+   - an island or cache target emptied by collection (a source collected, a cache claimed) goes stale, and the journal offers a replacement from the remaining sources and caches;
+   - a rumor whose type the holder then obtains (by collection or theft) is resolved, not stale;
+   - with every copy carried, the replacement is a carrier sighting from the older snapshot (30–60 s old, never current);
+   - a capped free trigger is delivered at the next boundary;
+   - the targeted-request outcomes cover all five results, including `duplicate` with the very same state.
+4. **Reveals:** scripted tests at the exact boundary ticks:
+   - the first full set, including a lost-then-restored set and a second completer;
+   - minute 20;
+   - minute 28, then every 30 s;
+   - nothing before control start.
+5. **Hidden information:** seeded property runs (random worlds with players collecting, stealing, caching and moving) check every message against the rules in the design:
+   - at least one seed runs the real constants for 36,000+ ticks, past minute 28 plus several carrier intervals; the other seeds use a config with compressed reveal times;
+   - no message has an id or an exact position (except the final island to a full-set holder);
+   - no player gets more than one carrier sighting per snapshot before minute 28;
+   - no stale message is ever sent for a carrier sighting;
+   - some runs skip ticks. The state replays to the same `hashState`. An `EXERCISED` coverage check asserts that every message kind occurred.
+6. **Content:** the constants (the sector grid 3 × 3, the sighting delay 30 s, the reveal times 20 min and 28 min, the carrier interval 30 s, the sector names) live in `@pirate-sea-race/content/intel` with a zod validator. A content test refuses a carrier interval of 0 and reveal times out of order.
+7. **Docs:** `docs/intel.md`, about a page: sectors, rumor generation and staleness, the reveal schedule, the message addressing, and how the caller builds the world view from the ledger.
+8. `npm ci` then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build` pass from a clean checkout, and the purity test covers the new directories.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- Two rules of §2, §3, §5, §11 or §16 contradict each other in a way that changes this acceptance.
+- A check can pass only by changing a path outside the owned paths.
+- After two hours of work, any required check still fails and you cannot name the next fix.
+
+Report `question` only for a choice that would change this acceptance.
+# Decisions: intel-core
+
+From the overnight session of 2026-09-24/25. The operator is asleep and asked the assistant to decide, record each decision, and use the workflow for the code.
+
+## Decisions
+
+- The information systems are built as pure rules first, in parallel with the online work. `objectives-endgame` wires them in.
+- There are nine named sectors (3 × 3), computed from the map size, so the same code serves the slice sea and the 12-island alpha.
+- Rumors never name ids or exact positions. They prefer sealed sources, then caches, then a carrier sighting. Carrier sightings come from a snapshot 30–60 s old (never current), which helps a player choose a route without giving them a tracker (§11).
+- The module reads a caller-built world view instead of importing the ledger, the same decoupling as the claim code.
+- The only exact position ever sent is the final island's, and only to a player holding a full set (§5).
+
+- Corrected after design challenge attempt 1 (its alternative, adopted): carrier sightings are one-shot and never go stale, at most one per player per 30 s before minute 28, so a victim can't track the thief. Only island and cache rumors go stale. Broadcasts carry a sector and a type, never a player. Losses come from diffing held types. Reveals fire on crossing boundaries.
+
+- Corrected after design challenge attempt 2: stale means emptied by collection (theft can't empty an island or a cache); targeted rumors carry a request id and get an outcome, so gold is charged only when something is delivered and retries can't double-spend (§11); carrier data comes from two 30 s snapshots, so a sighting is 30–60 s old, a deliberate small relaxation of "exactly 30 s"; capped free sightings are deferred, never dropped; duel-reserved rubbings still count as held.
+
+## Assumptions
+
+- The final island's position and the control start tick come from the config (the final-island sockets arrive with `objectives-endgame`).
+- The slice uses two rubbing types, so "all types" means both, per the preset.
+
+## Deferred
+
+- Wiring, the journal UI, buying rumors and dockside shops: `objectives-endgame`.
+=== intel-core-fixes
+# Task: intel
+
+## Goal
+
+Deliver the `intel-core` feature (the pure rumors, journal, sectors and reveals) with its review findings fixed. Run intel-core-001 built it and passed every check. Its coverage reviewer blocked it on a real bug: a player with two deferred sightings got the second a whole interval late. Its general reviewer was stopped before a verdict. Start from that run's snapshot, fix the findings, and the whole feature is reviewed again.
+
+## Context
+
+- `features/intel-core/intel-task.md` and `features/intel-core/decisions.md` define the feature, and all of it still applies. Read them first.
+- **First step:** restore intel-core-001's snapshot (commit `9c1861e`) into your worktree, deletions included, but not `features/`:
+  `git restore --source=refs/workflow/543db658493b6c2f/intel --staged --worktree -- . ':!features'`.
+  Check with `git diff --stat refs/workflow/543db658493b6c2f/intel -- . ':!features'` (it must print nothing). Then read `docs/intel.md`.
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build`.
+- Other features run at the same time and own the sea, server, web and tests, plus `packages/*/src/objectives`. Stay inside your owned paths.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Findings to fix (coverage reviewer)
+
+1. **(P1) Deferred sightings for several types.** `step.ts:344` queues one pending entry per type, and `step.ts:370-379` delivers the first at the boundary, which uses up that snapshot's sighting and puts the second back. So it arrives a whole interval late. **Settled rule:**
+   - A carrier-sighting message may list several types (one entry per type, all from the same older snapshot).
+   - The cap is **one sighting message per player per snapshot** before minute 28.
+   - A player has at most **one pending** deferred message, which holds the **set** of pending types. A new capped free trigger adds its type to that set.
+   - At the next boundary, the pending message is delivered with every pending type that is still eligible.
+   - Update `docs/intel.md` to say so.
+   - **Tests:**
+     - scripted: two pending types are delivered together at the next boundary;
+     - scripted: a third trigger joins the set;
+     - property checker: after every step, each player has at most one pending message, and a deferred trigger is delivered at the first boundary after it was capped (or dropped only because its type became ineligible, which the checker verifies).
+2. **(P2) Target preference proven, not sampled.** Sources before caches is checked on one seed at one step. Add a property check: whenever a rumor targets a cache sector, no eligible sealed source of that type existed at that tick; whenever it's a carrier sighting, no eligible source or cache existed. Add scripted cases over at least 20 seeds where both a source and a cache are eligible: every one picks the source.
+
+## Constraints
+
+- Owned paths as in `policy.json`. Apart from restoring the snapshot, change only what the findings need. Keep the structure, names and every existing test (adapt the one-type deferral test to the settled rule if its expectations change).
+
+## Acceptance
+
+- The restored `intel-core` feature meets all of `features/intel-core/intel-task.md`'s acceptance, with "one carrier sighting per player per snapshot" now meaning one sighting **message**.
+- Findings 1–2 are fixed with the tests they name.
+- `npm ci` then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build` pass from a clean checkout.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- Restoring the snapshot fails or touches a path outside the owned paths.
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A check can pass only by changing a path outside the owned paths.
+- After ninety minutes of work, any required check still fails and you cannot name the next fix.
+
+Report `question` only for a choice that would change this acceptance.
+# Decisions: intel-core-fixes
+
+From the overnight session of 2026-09-24/25. The operator is asleep and asked the assistant to decide, record each decision, and use the workflow for the code.
+
+## Decisions
+
+- intel-core-001 passed every check. The coverage reviewer blocked it on a real bug in deferred sightings, and the general reviewer was stopped before a verdict. This follow-up starts from the run's base (`9904848`, branch `intel/fixes-base`) and restores its snapshot (`9c1861e`), so the new reviewers see the whole feature plus the fixes.
+- A carrier-sighting message may list several types. The cap is one message per player per snapshot, and a player has at most one pending message, holding a set of types. A player who lost two types learns about both at the next boundary, not one interval apart, and still gets no more than one sighting message per 30 s before minute 28 (still no tracker).
+- The source-then-cache-then-carrier preference is proven by a property check on every rumor, not by one seed.
+
+## Assumptions
+
+- Everything else in `features/intel-core/` stands.
+
+## Deferred
+
+- Wiring and the journal UI: `objectives-endgame`.
+=== intel-core-fixes-2
+# Task: intel
+
+## Goal
+
+Deliver `intel-core` (the pure rumors, journal, sectors and reveals) with its remaining review findings fixed. Run intel-core-fixes-001 fixed the first deferred-sighting bug and passed every check, but its general reviewer found the same symptom on another path. Sightings triggered on one tick are still handled one type at a time, so the second type waits up to a whole interval. Start from that run's snapshot, fix it for good, and the whole feature is reviewed again.
+
+## Context
+
+- `features/intel-core/intel-task.md` and `decisions.md`, and `features/intel-core-fixes/intel-task.md` and `decisions.md`, define the feature, and all of it still applies. Read them first.
+- **First step:** restore intel-core-fixes-001's snapshot (commit `2309421`) into your worktree, deletions included, but not `features/`:
+  `git restore --source=refs/workflow/57859d023c4770f7/intel --staged --worktree -- . ':!features'`.
+  Check with `git diff --stat refs/workflow/57859d023c4770f7/intel -- . ':!features'` (it must print nothing). Then read `docs/intel.md` and `packages/simulation/src/intel/step.ts` (`freeLead`, `flushPending`, lines 380–440).
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build`.
+- Other features run at the same time and own other paths. Stay inside your owned paths.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Findings to fix (general reviewer)
+
+1. **(P1) One sighting decision per player per step.** Today `freeLead` runs once per type (`step.ts:417` for losses, `:434` for replacements), and the first uncapped call flushes a one-type message and uses up the snapshot's sighting.
+   - **Fix: one accumulator, one emit point.** Each player gets one sighting accumulator per step, a sorted set of types.
+     - It starts with the player's pending set if a boundary was crossed.
+     - Losses, journal replacements **and targeted requests** all add their type to it. None of them flushes on its own.
+     - After every pass of the step, each player gets exactly one decision. If the cap allows (or it's minute 28 or later), emit **one** message listing every still-eligible type from the older snapshot, and answer each targeted request in it `sighting`. Otherwise keep the **free** types as the single pending set, and answer targeted requests `capped`. A capped paid type is never queued, so a purchase is never charged for something deferred.
+     - The message's type order and sector choice must not depend on the order in which triggers were added.
+   - **Scripted tests:**
+     - two uncapped losses on one tick give one message with both types;
+     - a loss plus a replacement on one tick give one message;
+     - a loss plus a targeted request on one tick give one message, and the request is `sighting`;
+     - a capped tick with a loss and a targeted request leaves the loss pending and the request `capped`;
+     - two losses in one batched view (skipped ticks) give one message;
+     - a trigger on the boundary tick itself is included in that boundary's message.
+   - **Property checker:** at most one sighting message per player per step. Every free trigger is delivered in that step's message or the next boundary's. Fix `docs/intel.md` wherever it describes this.
+2. **(P2) No carrier sighting on the start trigger.** A starting rumor (§2) targets only sealed sources or caches. If every copy of a missing type is carried at the start (for example a late joiner), the starting rumor goes to another missing type that has a source or cache target (§2's "a rumor leading toward a reachable objective"). Only when no missing type has one is there no starting rumor (documented). A start never produces a carrier sighting, as `features/intel-core/intel-task.md` specifies (sightings only on a fresh loss, a targeted rumor, or a journal replacement). Update the scripted test that asserts the old behaviour, and add `start`'s carried-only case to the tests. `EXERCISED` stays with the three sighting triggers.
+
+## Constraints
+
+- Owned paths as in `policy.json`. Apart from restoring the snapshot, change only what the findings need. Keep the structure, names and every existing test, except where this task changes an expectation (say which in your report).
+
+## Acceptance
+
+- The restored feature meets `features/intel-core/intel-task.md` and `features/intel-core-fixes/intel-task.md`.
+- Findings 1–2 are fixed with the tests they name.
+- `npm ci` then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build` pass from a clean checkout.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- Restoring the snapshot fails or touches a path outside the owned paths.
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A check can pass only by changing a path outside the owned paths.
+- After sixty minutes of work, any required check still fails and you cannot name the next fix.
+
+Report `question` only for a choice that would change this acceptance.
+# Decisions: intel-core-fixes-2
+
+From the overnight session of 2026-09-24/25. The operator is asleep and asked the assistant to decide, record each decision, and use the workflow for the code.
+
+## Decisions
+
+- intel-core-fixes-001 passed every check. Its general reviewer blocked it on the same late-sighting symptom through another path: triggers on one tick were still handled one type at a time. This follow-up restores that run's snapshot (`2309421`) on its base (`7c82a04`), so the whole feature is reviewed again.
+- One sighting accumulator per player per step, joined by losses, replacements and targeted requests, with one emit decision at the end of the step (the challenge's alternative). Targeted requests are answered `sighting` or `capped` by that decision, and a capped paid type is never queued. "Learns about both at once" then holds on every path, including batched ticks and the boundary tick.
+- Starting rumors never become carrier sightings: the starting rumor goes to another missing type with a source or cache target, and only when none has one is there no starting rumor. Sightings stay on the three triggers the spec names.
+
+## Assumptions
+
+- Everything else in the earlier intel decisions stands.
+
+## Deferred
+
+- Wiring and the journal UI: `objectives-endgame`.
+=== intel-core-fixes-3
+# Task: intel
+
+## Goal
+
+Deliver `intel-core` with its last review findings fixed. Run intel-core-fixes-2-001 made every sighting trigger in one step share one message and passed every check. Its general reviewer approved it, but found that paid rumors could be charged for information the player already gets. Its coverage reviewer blocked it because no test proves that a message's order and sector choice are independent of trigger order. Start from that run's snapshot, fix these, and the whole feature is reviewed once more.
+
+## Context
+
+- The intel feature files, and every earlier follow-up's files, still apply: `features/intel-core/`, `features/intel-core-fixes/` and `features/intel-core-fixes-2/`, each with `intel-task.md` and `decisions.md`. Read them first.
+- **First step:** restore intel-core-fixes-2-001's snapshot (commit `a18265e`) into your worktree, deletions included, but not `features/`:
+  `git restore --source=refs/workflow/345eb3544aa89dcd/intel --staged --worktree -- . ':!features'`.
+  Check with `git diff --stat refs/workflow/345eb3544aa89dcd/intel -- . ':!features'` (it must print nothing). Then read `docs/intel.md` and `packages/simulation/src/intel/step.ts` (the accumulator, lines 400–490).
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build`.
+- Other features run at the same time and own other paths. Stay inside your owned paths.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Findings to fix (settled after design challenge attempt 1)
+
+Make order independence **true by construction**, then prove it. Each step builds its lead decisions in three phases:
+1. **Gather.** Collect every trigger into a set keyed by **(player, type)**, whatever order the triggers arrive in: losses, journal replacements, pending types from a boundary, targeted requests.
+2. **Decide.** Decide each (player, type) entry from the older snapshot. Sort its candidate sectors by a stable key, and draw the sector from a key derived from (seed, snapshot tick, playerId, type), or from the shared generator consumed in sorted (player, type) order. Each player gets at most one sighting message per step, listing its types in the fixed type order.
+3. **Answer.** Answer targeted requests **grouped by (player, type)** and sorted by `requestId`:
+   - `covered` (not charged) if a free trigger already put that player's type in this step's message, or a free rumor for that type in this step;
+   - otherwise `sighting` or `rumor` for the first request of that (player, type), and `covered` for the rest;
+   - when nothing can be delivered for that (player, type) (for example capped), every request gets the same non-charged result (`capped` or `none`).
+
+   The caller charges only `rumor` and `sighting`. **Two different players' requests never affect each other.**
+
+Also:
+- **Start never sights.** The sighting's reason type is narrowed to `fresh`, `targeted` and `replacement`, and the property checker rejects anything else.
+- **The reveal aligns with the interval.** `validateIntelRules` refuses a `carrierRevealTicks` that isn't a multiple of `carrierIntervalTicks`, with a content test. Every compressed config used by the property runs must pass the validator.
+
+**Tests:**
+- Test the phase-2 and phase-3 helpers directly over **all orders** of three triggers across three types, with two or more carriers per type. Include two players buying the same type in one step: both are delivered.
+- Add one black-box property check that permutes the request and world-view arrays within a step, then compares the messages, the outcomes sorted by `requestId`, and `hashState`.
+- Keep the scripted multi-type tests, and add cases where triggers arrive out of type order with contested sectors.
+
+## Constraints
+
+- Owned paths as in `policy.json`. Apart from restoring the snapshot, change only what the findings need. Keep the structure, names and every existing test, except where this task changes an expectation (say which in your report).
+
+## Acceptance
+
+- The restored feature meets every earlier intel task.
+- The three phases, the narrowed reason type and the alignment are implemented, with the tests named above.
+- `npm ci` then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build` pass from a clean checkout.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- Restoring the snapshot fails or touches a path outside the owned paths.
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A check can pass only by changing a path outside the owned paths.
+- After sixty minutes of work, any required check still fails and you cannot name the next fix.
+
+Report `question` only for a choice that would change this acceptance.
+# Decisions: intel-core-fixes-3
+
+From the overnight session of 2026-09-24/25. The operator is asleep and asked the assistant to decide, record each decision, and use the workflow for the code.
+
+## Decisions
+
+- intel-core-fixes-2-001 passed every check, and its general reviewer approved it. The coverage reviewer blocked it on an unproven order independence. This third follow-up restores its snapshot (`a18265e`) on its base (`7b340db`), so the whole feature is reviewed again.
+- A new `covered` outcome for targeted rumors: a paid request is never charged for a type the player already gets for free in that step, and never twice for one sighting entry. Ties go by `requestId`, never by trigger order.
+- Start can't produce a sighting, by type as well as by test.
+- The minute-28 reveal must align with the 30 s interval (validated), so pending and new sightings can't split across messages.
+
+- Corrected after design challenge attempt 1 (its alternative, adopted): three phases per step (gather by (player, type), decide in a stable order, answer grouped by (player, type)). Order independence then holds by construction, and one player's purchase never affects another's. Paid `rumor` requests are also `covered` when a free rumor already covers the type.
+
+## Assumptions
+
+- Everything else in the earlier intel decisions stands.
+
+## Deferred
+
+- Wiring and the journal UI: `objectives-endgame`.

@@ -1,0 +1,191 @@
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import styled, { css } from "styled-components";
+
+import { useTranslation } from "react-i18next";
+import { useParams } from "react-router-dom";
+import { useDebounce } from "react-use";
+import { Address, Hash } from "viem";
+
+import { Button } from "@kleros/ui-components-library";
+
+import DownArrow from "svgs/icons/arrow-down.svg";
+
+import { useSpamEvidence } from "hooks/useSpamEvidence";
+
+import { useEvidences } from "queries/useEvidences";
+import { usePopulatedDisputeData } from "queries/usePopulatedDisputeData";
+
+import { isUndefined } from "src/utils";
+
+import { landscapeStyle } from "styles/landscapeStyle";
+
+import { Divider } from "components/Divider";
+import EvidenceCard from "components/EvidenceCard";
+import { SkeletonEvidenceCard } from "components/StyledSkeleton";
+
+import EvidenceSearch from "./EvidenceSearch";
+
+const Container = styled.div`
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  align-items: center;
+  padding: 20px 16px 16px;
+
+  ${landscapeStyle(
+    () => css`
+      padding: 32px;
+    `
+  )}
+`;
+
+const StyledLabel = styled.label`
+  display: flex;
+  margin-top: 16px;
+  font-size: 16px;
+`;
+
+const ScrollButton = styled(Button)`
+  align-self: flex-end;
+  background-color: transparent;
+  padding: 0;
+  flex-direction: row-reverse;
+  gap: 8px;
+  .button-text {
+    color: ${({ theme }) => theme.primaryBlue};
+    font-weight: 400;
+  }
+  .button-svg {
+    margin: 0;
+    path {
+      fill: ${({ theme }) => theme.primaryBlue};
+    }
+  }
+
+  :hover {
+    background-color: transparent;
+    .button-svg {
+      path {
+        fill: ${({ theme }) => theme.secondaryBlue};
+      }
+    }
+    .button-text {
+      color: ${({ theme }) => theme.secondaryBlue};
+    }
+  }
+`;
+
+const SpamLabel = styled.label`
+  color: ${({ theme }) => theme.primaryBlue};
+  align-self: center;
+  cursor: pointer;
+`;
+
+interface IEvidence {
+  arbitrable?: Address;
+}
+const Evidence: React.FC<IEvidence> = ({ arbitrable }) => {
+  const { t } = useTranslation();
+  const { id } = useParams();
+  const ref = useRef<HTMLDivElement>(null);
+  const [search, setSearch] = useState<string>();
+  const [debouncedSearch, setDebouncedSearch] = useState<string>();
+  const [showSpam, setShowSpam] = useState(false);
+  const { data: spamEvidences } = useSpamEvidence(id!);
+  const { data: disputeData } = usePopulatedDisputeData(id, arbitrable);
+  const { data } = useEvidences(id!, debouncedSearch);
+
+  useDebounce(() => setDebouncedSearch(search), 500, [search]);
+
+  const scrollToLatest = useCallback(() => {
+    if (!ref.current) return;
+    const latestEvidence = ref.current.lastElementChild;
+
+    if (!latestEvidence) return;
+
+    latestEvidence.scrollIntoView({ behavior: "smooth" });
+  }, [ref]);
+
+  const isSpam = useCallback(
+    (evidenceId: string) => {
+      return Boolean(spamEvidences?.courtv2EvidenceSpamsByGroupId.evidenceIds?.includes(evidenceId));
+    },
+    [spamEvidences]
+  );
+
+  const arbitrableEvidences = disputeData?.extraEvidences;
+  const evidences = useMemo(() => {
+    if (!data?.evidences) return;
+    const spamEvidences = data.evidences.filter((evidence) => isSpam(evidence.id));
+    const realEvidences = data.evidences.filter((evidence) => !isSpam(evidence.id));
+    return { realEvidences, spamEvidences };
+  }, [data, isSpam]);
+
+  return (
+    <Container ref={ref}>
+      <EvidenceSearch {...{ search, setSearch }} />
+      <ScrollButton small Icon={DownArrow} text={t("buttons.scroll_to_latest")} onClick={scrollToLatest} />
+      {!isUndefined(arbitrableEvidences) && arbitrableEvidences.length > 0 ? (
+        <>
+          {arbitrableEvidences.map(({ name, description, fileURI, sender, timestamp, transactionHash }, index) => (
+            <EvidenceCard
+              key={index}
+              evidence=""
+              {...{
+                sender,
+                timestamp: isUndefined(timestamp) ? undefined : timestamp.toString(),
+                transactionHash: isUndefined(transactionHash) ? undefined : (transactionHash as Hash),
+                name,
+                description,
+                fileURI,
+              }}
+            />
+          ))}
+        </>
+      ) : null}
+      {evidences?.realEvidences ? (
+        <>
+          {evidences?.realEvidences.map(
+            ({ evidence, sender, timestamp, transactionHash, name, description, fileURI, evidenceIndex }) => (
+              <EvidenceCard
+                key={timestamp}
+                index={parseInt(evidenceIndex)}
+                sender={sender?.id}
+                {...{ evidence, timestamp, transactionHash, name, description, fileURI }}
+              />
+            )
+          )}
+          {spamEvidences && evidences?.spamEvidences.length !== 0 ? (
+            <>
+              <Divider />
+              {showSpam ? (
+                <>
+                  <SpamLabel onClick={() => setShowSpam(false)}>{t("evidence.hide_spam")}</SpamLabel>
+                  {evidences?.spamEvidences.map(
+                    ({ evidence, sender, timestamp, transactionHash, name, description, fileURI, evidenceIndex }) => (
+                      <EvidenceCard
+                        key={timestamp}
+                        index={parseInt(evidenceIndex)}
+                        sender={sender?.id}
+                        {...{ evidence, timestamp, transactionHash, name, description, fileURI }}
+                      />
+                    )
+                  )}
+                </>
+              ) : (
+                <SpamLabel onClick={() => setShowSpam(true)}>{t("evidence.show_likely_spam")}</SpamLabel>
+              )}
+            </>
+          ) : null}
+        </>
+      ) : (
+        <SkeletonEvidenceCard />
+      )}
+
+      {data && data.evidences.length === 0 ? <StyledLabel>{t("evidence.no_evidence_yet")}</StyledLabel> : null}
+    </Container>
+  );
+};
+
+export default Evidence;

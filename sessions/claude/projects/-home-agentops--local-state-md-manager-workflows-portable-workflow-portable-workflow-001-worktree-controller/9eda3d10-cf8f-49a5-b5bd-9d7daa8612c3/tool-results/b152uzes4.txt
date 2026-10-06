@@ -1,0 +1,364 @@
+# Workflow CLI cheatsheet
+
+Every command below was taken from the argparse definitions in `workflow/pipeline.py`, `workflow/launch.py` and `workflow/interactive.py` after the worker-lanes slice (PRD_WORKER_LANES). Longer explanations live in [RUNBOOK.md](RUNBOOK.md) and [features/project-workflows/README.md](../features/project-workflows/README.md).
+
+Worker lanes come from the feature's configuration: `features/<f>/feature.json` (2.0.0 or 2.1.0) declares every lane with its task file, `features/<f>/policy.json` (1.2.0) gives each lane its role label, owned paths, checks and `required_check_kinds`. A run launches every declared lane or the subset named with `--workers`; `<lane>` below is any selected lane id. Reviewers come from the same file: a 2.1.0 `reviewers` list gives each reviewer an id and a brief; without it the run has the single built-in reviewer `review`. `<reviewer>` below is a declared reviewer id; its node and files are `review-<reviewer>`, the default reviewer's stay `review`.
+
+```bash
+PY="$PWD/.venv/bin/python"                                   # controller interpreter, run from the repo root
+RUN="$HOME/.local/state/md-manager-workflows/<feature>/<run-id>"   # run directory, always outside the repo
+```
+
+Two entry points:
+
+| Entry point | Shape | Use |
+| --- | --- | --- |
+| `$PY -m workflow launch <feature> [flags]` | one command | prepare and start a committed feature |
+| `$PY -m workflow <action> "$RUN" [flags]` | one action per call | every other pipeline step, status, recovery |
+
+Nothing launches a Claude session without `--live`. Nothing ever pushes or merges `main`.
+
+## 1. One-command launch
+
+```bash
+$PY -m workflow launch project-workflows --dry-run --automatic          # validate and print the commands, execute nothing
+$PY -m workflow launch project-workflows --live --automatic             # unattended run to a verified feature branch
+$PY -m workflow launch project-workflows --live                         # manual run with operator gates
+$PY -m workflow launch project-workflows --live --automatic --workers adapter   # only the named lanes; the rest stay off-limits
+```
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `<feature>` | a directory under `features/` listed in `FEATURES` in `workflow/launch.py` | required |
+| `--run-id ID` | opaque run identifier, not a path | `<feature>-001` |
+| `--run-root DIR` | run storage outside the repository | `~/.local/state/md-manager-workflows/<feature>` |
+| `--workers a,b` | launch only these declared lanes (unknown ids, duplicates and an empty list are refused before any Git action); the selection is pinned in `plan.json` | every declared lane |
+| `--live` | authorize Claude usage | off |
+| `--automatic` | run-scoped permission bypass for workers, automatic freeze, checks, native reviewer, verified feature branch | off, manual gates |
+| `--worker-timeout-seconds N` | per-worker deadline from launch to completion signal, automatic only | 4 h, max 24 h |
+| `--review-timeout-seconds N` | reviewer deadline from its launch to its completion file, automatic only | 30 min, max 24 h |
+| `--reviewer-transport native\|print` | attachable reviewer session, or headless `claude --print`, automatic only | `native` |
+| `--no-herdr` | omit terminal attachments | attaches |
+| `--dry-run` | validate the feature configuration and print the commands | off |
+
+`launch` refuses an existing run directory. It runs, in order: `preflight`, `git switch -c <branch_prefix>/<run-id>`, `prepare`, `start`, and with `--automatic` also `automatic`. A `feature.json` still at version 1.0.0 (`ui_task`/`adapter_task`) is translated to the 2.0.0 shape and a deprecation line is printed; `--dry-run` lists it under `notes`. A policy `failure_drill` that names a lane the selection leaves out is skipped, with a note and a timeline event.
+
+## 2. Step-by-step pipeline (what `launch` runs for you)
+
+```bash
+$PY -m workflow preflight "$RUN" --repo "$PWD" --policy features/<f>/policy.json --herdr [--automatic]
+$PY -m workflow prepare   "$RUN" --repo "$PWD" --policy features/<f>/policy.json \
+                                 [--workers ui,docs] --task ui=features/<f>/ui-task.md --task docs=features/<f>/docs-task.md \
+                                 [--reviewer general=features/<f>/reviewers/general.md --reviewer coverage=features/<f>/reviewers/coverage.md] \
+                                 [--automatic --worker-timeout-seconds N --review-timeout-seconds N --reviewer-transport native|print]
+$PY -m workflow start     "$RUN" --live [--herdr]
+```
+
+| Action | Required flags | Optional flags | What it does |
+| --- | --- | --- | --- |
+| `preflight` | `--policy` | `--repo`, `--herdr`, `--automatic` | validates the policy, clean source, installed `git`/`claude`/`node`, the Claude CLI flags the run needs, Claude login; `--herdr` requires a managed Herdr pane (`HERDR_ENV=1`) |
+| `prepare` | `--policy`, `--task <lane>=<path>` once per selected lane | `--workers a,b`, `--reviewer <id>=<brief>` once per declared reviewer, `--repo`, `--automatic`, the three automatic settings | pins base commit, branch, policy digest, `workers` (selected lanes in declared order), `excluded_workers` and `reviewers` (each reviewer's id and brief text; absent means the single built-in reviewer) into `plan.json`, creates one worktree per selected lane, writes the first `run-state.json`; `--automatic` requires a `feature/` branch |
+| `start` | `--live` | `--herdr` | launches every selected lane's native session once; refuses an already-started run; with `--herdr` opens the workflow tab (one pane per lane, in declared order) |
+
+Manual-mode gates after the workers finish:
+
+```bash
+$PY -m workflow freeze  "$RUN" --handoff ui=ui-handoff.json --handoff docs=docs-handoff.json   # one --handoff per selected lane
+$PY -m workflow review  "$RUN" --review-file independent-review.json                            # single built-in reviewer
+$PY -m workflow review  "$RUN" --reviewer general  --review-file general-review.json             # declared reviewers: one import each
+$PY -m workflow review  "$RUN" --reviewer coverage --review-file coverage-review.json
+$PY -m workflow approve "$RUN" --bundle-sha256 <hash printed at the approval interrupt>
+```
+
+| Action | Required flags | What it does |
+| --- | --- | --- |
+| `freeze` | `--handoff <lane>=<path>` for every selected lane (each `{"summary": "...", "open_assumptions": []}`) | validates every handoff, stops the recorded sessions, snapshots (an edit under an excluded lane's owned paths is an ownership violation naming both lanes), checks each lane, builds the candidate from the selected lanes in declared order and rechecks it |
+| `review` | `--review-file` (one reviewer's approved review JSON in RUNBOOK section 5), `--reviewer <id>` when the run declares reviewers | stores the import as `<node>.imported.json`; once every declared reviewer is imported, combines them into `review.json` (`reviewers` list, findings tagged by reviewer) and resumes the graph; until then the run stays at the review gate |
+| `approve` | `--bundle-sha256` | refused until every declared reviewer is imported and approved; then fast-forwards the source branch locally to the reviewed candidate; no push |
+
+## 3. Automatic mode
+
+```bash
+$PY -m workflow automatic      "$RUN" --live     # supervise to a verified feature branch, or resume an interrupted run
+$PY -m workflow automatic-step "$RUN" --live     # one controller step, exit 75 = checkpoint persisted, run again
+```
+
+Resume after Ctrl-C, a closed terminal or a dropped SSH session with the same `automatic --live`; workers and the reviewers keep running meanwhile. Do not repeat `launch` for an existing run. The review node launches every declared reviewer over the shared `review-worktree/` and waits for all of them: the run continues only when every reviewer approves without an unresolved P0/P1; any block, rejected file or expired deadline blocks it and stops the other reviewers (their status files say `superseded`). A run stopped by a deadline, a blocked worker, a quota block, a rejected completion file or a blocked review is retained but not resumable: start a new `--run-id`.
+
+## 4. Inspect
+
+```bash
+$PY -m workflow status "$RUN"                        # next nodes, pending interrupts, errors; refreshes report.html
+$PY -m workflow export "$RUN"                        # rebuild run-state.json at the current export version (1.4.0), launches nothing
+$PY -m workflow attach "$RUN"                        # create the run's Herdr tab and panes when start ran without --herdr
+$PY -m workflow.interactive status     "$RUN"        # native session inventory for the run
+$PY -m workflow.interactive attach     "$RUN" [--reuse-observers observers.json]
+$PY -m workflow.interactive attach-one "$RUN" --node <lane>|review|review-<reviewer>    # reconnect one session in this terminal
+```
+
+`status` prints the run's `workers` and `excluded_workers` with the pending nodes. `attach-one` needs an interactive terminal, accepts any lane of the run or any of its reviewer nodes (`review`, or `review-<reviewer>` per declared reviewer), and refuses to restart a missing session. `export` takes the controller lock, constructs no sessions, and refuses a run whose `plan.json`, policy or `review.json` fail validation. Run it on runs recorded before export 1.4.0 so the viewer shows their review, its reviewers and inputs; an old run keeps its stored graph labels, reports both legacy lanes as selected and its one reviewer as `review`.
+
+## 5. Recovery
+
+```bash
+$PY -m workflow retry     "$RUN" --phase worker    --node docs      # rerun one failed lane check at the same revision
+$PY -m workflow retry     "$RUN" --phase candidate --node ui        # rerun one failed combined check
+$PY -m workflow retry     "$RUN"                                    # resume failed post-freeze graph steps, never relaunches
+$PY -m workflow reconcile "$RUN"                                    # rebind surviving sessions after an ambiguous launch, never relaunches
+```
+
+| Flag | Values | Default |
+| --- | --- | --- |
+| `--phase` | `worker`, `candidate` | `worker` |
+| `--node` | any lane of the run (`workers` in `plan.json`) | none, meaning resume without selecting a check |
+
+Three verification attempts per lane and phase, including the first. `retry` refuses runs that are waiting at an interrupt and refuses to relaunch failed `launch_*` steps; use `reconcile` for those.
+
+Native session controls, from the run's receipts:
+
+```bash
+claude agents --json                                  # list sessions; the run's are named workflow-<run-id>-<lane>, workflow-<run-id>-reviewer (default reviewer) and workflow-<run-id>-reviewer-<reviewer>
+claude stop <background_id>                           # stop one session by its exact id from <node>.interactive.json
+cd "$RUN/review-worktree" && claude --resume <uuid>   # reread or continue a reviewer transcript (every reviewer ran in this worktree)
+```
+
+## 6. Viewer
+
+```bash
+npm run dev                                              # API on 127.0.0.1:3001 plus Vite on 127.0.0.1:5173
+MD_MANAGER_API_PORT=3010 npm run dev:api                 # API alone on another port
+```
+
+The Projects viewer reads registered run roots from the projects registry file named by `MD_MANAGER_PROJECTS_CONFIG`; `config/projects.example.json` shows the shape. Unset means no projects. Sources come from `MD_MANAGER_CONFIG`. The adapter accepts exports 1.0.0 to 1.4.0, derives the run's lanes from `inputs.workers` (the fixed `ui`/`adapter` pair for exports without `inputs`) and serves one reviewer named `review` for exports before 1.4.0.
+
+Created files: worker-phase verification copies each changed text file (UTF-8, no NUL byte) into the packet before any check runs, as a `file` artifact with its repo-relative `path`. Caps: 512 KiB per file, 8 MiB per packet (`FILE_CAPTURE_LIMIT`, `PACKET_FILE_CAPTURE_LIMIT` in `workflow/checks.py`). Other changed paths are listed in `files_not_captured` as `binary`, `too_large`, `missing` (deleted, renamed away or not a regular file) or `budget` (over the packet cap). The candidate phase captures nothing. The viewer opens captured files through the artifact route (`text/plain`); runs verified before capture say the files were not captured.
+
+## 7. Files in a run directory
+
+| File | Written by | Meaning |
+| --- | --- | --- |
+| `plan.json`, `policy.json` | `prepare` | pinned base commit, branch, `workers`, `excluded_workers`, `failure_drill`, tasks, `reviewers` (ids and brief texts; absent means the built-in reviewer), automatic settings, policy |
+| `run-state.json` | every CLI boundary, `export` | versioned export the viewer reads |
+| `worktree-<lane>/` | `prepare` | one worktree per selected lane |
+| `<lane\|review\|review-<reviewer>>.interactive.json` | launch | session receipt with UUID, launch token, status (one per lane and per reviewer) |
+| `<node>.prompt.txt`, `<node>.launch.log` | launch | exact prompt (a reviewer's brief plus the fixed blocks and completion protocol) and launch output |
+| `<lane>.completion.json` | the worker | automatic mode completion signal |
+| `<lane>.handoff.json` | `freeze` or the controller | accepted handoff |
+| `<node>.stop.json` | stop | identity-checked stop marker |
+| `review-bundle.json`, `review.diff`, `review-worktree/` | candidate | what every reviewer sees (one shared worktree) |
+| `review.completion.json`, `review-<reviewer>.completion.json` | each reviewer | its bound verdict file (`node_id` names the reviewer) |
+| `<node>.imported.json` | `review --reviewer` | a manually imported review, one per reviewer |
+| `automatic-review.json`, `automatic-review-<reviewer>.json`, `review.json` | controller | combined review status, each declared reviewer's status (launch token, session, decision, `accepted`/`blocked`/`superseded`), and the combined verdict: `reviewers` entries plus unioned findings tagged by `reviewer` |
+| `verification/<phase>/<node>/<attempt>/packet.json` | checks | check evidence and screenshots; worker phase also the changed text files (`file` artifacts with `path`) and `files_not_captured` |
+| `report.html`, `events.jsonl`, `terminals.json` | controller | local report, timeline, Herdr pane map |
+| `controller.lock`, `pipeline.sqlite` | controller | lock and LangGraph checkpoint |
+
+## 8. Adding a feature to launch
+
+1. Create `features/<name>/` with `feature.json` matching `contracts/workflow/feature.schema.json` (`version` 2.0.0 or 2.1.0, `name`, `branch_prefix`, `policy`, `workers: [{node_id, task}]`, one entry per lane; 2.1.0 may add `reviewers: [{reviewer_id, prompt}]`, one brief file per reviewer that states only what to look for, ids under the same rules as lane ids and never a lane id), `policy.json` matching `contracts/workflow/verification.schema.json` (1.2.0: the same lane ids, a free `role` label, `owned_paths`, `checks` and `required_check_kinds` per lane; lane ids match `^[a-z][a-z0-9-]{0,31}$` and avoid `review`, `candidate`, `handoff`, `approval`, `integrate`, `multiple`, `none`, `both` and the `launch_`/`verify_`/`candidate_`/`review-` prefixes), and one task file per lane. `features/project-workflows/reviewers/` holds example briefs (`general.md`, the built-in brief; `coverage.md`, a test-coverage brief) that a 2.1.0 file can declare.
+2. Add `<name>` to the `FEATURES` tuple in `workflow/launch.py`.
+3. `$PY -m workflow launch <name> --dry-run --automatic` until it validates, then `--live`.
+# Readiness validation
+
+The complete pipeline is ready for a **supervised local run** with an operator-approved feature policy. No live feature graph or new Claude implementation workers were launched during this readiness pass.
+
+## Executed checks
+
+- `python -m unittest workflow.test_graph workflow.test_sessions workflow.test_interactive workflow.test_verification workflow.test_pipeline -v`: **40 passed** (historical: `workflow.test_graph` was removed with the worker-lanes slice; run `python -m unittest discover -s workflow -t .` today).
+- `npm run test:contracts`: **5 passed**.
+- `npm run test:unit`: **130 passed** (existing Markdown-manager regression tests).
+- `npm run build`: **passed**; existing Vite bundle-size warning remains.
+- `npm run lint`: **passed**.
+- `pip check`: **no broken requirements**.
+- `git diff --check`: **passed**.
+
+Python checks used the isolated `/tmp/md-manager-workflow-venv` environment, whose resolved dependencies are pinned in `requirements.lock`.
+
+## End-to-end evidence covered
+
+The offline pipeline uses fake workers, but actual Git, Python unittest and headless Chromium:
+
+1. Separate workers start at the same committed base and modify disjoint owned files.
+2. Explicit handoff captures immutable snapshots without modifying source HEAD.
+3. Required build, backend unit tests, Playwright assertions and screenshot attachments execute in fresh verification worktrees.
+4. Combined candidate checks run again before review.
+5. Review and approval are separate interrupts bound to exact candidate/bundle hashes.
+6. Explicit approval fast-forwards only the temporary test repository; no push.
+7. The generated HTML viewer is opened in Chromium; graph visibility and screenshot links are asserted and a full-page image is captured in the temporary fixture.
+8. An injected backend check failure reruns only that failed verification attempt after reopening checkpoints. Worker starts remain one each and the successful UI check packet stays byte-for-byte unchanged.
+9. Tampered evidence, stale review, missing screenshots/checks, zero-test runs, ownership violations and incorrect role mappings block.
+10. Native stop behavior is separately tested with mocked CLI/registry responses: successful stops, repeated calls, completed-stop-intent recovery, nonzero exits and lingering live workers. Missing handoffs do not stop workers.
+
+Unit-test fixtures and their temporary screenshots are cleaned up by the test runner; no synthetic packet is represented as a real agent review or live feature result. Earlier interactive-launch validation did use real native Claude terminals and Herdr attachments; those two demo sessions were stopped before this pass.
+
+## Independent review
+
+Pi reviewer run `7182030a-c0fa-466e-8e0c-39839dc999da` found:
+
+- P1: incorrect role mapping could bypass browser/backend test categories.
+- P2: production stop/recovery boundary lacked offline coverage.
+
+Both were fixed and regression-tested. Focused follow-up run `6618fab6-31a9-4e44-8162-c78d8de8abd9` found no remaining issues in that fix scope and returned **Merge verdict: OK**. The reviewer inspected source/tests, not live sessions or command execution; executed-check evidence above is the parent's.
+
+## First-feature launch preparation follow-up
+
+The Projects-viewer feature now has committed UI/adapter tasks, a versioned verification policy, a one-command supervised launcher, a private atomic run-state export, a hard three-attempt verification limit, and an explicit first adapter-verification gate failure. Follow-up local validation covers 47 Python tests plus 10 contract tests, including dry-run/no-consent/duplicate-launch guards and the configured failure drill across checkpoint reopening. No real workers were launched by these tests. The stable repository `.venv` is installed from the dependency lock on this VPS; it is ignored by Git.
+
+The new `run-state.json` producer seam is documented in `features/project-workflows/README.md`. UI worker checks can use explicit API fixtures; combined-candidate checks are assigned to exercise the real adapter. The implementation of the Projects viewer itself is the work to be performed by that future run, not something this preparation claims to have shipped.
+
+## Automatic feature-branch mode follow-up
+
+Automatic mode is implemented directly in the existing LangGraph runtime, not Pi subagent tooling. Local validation now passes **59 Python tests**, 10 contract tests and lint. Synthetic reviewer executables exercise the real read-only reviewer transport, exact-bundle binding, reviewer rejection, and duplicate-launch prevention. An end-to-end test uses three actual Python controller processes against the same SQLite checkpoint, real Git/unit/Chromium checks, an injected adapter gate failure, UI reuse and adapter attempt 2; the original source branch remains unchanged. Only the test feature branch advances.
+
+No real Claude workers or reviewer were launched for this validation. Actual live `--bg` permission-bypass behavior and model completion-protocol compliance still require the first owner-started live run. Worktrees are not security sandboxes. Automatic verification retries do not repair immutable source, and process deadlines require the controller to remain alive. No merge to main or push was performed for this implementation.
+
+## Deliberate operator boundaries
+
+- Select the feature, ownership and actual acceptance tests before preparing a run; the example policy is illustrative.
+- Tests and setup commands are trusted code, not sandboxed workloads.
+- Native terminal edits must stop before frozen verification.
+- Independent review is supplied by Pi/a human as an explicit artifact; the graph never invents approval.
+- Ambiguous native sessions, partial candidate allocations, source drift and exhausted usage stop for operator action, not silent relaunch/provider switching.
+- `report.html` is a local snapshot viewer; controls remain authenticated-by-local-operator CLI actions, not a remote web service.
+- Run/worktree cleanup and pushing remain separate, explicit actions.
+# Reusable verification policy and evidence gates
+
+Feature requirements are supplied per run. The gate implementation stays reusable.
+
+## Defaults
+
+| Worker | Required | Add when relevant |
+| --- | --- | --- |
+| Frontend | Build; browser tests for every named scenario; PNG screenshot per scenario | Typecheck, accessibility checks, mobile/desktop scenarios, visual regression assertions |
+| Backend | Unit tests with nonzero passing test count | API/schema contract tests; isolated database/adapter integration tests; failure/recovery tests |
+| Both | Ownership, exact run/attempt/revision identity, executed check logs, matching artifact hashes | Task-specific checks |
+
+Independent review and integration approval remain mandatory. A screenshot alone is not a browser test, and a successful shell exit with zero executed tests is not sufficient test evidence. Screenshots should be examined during independent review; this gate checks their presence/hash/format, not visual correctness.
+
+## Files
+
+- `contracts/workflow/verification.schema.json`: authoritative JSON Schema for per-feature policies.
+- `contracts/workflow/verificationEvidence.schema.json`: trusted verifier evidence sidecar; leaves existing v1 `WorkerResult` unchanged.
+- `contracts/workflow/verification.example.json`: illustrative viewer policy. Its future browser test path is an example, not an implemented test suite.
+- `workflow/verification.py`: policy validator and deterministic evidence evaluator.
+- `workflow/test_verification.py`: positive/negative fixture tests.
+
+These two supplementary schemas are authored directly, not generated by the existing Zod export script. The original v1 message schemas remain unchanged. Non-Python consumers must also implement the documented cross-field rules.
+
+## Configure a feature
+
+Each worker declares its role, node ID, exact owned path prefixes, and required checks. A check has a unique ID, kind, argv array, timeout and (for browser checks only) named scenarios. There are no ownership globs; `src/workflow` owns itself and descendants, not `src/workflow-other`. Worker ownership cannot overlap.
+
+All listed checks are required. Frontend policies cannot omit build or browser checks; backend policies cannot omit unit tests. Browser scenarios cannot be an empty list. For responsive work, name desktop/mobile cases explicitly and implement the corresponding viewport assertions and screenshot capture in the browser test.
+
+Policy commands are operator-approved configuration, never code invented by a worker at the join. An argv array does not make a command safe. The future runner must use `shell=False`, authorize the command, enforce timeouts and execute it in a separate verification worktree with isolated ports/caches/artifact paths. Do not execute arbitrary commands supplied by an untrusted UI or agent.
+
+## Evidence binding
+
+The sidecar binds the policy SHA-256, run ID, worker ID, attempt and output commit. Canonical policy JSON uses sorted keys, no whitespace separators and literal Unicode encoded as UTF-8. Each check ID points to one index in `WorkerResult.checks`; command text must equal Python `shlex.join(argv)`. The executed working directory must match the backend-owned verification worktree.
+
+Test check receipts require parsed counts of passed/failed/skipped tests. Browser receipts additionally require exact scenario IDs, passed status, and a screenshot artifact for each. No-test runs, failed/skipped required scenarios, missing logs/screenshots, stale revisions, duplicate IDs and modified artifact bytes block the gate. Build/typecheck checks do not require test counts.
+
+Phases gate differently. The **worker phase** verifies one lane's snapshot in isolation, so a lane's `build` and `browser` checks (which compile against contracts and a server that another lane of the same run may be changing) are executed and recorded there but do not gate; the packet's `gate.deferred_checks` lists them and the verify event says "recorded for the candidate gate". Lane-local kinds (`unit`, `contract`, `integration`) gate in both phases, and every check's argv, worktree and timeout are verified in both. The **candidate phase** runs every lane's checks on the combined revision and gates on all of them, so nothing reaches review or integration with a failing build or browser suite.
+
+All artifact paths are resolved through a **backend-owned registry**, constrained to its root and hash-checked. Agent-provided URI strings are not fetched or treated as arbitrary paths. PNG header checks are format sanity only, not image decoding or proof that an image came from a browser.
+
+## Boundary and remaining implementation
+
+This slice evaluates evidence; it does **not** run commands, launch a browser, take screenshots, launch Claude, or advance the live graph. Its tests use clearly synthetic local fixtures.
+
+Before wiring it into the live graph:
+
+1. Freeze/stop interactive edits and independently derive the complete Git diff and immutable output commit. Worker-reported changed files alone cannot prove ownership.
+2. Capture trusted command executions, parse actual test-runner results and collect browser screenshots in isolated verification worktrees. Never accept a worker's self-written sidecar as trusted execution proof.
+3. Supply backend-owned expected run/node/attempt/base/output identity and verification cwd to `evaluate_worker`.
+4. Preserve immutable logs/artifacts, then run independent review against those exact outputs.
+5. Obtain explicit integration approval; do not infer it from a passing evidence gate or an idle terminal.
+
+`evaluate_worker` always returns `integration_allowed: false`, with independent review and approval listed as pending gates—even if technical evidence passes. Unresolved worker assumptions are retained for that review. The live graph remains paused at its existing handoff until these remaining pieces are implemented.
+
+Run local tests without any live agent launches:
+
+```bash
+python -m unittest workflow.test_verification workflow.test_interactive workflow.test_sessions workflow.test_lanes -v
+npm run test:contracts
+```
+# Interactive Claude workers in a dedicated Herdr tab
+
+This is the preferred path when you want to **type into Claude**, not view streamed logs. It uses Claude Code's native persistent background terminals (tested with CLI 2.1.278).
+
+```text
+LangGraph launch_<lane> → claude --bg → persistent terminal/worktree, one per configured lane
+                                     ↑
+Herdr workflow tab → claude attach <id> in each pane (keyboard input enabled)
+```
+
+Herdr attaches to terminals that LangGraph already launched. It does not submit the initial tasks, launch replacement workers, or decide that work is accepted. Claude's background service owns the persistent PTY/process; LangGraph owns the launch intent, task/worktree binding and workflow checkpoints.
+
+## Start a run
+
+From this source checkout, with the workflow Python environment active:
+
+```bash
+python -m workflow.interactive prepare /path/outside-repo/my-run \
+  --repo "$PWD" --base HEAD \
+  --task ui=/path/to/ui-task.txt --task adapter=/path/to/adapter-task.txt \
+  --allow-edits
+
+python -m workflow.interactive run /path/outside-repo/my-run --live --herdr
+python -m workflow.interactive status /path/outside-repo/my-run
+```
+
+Source repository must be clean and the shared contract must exist at the pinned revision. One worktree per lane (`--task <lane>=<path>`, any lane ids the policy rules allow) is created at that exact commit. Do not reuse a print-mode run directory: interactive sessions are new native terminals, not conversions of completed `--print` conversations.
+
+`--live` authorizes Claude usage. `--allow-edits` enables Read/Glob/Grep/Edit/Write; omit it for read-only tools. Permission mode is **manual**, so you can answer permission prompts yourself. Shell tools and nested agents remain disabled in this initial slice. No bypass-permissions mode or automatic provider/budget fallback is configured. This is worktree isolation, not an OS sandbox.
+
+## Use the panels
+
+A dedicated `Workflow: <run-name>` tab contains one `Claude: <lane>` pane per lane, in declared order (the first lane takes the root pane, each following lane splits right of the previous one). Your original tab is not split and focus is preserved. Select a worker pane and type at Claude's normal prompt.
+
+- **Ctrl+Z** detaches to the pane's shell; Claude documents that the background session keeps running.
+- Closing the attachment pane does not intentionally stop the worker. A client/SSH disconnect should leave the native background session available to reattach; recovery still verifies its identity.
+- **Ctrl+C inside Claude** can interrupt its current turn. This is deliberately real interactive control, not a read-only viewer.
+- Do not type `/exit` unless you mean to end the native worker session. Exited/missing/uncertain workers require reconciliation, not blind restart.
+- Direct human messages consume Claude usage and can change work outside a LangGraph node execution. They are recorded by Claude, not individually checkpointed as LangGraph state transitions. Do not assume the graph knows those instructions or has validated their results.
+
+To reconnect in an available terminal:
+
+```bash
+python -m workflow.interactive attach-one /path/outside-repo/my-run --node <lane>
+```
+
+This validates the native session ID, worktree, name, live inventory state and PID before `exec`-ing `claude attach`. A terminal is required. Never type this command into a pane already occupied by another program. The programmatic pane adapter also checks that only the pane's shell is in the foreground before submitting a command.
+
+To create the dedicated tab after launching without `--herdr`:
+
+```bash
+python -m workflow.interactive attach /path/outside-repo/my-run
+```
+
+The recorded `terminals.json` prevents automatically opening duplicate attachments. A failed partial layout is retained for inspection. To deliberately replace old, idle log observers (one per lane), supply `--reuse-observers /old/run/observers.json` to `attach` or to `run --live --herdr`. The adapter checks distinct pane identities, same dedicated tab/current workspace, and shell availability, then records the ownership transfer. It never closes or repurposes an unrelated pane.
+
+## Identity and recovery
+
+Native `--bg` **ignores `--session-id`** and assigns its own ID. The `session_id` reserved in the common preparation plan is therefore a launch token for interactive mode, not the final Claude identity. The launcher writes intent before calling Claude, retains its stdout/stderr, extracts the ID from that launch receipt, and resolves the exact UUID through `claude agents --json`. It cross-checks the worktree and launch name. Actual IDs live in `*.interactive.json` and `terminals.json`.
+
+If the controller fails after launching, rerunning may reconcile the **same** terminal from the retained launch ID and native inventory. It does not launch again when an existing receipt lacks conclusive evidence. Neither a guessed UUID nor a name-only match is sufficient. CLI output format changes or unsupported states fail closed.
+
+`done` in the native inventory means a finished model turn, not necessarily an exited process. Attachment requires a live native PID in addition to the matching session/worktree identity. A final existence check cannot eliminate every race between checking and native attach; do not concurrently stop/restart sessions while attaching. PIDs are not used as authority to kill processes.
+
+## Workflow handoff
+
+The graph has one independent **launch** node per lane and then interrupts at `interactive_workers_active`. Finishing a launch node does not mean the implementation is finished. Neither idle/done state nor human typing triggers integration. The implementation does not yet offer a final evidence/verification/approval command, automated stop, or merge.
+
+Before integration is added, we still need to freeze further terminal edits, capture contract-complete results, run isolated tests/browser checks and obtain independent review. There is no claim of successful verification from these launch receipts.
+
+## Validation
+
+```bash
+python -m unittest workflow.test_interactive workflow.test_sessions workflow.test_lanes -v
+```
+
+Coverage includes native launch flags, assigned-ID binding, exact surviving-session reconciliation, refusal to retry ambiguous launches, identity/worktree checks, occupied-pane rejection, dedicated-tab attachment and the human-handoff interrupt. Live testing launched two native background workers via LangGraph, reconciled their assigned IDs without additional launches, and verified real `claude attach` processes and interactive prompts in the existing workflow tab.
+
+The headless print-mode launcher (`workflow.live`, `LIVE_SESSIONS.md`) was removed with the worker-lanes slice; `python -m workflow` is the complete pipeline.

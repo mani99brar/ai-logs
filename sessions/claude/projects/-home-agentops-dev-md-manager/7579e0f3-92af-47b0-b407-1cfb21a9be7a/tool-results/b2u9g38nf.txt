@@ -1,0 +1,188 @@
+Stops and outages: record only confirmed stops, stop every lane, exit 75 only when resumable
+
+A final review of round 3 confirmed three P2 defects in how the controller
+stops sessions and classifies Claude Code outages.
+
+A `claude stop` that ran and exited non-zero kept `issued: true`. That is
+what a restarting background service does before it respawns the session
+under a new PID. A retry in that respawn gap found the session missing from
+the listing and its old PID ended, then saved `stopped: true` without
+issuing any stop, so the respawned session kept running. stop_session now
+clears `issued` when the stop fails. The retry then looks through the gap
+(UpdateGaps) and stops the respawned process once, and it records nothing
+while the gap lasts.
+
+stop_workers raised at the first lane whose stop failed. After a blocked
+wait, that is usually the lane that blocked it (a `stopped` or `failed`
+row, a changed identity), so every later lane kept running and using quota.
+It now attempts every lane, then raises all the failures together, each
+named by lane. The combined error is a TransientInfraError only when every
+failure was one, so an interrupted freeze stays resumable. Any other
+refusal decides the run.
+
+Every TransientInfraError out of the graph exited 69/75 with "Nothing was
+stopped ... resume", even when the node had already ended on it for good:
+a print review terminates its jobs and blocks, and a reviewer launch or
+rebind is left at needs_reconciliation. The resume then stopped at
+"Non-retryable graph failure". drive now raises (exit 69, then 75) only for
+a state the next controller continues: an interrupted freeze, an
+interrupted native review, or an accepted review whose stops are still
+owed. Otherwise it records a `controller blocked` event naming the outage
+and classifies the failure like any other, so `automatic` exits 1.
+rebind_reviewers now treats an outage while a resume rebinds a reviewer as
+an interruption: it keeps the reviewer running and sets the review's
+interrupted marker, instead of marking it needs_reconciliation. A second
+outage during a resume therefore stays resumable, as RUNBOOK describes.
+
+RUNBOOK and the TransientInfraError docstring now describe this behaviour.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+
+diff --git a/workflow/RUNBOOK.md b/workflow/RUNBOOK.md
+index 14a3174..271c84a 100644
+--- a/workflow/RUNBOOK.md
++++ b/workflow/RUNBOOK.md
+@@ -244,7 +244,7 @@ In an automatic run the review node launches every reviewer itself, once per bun
+ - **Verdict.** Unanimous. The run continues only when every declared reviewer's file was accepted with `approved` and no reviewer left an unresolved P0/P1; the first `blocked` verdict, unresolved P0/P1, rejected file or expired deadline decides at once, without waiting for the other reviewers. `review.json` is then written with the combined `verdict`, `reviewers: [{reviewer_id, session_id, verdict, accepted_at}]` in declared order (`verdict` null for a reviewer that produced none) and the union of the accepted findings, each tagged with its `reviewer` (the same defect reported twice is kept twice), and `reviewer` lists every session UUID. An approval that still carries an unresolved P0/P1 is recorded as `verdict: "blocked"` with that reviewer's raw decision kept in its status file. Each reviewer's status file ends as `succeeded`, `accepted` (its approval was accepted but another reviewer blocked), `blocked` or `superseded` (still working when the run was decided). Fixing findings means a new run with a new bundle.
+ - **Deadline.** `review_timeout_seconds` counts from each reviewer's own launch (`launch_requested_at`) and survives controller restarts. A reviewer idle or done with a valid file is accepted before its deadline is checked, so a verdict the controller reads again after the deadline (resumed after exit 75 or Ctrl-C) still counts. A reviewer whose file was accepted before the controller stopped (`accepted_at` in its status) is read again whatever its session does now (a follow-up typed in its pane), as a controller that never stopped would not have waited for it; a file that no longer validates blocks as on its first read. The first reviewer to idle without a file until its deadline blocks the run; verdicts already accepted from the others are retained in `review.json`; **no second reviewer is ever launched**.
+ - **Stop.** After the combined decision the controller stops every reviewer with the same identity re-check as for workers (`<node>.stop.json`); the transcripts stay resumable. A stop that cannot be confirmed after acceptance ends the controller with the verdict kept (`automatic-review.json` stays `succeeded`, that reviewer's `stop.json` absent or unconfirmed, the reason on the timeline); `python -m workflow automatic "$RUN" --live` retries the outstanding stops before continuing and launches nothing.
+-- **Interruption.** Ctrl-C, a closed terminal or a dropped SSH session while the controller waits leaves every reviewer running with `automatic-review.json` at `running`; `python -m workflow automatic "$RUN" --live` resumes waiting for the same sessions' files. The same holds inside a launch window once that reviewer's `claude --bg` was issued (its `.interactive.json` exists): the receipt is `running`, without `session_id` when the interrupt hit the settle poll, and resume rebinds that one session through reconciliation, never a relaunch. An interrupt before a reviewer's launch was issued leaves the run at `needs_reconciliation`: resume rebinds the reviewers that were launched and launches nothing, so the run cannot continue; stop the running reviewers by their exact ids and start a new run.
++- **Interruption.** Ctrl-C, a closed terminal or a dropped SSH session while the controller waits leaves every reviewer running with `automatic-review.json` at `running`; `python -m workflow automatic "$RUN" --live` resumes waiting for the same sessions' files. The same holds inside a launch window once that reviewer's `claude --bg` was issued (its `.interactive.json` exists): the receipt is `running`, without `session_id` when the interrupt hit the settle poll, and resume rebinds that one session through reconciliation, never a relaunch; Claude Code unavailable during that rebind leaves the review resumable the same way (exit 75). An interrupt before a reviewer's launch was issued leaves the run at `needs_reconciliation`: resume rebinds the reviewers that were launched and launches nothing, so the run cannot continue; stop the running reviewers by their exact ids and start a new run.
+ - **Print fallback.** `--reviewer-transport print` (at `launch` or `prepare`, pinned into `plan.automatic`) keeps the headless `claude --print --json-schema` reviewer, one job per declared reviewer started in parallel: no pane, no human input, `<node>.stdout.json`/`<node>.stderr.log`, the same bundle binding and verdict rules. One difference from native transport: the controller collects the print jobs in declared order, so a later reviewer's block is acted on only after every earlier job has finished or timed out; every job still runs concurrently and keeps its own deadline. Plans pinned before the setting existed validate as `native` (they never launch a new reviewer); their exported inputs report the transport their recorded review used, or null.
+ 
+ To read or continue a reviewer's transcript after the run:
+@@ -286,7 +286,7 @@ Export rebuilds `run-state.json` from the run directory under the current export
+ - **Ambiguous startup:** inspect receipts/native inventory, then `reconcile "$RUN"`. It only permits existing durable launch intents and exact surviving sessions; no new native process is launched during reconciliation. Missing proof remains blocked.
+ - **Changed code:** before review, `repair` (below); after review started, create a new run. **Changed policy:** create a new run. Do not modify frozen snapshots/evidence and reuse approvals.
+ - **Partial candidate/worktree allocation:** preserve and inspect it. Automatic destructive cleanup or speculative Git conflict resolution is intentionally unavailable.
+-- **Claude Code unavailable (exit 75):** an update replacing the `claude` binary, or its background service restarting, is not a verdict on any session. Every `claude` call the controller makes waits it out for 60 seconds: a launch, a print job or a stop is repeated only when its exec failed (nothing ran, so none ever starts twice), and the `claude agents --json` listing, which only reads, is asked again every 2 seconds while it fails, prints no list or hangs (each 15-second timeout counts against the 60). After that the automatic controller stops nothing: it records an `interrupted` event naming the cause, and `automatic` (also `launch --automatic` and `resume`) exits 75 with the resume command and any stale Claude processes to restart (its `automatic-step` child exits 69, EX_UNAVAILABLE, which the supervisor turns into that 75, whichever step was running; 75 from a step still means a checkpoint persisted). The service also respawns idle sessions (a finished lane, a lane paused on a question, a reviewer that wrote its file) under new PIDs, about 15 seconds after it restarts or at any later time: while `claude agents` lists such a session without a PID, in a state between two processes, with its ended PID or not at all, the worker and reviewer waits, the reviewers' identity check before the verdict and every stop look again every 2 seconds, and a stop follows the new PID (same background id and session UUID); a gap that lasts 30 seconds counts as Claude Code unavailable. Only a stop already issued (`issued` in `<node>.stop.json`, written right before `claude stop` runs) counts a session the listing leaves out as stopped. Once `claude --version` works, run `"$PY" -m workflow automatic "$RUN" --live`: it waits for the same sessions again (a review interrupted this way re-enters its node, rebinding the running reviewers; a freeze re-enters, marked by `freeze-interrupted.json`, completing the stops it recorded in `<lane>.stop.json`; each marker is removed only once that re-entry ends, so a Ctrl-C or a closed terminal during it leaves the run resumable the same way); nothing is relaunched. A reviewer launch it interrupts leaves the review at `needs_reconciliation` (below). A deadline, a `blocked` completion, a rejected file, a `stopped` or `failed` session or a changed session identity still stops the sessions. A session still missing after 30 seconds makes every `automatic --live` exit 75 the same way: `claude agents --json --all` and `claude logs <id>` show whether it ended; waking it with `claude attach <id>`, or stopping the run (below), is your decision.
++- **Claude Code unavailable (exit 75):** an update replacing the `claude` binary, or its background service restarting, is not a verdict on any session. Every `claude` call the controller makes waits it out for 60 seconds: a launch, a print job or a stop is repeated only when its exec failed (nothing ran, so none ever starts twice), and the `claude agents --json` listing, which only reads, is asked again every 2 seconds while it fails, prints no list or hangs (each 15-second timeout counts against the 60). After that the automatic controller stops nothing: it records an `interrupted` event naming the cause, and `automatic` (also `launch --automatic` and `resume`) exits 75 with the resume command and any stale Claude processes to restart (its `automatic-step` child exits 69, EX_UNAVAILABLE, which the supervisor turns into that 75, whichever step was running; 75 from a step still means a checkpoint persisted). The service also respawns idle sessions (a finished lane, a lane paused on a question, a reviewer that wrote its file) under new PIDs, about 15 seconds after it restarts or at any later time: while `claude agents` lists such a session without a PID, in a state between two processes, with its ended PID or not at all, the worker and reviewer waits, the reviewers' identity check before the verdict and every stop look again every 2 seconds, and a stop follows the new PID (same background id and session UUID); a gap that lasts 30 seconds counts as Claude Code unavailable. Only a stop already issued (`issued` in `<node>.stop.json`, written right before `claude stop` runs, and cleared when it exits non-zero, as it does while the service restarts) counts a session the listing leaves out as stopped; a failed stop is issued again to the respawned session. Once `claude --version` works, run `"$PY" -m workflow automatic "$RUN" --live`: it waits for the same sessions again (a review interrupted this way re-enters its node, rebinding the running reviewers; a freeze re-enters, marked by `freeze-interrupted.json`, completing the stops it recorded in `<lane>.stop.json`; each marker is removed only once that re-entry ends, so a Ctrl-C or a closed terminal during it leaves the run resumable the same way); nothing is relaunched. A reviewer launch it interrupts leaves the review at `needs_reconciliation` (below), and a print review it interrupts terminates its jobs: no resume continues either, so the controller records a `blocked` event naming the cause and `automatic` exits 1. A deadline, a `blocked` completion, a rejected file, a `stopped` or `failed` session or a changed session identity still stops the sessions: every lane's stop is attempted, and the ones that cannot be confirmed (usually that lane's own) are named together on the timeline. A session still missing after 30 seconds makes every `automatic --live` exit 75 the same way: `claude agents --json --all` and `claude logs <id>` show whether it ended; waking it with `claude attach <id>`, or stopping the run (below), is your decision.
+diff --git a/workflow/RUNBOOK.md b/workflow/RUNBOOK.md
+index 14a3174..271c84a 100644
+--- a/workflow/RUNBOOK.md
++++ b/workflow/RUNBOOK.md
+@@ -244,7 +244,7 @@ In an automatic run the review node launches every reviewer itself, once per bun
+ - **Verdict.** Unanimous. The run continues only when every declared reviewer's file was accepted with `approved` and no reviewer left an unresolved P0/P1; the first `blocked` verdict, unresolved P0/P1, rejected file or expired deadline decides at once, without waiting for the other reviewers. `review.json` is then written with the combined `verdict`, `reviewers: [{reviewer_id, session_id, verdict, accepted_at}]` in declared order (`verdict` null for a reviewer that produced none) and the union of the accepted findings, each tagged with its `reviewer` (the same defect reported twice is kept twice), and `reviewer` lists every session UUID. An approval that still carries an unresolved P0/P1 is recorded as `verdict: "blocked"` with that reviewer's raw decision kept in its status file. Each reviewer's status file ends as `succeeded`, `accepted` (its approval was accepted but another reviewer blocked), `blocked` or `superseded` (still working when the run was decided). Fixing findings means a new run with a new bundle.
+ - **Deadline.** `review_timeout_seconds` counts from each reviewer's own launch (`launch_requested_at`) and survives controller restarts. A reviewer idle or done with a valid file is accepted before its deadline is checked, so a verdict the controller reads again after the deadline (resumed after exit 75 or Ctrl-C) still counts. A reviewer whose file was accepted before the controller stopped (`accepted_at` in its status) is read again whatever its session does now (a follow-up typed in its pane), as a controller that never stopped would not have waited for it; a file that no longer validates blocks as on its first read. The first reviewer to idle without a file until its deadline blocks the run; verdicts already accepted from the others are retained in `review.json`; **no second reviewer is ever launched**.
+ - **Stop.** After the combined decision the controller stops every reviewer with the same identity re-check as for workers (`<node>.stop.json`); the transcripts stay resumable. A stop that cannot be confirmed after acceptance ends the controller with the verdict kept (`automatic-review.json` stays `succeeded`, that reviewer's `stop.json` absent or unconfirmed, the reason on the timeline); `python -m workflow automatic "$RUN" --live` retries the outstanding stops before continuing and launches nothing.
+-- **Interruption.** Ctrl-C, a closed terminal or a dropped SSH session while the controller waits leaves every reviewer running with `automatic-review.json` at `running`; `python -m workflow automatic "$RUN" --live` resumes waiting for the same sessions' files. The same holds inside a launch window once that reviewer's `claude --bg` was issued (its `.interactive.json` exists): the receipt is `running`, without `session_id` when the interrupt hit the settle poll, and resume rebinds that one session through reconciliation, never a relaunch. An interrupt before a reviewer's launch was issued leaves the run at `needs_reconciliation`: resume rebinds the reviewers that were launched and launches nothing, so the run cannot continue; stop the running reviewers by their exact ids and start a new run.
++- **Interruption.** Ctrl-C, a closed terminal or a dropped SSH session while the controller waits leaves every reviewer running with `automatic-review.json` at `running`; `python -m workflow automatic "$RUN" --live` resumes waiting for the same sessions' files. The same holds inside a launch window once that reviewer's `claude --bg` was issued (its `.interactive.json` exists): the receipt is `running`, without `session_id` when the interrupt hit the settle poll, and resume rebinds that one session through reconciliation, never a relaunch; Claude Code unavailable during that rebind leaves the review resumable the same way (exit 75). An interrupt before a reviewer's launch was issued leaves the run at `needs_reconciliation`: resume rebinds the reviewers that were launched and launches nothing, so the run cannot continue; stop the running reviewers by their exact ids and start a new run.
+ - **Print fallback.** `--reviewer-transport print` (at `launch` or `prepare`, pinned into `plan.automatic`) keeps the headless `claude --print --json-schema` reviewer, one job per declared reviewer started in parallel: no pane, no human input, `<node>.stdout.json`/`<node>.stderr.log`, the same bundle binding and verdict rules. One difference from native transport: the controller collects the print jobs in declared order, so a later reviewer's block is acted on only after every earlier job has finished or timed out; every job still runs concurrently and keeps its own deadline. Plans pinned before the setting existed validate as `native` (they never launch a new reviewer); their exported inputs report the transport their recorded review used, or null.
+ 
+ To read or continue a reviewer's transcript after the run:
+@@ -286,7 +286,7 @@ Export rebuilds `run-state.json` from the run directory under the current export
+ - **Ambiguous startup:** inspect receipts/native inventory, then `reconcile "$RUN"`. It only permits existing durable launch intents and exact surviving sessions; no new native process is launched during reconciliation. Missing proof remains blocked.
+ - **Changed code:** before review, `repair` (below); after review started, create a new run. **Changed policy:** create a new run. Do not modify frozen snapshots/evidence and reuse approvals.
+ - **Partial candidate/worktree allocation:** preserve and inspect it. Automatic destructive cleanup or speculative Git conflict resolution is intentionally unavailable.
+-- **Claude Code unavailable (exit 75):** an update replacing the `claude` binary, or its background service restarting, is not a verdict on any session. Every `claude` call the controller makes waits it out for 60 seconds: a launch, a print job or a stop is repeated only when its exec failed (nothing ran, so none ever starts twice), and the `claude agents --json` listing, which only reads, is asked again every 2 seconds while it fails, prints no list or hangs (each 15-second timeout counts against the 60). After that the automatic controller stops nothing: it records an `interrupted` event naming the cause, and `automatic` (also `launch --automatic` and `resume`) exits 75 with the resume command and any stale Claude processes to restart (its `automatic-step` child exits 69, EX_UNAVAILABLE, which the supervisor turns into that 75, whichever step was running; 75 from a step still means a checkpoint persisted). The service also respawns idle sessions (a finished lane, a lane paused on a question, a reviewer that wrote its file) under new PIDs, about 15 seconds after it restarts or at any later time: while `claude agents` lists such a session without a PID, in a state between two processes, with its ended PID or not at all, the worker and reviewer waits, the reviewers' identity check before the verdict and every stop look again every 2 seconds, and a stop follows the new PID (same background id and session UUID); a gap that lasts 30 seconds counts as Claude Code unavailable. Only a stop already issued (`issued` in `<node>.stop.json`, written right before `claude stop` runs) counts a session the listing leaves out as stopped. Once `claude --version` works, run `"$PY" -m workflow automatic "$RUN" --live`: it waits for the same sessions again (a review interrupted this way re-enters its node, rebinding the running reviewers; a freeze re-enters, marked by `freeze-interrupted.json`, completing the stops it recorded in `<lane>.stop.json`; each marker is removed only once that re-entry ends, so a Ctrl-C or a closed terminal during it leaves the run resumable the same way); nothing is relaunched. A reviewer launch it interrupts leaves the review at `needs_reconciliation` (below). A deadline, a `blocked` completion, a rejected file, a `stopped` or `failed` session or a changed session identity still stops the sessions. A session still missing after 30 seconds makes every `automatic --live` exit 75 the same way: `claude agents --json --all` and `claude logs <id>` show whether it ended; waking it with `claude attach <id>`, or stopping the run (below), is your decision.
++- **Claude Code unavailable (exit 75):** an update replacing the `claude` binary, or its background service restarting, is not a verdict on any session. Every `claude` call the controller makes waits it out for 60 seconds: a launch, a print job or a stop is repeated only when its exec failed (nothing ran, so none ever starts twice), and the `claude agents --json` listing, which only reads, is asked again every 2 seconds while it fails, prints no list or hangs (each 15-second timeout counts against the 60). After that the automatic controller stops nothing: it records an `interrupted` event naming the cause, and `automatic` (also `launch --automatic` and `resume`) exits 75 with the resume command and any stale Claude processes to restart (its `automatic-step` child exits 69, EX_UNAVAILABLE, which the supervisor turns into that 75, whichever step was running; 75 from a step still means a checkpoint persisted). The service also respawns idle sessions (a finished lane, a lane paused on a question, a reviewer that wrote its file) under new PIDs, about 15 seconds after it restarts or at any later time: while `claude agents` lists such a session without a PID, in a state between two processes, with its ended PID or not at all, the worker and reviewer waits, the reviewers' identity check before the verdict and every stop look again every 2 seconds, and a stop follows the new PID (same background id and session UUID); a gap that lasts 30 seconds counts as Claude Code unavailable. Only a stop already issued (`issued` in `<node>.stop.json`, written right before `claude stop` runs, and cleared when it exits non-zero, as it does while the service restarts) counts a session the listing leaves out as stopped; a failed stop is issued again to the respawned session. Once `claude --version` works, run `"$PY" -m workflow automatic "$RUN" --live`: it waits for the same sessions again (a review interrupted this way re-enters its node, rebinding the running reviewers; a freeze re-enters, marked by `freeze-interrupted.json`, completing the stops it recorded in `<lane>.stop.json`; each marker is removed only once that re-entry ends, so a Ctrl-C or a closed terminal during it leaves the run resumable the same way); nothing is relaunched. A reviewer launch it interrupts leaves the review at `needs_reconciliation` (below), and a print review it interrupts terminates its jobs: no resume continues either, so the controller records a `blocked` event naming the cause and `automatic` exits 1. A deadline, a `blocked` completion, a rejected file, a `stopped` or `failed` session or a changed session identity still stops the sessions: every lane's stop is attempted, and the ones that cannot be confirmed (usually that lane's own) are named together on the timeline. A session still missing after 30 seconds makes every `automatic --live` exit 75 the same way: `claude agents --json --all` and `claude logs <id>` show whether it ended; waking it with `claude attach <id>`, or stopping the run (below), is your decision.
+ - **Usage exhausted:** workers stay at the manual terminal/handoff boundary. Preserve their receipts/worktrees, record the decision, and ask the owner to wait or approve a new plan/provider. The system never switches to another payment/provider mode or replays an opaque Claude workflow automatically.
+ - **Stopping an unfinished run:** use the exact native IDs from its receipts (`<lane>.interactive.json` for every selected lane and, in automatic mode, `review.interactive.json` or `review-<id>.interactive.json` for every reviewer) with Claude's `stop` command after verifying identity. Closing Herdr alone is not a stop. All run artifacts/worktrees are retained; cleanup is a separate operator decision.
+ - **Reviewer needs reconciliation:** `automatic-review.json` at `needs_reconciliation` or `blocked` never relaunches a reviewer. Inspect each reviewer's `.interactive.json`, `.launch.log` and status file (`automatic-review.json` for the built-in reviewer, `automatic-review-<id>.json` per declared reviewer) and `claude agents --json`, stop a stray reviewer by its exact ID, and start a new run for a fresh review.
+@@ -387,7 +387,7 @@ cd "$RUN/review-worktree" && claude --resume <uuid>   # reread or continue a rev
+ | `challenge-<n>.prompt.txt`, `challenge-<n>.stdout.json`, `challenge-<n>.stderr.log`, `challenge.running.json` | `start`, `resume` | a challenge job's prompt, output and in-flight marker |
+ | `challenge-worktree/`, `challenge-inputs/` | `start`, `prepare` | the read-only base-commit checkout the challenge reads, the pinned PRD copy |
+ | `challenge-revision.json` | `resume` | a move to revised feature files in progress (old base, paths); `start` and `--accept-challenge` refuse while it exists |
+-| `<node>.stop.json` | stop | identity-checked stop marker (`issued` once `claude stop` runs) |
++| `<node>.stop.json` | stop | identity-checked stop marker (`issued` once `claude stop` runs, cleared if it fails) |
+ | `freeze-interrupted.json` | controller | the cause of a freeze Claude Code's unavailability interrupted; the next `automatic --live` re-enters the freeze and removes it once that re-entry ends |
+ | `candidate.json`, `candidate/`, `candidate-<g>.json`, `candidate-<g>/` | candidate | the combined revision and its worktree; generation g after g lane repairs |
+ | `repairs.json`, `repair-<n>.diff` | `repair` | the lane repairs (snapshots, attempt floors, fork) and each repair's change per lane |
+diff --git a/workflow/automatic.py b/workflow/automatic.py
+index 7d12f37..2d1d090 100644
+--- a/workflow/automatic.py
++++ b/workflow/automatic.py
+@@ -600,6 +600,13 @@ def rebind_reviewers(runtime, state: ReviewStatus) -> None:
+             try:
+                 bound = runtime.reconcile_reviewer(reviewer_id)
+             except Exception as error:
++                if isinstance(error, TransientInfraError) and not partial:
++                    # Claude Code itself was unavailable, not a verdict: the reviewer keeps running, its receipt unbound. The
++                    # marker lets the next controller re-enter the review and rebind it again (review_interrupted).
++                    combined["interrupted"] = str(error)
++                    state.save()
++                    runtime.event("review", "interrupted", f"{error}. {REVIEW_RESUME_NOTE.format(directory=runtime.directory)}")
++                    raise
+                 status.update(status="needs_reconciliation", error=str(error))
+                 combined.update(status="needs_reconciliation", error=str(error))
+                 state.save()
+@@ -1269,9 +1276,12 @@ def drive(runtime, *, single_step=False) -> str | None:
+                 failed = graph.get_state(config)
+                 if not any(task.error for task in failed.tasks):
+                     raise
+-                if isinstance(error, TransientInfraError):
+-                    # Claude Code itself was unavailable, whichever node called it: no verdict on any session. Raised, so
+-                    # the step exits 69 (75 would claim a persisted checkpoint to continue from) and `automatic` exits 75.
++                if isinstance(error, TransientInfraError) and (freeze_failure(failed) or review_interrupted(runtime, failed)
++                                                                or reviewer_stop_pending(runtime, failed)):
++                    # Claude Code itself was unavailable, whichever node called it, and the next controller continues what it
++                    # left (the freeze's recorded stops, native reviewers still running, an accepted review's stops): no verdict
++                    # on any session. Raised, so the step exits 69 (75 would claim a persisted checkpoint to continue from)
++                    # and `automatic` exits 75.
+                     if freeze_failure(failed):
+                         save_json(runtime.directory / FREEZE_INTERRUPTED, {"error": str(error)})
+                         runtime.event("freeze", "interrupted", f"{error}. {FREEZE_RESUME_NOTE.format(directory=runtime.directory)}")
+@@ -1279,6 +1289,12 @@ def drive(runtime, *, single_step=False) -> str | None:
+                         runtime.event("controller", "interrupted", f"{error}. {UNAVAILABLE_NOTE.format(directory=runtime.directory)}")
+                     settle_interruption(runtime, failed)
+                     raise
++                if isinstance(error, TransientInfraError):
++                    # Exit 75 is only for a state `automatic --live` continues. This node ended on the outage for good (a print
++                    # review terminated its jobs, a reviewer launch needs reconciliation): the run is blocked, classified below.
++                    names = ", ".join(task.name for task in failed.tasks if task.error and task.name in failed.next)
++                    runtime.event("controller", "blocked", f"{error}. The {names} step ended on it in a state no resume continues; "
++                                                           "inspect retained evidence")
+                 settle_interruption(runtime)
+                 if reviewer_stop_pending(runtime, failed):
+                     # Not retried in this loop: the operator inspects the session first; a resumed
+diff --git a/workflow/pipeline.py b/workflow/pipeline.py
+index 59108e7..431bac7 100644
+--- a/workflow/pipeline.py
++++ b/workflow/pipeline.py
+@@ -371,6 +371,10 @@ class Pipeline:
+                     save_json(marker, intent)
+                     raise
+                 if result.returncode != 0:
++                    # It ran and failed (a restarting background service refuses it, then respawns the session): nothing
++                    # confirms it, so it is still owed and a retry looks through the respawn gap instead of trusting absence.
++                    intent["issued"] = False
++                    save_json(marker, intent)
+                     raise RuntimeError(f"Stop failed for {node}; inspect native session before retrying")
+             # Recover stop-before-receipt without issuing another stop command.
+             rows = self.sessions.inventory()
+@@ -380,8 +384,18 @@ class Pipeline:
+             save_json(marker, intent)
+ 
+     def stop_workers(self):
++        """Stop every lane, continuing past failures, so no session keeps using quota for a run that cannot continue (the lane
++        that blocked a wait is often one whose stop is refused); the unconfirmed ones are then raised together, by lane."""
++        failures = {}
+         for node in self.workers:
+-            self.stop_session(node)
++            try:
++                self.stop_session(node)
++            except Exception as error:
++                failures[node] = error
++        if failures:
++            # Claude Code unavailable for each of them keeps a freeze resumable; any other refusal decides the run.
++            transient = all(isinstance(error, TransientInfraError) for error in failures.values())
++            raise (TransientInfraError if transient else RuntimeError)("; ".join(f"{node}: {error}" for node, error in failures.items()))
+         stopped_ids = {read_json(self.directory / f"{node}.stop.json")["session_id"] for node in self.workers}
+         if any(row.get("sessionId") in stopped_ids and row.get("pid") for row in self.sessions.inventory()):
+             raise RuntimeError("A stopped worker was restarted; reconcile before snapshot capture")
+diff --git a/workflow/sessions.py b/workflow/sessions.py
+index 2f8abac..d440623 100644
+--- a/workflow/sessions.py
++++ b/workflow/sessions.py
+@@ -218,7 +218,9 @@ UPDATE_ERRNOS = {errno.ENOENT, errno.ENOEXEC, errno.ETXTBSY}
+ class TransientInfraError(RuntimeError):
+     """Claude Code itself is unavailable: an update is replacing the binary, or the background service is restarting.
+ 
+-    It is not a verdict on any session, so the automatic controller stops nothing on it and exits resumable.
++    It is not a verdict on any session, so the automatic controller stops nothing on it and exits resumable, wherever the
++    next controller continues the step: a print review it interrupts has terminated its jobs, and a reviewer launch it
++    interrupts needs reconciliation, so those block the run.
+     Raised by type at the source (run_claude and friends, the session inventory); never classified from message text.
+     """
+ 

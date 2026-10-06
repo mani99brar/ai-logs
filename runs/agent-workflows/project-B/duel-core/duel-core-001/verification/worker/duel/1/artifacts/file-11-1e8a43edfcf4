@@ -1,0 +1,456 @@
+import { describe, expect, it } from "vitest";
+import {
+  canAct,
+  createDuelState,
+  defaultDuelConfig as config,
+  duelInput as I,
+  MOVESET_VERSION,
+  mirrorBox,
+  overlaps,
+  stepDuel,
+  traceDuel,
+  worldBox,
+  type DuelInputs,
+  type DuelState,
+  type FighterState,
+} from "./index.js";
+
+const { rules, fighter: body, arena } = config.moveset;
+const HALF = body.pushbox.halfWidth;
+const RIGHT_WALL = arena.width - HALF;
+const R = I("right");
+const L = I("left");
+const LIGHT = I("light");
+const HEAVY = I("heavy");
+const THROW = I("light", "heavy");
+
+/** A duel with the fighters at `x0` and `x1`, optionally changed, at `frame`. */
+function duel(x0: number, x1: number, patch0: Partial<FighterState> = {}, patch1: Partial<FighterState> = {}, frame = 0): DuelState {
+  const state = createDuelState(config, { x: [x0, x1] });
+  return { ...state, frame, fighters: [{ ...state.fighters[0], ...patch0 }, { ...state.fighters[1], ...patch1 }] };
+}
+
+/** Player two against the right wall (holding right is its guard), player one `dx` to its left. */
+function cornered(dx: number, patch0: Partial<FighterState> = {}, patch1: Partial<FighterState> = {}): DuelState {
+  return duel(RIGHT_WALL - dx, RIGHT_WALL, patch0, patch1);
+}
+
+function hold(frames: number, p1 = 0, p2 = 0): DuelInputs[] {
+  return Array.from({ length: frames }, () => [p1, p2] as const);
+}
+
+function script(...parts: DuelInputs[][]): DuelInputs[] {
+  return parts.flat();
+}
+
+/** Every state from the initial one; `trace[k]` is the state after k frames. */
+function run(state: DuelState, inputs: readonly DuelInputs[]): DuelState[] {
+  return traceDuel(config, state, inputs);
+}
+
+function events(trace: readonly DuelState[]) {
+  return trace.flatMap((state) => state.events.map((event) => ({ frame: state.frame, ...event })));
+}
+
+/** The first frame after `after` on which the fighter can start something. */
+function firstFreeFrame(trace: readonly DuelState[], index: 0 | 1, after: number): number {
+  for (let frame = after; frame < trace.length; frame++) if (canAct(trace[frame]!.fighters[index])) return frame + 1;
+  throw new Error("the fighter never became free");
+}
+
+describe("round and result (§7)", () => {
+  it("starts both fighters apart, facing each other, with 1,000 health and full stamina", () => {
+    const state = createDuelState(config);
+    expect(state).toMatchObject({ frame: 0, phase: "round", result: null, movesetVersion: MOVESET_VERSION });
+    expect(state.fighters[0]).toMatchObject({ x: arena.width / 2 - arena.startGap / 2, y: 0, facing: 1, health: 1000, stamina: 100, action: "idle" });
+    expect(state.fighters[1]).toMatchObject({ x: arena.width / 2 + arena.startGap / 2, y: 0, facing: -1, health: 1000, stamina: 100 });
+    // No free opening hit: nothing reaches from the start positions.
+    const trace = run(state, script(hold(1, HEAVY, I("down", "heavy")), hold(30), hold(1, I("special1"), LIGHT), hold(60)));
+    expect(events(trace)).toEqual([]);
+  });
+
+  it("ends the one round after 3,600 frames and gives the timeout to higher health", () => {
+    expect(rules.roundFrames).toBe(3600);
+    const trace = run(duel(3000, 7000, { health: 640 }, { health: 700 }), hold(3600));
+    expect(trace[3599]!.result).toBeNull();
+    expect(trace[3600]!.result).toEqual({ winner: 1, reason: "timeout", frame: 3600 });
+    expect(trace[3600]!.phase).toBe("over");
+  });
+
+  it("goes to ten seconds of overtime on equal health, and an exact tie after it is a draw", () => {
+    const trace = run(createDuelState(config), hold(4200));
+    expect(trace[3600]).toMatchObject({ phase: "overtime", result: null });
+    expect(trace[4199]!.result).toBeNull();
+    expect(trace[4200]!.result).toEqual({ winner: null, reason: "overtime", frame: 4200 });
+  });
+
+  it("compares health again when overtime ends", () => {
+    const tied = run(createDuelState(config), hold(3600))[3600]!;
+    const close: DuelState = { ...tied, fighters: [{ ...tied.fighters[0], x: 5000 }, { ...tied.fighters[1], x: 5600 }] };
+    const trace = run(close, script(hold(1, LIGHT), hold(599)));
+    expect(trace[600]!.fighters[1].health).toBe(955);
+    expect(trace[600]!.result).toEqual({ winner: 0, reason: "overtime", frame: 4200 });
+  });
+
+  it("only advances the frame counter once the duel is over", () => {
+    const over = run(createDuelState(config), hold(4200))[4200]!;
+    const after = stepDuel(config, over, [R, LIGHT]);
+    expect(after).toEqual({ ...over, frame: 4201, events: [] });
+  });
+
+  it("lets a KO on the final round frame beat the timeout", () => {
+    // Player two leads on health, so the timeout would be theirs; player one's jab lands on frame 3600.
+    const start = duel(5000, 5600, { health: 40 }, { health: 45 }, 3592);
+    expect(run(start, hold(8))[8]!.result).toEqual({ winner: 1, reason: "timeout", frame: 3600 });
+    const trace = run(start, script(hold(1, LIGHT), hold(7)));
+    expect(trace[8]!.frame).toBe(3600);
+    expect(trace[8]!.result).toEqual({ winner: 0, reason: "ko", frame: 3600 });
+  });
+
+  it("makes two simultaneous lethal hits a draw", () => {
+    const trace = run(duel(5000, 5600, { health: 45 }, { health: 45 }), script(hold(1, LIGHT, LIGHT), hold(7)));
+    expect(trace[8]!.fighters.map((fighter) => fighter.health)).toEqual([0, 0]);
+    expect(trace[8]!.result).toEqual({ winner: null, reason: "double-ko", frame: 8 });
+  });
+
+  it("applies both fighters' hits of a frame before declaring a KO, whichever player is first", () => {
+    for (const lethal of [0, 1] as const) {
+      const start = duel(5000, 5600, lethal === 0 ? {} : { health: 45 }, lethal === 0 ? { health: 45 } : {});
+      const trace = run(start, script(hold(1, LIGHT, LIGHT), hold(7)));
+      const frame = trace[8]!;
+      expect(frame.fighters[lethal].health).toBe(955);
+      expect(frame.fighters[lethal === 0 ? 1 : 0].health).toBe(0);
+      expect(frame.result).toEqual({ winner: lethal, reason: "ko", frame: 8 });
+    }
+  });
+});
+
+describe("movement (§7, §8)", () => {
+  it("walks forward and back at their speeds", () => {
+    const trace = run(duel(3000, 7000), script(hold(10, R, L), hold(10, L, R)));
+    expect(trace[10]!.fighters.map((fighter) => fighter.x)).toEqual([3000 + 10 * body.walkForwardSpeed, 7000 - 10 * body.walkForwardSpeed]);
+    expect(trace[20]!.fighters.map((fighter) => fighter.x)).toEqual([3480 - 10 * body.walkBackSpeed, 6520 + 10 * body.walkBackSpeed]);
+    expect(trace[20]!.fighters[0].action).toBe("walk");
+  });
+
+  it("treats both horizontal directions together as neutral", () => {
+    const trace = run(duel(3000, 7000), script(hold(10, I("left", "right"), I("right", "left")), hold(1, I("left", "right", "down"))));
+    expect(trace[10]!.fighters.map((fighter) => [fighter.x, fighter.action])).toEqual([
+      [3000, "idle"],
+      [7000, "idle"],
+    ]);
+    expect(trace[11]!.fighters[0]).toMatchObject({ x: 3000, action: "crouch", crouching: true });
+    expect(run(duel(3000, 7000), hold(1, I("up", "down")))[1]!.fighters[0]).toMatchObject({ y: 0, action: "idle" });
+  });
+
+  it("crouches in place while down is held", () => {
+    const trace = run(duel(3000, 7000), hold(5, I("down", "right")));
+    expect(trace[5]!.fighters[0]).toMatchObject({ x: 3000, action: "crouch", crouching: true });
+  });
+
+  it("jumps for 40 frames and lands", () => {
+    const trace = run(duel(3000, 7000), script(hold(1, I("up")), hold(45)));
+    expect(trace[1]!.fighters[0].y).toBe(body.jumpVelocity);
+    for (let frame = 1; frame <= 40; frame++) expect(trace[frame]!.fighters[0].y).toBeGreaterThan(0);
+    expect(trace[41]!.fighters[0]).toMatchObject({ y: 0, vy: 0, action: "idle" });
+  });
+
+  it("auto-faces the opponent after a jump crosses over them", () => {
+    const trace = run(duel(4000, 4992), script(hold(1, I("up", "right")), hold(50)));
+    const [one, two] = trace[51]!.fighters;
+    expect(one.x).toBeGreaterThan(two.x);
+    expect([one.facing, two.facing]).toEqual([-1, 1]);
+  });
+
+  it("dashes forward and backdashes for 20 stamina each, and not below 20", () => {
+    const dash = run(duel(3000, 7000), script(hold(1, I("dash")), hold(20)));
+    expect(dash[1]!.fighters[0]).toMatchObject({ action: "dash", stamina: 80 });
+    expect(dash[21]!.fighters[0]).toMatchObject({ x: 3000 + body.dashFrames * body.dashSpeed, action: "idle" });
+    const backdash = run(duel(3000, 7000), script(hold(1, I("left", "dash")), hold(20)));
+    expect(backdash[1]!.fighters[0]).toMatchObject({ action: "backdash", stamina: 80 });
+    expect(backdash[21]!.fighters[0].x).toBe(3000 - body.backdashFrames * body.backdashSpeed);
+    const tired = run(duel(3000, 7000, { stamina: 19 }), script(hold(1, I("dash")), hold(20)));
+    expect(tired[21]!.fighters[0]).toMatchObject({ x: 3000, stamina: 19 });
+  });
+
+  it("keeps fighters inside the walls", () => {
+    const trace = run(duel(HALF + 100, RIGHT_WALL - 100), script(hold(10, L, R), hold(1, I("left", "dash"), I("right", "dash")), hold(20)));
+    for (const state of trace.slice(10)) expect(state.fighters.map((fighter) => fighter.x)).toEqual([HALF, RIGHT_WALL]);
+  });
+
+  it("never lets the two pushboxes overlap", () => {
+    const trace = run(duel(5000, 5600), script(hold(40, R), hold(20, I("dash"), I("dash"))));
+    for (const state of trace) expect(Math.abs(state.fighters[1].x - state.fighters[0].x)).toBeGreaterThanOrEqual(2 * HALF);
+    expect(trace[40]!.fighters[1].x).toBeGreaterThan(5600);
+  });
+});
+
+describe("guard (§7)", () => {
+  const outcome = (p1: number, p2: number, frames = 30) =>
+    events(run(cornered(600), script(hold(1, p1, p2), hold(frames, 0, p2)))).map(({ kind, moveId }) => `${kind} ${moveId}`);
+
+  it("blocks highs and mids with standing guard (holding back)", () => {
+    expect(outcome(HEAVY, R)).toEqual(["block heavy-mid"]);
+    expect(outcome(I("down", "light"), R)).toEqual(["block anti-air"]);
+  });
+
+  it("blocks lows with crouching guard (down-back)", () => {
+    expect(outcome(I("down", "heavy"), I("down", "right"))).toEqual(["block low-sweep"]);
+  });
+
+  it("loses to a low when standing and to a mid when crouching", () => {
+    expect(outcome(I("down", "heavy"), R)).toEqual(["hit low-sweep"]);
+    expect(outcome(HEAVY, I("down", "right"))).toEqual(["hit heavy-mid"]);
+  });
+
+  it("avoids highs while crouching, guarding or not", () => {
+    expect(outcome(I("down", "light"), I("down"))).toEqual([]);
+    expect(outcome(I("down", "light"), I("down", "right"))).toEqual([]);
+    expect(outcome(I("special2"), I("down"))).toEqual([]);
+  });
+
+  it("does not guard without holding back, or with both directions held", () => {
+    expect(outcome(HEAVY, 0)).toEqual(["hit heavy-mid"]);
+    expect(outcome(HEAVY, L)).toEqual(["hit heavy-mid"]);
+    expect(outcome(HEAVY, I("left", "right"))).toEqual(["hit heavy-mid"]);
+  });
+
+  it("deals the move's damage on hit and none on block", () => {
+    expect(run(cornered(600), script(hold(1, HEAVY), hold(30)))[31]!.fighters[1].health).toBe(890);
+    expect(run(cornered(600), script(hold(1, HEAVY, R), hold(30, 0, R)))[31]!.fighters[1].health).toBe(1000);
+  });
+});
+
+describe("throws (§7)", () => {
+  it("beats standing and crouching guard, landing after the ten-frame escape window", () => {
+    for (const guard of [R, I("down", "right")]) {
+      const trace = run(cornered(600), script(hold(1, THROW, guard), hold(40, 0, guard)));
+      expect(events(trace)).toEqual([
+        { frame: 13, kind: "grab", attacker: 0, moveId: "throw", damage: 0 },
+        { frame: 24, kind: "throw", attacker: 0, moveId: "throw", damage: 120 },
+      ]);
+      expect(trace[24]!.fighters[1]).toMatchObject({ health: 880, action: "knockdown" });
+    }
+  });
+
+  it("can be escaped by either player on any of the ten frames after the grab", () => {
+    // Player one throws player two into the right wall, or player two throws player one into the left wall.
+    const setups = [
+      { thrower: 0, start: cornered(600) },
+      { thrower: 1, start: duel(HALF, HALF + 600) },
+    ] as const;
+    for (const { thrower, start } of setups) {
+      const defender = thrower === 0 ? 1 : 0;
+      const attempt = (frame: number) => {
+        const inputs = hold(40);
+        inputs[0] = thrower === 0 ? [THROW, 0] : [0, THROW];
+        inputs[frame - 1] = defender === 0 ? [THROW, 0] : [0, THROW];
+        const trace = run(start, inputs);
+        return { trace, kinds: events(trace).map((event) => `${event.frame} ${event.kind}`) };
+      };
+      for (const frame of [14, 23]) {
+        const { trace, kinds } = attempt(frame);
+        expect(kinds).toEqual(["13 grab", `${frame} throw-escape`]);
+        expect(trace[frame]!.fighters.map((fighter) => [fighter.action, fighter.health])).toEqual([
+          ["throw-break", 1000],
+          ["throw-break", 1000],
+        ]);
+      }
+      // A press on the grab frame is too early and one on frame 24 too late.
+      expect(attempt(13).kinds).toEqual(["13 grab", "24 throw"]);
+      expect(attempt(24).kinds).toEqual(["13 grab", "24 throw"]);
+    }
+  });
+
+  it("breaks two throws on the same frame with no damage", () => {
+    const trace = run(cornered(600), script(hold(1, THROW, THROW), hold(30)));
+    expect(events(trace).map(({ frame, kind, attacker, damage }) => [frame, kind, attacker, damage])).toEqual([
+      [13, "throw-clash", 0, 0],
+      [13, "throw-clash", 1, 0],
+    ]);
+    const [one, two] = trace[13]!.fighters;
+    expect([one.action, two.action, one.health, two.health]).toEqual(["throw-break", "throw-break", 1000, 1000]);
+    expect(two.x - one.x).toBeGreaterThan(600);
+  });
+
+  it("loses to a strike whose hitbox is active while the throw is active", () => {
+    // Both the jab (frames 13-15) and the throw (13-14) are active on frame 13.
+    const trace = run(cornered(600), script(hold(1, 0, THROW), hold(4), hold(1, LIGHT), hold(30)));
+    expect(events(trace).map(({ frame, kind, moveId }) => `${frame} ${kind} ${moveId}`)).toEqual(["13 hit jab"]);
+    expect(trace[36]!.fighters[0].health).toBe(1000);
+  });
+
+  it("loses to a strike that is active during the throw's startup", () => {
+    const trace = run(cornered(600), script(hold(1, LIGHT), hold(1), hold(1, 0, THROW), hold(30)));
+    expect(events(trace).map(({ frame, kind, moveId }) => `${frame} ${kind} ${moveId}`)).toEqual(["8 hit jab"]);
+  });
+
+  it("beats a strike that is still in startup", () => {
+    const trace = run(cornered(600), script(hold(1, HEAVY, THROW), hold(30)));
+    expect(events(trace).map(({ frame, kind, attacker }) => `${frame} ${kind} ${attacker}`)).toEqual(["13 grab 1", "24 throw 1"]);
+  });
+});
+
+describe("stamina (§7)", () => {
+  it("charges 10 to block a light, 25 a heavy and 20 a special", () => {
+    const blocked = (start: DuelState, attack: number) => run(start, script(hold(1, attack, R), hold(30, 0, R)))[31]!.fighters[1].stamina;
+    expect(blocked(cornered(600), LIGHT)).toBe(90);
+    expect(blocked(cornered(600), HEAVY)).toBe(75);
+    expect(blocked(cornered(1000), I("special1"))).toBe(80);
+  });
+
+  it("regenerates 20 a second after one second without spending or blocking", () => {
+    const trace = run(duel(3000, 7000), script(hold(1, I("dash")), hold(140)));
+    const stamina = (frame: number) => trace[frame]!.fighters[0].stamina;
+    expect([stamina(1), stamina(61), stamina(63), stamina(64), stamina(121), stamina(141)]).toEqual([80, 80, 80, 81, 100, 100]);
+  });
+
+  it("restarts the regeneration delay on every block", () => {
+    const trace = run(cornered(600, {}, { stamina: 50 }), script(hold(1, LIGHT, R), hold(100, 0, R)));
+    expect(trace[8]!.fighters[1].stamina).toBe(40);
+    expect(trace[8 + 60]!.fighters[1].stamina).toBe(40);
+    expect(trace[8 + 63]!.fighters[1].stamina).toBe(41);
+  });
+
+  it("breaks the guard when a block costs more than the stamina left: 30 frames of stagger, 30 stamina back", () => {
+    const trace = run(cornered(600, {}, { stamina: 5 }), script(hold(1, LIGHT, R), hold(60, 0, R)));
+    expect(events(trace)[0]).toEqual({ frame: 8, kind: "guard-break", attacker: 0, moveId: "jab", damage: 0 });
+    expect(trace[8]!.fighters[1]).toMatchObject({ action: "stagger", stamina: 30, health: 1000 });
+    expect(firstFreeFrame(trace, 1, 8)).toBe(8 + rules.guardBreakStaggerFrames);
+  });
+
+  it("leaves the staggered fighter open to a punish even while holding back", () => {
+    const trace = run(cornered(600, {}, { stamina: 5 }), script(hold(1, LIGHT, R), hold(21, 0, R), hold(1, LIGHT, R), hold(20, 0, R)));
+    expect(events(trace).map(({ frame, kind }) => `${frame} ${kind}`)).toEqual(["8 guard-break", "30 hit"]);
+  });
+
+  it("decides a guard break from the stamina held at the start of the frame", () => {
+    const block = (stamina: number) => run(cornered(600, {}, { stamina }), script(hold(1, HEAVY, R), hold(20, 0, R)))[19]!.fighters[1];
+    expect(block(25)).toMatchObject({ action: "blockstun", stamina: 0 });
+    expect(block(24)).toMatchObject({ action: "stagger", stamina: 30 });
+  });
+});
+
+describe("damage and combos (§7)", () => {
+  /** Player one mashes light (a press every other frame) at player two, who stands still. */
+  const mash = (frames: number) => run(cornered(600), Array.from({ length: frames }, (_, index) => [index % 2 === 0 ? LIGHT : 0, 0] as const));
+
+  it("scales a combo's damaging hits by 100, 80, 65, 50 and 40 percent", () => {
+    expect(rules.comboScaling).toEqual([100, 80, 65, 50, 40]);
+    const hits = events(mash(100)).filter((event) => event.kind === "hit");
+    expect(hits.map((hit) => hit.damage)).toEqual([45, 36, 29, 22, 18]);
+    expect(hits.map((hit) => hit.frame)).toEqual([8, 30, 52, 74, 96]);
+  });
+
+  it("forces a non-juggleable recovery on the fifth damaging hit, then starts a fresh combo", () => {
+    const trace = mash(150);
+    expect(trace[96]!.fighters[1]).toMatchObject({ action: "knockdown", combo: 5 });
+    const hits = events(trace).filter((event) => event.kind === "hit");
+    // The sixth jab (active 118-120) passes through the recovering fighter; the seventh starts a new combo.
+    expect(hits.map((hit) => [hit.frame, hit.damage])).toEqual([
+      [8, 45],
+      [30, 36],
+      [52, 29],
+      [74, 22],
+      [96, 18],
+      [140, 45],
+    ]);
+    expect(firstFreeFrame(trace, 1, 96)).toBe(96 + rules.forcedRecoveryFrames);
+  });
+});
+
+describe("input buffer (§8)", () => {
+  // A whiffed heavy mid (46 frames) leaves player one free on frame 47.
+  const pressLightAt = (frame: number) => {
+    const inputs = hold(50);
+    inputs[0] = [HEAVY, 0];
+    inputs[frame - 1] = [LIGHT, 0];
+    return run(duel(3000, 7000), inputs)[47]!.fighters[0];
+  };
+
+  it("keeps a press for four frames", () => {
+    expect(pressLightAt(44)).toMatchObject({ action: "attack", moveId: "jab", actionFrame: 1 });
+    expect(pressLightAt(46)).toMatchObject({ action: "attack", moveId: "jab", actionFrame: 1 });
+  });
+
+  it("drops a press older than four frames", () => {
+    expect(pressLightAt(43)).toMatchObject({ action: "idle" });
+  });
+});
+
+describe("frame advantage", () => {
+  // The heavy mid reaches a standing hurtbox whose origin is less than 1280 sub-pixels (80 px) away.
+  const blocked = (start: DuelState, punishAt?: number) => {
+    const inputs = script(hold(1, HEAVY, R), hold(60, 0, R));
+    if (punishAt !== undefined) for (let frame = punishAt; frame <= inputs.length; frame++) inputs[frame - 1] = [0, frame === punishAt ? LIGHT : 0];
+    return run(start, inputs);
+  };
+
+  for (const [label, start] of [
+    ["at its longest reach, in the corner", cornered(1279)],
+    ["midscreen, with the defender walking back", duel(5000, 5512)],
+  ] as const) {
+    it(`makes the heavy mid −12 on block and punishable by a jab (${label})`, () => {
+      const trace = blocked(start);
+      expect(events(trace).map(({ frame, kind }) => `${frame} ${kind}`)).toEqual(["19 block"]);
+      const attackerFree = firstFreeFrame(trace, 0, 19);
+      const defenderFree = firstFreeFrame(trace, 1, 19);
+      expect(attackerFree - defenderFree).toBe(12);
+      // The blocked heavy leaves at most 1343 sub-pixels; the jab reaches a standing hurtbox up to 1343 away.
+      const [attacker, defender] = trace[19]!.fighters;
+      expect(defender.x - attacker.x).toBeLessThanOrEqual(1343);
+
+      const punished = blocked(start, defenderFree);
+      const jab = events(punished).find((event) => event.attacker === 1)!;
+      expect(jab).toMatchObject({ kind: "hit", moveId: "jab", frame: defenderFree + 7 });
+      expect(jab.frame).toBeLessThan(attackerFree);
+      expect(punished[jab.frame - 1]!.fighters[0]).toMatchObject({ action: "attack", moveId: "heavy-mid" });
+    });
+  }
+
+  it("does not reach 80 px", () => {
+    expect(events(blocked(cornered(1280)))).toEqual([]);
+  });
+});
+
+describe("the Duelist's other moves", () => {
+  it("launches with the launcher (forward + heavy)", () => {
+    const trace = run(cornered(600), script(hold(1, I("right", "heavy")), hold(20)));
+    expect(events(trace).map(({ frame, kind, moveId }) => `${frame} ${kind} ${moveId}`)).toEqual(["17 hit launcher"]);
+    expect(trace[18]!.fighters[1].y).toBeGreaterThan(0);
+  });
+
+  it("catches a jump with the anti-air (down + light)", () => {
+    const inputs = script(hold(1, 0, I("up")), hold(8), hold(1, I("down", "light")), hold(20));
+    const hits = events(run(duel(5000, 5700), inputs));
+    expect(hits.map(({ frame, kind, moveId }) => `${frame} ${kind} ${moveId}`)).toEqual(["16 hit anti-air"]);
+  });
+
+  it("lets strikes pass through the counter slash's startup", () => {
+    const trace = run(cornered(600), script(hold(1, 0, LIGHT), hold(1), hold(1, I("special2")), hold(20)));
+    expect(events(trace).map(({ frame, kind, moveId }) => `${frame} ${kind} ${moveId}`)).toEqual(["11 hit counter-slash"]);
+    expect(trace[20]!.fighters[0].health).toBe(1000);
+  });
+
+  it("advances with the advancing thrust", () => {
+    const trace = run(duel(3000, 7000), script(hold(1, I("special1")), hold(50)));
+    expect(trace[18]!.fighters[0].x).toBe(3000 + 18 * 64);
+    expect(trace[50]!.fighters[0].x).toBe(3000 + 18 * 64);
+  });
+});
+
+describe("boxes", () => {
+  it("mirrors [x, x + w) to [-x - w, -x) when facing left", () => {
+    const box = { x: 256, y: 16, w: 512, h: 32 };
+    expect(mirrorBox(box)).toEqual({ x: -768, y: 16, w: 512, h: 32 });
+    expect(worldBox(box, 1000, 0, 1)).toEqual({ x0: 1256, x1: 1768, y0: 16, y1: 48 });
+    expect(worldBox(box, 1000, 0, -1)).toEqual({ x0: 232, x1: 744, y0: 16, y1: 48 });
+  });
+
+  it("treats boxes as half-open: touching edges do not overlap", () => {
+    const a = { x0: 0, x1: 10, y0: 0, y1: 10 };
+    expect(overlaps(a, { x0: 10, x1: 20, y0: 0, y1: 10 })).toBe(false);
+    expect(overlaps(a, { x0: 9, x1: 20, y0: 0, y1: 10 })).toBe(true);
+    expect(overlaps(a, { x0: 0, x1: 10, y0: 10, y1: 20 })).toBe(false);
+  });
+});

@@ -1,0 +1,321 @@
+import { dockLabel, HEADING_COUNT, WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import { defaultSimulationConfig, dockInReach, NOT_DOCKED, toTilePosition } from "@pirate-sea-race/simulation";
+import { cssColor, slotColor, type GrappleSnapshot, type ObjectivesSnapshot, type ShipSnapshot, type StatusSnapshot } from "./matchView.js";
+
+export type ConnectionStatus = "connected" | "disconnected";
+
+export interface HudModel {
+  readonly code: string;
+  readonly protocolVersion: number;
+  readonly custom: boolean;
+  readonly status: ConnectionStatus;
+  readonly selfId: string;
+  /** Players in the match, including those out of sight. */
+  readonly players: number;
+  /** The ships the server sent: the player's own and those in sight. */
+  readonly ships: readonly ShipSnapshot[];
+  /** The world tick of the last patch. */
+  readonly worldTick: number;
+  /** This player's encounter status, once the server sent it. */
+  readonly encounter: StatusSnapshot | undefined;
+  /** The grapples in sight, or aimed at this player. */
+  readonly grapples: readonly GrappleSnapshot[];
+  /** This player's rubbings and gold, once the server sent them. */
+  readonly objectives?: ObjectivesSnapshot | undefined;
+}
+
+/** Whole seconds left until a world tick, rounded up; 0 once it has passed. */
+export function secondsUntil(tick: number, worldTick: number): number {
+  return Math.max(0, Math.ceil((tick - worldTick) / WORLD_STEPS_PER_SECOND));
+}
+
+/** A duel's elapsed time as its marker shows it (§6): minutes and seconds since the duel began. */
+export function elapsedText(startTick: number, worldTick: number): string {
+  const seconds = Math.max(0, Math.floor((worldTick - startTick) / WORLD_STEPS_PER_SECOND));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+const COMPASS = ["east", "south-east", "south", "south-west", "west", "north-west", "north", "north-east"] as const;
+
+/** The compass point (of eight) from one position toward another; y grows south. */
+export function compassToward(from: { x: number; y: number }, to: { x: number; y: number }): (typeof COMPASS)[number] {
+  const turns = Math.atan2(to.y - from.y, to.x - from.x) / (2 * Math.PI);
+  return COMPASS[(Math.round(turns * 8) + 8) % 8]!;
+}
+
+/** The compass point of a heading (of 64). */
+export function compassOfHeading(heading: number): (typeof COMPASS)[number] {
+  return COMPASS[Math.round((heading / HEADING_COUNT) * 8) % 8]!;
+}
+
+export interface HudLine {
+  readonly text: string;
+  /** What the line says, for tests and styling. */
+  readonly state: string;
+  /** Seconds left, where the line counts down. */
+  readonly seconds?: number;
+}
+
+/**
+ * The grapple (J, §6): aiming (this player's telegraph is out, with its aim), cooling down after a miss, not
+ * available (in a duel or waiting to respawn), or ready.
+ */
+export function grappleLine(model: Pick<HudModel, "selfId" | "encounter" | "grapples" | "worldTick">): HudLine {
+  const own = model.grapples.find((grapple) => grapple.attackerId === model.selfId);
+  if (own !== undefined) return { text: `Grappling, aimed ${compassOfHeading(own.aim)}`, state: "aiming", seconds: secondsUntil(own.landTick, model.worldTick) };
+  const status = model.encounter;
+  if (status !== undefined && status.mode !== "sea") return { text: "", state: "unavailable" };
+  const cooldown = status === undefined ? 0 : secondsUntil(status.cooldownUntil, model.worldTick);
+  if (cooldown > 0) return { text: `J: grapple in ${cooldown} s`, state: "cooldown", seconds: cooldown };
+  return { text: "J: grapple a ship ahead", state: "ready" };
+}
+
+/** A grapple aimed at this player (§6: escape before it lands), with the side it comes from. */
+export function incomingLine(model: Pick<HudModel, "selfId" | "grapples" | "ships" | "worldTick">): HudLine {
+  const incoming = model.grapples.find((grapple) => grapple.defenderId === model.selfId);
+  if (incoming === undefined) return { text: "", state: "none" };
+  const own = model.ships.find((ship) => ship.id === model.selfId);
+  const attacker = model.ships.find((ship) => ship.id === incoming.attackerId);
+  // Without both ships, the aim still says where it comes from: from the opposite side of its direction.
+  const from = own !== undefined && attacker !== undefined ? compassToward(own, attacker) : compassOfHeading(incoming.aim + HEADING_COUNT / 2);
+  return { text: `Incoming grapple from the ${from}! Sail out of range or out of its aim`, state: from, seconds: secondsUntil(incoming.landTick, model.worldTick) };
+}
+
+const PROTECTION_SOURCES: Record<string, string> = { spawn: "departure", win: "won a duel", draw: "drawn duel", respawn: "respawned" };
+
+/** Escape protection (§6): nobody can grapple this player until it runs out (or it grapples someone). */
+export function protectionLine(model: Pick<HudModel, "encounter" | "worldTick">): HudLine {
+  const status = model.encounter;
+  if (status === undefined || status.protection === "") return { text: "", state: "none" };
+  const seconds = secondsUntil(status.protectedUntil, model.worldTick);
+  return { text: `Protected for ${seconds} s (${PROTECTION_SOURCES[status.protection] ?? status.protection})`, state: status.protection, seconds };
+}
+
+/** The loser's wait out of the world (§6): 15 s from the end of the fight, then a dock. */
+export function respawnLine(model: Pick<HudModel, "encounter" | "worldTick">): HudLine {
+  const status = model.encounter;
+  if (status === undefined || status.mode !== "respawning") return { text: "", state: "none" };
+  const seconds = secondsUntil(status.respawnAt, model.worldTick);
+  return { text: `Duel lost: respawning at a dock in ${seconds} s`, state: "respawning", seconds };
+}
+
+const TYPE_NAMES: Readonly<Record<string, string>> = { sun: "Sun", moon: "Moon", tide: "Tide", storm: "Storm" };
+
+/** A rubbing type's name as the HUD writes it: "Sun". */
+export function typeName(type: string): string {
+  return TYPE_NAMES[type] ?? type;
+}
+
+/** The rubbings a player holds, by name: "Sun, Moon", or "none yet". */
+export function rubbingsText(types: readonly string[]): string {
+  return types.length === 0 ? "none yet" : types.map(typeName).join(", ");
+}
+
+/**
+ * What the island the player is moored at still seals (§4), which the server sends only to players moored there:
+ * "Palm Key holds: Sun, Sun", or that it holds nothing more. Empty at sea.
+ */
+export function islandLine(model: Pick<HudModel, "selfId" | "ships" | "objectives">): HudLine {
+  const own = model.ships.find((ship) => ship.id === model.selfId);
+  const objectives = model.objectives;
+  if (own === undefined || own.dock === NOT_DOCKED || objectives === undefined) return { text: "", state: "none" };
+  const island = defaultSimulationConfig.map.islands[defaultSimulationConfig.map.docks[own.dock]?.island ?? -1]?.name ?? "This island";
+  if (objectives.islandTypes.length === 0) return { text: `${island} holds no more rubbings`, state: "empty" };
+  return { text: `${island} holds: ${objectives.islandTypes.map(typeName).join(", ")}`, state: objectives.islandTypes.join(",") };
+}
+
+/** A recovery cache at the dock the player is moored at (§12): its contents, which only a player moored there sees. */
+export function cacheLine(model: Pick<HudModel, "objectives">): HudLine {
+  const types = model.objectives?.cacheTypes ?? [];
+  if (types.length === 0) return { text: "", state: "none" };
+  return { text: `Recovery cache here: ${types.map(typeName).join(", ")}`, state: types.join(",") };
+}
+
+/**
+ * Holding E at a dock (§4, §12): the hold in progress with the seconds left, or what E would do here (the island's
+ * rubbing first, then a cache's), or nothing.
+ */
+export function holdLine(model: Pick<HudModel, "objectives">): HudLine {
+  const objectives = model.objectives;
+  if (objectives === undefined) return { text: "", state: "none" };
+  if (objectives.channel !== "") {
+    const seconds = Math.max(0, Math.ceil((objectives.channelTotal - objectives.channelHeld) / WORLD_STEPS_PER_SECOND));
+    const what = objectives.channel === "collect" ? `Collecting the ${typeName(objectives.channelType)} rubbing` : `Claiming the ${typeName(objectives.channelType)} rubbing from the cache`;
+    return { text: `${what}: keep holding E, ${seconds} s left`, state: `${objectives.channel}:${objectives.channelType}`, seconds };
+  }
+  const [kind, type] = objectives.target.split(":");
+  if (kind === "collect") return { text: `Hold E to collect the ${typeName(type!)} rubbing`, state: `ready:${objectives.target}` };
+  if (kind === "claim") return { text: `Hold E to claim the ${typeName(type!)} rubbing from the cache`, state: `ready:${objectives.target}` };
+  return { text: "", state: "none" };
+}
+
+/** The hold's progress from 0 to 1, for the bar (0 without a hold). */
+export function holdProgress(objectives: ObjectivesSnapshot | undefined): number {
+  if (objectives === undefined || objectives.channel === "" || objectives.channelTotal === 0) return 0;
+  return Math.min(1, objectives.channelHeld / objectives.channelTotal);
+}
+
+/** The last finished hold: "Collected the Sun rubbing", or why it came to nothing. */
+export function resultLine(model: Pick<HudModel, "objectives">): HudLine {
+  const result = model.objectives?.channelResult ?? "";
+  if (result === "") return { text: "", state: "none" };
+  const [kind, detail] = result.split(":");
+  if (kind === "collected") return { text: `Collected the ${typeName(detail!)} rubbing`, state: result };
+  if (kind === "claimed") return { text: `Claimed the ${typeName(detail!)} rubbing from the cache`, state: result };
+  return { text: "Someone else took that rubbing first", state: result };
+}
+
+/**
+ * The last duel's settlement (§4, §11), from this player's side: what was stolen and the gold that moved. The loser
+ * sees what was taken; both see the gold change; a draw moves nothing.
+ */
+export function settlementLine(model: Pick<HudModel, "objectives">): HudLine {
+  const objectives = model.objectives;
+  if (objectives === undefined || objectives.settledRole === "") return { text: "", state: "none" };
+  const gold = Math.abs(objectives.goldChange);
+  const stolen = objectives.stolen === "" ? "" : typeName(objectives.stolen);
+  switch (objectives.settledRole) {
+    case "winner":
+      if (stolen === "") return { text: gold > 0 ? `Duel won: +${gold} gold (they held nothing you lack)` : "Duel won: nothing to take", state: "winner" };
+      return { text: `Duel won: you took the ${stolen} rubbing${gold > 0 ? ` and ${gold} gold` : ""}`, state: `winner:${objectives.stolen}` };
+    case "loser":
+      if (stolen === "") return { text: gold > 0 ? `Duel lost: -${gold} gold` : "Duel lost: nothing taken", state: "loser" };
+      return { text: `Duel lost: they took your ${stolen} rubbing${gold > 0 ? ` and ${gold} gold` : ""}`, state: `loser:${objectives.stolen}` };
+    default:
+      return { text: "Duel drawn: nothing changed hands", state: "draw" };
+  }
+}
+
+/** One option of the winner's theft choice: its key (1, 2, …), its type and its label. */
+export interface TheftOption {
+  readonly key: string;
+  readonly type: string;
+  readonly label: string;
+}
+
+/**
+ * The winner's theft choice (§4), while it is open: the eligible types on keys 1, 2, … and the whole seconds left
+ * before the default applies. Undefined for anyone else, or once settled.
+ */
+export function theftChoice(model: Pick<HudModel, "objectives" | "worldTick">): { options: TheftOption[]; seconds: number; duel: string } | undefined {
+  const objectives = model.objectives;
+  if (objectives === undefined || objectives.theftDuel === "" || objectives.theftOptions.length === 0) return undefined;
+  return {
+    duel: objectives.theftDuel,
+    seconds: secondsUntil(objectives.theftDeadline, model.worldTick),
+    options: objectives.theftOptions.map((type, index) => ({ key: String(index + 1), type, label: `${index + 1}: ${typeName(type)}` })),
+  };
+}
+
+function writeLine(element: HTMLElement, line: HudLine): void {
+  element.textContent = line.text;
+  element.dataset["state"] = line.state;
+  if (line.seconds === undefined) delete element.dataset["seconds"];
+  else element.dataset["seconds"] = String(line.seconds);
+}
+
+function field(root: ParentNode, id: string): HTMLElement {
+  const element = root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  if (element === null) throw new Error(`missing HUD field ${id}`);
+  return element;
+}
+
+/** "Palm Key, south dock" when moored, "at sea" otherwise. */
+export function dockText(dock: number): string {
+  return dock === NOT_DOCKED ? "at sea" : dockLabel(defaultSimulationConfig.map, dock);
+}
+
+/**
+ * What the player can do about docking right now, by the simulation's own rule (`dockInReach`; speed does not matter):
+ * nothing to say when moored or far from any dock; otherwise press E.
+ */
+export function dockHint(ship: Pick<ShipSnapshot, "x" | "y" | "dock">): string {
+  if (ship.dock !== NOT_DOCKED) return "";
+  const config = defaultSimulationConfig;
+  const berth = dockInReach(config, ship.x, ship.y);
+  return berth === undefined ? "" : `Press E to dock at ${dockLabel(config.map, berth.id)}`;
+}
+
+/** Writes the match status and the latest authoritative (not interpolated) state of the visible ships. */
+export function renderHud(root: ParentNode, model: HudModel): void {
+  field(root, "hud-code").textContent = model.code;
+  field(root, "hud-protocol").textContent = `v${model.protocolVersion}`;
+  field(root, "hud-players").textContent = String(model.players);
+  field(root, "hud-status").textContent = model.status;
+  field(root, "hud-mode").textContent = model.custom ? "custom" : "standard";
+  field(root, "hud-self").textContent = model.selfId;
+  const own = model.ships.find((ship) => ship.id === model.selfId);
+  const dock = field(root, "hud-dock");
+  dock.textContent = own === undefined ? "" : dockText(own.dock);
+  dock.dataset["dock"] = String(own?.dock ?? NOT_DOCKED);
+  field(root, "hud-dock-hint").textContent = own === undefined ? "" : dockHint(own);
+  writeLine(field(root, "hud-grapple"), grappleLine(model));
+  writeLine(field(root, "hud-incoming"), incomingLine(model));
+  writeLine(field(root, "hud-protection"), protectionLine(model));
+  writeLine(field(root, "hud-respawn"), respawnLine(model));
+  writeLine(field(root, "hud-island"), islandLine(model));
+  writeLine(field(root, "hud-cache"), cacheLine(model));
+  writeLine(field(root, "hud-hold"), holdLine(model));
+  const bar = field(root, "hud-hold-progress");
+  const progress = holdProgress(model.objectives);
+  bar.hidden = model.objectives?.channel === "" || model.objectives === undefined;
+  bar.style.setProperty("--progress", String(progress));
+  bar.dataset["held"] = String(model.objectives?.channelHeld ?? 0);
+  bar.dataset["total"] = String(model.objectives?.channelTotal ?? 0);
+  writeLine(field(root, "hud-result"), resultLine(model));
+
+  const list = field(root, "positions");
+  const items = model.ships.map((ship) => {
+    const item = document.createElement("li");
+    item.dataset["shipId"] = ship.id;
+    item.dataset["slot"] = String(ship.slot);
+    item.dataset["x"] = String(ship.x);
+    item.dataset["y"] = String(ship.y);
+    item.dataset["heading"] = String(ship.heading);
+    item.dataset["speed"] = String(ship.speed);
+    item.dataset["dock"] = String(ship.dock);
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = cssColor(slotColor(ship.slot));
+    const tile = toTilePosition(defaultSimulationConfig, ship.x, ship.y);
+    const who = ship.id === model.selfId ? "you" : ship.id;
+    item.append(swatch, `${who}: tile ${tile.tileX},${tile.tileY}, heading ${ship.heading}, speed ${ship.speed}`);
+    return item;
+  });
+  list.replaceChildren(...items);
+}
+
+/**
+ * The purse, beside the game whether it shows the sea or the arena: gold, rubbings, the last duel's settlement and,
+ * for a winner choosing, the theft choice with its countdown (keys 1 and 2, or a click).
+ */
+export function renderPurse(root: ParentNode, model: Pick<HudModel, "objectives" | "worldTick">): void {
+  const objectives = model.objectives;
+  const gold = field(root, "purse-gold");
+  gold.textContent = objectives === undefined ? "" : String(objectives.gold);
+  gold.dataset["gold"] = String(objectives?.gold ?? 0);
+  const rubbings = field(root, "purse-rubbings");
+  rubbings.textContent = objectives === undefined ? "" : rubbingsText(objectives.rubbings);
+  rubbings.dataset["types"] = objectives?.rubbings.join(",") ?? "";
+  writeLine(field(root, "purse-settlement"), settlementLine(model));
+  const panel = field(root, "theft-choice");
+  const choice = theftChoice(model);
+  panel.hidden = choice === undefined;
+  panel.dataset["duel"] = choice?.duel ?? "";
+  writeLine(field(root, "theft-deadline"), choice === undefined ? { text: "", state: "none" } : { text: `${choice.seconds} s to choose, then the rarest is taken`, state: "open", seconds: choice.seconds });
+  const buttons = field(root, "theft-options");
+  const wanted = choice?.options.map((option) => option.type).join(",") ?? "";
+  if (buttons.dataset["types"] !== wanted) {
+    buttons.dataset["types"] = wanted;
+    buttons.replaceChildren(
+      ...(choice?.options ?? []).map((option) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset["type"] = option.type;
+        button.dataset["key"] = option.key;
+        button.textContent = option.label;
+        return button;
+      }),
+    );
+  }
+}

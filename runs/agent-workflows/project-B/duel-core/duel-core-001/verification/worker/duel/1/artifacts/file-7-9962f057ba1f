@@ -1,0 +1,311 @@
+import { z } from "zod";
+import { baselineFrameBudgets, moveTimingSchema, type MoveTiming } from "../frameBudgets.js";
+import { formatIssues, type ValidationResult } from "../rules.js";
+
+/**
+ * An axis-aligned box in integer sub-pixels, relative to a fighter's origin (the middle of its feet) for a fighter
+ * facing right; y grows upwards from the floor. The box covers the half-open ranges [x, x + w) × [y, y + h), so it
+ * needs a positive width and height to cover anything.
+ */
+export const boxSchema = z.strictObject({
+  x: z.int(),
+  y: z.int(),
+  w: z.int().positive(),
+  h: z.int().positive(),
+});
+
+export type Box = z.infer<typeof boxSchema>;
+
+/** §8's move timing, restricted to what a fighter's own move can be: numeric active frames, blockable or not. */
+export type DuelMoveTiming = Omit<MoveTiming, "active" | "onBlock"> & {
+  readonly active: number;
+  readonly onBlock: { readonly kind: "frames"; readonly advantage: number } | { readonly kind: "unguardable" };
+};
+
+export type GuardLevel = "high" | "mid" | "low" | "unguardable";
+export type MoveCategory = "light" | "heavy" | "special" | "throw";
+
+/**
+ * One move. Frame counts are 60 Hz frames: `startup` frames come before the first active frame, then `active`, then
+ * `recovery`. Distances and velocities are sub-pixels (per frame).
+ */
+export interface DuelMove {
+  readonly timing: DuelMoveTiming;
+  readonly kind: "strike" | "throw";
+  /** Decides what blocking it costs (§7) and which rules apply. */
+  readonly category: MoveCategory;
+  /** The hurtbox the attacker uses while performing the move. */
+  readonly stance: "standing" | "crouching";
+  readonly guard: GuardLevel;
+  /** One box for the whole active phase. */
+  readonly hitbox: Box;
+  /** Before combo scaling. */
+  readonly damage: number;
+  /** Frames the defender cannot act after a hit, counting the contact frame; for a throw, the knockdown after it. */
+  readonly hitstun: number;
+  /** Frames the defender cannot act after blocking, counting the contact frame; 0 for a throw. */
+  readonly blockstun: number;
+  readonly hitPushback: number;
+  readonly blockPushback: number;
+  /** Upward velocity given to the defender on hit (sub-pixels per frame); 0 leaves a grounded defender grounded. */
+  readonly launch: number;
+  /** Forward velocity of the attacker during startup and active frames. */
+  readonly advance: number;
+  /** Frames from the move's first frame during which strikes pass through the attacker. */
+  readonly strikeInvulnerable: number;
+  /** Stamina the defender spends to block it. */
+  readonly guardStaminaCost: number;
+}
+
+/** Which move each input starts (§8): down + heavy is the low sweep, forward + heavy the launcher, down + light the anti-air. */
+export interface DuelCommands {
+  readonly light: string;
+  readonly downLight: string;
+  readonly heavy: string;
+  readonly downHeavy: string;
+  readonly forwardHeavy: string;
+  readonly special1: string;
+  readonly special2: string;
+  readonly throw: string;
+}
+
+/** A fighter's body and movement. Distances are sub-pixels, speeds sub-pixels per frame, durations frames. */
+export interface DuelFighter {
+  readonly hurtboxes: { readonly standing: Box; readonly crouching: Box; readonly airborne: Box };
+  /** Two fighters' pushboxes never overlap: centred on the origin, `halfWidth` either side, `height` tall. */
+  readonly pushbox: { readonly halfWidth: number; readonly height: number };
+  readonly walkForwardSpeed: number;
+  readonly walkBackSpeed: number;
+  readonly jumpVelocity: number;
+  readonly jumpSpeedX: number;
+  /** Subtracted from the vertical velocity every airborne frame. */
+  readonly gravity: number;
+  readonly dashFrames: number;
+  readonly dashSpeed: number;
+  readonly backdashFrames: number;
+  readonly backdashSpeed: number;
+  /** Recovery of both fighters after a throw escape or two throws breaking each other. */
+  readonly throwBreakFrames: number;
+  /** How far each fighter is pushed away from the other when a throw breaks. */
+  readonly throwBreakPushback: number;
+}
+
+/** The single-plane arena: a floor between two walls. */
+export interface DuelArena {
+  readonly subPixelsPerPixel: number;
+  /** Wall to wall, in sub-pixels. Fighters' origins stay a pushbox half-width inside the walls. */
+  readonly width: number;
+  /** Distance between the two fighters' origins at the start, placed symmetrically about the centre. */
+  readonly startGap: number;
+}
+
+/** §7's round, stamina and combo rules as numbers. */
+export interface DuelRules {
+  readonly roundFrames: number;
+  readonly overtimeFrames: number;
+  readonly maxHealth: number;
+  readonly maxStamina: number;
+  readonly dashStaminaCost: number;
+  readonly guardStaminaCost: { readonly light: number; readonly heavy: number; readonly special: number };
+  /** Frames without spending or blocking before stamina regenerates. */
+  readonly staminaRegenDelayFrames: number;
+  /** After the delay, one stamina point every this many frames (3 frames is 20 a second). */
+  readonly staminaRegenIntervalFrames: number;
+  readonly guardBreakStaggerFrames: number;
+  readonly guardBreakStaminaRestore: number;
+  /** Percent of base damage for the first, second, ... damaging hit of a combo. */
+  readonly comboScaling: readonly number[];
+  /** The damaging hit that forces the non-juggleable recovery. */
+  readonly comboCap: number;
+  readonly forcedRecoveryFrames: number;
+  readonly throwEscapeFrames: number;
+  readonly inputBufferFrames: number;
+}
+
+/** Everything the duel step reads. `version` identifies it all; a duel state records it. */
+export interface DuelMoveset {
+  readonly version: string;
+  readonly rules: DuelRules;
+  readonly arena: DuelArena;
+  readonly fighter: DuelFighter;
+  readonly moves: readonly DuelMove[];
+  readonly commands: DuelCommands;
+}
+
+const count = z.int().nonnegative();
+const positive = z.int().positive();
+
+export const duelMoveSchema = z
+  .strictObject({
+    // The timing is §8's own schema, so its rules (positive startup and active frames, block advantage within
+    // active + recovery) are checked in one place.
+    timing: moveTimingSchema,
+    kind: z.enum(["strike", "throw"]),
+    category: z.enum(["light", "heavy", "special", "throw"]),
+    stance: z.enum(["standing", "crouching"]),
+    guard: z.enum(["high", "mid", "low", "unguardable"]),
+    hitbox: boxSchema,
+    damage: positive,
+    hitstun: positive,
+    blockstun: count,
+    hitPushback: count,
+    blockPushback: count,
+    launch: count,
+    advance: count,
+    strikeInvulnerable: count,
+    guardStaminaCost: count,
+  })
+  .superRefine((move, ctx) => {
+    const { timing } = move;
+    if (timing.active === "projectile-life") {
+      ctx.addIssue({ code: "custom", path: ["timing", "active"], message: "a fighter's move needs a number of active frames" });
+      return;
+    }
+    const isThrow = move.kind === "throw";
+    if (isThrow !== (move.category === "throw") || isThrow !== (move.guard === "unguardable")) {
+      ctx.addIssue({ code: "custom", path: ["kind"], message: "a throw, and only a throw, has the throw category and is unguardable" });
+    }
+    if (isThrow) {
+      if (timing.onBlock.kind !== "unguardable") ctx.addIssue({ code: "custom", path: ["timing", "onBlock"], message: "a throw is unguardable" });
+      if (move.blockstun !== 0) ctx.addIssue({ code: "custom", path: ["blockstun"], message: "a throw cannot be blocked" });
+    } else if (timing.onBlock.kind !== "frames") {
+      ctx.addIssue({ code: "custom", path: ["timing", "onBlock"], message: "a strike needs a frame advantage on block" });
+    } else if (move.blockstun !== timing.active + timing.recovery + timing.onBlock.advantage) {
+      // Contact on the first active frame, which is also the defender's first blockstun frame.
+      ctx.addIssue({
+        code: "custom",
+        path: ["blockstun"],
+        message: `blockstun ${move.blockstun} does not give ${timing.onBlock.advantage} on block (needs ${timing.active + timing.recovery + timing.onBlock.advantage})`,
+      });
+    }
+    if (move.strikeInvulnerable > timing.startup) {
+      ctx.addIssue({ code: "custom", path: ["strikeInvulnerable"], message: "strike invulnerability cannot outlast startup" });
+    }
+  });
+
+const hurtboxesSchema = z.strictObject({ standing: boxSchema, crouching: boxSchema, airborne: boxSchema });
+
+export const duelFighterSchema = z.strictObject({
+  hurtboxes: hurtboxesSchema,
+  pushbox: z.strictObject({ halfWidth: positive, height: positive }),
+  walkForwardSpeed: positive,
+  walkBackSpeed: positive,
+  jumpVelocity: positive,
+  jumpSpeedX: count,
+  gravity: positive,
+  dashFrames: positive,
+  dashSpeed: positive,
+  backdashFrames: positive,
+  backdashSpeed: positive,
+  throwBreakFrames: positive,
+  throwBreakPushback: count,
+});
+
+export const duelArenaSchema = z.strictObject({ subPixelsPerPixel: positive, width: positive, startGap: positive });
+
+export const duelRulesSchema = z.strictObject({
+  roundFrames: positive,
+  overtimeFrames: positive,
+  maxHealth: positive,
+  maxStamina: positive,
+  dashStaminaCost: count,
+  guardStaminaCost: z.strictObject({ light: count, heavy: count, special: count }),
+  staminaRegenDelayFrames: count,
+  staminaRegenIntervalFrames: positive,
+  guardBreakStaggerFrames: positive,
+  guardBreakStaminaRestore: count,
+  comboScaling: z.array(z.int().min(1).max(100)).min(1),
+  comboCap: positive,
+  forcedRecoveryFrames: positive,
+  throwEscapeFrames: positive,
+  inputBufferFrames: positive,
+});
+
+const commandsSchema = z.strictObject({
+  light: z.string(),
+  downLight: z.string(),
+  heavy: z.string(),
+  downHeavy: z.string(),
+  forwardHeavy: z.string(),
+  special1: z.string(),
+  special2: z.string(),
+  throw: z.string(),
+});
+
+export const duelMovesetSchema = z
+  .strictObject({
+    version: z.string().min(1),
+    rules: duelRulesSchema,
+    arena: duelArenaSchema,
+    fighter: duelFighterSchema,
+    moves: z.array(duelMoveSchema).min(1),
+    commands: commandsSchema,
+  })
+  .superRefine((moveset, ctx) => {
+    const { rules, arena, fighter } = moveset;
+    const byId = new Map<string, (typeof moveset.moves)[number]>();
+    moveset.moves.forEach((move, index) => {
+      const id = move.timing.id;
+      if (byId.has(id)) ctx.addIssue({ code: "custom", path: ["moves", index, "timing", "id"], message: `${id}: duplicate move id` });
+      byId.set(id, move);
+      // A move named like a §8 baseline row must use that row's timing exactly.
+      const baseline = baselineFrameBudgets.find((row) => row.id === id);
+      if (baseline !== undefined && !sameTiming(move.timing, baseline)) {
+        ctx.addIssue({ code: "custom", path: ["moves", index, "timing"], message: `${id}: timing differs from §8's baseline row` });
+      }
+      const cost = move.category === "throw" ? 0 : rules.guardStaminaCost[move.category];
+      if (move.guardStaminaCost !== cost) {
+        ctx.addIssue({ code: "custom", path: ["moves", index, "guardStaminaCost"], message: `${id}: blocking a ${move.category} costs ${cost}` });
+      }
+    });
+    for (const [command, id] of Object.entries(moveset.commands)) {
+      const move = byId.get(id);
+      if (move === undefined) {
+        ctx.addIssue({ code: "custom", path: ["commands", command], message: `unknown move "${id}"` });
+      } else if ((command === "throw") !== (move.kind === "throw")) {
+        ctx.addIssue({ code: "custom", path: ["commands", command], message: `"${id}" is the wrong kind of move for ${command}` });
+      }
+    }
+    if (rules.comboCap > rules.comboScaling.length) {
+      ctx.addIssue({ code: "custom", path: ["rules", "comboCap"], message: "every hit up to the cap needs a scaling step" });
+    }
+    if (rules.dashStaminaCost > rules.maxStamina) {
+      ctx.addIssue({ code: "custom", path: ["rules", "dashStaminaCost"], message: "a dash would cost more than full stamina" });
+    }
+    // Symmetric start positions need even distances, and both fighters must start inside the walls and out of reach
+    // of every move (§6: no free opening hit).
+    if (arena.width % 2 !== 0 || arena.startGap % 2 !== 0) {
+      ctx.addIssue({ code: "custom", path: ["arena"], message: "arena width and start gap must be even" });
+    }
+    if (arena.startGap > arena.width - 2 * fighter.pushbox.halfWidth) {
+      ctx.addIssue({ code: "custom", path: ["arena", "startGap"], message: "the start positions lie outside the walls" });
+    }
+    const hurtReach = Math.max(...Object.values(fighter.hurtboxes).map((box) => Math.max(box.x + box.w, -box.x)));
+    const hitReach = Math.max(...moveset.moves.map((move) => move.hitbox.x + move.hitbox.w));
+    if (arena.startGap < hitReach + hurtReach) {
+      ctx.addIssue({ code: "custom", path: ["arena", "startGap"], message: "fighters would start within reach of a move" });
+    }
+  });
+
+function sameTiming(a: MoveTiming, b: MoveTiming): boolean {
+  const advantage = (timing: MoveTiming) => (timing.onBlock.kind === "frames" ? timing.onBlock.advantage : null);
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.startup === b.startup &&
+    a.active === b.active &&
+    a.recovery === b.recovery &&
+    a.onBlock.kind === b.onBlock.kind &&
+    advantage(a) === advantage(b)
+  );
+}
+
+export function validateDuelMove(candidate: unknown): ValidationResult<DuelMove> {
+  const parsed = duelMoveSchema.safeParse(candidate);
+  return parsed.success ? { ok: true, value: parsed.data as DuelMove } : { ok: false, issues: formatIssues(parsed.error) };
+}
+
+export function validateDuelMoveset(candidate: unknown): ValidationResult<DuelMoveset> {
+  const parsed = duelMovesetSchema.safeParse(candidate);
+  return parsed.success ? { ok: true, value: parsed.data as DuelMoveset } : { ok: false, issues: formatIssues(parsed.error) };
+}

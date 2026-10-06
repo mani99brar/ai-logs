@@ -1,0 +1,375 @@
+# Architecture
+
+The §14 browser architecture as far as the §3 sea and the §18 combat spike: browsers join a private match on one authoritative Colyseus room, the shared fixed-step simulation sails the ships over an authored tile map, and every browser draws what the server lets it see. Separately, two browsers fight a 1v1 duel in a standalone duel room with §15's prediction and rollback (the netcode is in `docs/duel.md`).
+
+| Workspace | §14 component | What it holds now |
+| --- | --- | --- |
+| `apps/web` | Browser client and web shell | Landing page, HUD, keyboard helm, input sender, snapshot interpolation, Phaser scene (tile map, following camera, ships, fogged minimap); the duel client (keyboard with tap latch, `DuelClientSession` loop, arena scene, duel HUD, dev-only latency setting) |
+| `apps/server` | Match process | `MatchRoom` (one Colyseus room per match), the Schema mirror of the simulation, per-client views, input gate, entry points; `DuelRoom` and its input gate; the shared private admission |
+| `packages/simulation` | Shared fixed-step functions | Integer match state, heading table, sailing, collisions, docking, visibility rule, seeded generator, `hashState`; the duel (`/duel`) and its netcode (`/netcode`: `DuelAuthority`, `DuelRollback`, `DuelClock`, `DuelClientSession`, the input-delay policy) |
+| `packages/protocol` | Data contracts (§16) | Protocol version (4), create and join options, the input schemas and validation, the duel messages, refusal messages, the test-placement request |
+| `packages/content` | Content and tuning (§17) | The slice sea (generated from Tiled), the Tiled converter, map validators, ship tuning, sight and engagement ranges, rules presets, frame budgets |
+| `packages/test-tools` | Test harness (§17) | `HeadlessClient`: a browserless player on the real Colyseus SDK that also records the raw frames it receives; `HeadlessDuelClient` (the browser's `DuelClientSession` on the SDK, driven by a script), `ImpairmentProxy`, and `replayRecordedDuel` |
+
+The HTTP service, PostgreSQL, static hosting and monitoring are not built yet (`infra/` is a placeholder).
+
+## The sea
+
+- **Map format and pipeline.** The map is `assets/source/maps/slice-sea.tmj`, in a documented subset of Tiled's JSON format (`packages/content/src/tiledMap.ts`): orthogonal, finite, 24 px tiles (`TILE_PIXELS`, as drawn); one imageless tileset whose tiles carry a `type` of `sea`, `land`, `shoal` or `dock`; a `terrain` layer as a plain gid array; an `objects` layer with a named `island` rectangle per island (property `theme`), a `spawn` point per slot (properties `slot` and `facing`) and one `hub` point. Nothing else is accepted. `npm run map:build -- --from-sketch` writes it from one mirrored ASCII quarter (`sliceSeaSketch.ts`; a unit test fails when they differ). `npm run map:build` (`scripts/build-map.ts`) converts it into `packages/content/src/maps/sliceSea.ts` (terrain rows and objects) if it passes the validators; a unit test fails when that module is stale (it reads the `.tmj` as a Vite `?raw` import).
+- **Validators.** `validateSeaMap` checks §2 and §3: four small islands, each land tile inside one island rectangle, each island with a dock beside its land and open sea; shoals; eight spawn slots on open sea outside the islands' bounding box and pairwise beyond `ENGAGEMENT_RANGE_TILES` (6); every dock and slot reachable by sea; and, by eight-way shortest paths (no cut corners) at full speed: each island's nearest neighbour 20–40 s away, no dock-or-slot crossing over 90 s, a dock within 40 s of every slot. No empty stretches: every navigable tile is within the sight radius of land, a shoal or a dock (not the edge). Routes meet: closing the disc around the hub (open sea near the centre; radius half the sight radius, so ships in it see each other) lengthens or cuts every shortest path between docks of different islands. At most 112 tiles a side. The slice sea (111 × 111 tiles, midline shoal walls open only in the hub's disc): neighbours 26 s apart, longest crossing 39 s, water within 9.9 tiles of an obstacle, 91 % open sea.
+- **Sailing.** Positions are integer sub-units (256 a tile); headings are 64 directions, 0 east, clockwise (y grows down), unit vectors from a literal cosine table. Each world step the throttle (`-moveY`) accelerates towards 39 sub-units a step (3.05 tiles a second), brakes, or reverses slowly from a stop; `moveX` turns a heading a step (3.2 s a circle); none coasts to a stop. On 24 px tiles that handles like the old five tiles a second on 16 px (unit tests hold it within 25 %). The hull is a square of half-size 80. A move sweeps each axis in turn through the tile columns or rows its leading edge enters and stops flush at the first land, shoal or map edge: a ship slides along an obstacle met at an angle, runs aground head-on, and never tunnels.
+- **Docking.** Hold E near a dock to moor, at any speed and throttle: with the hull on or beside the berth tile (unless pinched), or within reach with a clear run, it moves to the dock's centre, stops and records the dock, so no arrival slides past or grounds beside it (pinched: a diagonal tile whose two shared tiles are blocked). It stays moored while E or the throttle it moored with (`mooredThrottle`) is held; pressing a throttle after releasing that one, or the other direction, casts off. An input stall does not: the server gives a lapsed client no input, keeping the latch. The keyboard keeps a tap of E until its next read (not past a blur), the server until its next step; then the HUD says "Press E to dock".
+- **Visibility boundary (§16).** The room's `ships` map is tagged `.view()`. Each client gets a `StateView`; after every mirror the room puts into it the client's own ship and each ship within `SIGHT_RADIUS_TILES` (10, `visibleShipIds`) and takes out the rest, so Colyseus encodes no other ship into that client's patches (an integration test checks the decoded state and the raw frames). `players` in the state is the public player count. Terrain is static content every client bundles, never synced; the minimap fog is client-side presentation, not a security boundary.
+- **Test placement.** Tests place ships through `POST /__test/place` (code, session id, tile, heading); its tile bounds come from the map. Only the dev and test entry (`apps/server/src/dev.ts`) offers it, when `PIRATE_SEA_RACE_TEST_PLACEMENT=1`; the production entry (`main.ts`) never reads that, which the build smoke test checks. It only moves a ship: admission and views are unchanged.
+
+## The duel (combat spike)
+
+- **Duel room.** `DuelRoom` (room name `duel`) holds one duel: two players, or one in practice against a server-side dummy (player two, `idle` or `guard`). It is admitted like a match, by the same code in `admission.ts`: a one-time create token, `onAuth` before any seat, the room's own check, `filterBy(['code', 'createToken'])`, no token in the listing. The countdown (180 frames) starts once every seat is taken; the room probes round trips during it, chooses the shared input delay 30 frames before the end, then steps `DuelAuthority` at 60 Hz with `setFixedTimestep`. Inputs go through `DuelInputGate`, which admits them through the same `InputAdmission` as the world's `InputGate` (the rate window and the protocol validation: 128 bytes, 60 a second of room ticks, increasing sequence, 30 frames of lead), so the two cannot drift, and counts its drops. Frame bundles and probes are Colyseus messages; the lobby is a small Schema state. A drop keeps the seat for 10 s (`allowReconnection`); leaving, or staying away, forfeits, decided at the next frame boundary (two forfeits on one frame: no winner). The rules and rates are in `docs/duel.md`.
+- **One rollback core.** The browser's `DuelClient` and `HeadlessDuelClient` both run `DuelClientSession` from `@pirate-sea-race/simulation/netcode`; they differ only in transport and input (keyboard or script). The arena draws the predicted state; the HUD shows the confirmed one (server-equal health, stamina and clock) and the room's result. `window.__duel` exposes the session's counters and tagged inputs, read-only, for the browser tests.
+- **Impairment harness.** `ImpairmentProxy` is a TCP proxy (Node's `net`, no new dependency) between a client and the server. It forwards HTTP untouched in content and splits the WebSocket stream into frames; each frame waits half the round trip plus a uniform ±jitter/2 in its direction, never overtaking the frame before it, and a lost frame (seeded draw) waits a further retransmission timeout (200 ms), stalling everything behind it as TCP does. `sever()` cuts every connection (optionally refusing new ones) for the reconnect tests. `tests/integration/duelHarness.test.ts` runs a scripted duel between two headless clients through it, with no impairment and at 80 ms, 20 ms jitter and 1 % loss, and requires no desync at any of the ~180 hash checks per client, no rate-limited input, and corrections at most one per change of the opponent's applied input plus one per own substituted input, and at most 8 a second; it prints and annotates the counts. `replayRecordedDuel` replays a log (for example the pairs a client received) with `replayDuel`.
+- **Dev latency.** Only in `npm run dev` (`import.meta.env.DEV`), `?rtt=80&jitter=20` on the page delays that browser's duel socket both ways, probes and pings included; the build smoke test checks the production bundle does not contain it. The browser checks run the production build, so the setting is tested below the browser: `apps/web/src/devLatency.ts` has no DOM dependency, unit tests with fake timers check its delay, jitter bound and order on a real SDK room, and `tests/integration/devLatency.test.ts` wraps two headless duel clients in it and checks that the room's measured round trip and chosen input delay rise above the same duel without it.
+
+## Rules the code keeps
+
+- **Purity.** `simulation`, `protocol` and `content` import no Phaser, Colyseus, DOM, timers, wall-clock time or `Math.random`, and call no floating-point transcendental `Math` function. Their tsconfig leaves out the DOM library, and `tests/unit/purity.test.ts` fails on a violation.
+- **Integers.** Every number in the simulation state is an integer, so `hashState` (64-bit FNV-1a over a canonical serialization) does not depend on the JavaScript engine; a determinism test replays an input log.
+- **One clock.** The room steps the simulation 60 times a second with Colyseus `setFixedTimestep`. World logic runs on frames divisible by 3 (20 Hz); the room then mirrors the plain state into its Schema and updates the views, and Colyseus patches clients at 20 Hz. Integration tests measure both rates, also with eight sailing ships in one cluster.
+- **The server alone writes state.** At sea, clients send only `input` messages, `{seq, frame, buttons, moveX, moveY}`, validated with zod. `InputGate` drops, and counts, messages over the rate cap (60 per second of match time) or over 128 bytes, malformed ones (axes outside [-1, 1] are rejected, not clamped), ones whose sequence number is not higher than the last, and ones tagged more than 30 frames ahead. A held input lapses to neutral after 15 frames. An accepted world input applies from the server's next step whatever frame it names, since sea clients do not predict; a duel input applies to exactly the frame it names (`docs/duel.md`). Unknown message types are dropped. Colyseus's own limits sit above these: WebSocket frames over 4 KiB and more than 240 messages a second disconnect.
+- **Joining.** Matches and duels share the admission code (`apps/server/src/admission.ts`). Colyseus serves `create`, `join`, `joinOrCreate` and `joinById` over HTTP and reserves a seat before any room check, so a private match is guarded in three layers. The static `onAuth` runs before any seat is reserved: it refuses a mismatched protocol version (426), a request with neither or both of `code` and `createToken` or a malformed token (400), an unknown code (404) and a full match (409). A `create` carries a one-time 128-bit `createToken`; the room is registered with `filterBy(['code', 'createToken'])` and `onCreate` replaces the listing's metadata with `{code, custom}`, so no listing holds a token and a token-carrying request can only create. The room's `onJoin` is the backstop, and the only check `joinById` meets after `onAuth`: one seat with the creator's token, then only seats with the match's code (404 for another code, 403 otherwise). Refusal messages stay under 100 bytes. A caller who knows a room id can still hold seats with `joinById` until each reservation expires (15 s).
+- **Rendering.** The client draws the ships the server sent 100 ms in the past, interpolating between patches; the HUD lists their latest decoded state. The camera follows the player's ship over a Phaser tile map at 24 px a tile (the 480 px sight circle fits the 800 × 560 view) that leaves open sea to the background colour, keeping a software renderer fast. The sea does not predict; the duel arena does (above), and uses Phaser's canvas renderer so a machine without a GPU keeps its main thread free for the 4 ms client tick.
+
+## Toolchain
+
+npm workspaces, TypeScript 7.0.2 (`tsc` for typechecks and package builds), Vite 8.3.0 (web build), Vitest 5.0.1 (`unit` and `integration` projects), tsx (map script and dev server), Phaser 4.2.1, `colyseus` 0.18.8 with `@colyseus/schema` 5.0.34, `@colyseus/sdk` 0.18.4, zod 4.6.5, Playwright 1.63.0. Workspace packages export a `@pirate-sea-race/source` condition that points at `src/`, so development and tests need no build. `npm run build` compiles each package to `dist/` in dependency order, then `scripts/smoke-build.ts` loads every workspace export from `dist/`, starts the built server on a free port, creates a match through the SDK, waits for the creator's ship and checks that no test-placement route answers, with every wait bounded. `colyseus` brings `uWebSockets.js` in from GitHub, so `npm ci` needs github.com as well as the npm registry. The duel added no dependency: `packages/test-tools` now also depends on the workspace's `@pirate-sea-race/simulation`, and the smoke test also loads `@pirate-sea-race/simulation/netcode` from `dist/`, checks the web bundle for the dev-only latency setting, and plays the first frames of a practice duel on the built server.
+# assets/source/maps
+
+`slice-sea.tmj` is the slice sea (§3, §18 stage 2), a Tiled JSON map of 111 × 111 tiles. It uses only the subset documented in `packages/content/src/tiledMap.ts`:
+
+- orthogonal, finite, 24 × 24 px tiles (the size the game draws them);
+- one embedded tileset (`firstgid` 1) whose tiles have a `type`: `sea`, `land`, `shoal` or `dock`. The art is placeholder colours drawn by the game, so the tileset has no image;
+- a tile layer named `terrain`, stored as a plain array of tile ids, every cell filled;
+- an object layer named `objects` with an `island` rectangle per island (on tile boundaries, named, string property `theme`: `tropical`, `volcanic`, `ruin` or `mist`), a `spawn` point per spawn slot (int property `slot` from 0, string property `facing`: `E`, `SE`, `S`, `SW`, `W`, `NW`, `N` or `NE`), and one `hub` point without properties: the crossing near the centre that every route between islands passes.
+
+The map is generated: `sliceSeaSketch.ts` draws its north-west quarter in ASCII (`.` sea, `#` land, `%` shoal, `D` dock) and mirrors it into the other three, with the islands, spawn slots and hub. Shoal walls on the midlines open only near the hub, so ships sailing between islands meet there; reefs keep every stretch of open water within sight of an obstacle. The row three tiles south of the hub stays clear for 20 tiles either side of it, for the tests. `npm run map:build -- --from-sketch` writes it, and a unit test fails while the committed `.tmj` differs from what the sketch draws. To change the map, edit the sketch and run, from the repository root:
+
+```
+npm run map:build -- --from-sketch
+```
+
+`npm run map:build` (with or without `--from-sketch`) refuses a map outside the subset or one that fails the map validators (four islands with docks, shoals, reachable docks and slots, travel times, no open water beyond the sight radius from land, a shoal or a dock, and every route between islands through the hub), prints the travel times, the largest distance to an obstacle, the open-sea share and each route's closest approach to the hub, and writes `packages/content/src/maps/sliceSea.ts`. A unit test fails while that module is out of date.
+/**
+ * The sketch the slice sea is drawn from: one quarter of the map as ASCII, mirrored into all four quarters, so every
+ * island, spawn slot and route has a twin in each corner (§2's spawn fairness). `sliceSeaTmj` returns the text of
+ * `slice-sea.tmj` in the Tiled subset `packages/content/src/tiledMap.ts` documents; that file stays the committed
+ * source `npm run map:build` reads. `scripts/build-map.ts` writes it; a unit test (`maps.test.ts`) fails while the
+ * committed file differs from what this sketch draws. Regenerate after editing this sketch, from the repository root:
+ *
+ *   npm run map:build -- --from-sketch
+ *
+ * It stays pure: it imports nothing (no workspace package and no Node API; a unit test refuses any Node import) and
+ * does nothing when imported.
+ */
+
+/** Tiled's tile size for sea maps: `TILE_PIXELS` in `packages/content/src/tiledMap.ts`. */
+const TILE_PIXELS = 24;
+
+/**
+ * The north-west quarter, 56 × 56 tiles: `.` sea, `#` land, `%` shoal, `D` dock. Its last column and row are the map's
+ * midlines, shared with the mirrored quarters: shoal walls that stop five tiles short of the centre, so the only way
+ * from one quarter to another is through the open crossing around the hub (the map's centre tile). Row 52 here, and
+ * so the row three tiles south of the hub too, is kept clear from 20 tiles west of the hub to 20 east of it: the
+ * browser and integration tests put ships on it.
+ */
+const QUARTER = [
+  ".......................................................%", // 0
+  ".......................................................%", // 1
+  ".......................................................%", // 2
+  ".......................................................%", // 3
+  ".......................................................%", // 4
+  ".....%%...............%%...............................%", // 5
+  "....%%%%.............%%%%...............%%.............%", // 6
+  ".....%%...............%%...............%%%%............%", // 7
+  "........................................%%.............%", // 8
+  ".......................................................%", // 9
+  ".......................................................%", // 10
+  ".......................................................%", // 11
+  ".................................%%....................%", // 12
+  "............%%...................%%....................%", // 13
+  "............%%.........................................%", // 14
+  ".......................................................%", // 15
+  ".......................................................%", // 16
+  "....................########...........................%", // 17
+  "...................###########.........................%", // 18
+  "..................#############........................%", // 19
+  "..................#############........................%", // 20
+  ".................D#############........................%", // 21
+  "..................#############..............%%........%", // 22
+  ".....%%...........#############.............%%%%.......%", // 23
+  "....%%%%..........#############..............%%........%", // 24
+  ".....%%...........#############........................%", // 25
+  "..................#############........................%", // 26
+  "...................####D...............................%", // 27
+  ".......................................................%", // 28
+  ".......................................................%", // 29
+  ".......................................................%", // 30
+  ".......................................................%", // 31
+  ".......................................................%", // 32
+  "...........%%..................................%%......%", // 33
+  "...........%%......%%%%%%%%....................%%......%", // 34
+  "...................%%%%%%%%............................%", // 35
+  "........................................%..............%", // 36
+  ".......................................%%%.............%", // 37
+  "......................................%%%%%............%", // 38
+  ".......................................%%%.............%", // 39
+  "........................................%..............%", // 40
+  ".....%%................................................%", // 41
+  "....%%%%...............................................%", // 42
+  ".....%%................................................%", // 43
+  ".......................................................%", // 44
+  ".......................%%..............................%", // 45
+  "......................%%%%.......%%....................%", // 46
+  ".......................%%........%%....................%", // 47
+  ".......................................................%", // 48
+  ".......................................................%", // 49
+  ".......................................................%", // 50
+  "........................................................", // 51
+  "........................................................", // 52
+  "........................................................", // 53
+  "........................................................", // 54
+  "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%.....", // 55
+];
+
+const QUARTER_SIZE = QUARTER.length;
+const SIZE = 2 * QUARTER_SIZE - 1;
+const GID: Readonly<Record<string, number>> = { ".": 1, "#": 2, "%": 3, D: 4 };
+
+interface Mirror {
+  readonly x: boolean;
+  readonly y: boolean;
+}
+
+/** The island in the sketched quarter: its rectangle holds its land and docks. */
+const ISLAND = { tileX: 17, tileY: 17, widthTiles: 14, heightTiles: 12 };
+const ISLANDS: readonly { name: string; theme: string; mirror: Mirror }[] = [
+  { name: "Palm Key", theme: "tropical", mirror: { x: false, y: false } },
+  { name: "Ember Rock", theme: "volcanic", mirror: { x: true, y: false } },
+  { name: "Old Stones", theme: "ruin", mirror: { x: false, y: true } },
+  { name: "Mist Cay", theme: "mist", mirror: { x: true, y: true } },
+];
+
+/** The two spawn positions in the sketched quarter, facing its island; slots run clockwise from the north. */
+const NORTH_SPAWN = { tileX: 31, tileY: 5, facing: "SW" };
+const WEST_SPAWN = { tileX: 5, tileY: 32, facing: "NE" };
+const SPAWNS: readonly { spawn: typeof NORTH_SPAWN; mirror: Mirror }[] = [
+  { spawn: NORTH_SPAWN, mirror: { x: false, y: false } },
+  { spawn: NORTH_SPAWN, mirror: { x: true, y: false } },
+  { spawn: WEST_SPAWN, mirror: { x: true, y: false } },
+  { spawn: WEST_SPAWN, mirror: { x: true, y: true } },
+  { spawn: NORTH_SPAWN, mirror: { x: true, y: true } },
+  { spawn: NORTH_SPAWN, mirror: { x: false, y: true } },
+  { spawn: WEST_SPAWN, mirror: { x: false, y: true } },
+  { spawn: WEST_SPAWN, mirror: { x: false, y: false } },
+];
+
+/** The Tiled JSON text of the slice sea, as `slice-sea.tmj` holds it (ending with a newline). */
+export function sliceSeaTmj(): string {
+  for (const [index, row] of QUARTER.entries()) {
+    if (row.length !== QUARTER_SIZE) throw new Error(`sketch row ${index} has ${row.length} tiles, not ${QUARTER_SIZE}`);
+  }
+
+  const flip = (tile: number, mirrored: boolean) => (mirrored ? SIZE - 1 - tile : tile);
+  const flipFacing = (facing: string, mirror: Mirror) =>
+    [...facing].map((letter) => (mirror.x && letter === "E" ? "W" : mirror.x && letter === "W" ? "E" : mirror.y && letter === "N" ? "S" : mirror.y && letter === "S" ? "N" : letter)).join("");
+
+  const data: number[] = [];
+  for (let tileY = 0; tileY < SIZE; tileY++) {
+    for (let tileX = 0; tileX < SIZE; tileX++) {
+      const char = QUARTER[Math.min(tileY, SIZE - 1 - tileY)]![Math.min(tileX, SIZE - 1 - tileX)]!;
+      const gid = GID[char];
+      if (gid === undefined) throw new Error(`unknown sketch character "${char}"`);
+      data.push(gid);
+    }
+  }
+
+  let nextId = 1;
+  const objects: object[] = [];
+  for (const island of ISLANDS) {
+    const tileX = island.mirror.x ? SIZE - ISLAND.tileX - ISLAND.widthTiles : ISLAND.tileX;
+    const tileY = island.mirror.y ? SIZE - ISLAND.tileY - ISLAND.heightTiles : ISLAND.tileY;
+    objects.push({
+      id: nextId++,
+      name: island.name,
+      type: "island",
+      x: tileX * TILE_PIXELS,
+      y: tileY * TILE_PIXELS,
+      width: ISLAND.widthTiles * TILE_PIXELS,
+      height: ISLAND.heightTiles * TILE_PIXELS,
+      rotation: 0,
+      visible: true,
+      properties: [{ name: "theme", type: "string", value: island.theme }],
+    });
+  }
+  const point = (tileX: number, tileY: number) => ({ x: tileX * TILE_PIXELS + TILE_PIXELS / 2, y: tileY * TILE_PIXELS + TILE_PIXELS / 2 });
+  for (const [slot, { spawn, mirror }] of SPAWNS.entries()) {
+    objects.push({
+      id: nextId++,
+      name: `spawn ${slot}`,
+      type: "spawn",
+      point: true,
+      ...point(flip(spawn.tileX, mirror.x), flip(spawn.tileY, mirror.y)),
+      width: 0,
+      height: 0,
+      rotation: 0,
+      visible: true,
+      properties: [
+        { name: "facing", type: "string", value: flipFacing(spawn.facing, mirror) },
+        { name: "slot", type: "int", value: slot },
+      ],
+    });
+  }
+  const centre = QUARTER_SIZE - 1;
+  objects.push({ id: nextId++, name: "hub", type: "hub", point: true, ...point(centre, centre), width: 0, height: 0, rotation: 0, visible: true });
+
+  const map = {
+    compressionlevel: -1,
+    height: SIZE,
+    infinite: false,
+    layers: [
+      { data: "DATA", height: SIZE, id: 1, name: "terrain", opacity: 1, type: "tilelayer", visible: true, width: SIZE, x: 0, y: 0 },
+      { draworder: "topdown", id: 2, name: "objects", objects, opacity: 1, type: "objectgroup", visible: true, x: 0, y: 0 },
+    ],
+    nextlayerid: 3,
+    nextobjectid: nextId,
+    orientation: "orthogonal",
+    renderorder: "right-down",
+    tiledversion: "1.11.2",
+    tileheight: TILE_PIXELS,
+    tilesets: [
+      {
+        columns: 0,
+        firstgid: 1,
+        grid: { height: TILE_PIXELS, orientation: "orthogonal", width: TILE_PIXELS },
+        margin: 0,
+        name: "terrain",
+        spacing: 0,
+        tilecount: 4,
+        tileheight: TILE_PIXELS,
+        tilewidth: TILE_PIXELS,
+        tiles: [
+          { id: 0, type: "sea" },
+          { id: 1, type: "land" },
+          { id: 2, type: "shoal" },
+          { id: 3, type: "dock" },
+        ],
+      },
+    ],
+    tilewidth: TILE_PIXELS,
+    type: "map",
+    version: "1.10",
+    width: SIZE,
+  };
+
+  // Tiled's own layout: one space of indent per level, and the terrain as one CSV line per row.
+  const rows = Array.from({ length: SIZE }, (_, tileY) => data.slice(tileY * SIZE, (tileY + 1) * SIZE).join(","));
+  const text = JSON.stringify(map, null, 1).replace('"DATA"', `[\n${rows.join(",\n")}]`);
+  return `${text}\n`;
+}
+/**
+ * Converts the Tiled sea map (`assets/source/maps/slice-sea.tmj`, the subset documented in
+ * `packages/content/src/tiledMap.ts`) into the typed module `packages/content/src/maps/sliceSea.ts`, after checking
+ * it against the map validators. `--check` writes nothing and fails when the module is out of date. `--from-sketch`
+ * first rewrites the `.tmj` from the ASCII sketch in `assets/source/maps/sliceSeaSketch.ts`.
+ *
+ *   npm run map:build -- --from-sketch   redraw the .tmj from the sketch, then convert and write
+ *   npm run map:build                    convert and write
+ *   npm run map:check                    compare only
+ */
+import { readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { sliceSeaTmj } from "../assets/source/maps/sliceSeaSketch.js";
+import { shipTuning } from "../packages/content/src/sailing.js";
+import { createSeaMap } from "../packages/content/src/seaMap.js";
+import { validateSeaMap } from "../packages/content/src/seaValidation.js";
+import { convertTiledMap, formatSeaMapModule } from "../packages/content/src/tiledMap.js";
+
+const SLICE_SEA = {
+  name: "slice-sea",
+  source: "assets/source/maps/slice-sea.tmj",
+  module: "packages/content/src/maps/sliceSea.ts",
+  exportName: "sliceSeaSource",
+} as const;
+
+const root = fileURLToPath(new URL("..", import.meta.url));
+
+function fail(lines: readonly string[]): never {
+  for (const line of lines) console.error(`  ${line}`);
+  process.exit(1);
+}
+
+if (process.argv.includes("--from-sketch")) {
+  const tmj = sliceSeaTmj();
+  writeFileSync(`${root}${SLICE_SEA.source}`, tmj);
+  const size = JSON.parse(tmj) as { width: number; height: number };
+  console.log(`wrote ${SLICE_SEA.source} from the sketch: ${size.width} × ${size.height} tiles`);
+}
+
+const converted = convertTiledMap(SLICE_SEA.name, JSON.parse(readFileSync(`${root}${SLICE_SEA.source}`, "utf8")));
+if (!converted.ok) {
+  console.error(`${SLICE_SEA.source} is outside the supported Tiled subset:`);
+  fail(converted.issues);
+}
+const validated = validateSeaMap(createSeaMap(converted.value), shipTuning);
+if (!validated.ok) {
+  console.error(`${SLICE_SEA.source} fails the map validators:`);
+  fail(validated.issues);
+}
+
+const text = formatSeaMapModule(converted.value, SLICE_SEA.exportName, SLICE_SEA.source);
+const target = `${root}${SLICE_SEA.module}`;
+let current: string | undefined;
+try {
+  current = readFileSync(target, "utf8");
+} catch {
+  current = undefined;
+}
+
+const report = validated.value;
+console.log(`${SLICE_SEA.source}: ${converted.value.widthTiles} × ${converted.value.heightTiles} tiles`);
+for (const entry of report.nearestIsland) console.log(`  ${entry.island} → ${entry.nearest}: ${entry.seconds} s`);
+console.log(`  longest crossing: ${report.longestCrossing.from} → ${report.longestCrossing.to}: ${report.longestCrossing.seconds} s`);
+console.log(`  first dock from a spawn slot: ${Math.max(...report.firstDock.map((entry) => entry.seconds))} s at most`);
+const tiles = (squared: number) => Math.sqrt(squared).toFixed(1);
+console.log(`  largest distance from open water to land, a shoal or a dock: ${tiles(report.largestObstacleDistanceSquared)} tiles`);
+console.log(`  open sea: ${(report.openSeaShare * 100).toFixed(1)} % of the map`);
+for (const entry of report.hubApproach) console.log(`  ${entry.from} → ${entry.to}: passes ${tiles(entry.squaredTiles)} tiles from the hub`);
+
+if (process.argv.includes("--check")) {
+  if (current !== text) fail([`${SLICE_SEA.module} is out of date: run npm run map:build`]);
+  console.log(`${SLICE_SEA.module} is up to date`);
+} else if (current === text) {
+  console.log(`${SLICE_SEA.module} is already up to date`);
+} else {
+  writeFileSync(target, text);
+  console.log(`wrote ${SLICE_SEA.module}`);
+}
+claim-channel
+docking-feel
+duel-core
+duel-core-fixes
+duel-online
+duel-online-fixes
+encounters-core
+final-island
+fruit-kits-core
+fruit-kits-core-fixes
+ledger-economy
+ledger-economy-fixes
+objectives-ledger
+ruins-core
+sea-compact
+sea-compact-fixes
+skeleton
+skeleton-fixes
+world-sea
+world-sea-fixes
+features/claim-channel:

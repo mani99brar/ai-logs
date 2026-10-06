@@ -1,0 +1,124 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { dockCentre, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { createEncounterConfig } from "@pirate-sea-race/simulation/encounters";
+import { cacheRubbings, objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { ImpairmentProxy, sleep, type HeadlessClient } from "@pirate-sea-race/test-tools";
+import { GUEST_SEAT, holds, HOST_SEAT, lastDuel, ledgerOf, ledgerPlayer, pair, placePair, QUICK_ABSENCE_TICKS, quickEncounters, tuned } from "./rubbingsSetup.js";
+import { collectAt, dockFor, grapple, playersAt, roomOf, tracker, until } from "./seaDuelSetup.js";
+
+/**
+ * §12's timers on the world tick, with a short seat (test-only override: 10 s instead of 60 s; one-second holds; a 3 s
+ * duel absence): a reservation that expires removes the player and leaves exactly their remaining rubbings in a cache
+ * at the dock the encounter rules would respawn them at; a disconnected ship can be grappled and robbed; a fighter who
+ * drops mid-duel forfeits after the absence counted in world ticks, respawns, and keeps the seat to its deadline.
+ * Every test's rooms check the ledger and the room invariants after every world tick (`tracker`).
+ */
+const SEAT_TICKS = 200;
+let server: RunningGameServer;
+let endpoint: string;
+const encounters = createEncounterConfig({ rules: quickEncounters });
+
+beforeAll(async () => {
+  server = await startGameServer({
+    port: 0,
+    host: "127.0.0.1",
+    handleSignals: false,
+    testPlacement: true,
+    matchTuning: tuned({ objectives: { ...objectiveRules, collectTicks: 20, cacheClaimTicks: 20, seatReservationTicks: SEAT_TICKS }, reconnectionSeconds: 15 }),
+  });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+describe.concurrent("the seat's reservation on the world tick (§12)", () => {
+  it("removes a player whose reservation expires, with exactly their rubbings in a cache at the dock the rules would respawn them at", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    // The leaver sails out of Mist Cay's north; a watcher sits in its sight.
+    const [watcher, leaver] = (await playersAt(endpoint, [HOST_SEAT, GUEST_SEAT], track, { endpoints: [endpoint, proxy.endpoint] })) as [HeadlessClient, HeadlessClient];
+    await collectAt(leaver, endpoint, dockFor("sun"), "sun");
+    await collectAt(leaver, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, watcher, leaver);
+    proxy.sever({ refuse: true });
+    await until(() => ledgerPlayer(watcher, leaver.sessionId)?.status === "disconnected", 3000, "the disconnect");
+    const deadline = ledgerPlayer(watcher, leaver.sessionId)!.reservationDeadline!;
+    const ship = roomOf(watcher).matchState.ships.find((each) => each.id === leaver.sessionId)!;
+    // The ship stays in the world (and in the watcher's sight) until the deadline.
+    await sleep(1000);
+    expect(watcher.ship(leaver.sessionId)).toBeDefined();
+    await until(() => ledgerPlayer(watcher, leaver.sessionId)?.status === "left", 15_000, "the expiry");
+    const ledger = ledgerOf(watcher);
+    expect(ledger.caches).toHaveLength(1);
+    const [cache] = ledger.caches;
+    expect(cache!.createdTick).toBe(deadline);
+    const expected = encounters.modes.ship.rules.respawnPoint({ encounter: ship, own: ship, opponents: [watcher.ship()!], clearRadius: encounters.respawnClearRadius });
+    expect({ x: cache!.x, y: cache!.y }).toEqual({ x: expected.x, y: expected.y });
+    expect(cacheRubbings(ledger, cache!.id).map((rubbing) => rubbing.type).sort()).toEqual(["moon", "sun"]);
+    await watcher.waitFor(() => watcher.ship(leaver.sessionId) === undefined && watcher.playerCount === 1, 2000);
+    expect(roomOf(watcher).matchState.ships.map((each) => each.id)).toEqual([watcher.sessionId]);
+    // §12: the released seat counts as leaving the match: the flow and its roster drop the player.
+    await watcher.waitFor(() => watcher.room.state.roster.size === 1, 2000);
+    expect([...watcher.room.state.roster.values()].map((entry) => entry.seat)).toEqual([watcher.seat]);
+    expect(roomOf(watcher).flowState.players.find((player) => player.id === leaver.sessionId)?.left).toBe(true);
+  }, 45_000);
+
+  it("lets a disconnected ship be grappled and robbed, and drops its seat at the deadline", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    const { host, guest } = await pair(endpoint, track, {}, [endpoint, proxy.endpoint]);
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, host, guest);
+    proxy.sever({ refuse: true });
+    await until(() => ledgerPlayer(host, guest.sessionId)?.status === "disconnected", 3000, "the disconnect");
+    // The ship is still there, in sight and grapple range: the host grapples it; the absent guest forfeits.
+    expect(host.ship(guest.sessionId)).toBeDefined();
+    host.tapGrapple();
+    await host.waitFor(() => host.objectives()?.theftOptions.join(",") === "moon", 8000);
+    host.chooseTheft("moon");
+    await host.waitFor(() => host.rubbings().join(",") === "moon" && host.gold() === 60, 2000);
+    expect(ledgerPlayer(host, guest.sessionId)).toMatchObject({ status: "disconnected", gold: 40 });
+    expect(holds(host, guest.sessionId)).toEqual([]);
+    // Never back: at the deadline the seat goes, with nothing left for a cache.
+    await until(() => ledgerPlayer(host, guest.sessionId)?.status === "left", 15_000, "the expiry");
+    expect(ledgerOf(host).caches).toEqual([]);
+  }, 45_000);
+
+  it("forfeits a fighter away from the duel for its absence in world ticks; they respawn, keep the seat to its deadline, then their rest goes to a cache", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const proxy = await ImpairmentProxy.start(server.port);
+    onTestFinished(async () => void (await proxy.close()));
+    const { host, guest } = await pair(endpoint, track, {}, [endpoint, proxy.endpoint]);
+    await collectAt(guest, endpoint, dockFor("sun"), "sun");
+    await collectAt(guest, endpoint, dockFor("moon"), "moon");
+    await placePair(endpoint, host, guest);
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "fighting", 5000);
+    proxy.sever({ refuse: true });
+    await until(() => ledgerPlayer(host, guest.sessionId)?.status === "disconnected", 3000, "the drop");
+    const deadline = ledgerPlayer(host, guest.sessionId)!.reservationDeadline!;
+    const dropTick = deadline - SEAT_TICKS;
+    await host.waitFor(() => (host.objectives()?.theftOptions.length ?? 0) === 2, 8000);
+    // The forfeit came from the room's count of world ticks, not a socket timer.
+    const forfeitTick = lastDuel(host)!.result!.tick;
+    expect(forfeitTick - dropTick).toBeGreaterThanOrEqual(QUICK_ABSENCE_TICKS);
+    expect(forfeitTick - dropTick).toBeLessThanOrEqual(QUICK_ABSENCE_TICKS + 2);
+    host.chooseTheft("sun");
+    await host.waitFor(() => host.rubbings().join(",") === "sun", 2000);
+    // The loser respawns at a dock, still disconnected, still holding the Moon, until the seat's deadline.
+    await until(() => roomOf(host).matchState.ships.find((ship) => ship.id === guest.sessionId)?.dock !== -1 && roomOf(host).encounterState.players.every((player) => player.respawn === null), 8000, "the respawn");
+    const respawnDock = roomOf(host).matchState.ships.find((ship) => ship.id === guest.sessionId)!.dock;
+    expect(ledgerPlayer(host, guest.sessionId)).toMatchObject({ status: "disconnected", reservationDeadline: deadline });
+    expect(holds(host, guest.sessionId)).toEqual(["moon"]);
+    await until(() => ledgerPlayer(host, guest.sessionId)?.status === "left", 15_000, "the expiry");
+    const ledger = ledgerOf(host);
+    expect(ledger.caches).toHaveLength(1);
+    expect(ledger.caches[0]).toMatchObject({ createdTick: deadline, ...dockCentre(seaMap, respawnDock) });
+    expect(cacheRubbings(ledger, ledger.caches[0]!.id).map((rubbing) => rubbing.type)).toEqual(["moon"]);
+  }, 45_000);
+});

@@ -1,0 +1,305 @@
+import {
+  DUEL_UNAVAILABLE_MESSAGE,
+  MATCH_UNAVAILABLE_MESSAGE,
+  MatchMessageType,
+  parseRevealMessage,
+  PROTOCOL_VERSION,
+  RubbingMessageType,
+  startRefusedMessageSchema,
+  type ChooseTheftMessage,
+  type DummyBehaviour,
+  type StartMatchMessage,
+} from "@pirate-sea-race/protocol";
+import { defaultSimulationConfig } from "@pirate-sea-race/simulation";
+import { startArena } from "./arenaScene.js";
+import { createMatch, joinMatch, refusalMessage, serverEndpoint, type MatchRoom } from "./connection.js";
+import { DuelClient } from "./duelClient.js";
+import { createDuel, joinDuel, type DuelRoom } from "./duelConnection.js";
+import { duelRoomTransport, SeaDuelRouter } from "./duelTransport.js";
+import { renderFlow, revealBanner, showBanner, startRefusalText, type ClaimStatus, type FlowModel } from "./flowHud.js";
+import { chosenTheftType, renderHud, renderPurse, theftChoice, type ConnectionStatus, type TheftInput } from "./hud.js";
+import { InputSender } from "./inputSender.js";
+import { KeyboardHelm, NEUTRAL_HELM } from "./keyboard.js";
+import { MatchView, type ShipSnapshot } from "./matchView.js";
+import { MatchGame } from "./seaScene.js";
+
+const INPUT_INTERVAL_MS = 1000 / 60;
+
+function element<T extends HTMLElement>(selector: string): T {
+  const found = document.querySelector<T>(selector);
+  if (found === null) throw new Error(`missing element ${selector}`);
+  return found;
+}
+
+const landing = element<HTMLElement>("#landing");
+const matchSection = element<HTMLElement>("#match");
+const createButton = element<HTMLButtonElement>("#create-match");
+const joinForm = element<HTMLFormElement>("#join-form");
+const joinButton = element<HTMLButtonElement>("#join-match");
+const codeInput = element<HTMLInputElement>("#join-code");
+const errorText = element<HTMLElement>("#join-error");
+const duelSection = element<HTMLElement>("#duel");
+const duelHud = element<HTMLElement>("#duel-hud");
+const seaHud = element<HTMLElement>("#hud");
+const duelButtons = [element<HTMLButtonElement>("#create-duel"), element<HTMLButtonElement>("#practice-duel"), element<HTMLButtonElement>("#join-duel")];
+const duelCodeInput = element<HTMLInputElement>("#duel-code");
+const duelErrorText = element<HTMLElement>("#duel-error");
+const endpoint = serverEndpoint(window.location);
+
+element<HTMLElement>('[data-testid="landing-protocol"]').textContent = String(PROTOCOL_VERSION);
+
+createButton.addEventListener("click", () => void connect(() => createMatch(endpoint)));
+joinForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void connect(() => joinMatch(endpoint, codeInput.value));
+});
+
+element<HTMLButtonElement>("#create-duel").addEventListener("click", () => void connectDuel(() => createDuel(endpoint, false)));
+element<HTMLButtonElement>("#practice-duel").addEventListener("click", () => void connectDuel(() => createDuel(endpoint, true)));
+element<HTMLFormElement>("#join-duel-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  void connectDuel(() => joinDuel(endpoint, duelCodeInput.value));
+});
+
+async function connectDuel(open: () => Promise<DuelRoom>): Promise<void> {
+  for (const button of duelButtons) button.disabled = true;
+  duelErrorText.textContent = "";
+  try {
+    const room = await open();
+    // Development only: `?rtt=80&jitter=20` delays this socket both ways (README). Vite drops this branch, and the
+    // module it imports, from the production build.
+    if (import.meta.env.DEV) {
+      const { applyDevLatency, devLatencyFromQuery } = await import("./devLatency.js");
+      const latency = devLatencyFromQuery(window.location.search);
+      if (latency !== undefined) applyDevLatency(room, latency);
+    }
+    enterDuel(room);
+  } catch (error) {
+    const message = refusalMessage(error);
+    duelErrorText.textContent = message === MATCH_UNAVAILABLE_MESSAGE ? DUEL_UNAVAILABLE_MESSAGE : message;
+    for (const button of duelButtons) button.disabled = false;
+  }
+}
+
+/** The duel HUD's developer toggle drives whichever duel is showing. */
+function wireHitboxToggle(current: () => DuelClient | undefined): void {
+  const boxes = element<HTMLInputElement>("#show-boxes");
+  boxes.addEventListener("change", () => {
+    current()?.setShowBoxes(boxes.checked);
+    boxes.blur();
+  });
+}
+
+function enterDuel(room: DuelRoom): void {
+  landing.hidden = true;
+  duelSection.hidden = false;
+  const duel = new DuelClient(duelRoomTransport(room), duelHud);
+  wireHitboxToggle(() => duel);
+  const dummy = element<HTMLSelectElement>("#dummy-select");
+  dummy.addEventListener("change", () => {
+    duel.setDummy(dummy.value as DummyBehaviour);
+    dummy.blur();
+  });
+  const dummyControl = element<HTMLElement>("#dummy-control");
+  const showDummyControl = () => {
+    dummyControl.hidden = room.state?.practice !== true;
+  };
+  showDummyControl();
+  room.onStateChange(showDummyControl);
+  startArena(element<HTMLElement>("#arena"), duel);
+}
+
+async function connect(open: () => Promise<MatchRoom>): Promise<void> {
+  setBusy(true);
+  errorText.textContent = "";
+  try {
+    enterMatch(await open());
+  } catch (error) {
+    errorText.textContent = refusalMessage(error);
+    setBusy(false);
+  }
+}
+
+function setBusy(busy: boolean): void {
+  createButton.disabled = busy;
+  joinButton.disabled = busy;
+}
+
+function enterMatch(room: MatchRoom): void {
+  landing.hidden = true;
+  matchSection.hidden = false;
+
+  const view = new MatchView(room.sessionId);
+  const sender = new InputSender({ send: (type, message) => room.send(type, message) });
+  const keyboard = new KeyboardHelm(window);
+  const router = new SeaDuelRouter(room);
+  let status: ConnectionStatus = "connected";
+  let duel: { readonly key: string; readonly client: DuelClient } | undefined;
+  let game: MatchGame | undefined;
+  wireHitboxToggle(() => duel?.client);
+
+  /**
+   * A duel at sea (§6): when the room holds one for this player, the arena scene takes over the game and the duel HUD
+   * the sea HUD's place, until the room lets the duel go; then the sea is back.
+   */
+  const followDuel = () => {
+    const key = router.current();
+    if (duel !== undefined && duel.key !== key) {
+      duel.client.dispose();
+      router.forget();
+      duel = undefined;
+      game?.showSea();
+      duelSection.append(duelHud);
+      seaHud.hidden = false;
+    }
+    if (duel === undefined && key !== undefined && game !== undefined) {
+      const client = new DuelClient(router.transport(key), duelHud);
+      duel = { key, client };
+      seaHud.hidden = true;
+      matchSection.append(duelHud);
+      game.showArena(client);
+    }
+  };
+
+  const refresh = () => {
+    const state = room.state;
+    if (state?.ships === undefined) return;
+    const now = performance.now();
+    const ships: ShipSnapshot[] = [...state.ships.values()];
+    const grapples = [...(state.grapples?.values() ?? [])];
+    const encounter = state.status?.get(room.sessionId);
+    view.ingest(ships, now);
+    view.ingestEncounters(grapples, state.markers?.values() ?? [], encounter, state.worldTick);
+    view.ingestObjectives(encounter, state.caches?.values() ?? []);
+    sender.observeFrame(state.frame, now);
+    renderHud(matchSection, {
+      code: state.code,
+      protocolVersion: state.protocolVersion,
+      custom: state.custom,
+      status,
+      selfId: room.sessionId,
+      players: state.players,
+      ships,
+      worldTick: state.worldTick,
+      encounter: view.status(),
+      grapples: view.grapples(),
+      objectives: view.objectives(),
+    });
+    renderPurse(matchSection, { objectives: view.objectives(), worldTick: state.worldTick });
+    const claiming = claimingShips(room);
+    const flow = { ...flowModel(room, ships), rivalClaiming: [...claiming.keys()].some((id) => id !== room.sessionId) };
+    view.ingestFlow(flow.claim, claiming, flow.treasureRadius);
+    renderFlow(matchSection, flow);
+    followDuel();
+  };
+
+  // §2's lobby: the host's Start, and the server's answer when it refuses one.
+  const lobbyError = element<HTMLElement>('[data-testid="lobby-error"]');
+  element<HTMLButtonElement>("#start-match").addEventListener("click", () => {
+    lobbyError.textContent = "";
+    room.send(MatchMessageType.Start, {} satisfies StartMatchMessage);
+  });
+  room.onMessage(MatchMessageType.StartRefused, (message: unknown) => {
+    const refusal = startRefusedMessageSchema.safeParse(message);
+    if (refusal.success) lobbyError.textContent = startRefusalText(refusal.data.reason);
+  });
+  // §2 and §5's reveals, each as a banner over the sea and a line in the list of reveals.
+  const bannerTimers: { hide?: number } = {};
+  room.onMessage(MatchMessageType.Reveal, (message: unknown) => {
+    const reveal = parseRevealMessage(message);
+    if (reveal !== undefined) showBanner(matchSection, revealBanner(reveal), bannerTimers);
+  });
+  // The results stay until the player leaves: back to the landing page.
+  element<HTMLButtonElement>("#back-to-lobby").addEventListener("click", () => {
+    void room.leave(true).catch(() => undefined).finally(() => window.location.assign("/"));
+  });
+
+  /** §4's theft choice: the winner presses 1 or 2 (or clicks an option); the server checks it and settles. */
+  const chooseTheft = (input: TheftInput): boolean => {
+    const choice = theftChoice({ objectives: view.objectives(), worldTick: view.worldTick() });
+    const type = chosenTheftType(choice, input);
+    if (choice === undefined || type === undefined) return false;
+    room.send(RubbingMessageType.ChooseTheft, { duel: choice.duel, type } as ChooseTheftMessage);
+    return true;
+  };
+  window.addEventListener("keydown", (event) => {
+    // A held key's auto-repeat is not a new choice.
+    if (event.repeat) return;
+    if (chooseTheft({ code: event.code })) event.preventDefault();
+  });
+  element<HTMLElement>('[data-testid="theft-options"]').addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>("button[data-key]");
+    if (button !== null && button !== undefined) chooseTheft({ option: Number(button.dataset["key"]) });
+  });
+
+  room.onStateChange(refresh);
+  room.onLeave(() => {
+    status = "disconnected";
+    refresh();
+  });
+  refresh();
+
+  const inputTimer = window.setInterval(() => {
+    // The helm is read even in a duel, so a key tapped there (J is also the light attack) is not kept for the sea.
+    const helm = keyboard.helm();
+    if (status === "connected") sender.update(duel === undefined ? helm : NEUTRAL_HELM, performance.now());
+    else window.clearInterval(inputTimer);
+  }, INPUT_INTERVAL_MS);
+
+  game = new MatchGame(element<HTMLElement>("#game"), view);
+  followDuel();
+}
+
+/** The flow's part of the page, from the synced state (public) and this player's own status (private, §16). */
+function flowModel(room: MatchRoom, ships: readonly ShipSnapshot[]): Omit<FlowModel, "rivalClaiming"> {
+  const state = room.state;
+  const status = state.status?.get(room.sessionId);
+  const own = ships.find((ship) => ship.id === room.sessionId);
+  const claim: ClaimStatus | undefined =
+    status === undefined
+      ? undefined
+      : {
+          fullSet: status.fullSet === true,
+          routeKnown: status.routeKnown === true,
+          routeActive: status.routeActive === true,
+          routeX: status.routeX ?? 0,
+          routeY: status.routeY ?? 0,
+          claim: status.claim ?? "",
+          claimHeld: status.claimHeld ?? 0,
+          claimTotal: status.claimTotal ?? 0,
+          claimInterrupt: status.claimInterrupt ?? "",
+          claimInterruptAt: status.claimInterruptAt ?? 0,
+        };
+  return {
+    code: state.code,
+    lobby: {
+      phase: state.phase ?? "",
+      seats: [...(state.roster?.values() ?? [])].map((entry) => entry.seat),
+      hostSeat: state.hostSeat ?? 0,
+      seat: status?.seat ?? 0,
+      minPlayers: state.minPlayers ?? 2,
+      readyEndsAt: state.readyEndsAt ?? 0,
+      worldTick: state.worldTick,
+    },
+    remainingTicks: state.remainingTicks ?? 0,
+    finalSector: state.finalSector ?? "",
+    claim,
+    own: own === undefined ? undefined : { x: own.x, y: own.y, speed: own.speed },
+    treasureRadius: state.treasureRadius ?? 0,
+    subUnitsPerTile: defaultSimulationConfig.map.subUnitsPerTile,
+    results: {
+      endReason: state.endReason ?? "",
+      winnerSeat: state.winnerSeat ?? 0,
+      seat: status?.seat ?? 0,
+      hostSeat: state.hostSeat ?? 0,
+      lines: [...(state.results ?? [])],
+    },
+  };
+}
+
+/** The ships in sight channelling the claim (§5: nearby players are warned), with the ticks each has held. */
+function claimingShips(room: MatchRoom): Map<string, number> {
+  const claiming = new Map<string, number>();
+  for (const ship of room.state.ships?.values() ?? []) if (ship.claiming === true) claiming.set(ship.id, ship.claimHeld);
+  return claiming;
+}

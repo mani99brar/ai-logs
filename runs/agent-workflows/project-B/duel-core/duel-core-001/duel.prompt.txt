@@ -1,0 +1,99 @@
+You are a workflow worker in your own worktree. A human can type directly into this terminal. Do not launch agents, commit, merge, push or modify shared contracts. Stay within this worktree. Report changed files, checks actually executed, and open assumptions. Completion of a turn is not workflow approval.
+
+# Task: duel
+
+## Goal
+
+Build the deterministic 1v1 duel simulation of §7 and §8 as pure code: two fighters with the Duelist kit in one single-plane arena, stepped at 60 Hz from per-frame inputs, with snapshots that restore and replay exactly. This is the core that the combat spike (`duel-online`) will put online, and that the match room will later host as a duel object (§14). No rendering and no networking.
+
+## Context
+
+- Read `docs/spec.md` §7 (fighting system), §8 (controls and frame budgets), §15 ("Authoritative prediction policy": snapshots, restore, replay), §14 ("Match and duel boundaries") and §19 ("Combat determinism"). §9 describes the Duelist kit; §10's Haki abilities are deferred (see `decisions.md`).
+- Read `docs/architecture.md` and the existing pure packages: `packages/simulation` (integer state, `hashState`, the seeded generator in `random.ts`, `fixed.ts`), `packages/content` (`frameBudgets.ts` already holds §8's baseline table with a zod validator) and `tests/unit/purity.test.ts`, which also scans any new directory under the pure packages.
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build` (which ends with `scripts/smoke-build.ts`). It reads test counts from Vitest's summary; `tests/reporters/testSummary.ts` also prints them.
+- Another feature (`world-sea`) runs at the same time on the rest of the repository. Stay inside your owned paths so the two merge cleanly.
+
+## Constraints
+
+- Owned paths only: `packages/simulation/src/duel`, `packages/content/src/moves`, `packages/simulation/package.json` and `packages/content/package.json` (only for the subpath exports and the `postbuild` self-check below) and `docs/duel.md`. Do not edit any existing source file, barrel `index.ts`, tsconfig, root file, `scripts/` or `docs/architecture.md`. `packages/test-tools` is not changed in this feature (see `decisions.md`); do not add dependencies anywhere, because the lockfile belongs to `world-sea`.
+- Expose the new code through subpath exports that follow the existing pattern (the `@pirate-sea-race/source` condition first, then `types` and `default` into `dist/`): `@pirate-sea-race/simulation/duel` and `@pirate-sea-race/content/moves`. `scripts/smoke-build.ts` only knows the existing exports, so each of the two packages gets a `postbuild` script that imports its new subpath from `dist/` without the source condition and fails when it resolves elsewhere or exports nothing. `npm run build` runs it after the package's own build.
+- Pure and integer, like the rest of `packages/simulation`: no Phaser, Colyseus, DOM, timers, wall-clock time, `Math.random` or floating-point transcendental `Math` functions. Every number in the duel state is a safe integer, so `hashState` covers it.
+- The duel step is a function of (config, state, two inputs) that returns a new state and never mutates its input. Randomness, if any, comes from a seeded generator kept in the duel state.
+- Out of scope: rendering, networking, rooms, protocol messages, fruit kits, Haki abilities, world integration, theft.
+
+## Acceptance
+
+- Duel rules from §7, covered by unit tests that drive the step with scripted input logs (one test per rule unless a rule is trivially shared):
+  - one round, 60-second clock (3,600 frames), 1,000 health each; timeout → higher health wins; equal health → 10-second overtime, then compare, and an exact tie is a draw;
+  - both simultaneous lethal hits → draw; a KO on the final round frame beats the timeout; both fighters' hits for a frame are evaluated before a KO is declared, independent of player order;
+  - walk, crouch, jump, forward dash and backdash; fighters auto-face each other and stay inside the arena walls;
+  - standing guard blocks highs and mids; crouching guard blocks lows, avoids highs and loses to mids; holding back guards and down-back guards low;
+  - throws beat guard and have a 10-frame escape window; a throw escape is available to both players;
+  - stamina: 100 max; dash costs 20; blocking a light costs 10, a heavy 25 and a special 20; regenerates 20 per second after one second without spending or blocking; a guard break staggers 30 frames and restores 30 stamina;
+  - damage: jab 45, committed heavies and specials 100–150; combo scaling 100, 80, 65, 50 and 40 percent; the fifth damaging hit forces a non-juggleable recovery;
+  - a 4-frame input buffer; both horizontal directions together are neutral (§8). A duel input carries the held directions as separate bits (left, right, up, down) plus the button bits, so the step itself resolves opposite directions to neutral and can test it.
+- Move data in `packages/content/src/moves`: the Duelist's normals (light/jab, heavy mid, low sweep, launcher, anti-air, throw) and its two specials (advancing thrust, counter slash), each with startup, active and recovery frames, one integer hitbox for its whole active phase, damage, hitstun, blockstun, pushback, guard level (high, mid, low, unguardable) and stamina cost. Fighters have one fixed integer hurtbox per stance (standing, crouching, airborne); per-frame box timelines come later. The timings of the jab, heavy mid, low sweep and throw are taken from `baselineFrameBudgets` in `frameBudgets.ts`, not retyped, and the validator reuses `moveTimingSchema` for them rather than duplicating its rules. A zod validator rejects impossible data (non-positive startup or active frames, block advantage beyond active + recovery, hitboxes with no area, unknown move references), with unit tests. A `MOVESET_VERSION` constant identifies the move data.
+- Frame advantage: a unit test shows the heavy mid is −12 on block, and that the defender's jab, started on the first frame it can act, lands before the heavy's recovery ends (a punish). Choose the heavy's block pushback and the jab's reach so that this holds at the spacing a blocked heavy actually leaves, and document both values.
+- Facing and symmetry: boxes are half-open integer ranges, and facing left mirrors `[x, x + w)` to `[-x - w, -x)`. A symmetry test swaps the two players (slots, positions mirrored about the arena centre, inputs mirrored) and gets the mirrored outcome frame by frame for a scripted exchange.
+- Same-frame resolution, written in `docs/duel.md` and unit-tested: every hit, block and throw of a frame is detected against the state at the start of that frame for both fighters, and all results apply together; the outcome never depends on which player is first. Two throws on the same frame break each other with no damage. A strike whose hitbox is active on a frame where the opponent's throw is in startup or active beats the throw. Stamina costs and guard breaks of the frame are computed from start-of-frame stamina.
+- Determinism and rollback: the same initial state and input log give the same `hashState` after 3,600 frames; a one-input change gives a different hash; restoring a snapshot taken at frame N and replaying the logged inputs from N gives the same hash as the uninterrupted run. The duel state records `MOVESET_VERSION`, and restoring or replaying against different move data is refused.
+- Replay: a pure `replayDuel(config, initial, log)` in `packages/simulation/src/duel` runs an input log through the step and returns the final state and hash. The log's JSON format is documented and validated by a zod schema in `packages/content/src/moves`. The determinism and rollback tests use it.
+- `docs/duel.md` (at most a page and a half): the state shape, the step's order of operations within a frame, the units, and how snapshot, restore and replay are meant to be used by the netcode.
+- `npm ci` then `npm run typecheck`, `npm run test:unit`, `npm run test:integration` and `npm run build` pass from a clean checkout. The build's `postbuild` self-checks load both new subpath exports from `dist/`, and the purity test covers the new directories.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A rule in §7 or §8 contradicts another in a way that changes this acceptance.
+- A check can pass only by changing a path outside the owned paths.
+- After two hours of work, any required check still fails and you cannot name the next fix.
+
+Report `question` only for a choice that would change this acceptance.
+
+Approved ownership and checks:
+{"node_id": "duel", "role": "simulation", "required_check_kinds": ["typecheck", "unit", "integration", "build"], "owned_paths": ["packages/simulation/src/duel", "packages/simulation/package.json", "packages/content/src/moves", "packages/content/package.json", "packages/test-tools/src/replay", "packages/test-tools/package.json", "docs/duel.md"], "checks": [{"id": "typecheck", "kind": "typecheck", "argv": ["npm", "run", "typecheck"], "timeout_seconds": 300, "scenarios": []}, {"id": "unit", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 300, "scenarios": []}, {"id": "integration", "kind": "integration", "argv": ["npm", "run", "test:integration"], "timeout_seconds": 300, "scenarios": []}, {"id": "build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 600, "scenarios": []}]}
+
+Decisions recorded before launch (decisions.md; they bind this run):
+# Decisions: duel-core
+
+From the operator session of 2026-09-24 (slice planning after the skeleton merged into `main`), revised after design challenge attempt 1 of duel-core-001 by the assistant under the operator's standing instruction to finish the run.
+
+## Decisions
+
+- Scope is the pure duel simulation only (slice 1 of the plan). Networking, the arena client and the duel room are the next feature, `duel-online`, which builds against this feature's API from `main`. The API therefore has to be usable without changes: a step function, a snapshot that is plain data, and a pure replay function.
+- One lane (`duel`). Duel rules and move data are too coupled to split, and a split lane would fail its isolated typecheck against the other's types.
+- Only the Duelist kit. Fruit kits (§9) come with the content slice; the Duelist's two specials are the advancing thrust and the counter slash.
+- Haki abilities (§10: Armament, Observation parry, Resolve finisher) and the Haki meter are deferred. The spike's exit (§18: guard, punish, throw, simultaneous hit, reconnect) doesn't need them, and they add balance work before the core is proven.
+- Units: integer sub-pixels, 16 sub-pixels per arena pixel. Positions, velocities, gravity and hitboxes are integers; hitboxes and hurtboxes are axis-aligned rectangles relative to the fighter's origin and facing.
+- The code lives in new directories behind subpath exports (`@pirate-sea-race/simulation/duel`, `@pirate-sea-race/content/moves`), so this feature edits no existing file. `world-sea` runs at the same time on the rest of the repository, and the two branches must merge without conflicts.
+- No browser check: nothing is rendered. The policy's checks are typecheck, unit, integration (unchanged, to prove nothing broke) and build.
+- Proving the build output (challenge P1): `scripts/smoke-build.ts` hard-codes the existing exports and `scripts/` is not this lane's (the policy can't change without a new run, and `world-sea` owns `scripts/`). So each of the two packages proves its own new subpath with a `postbuild` script that imports it from `dist/` without the source condition. Adding the two subpaths to `smoke-build.ts` is left for the merge or a later feature.
+- The replay runner is a pure `replayDuel` in `packages/simulation/src/duel`, with the log's zod schema in `packages/content/src/moves` (challenge P2). `packages/test-tools` would need a new dependency on `simulation`, and so a lockfile change, and the lockfile belongs to `world-sea` in this parallel pair. `duel-online` can wrap `replayDuel` in `test-tools` later. This departs from §17's "test-tools: replay runner" for now.
+- Simplified collision data (challenge's simpler alternative): one hitbox per move for its whole active phase and one hurtbox per stance. Per-frame timelines wait until playtests need them.
+- Same-frame rules the spec leaves open, decided here: detect everything against start-of-frame state and apply together; throw against throw breaks both with no damage; an active strike beats a throw in startup or active; stamina and guard breaks use start-of-frame stamina. A mirrored-players symmetry test guards order independence.
+- The duel input carries held directions as separate left/right/up/down bits, so the step resolves both-horizontal to neutral (§8) and `duel-online`'s adapter passes keys through unchanged.
+- The four §8 baseline moves take their timings from `baselineFrameBudgets` and reuse `moveTimingSchema`, and the duel state records `MOVESET_VERSION` so a snapshot is never replayed against other move data.
+
+## Assumptions
+
+- The arena is one plane with two walls and a floor; its width is content data. There's no stage hazard and no ring-out.
+- A duel input per player per frame is one bit field: held directions (left, right, up, down) and buttons (light, heavy, special one, special two, dash), as §8 maps keys. Keyboard mapping is client work.
+- Frame data for moves outside §8's table (launcher, anti-air, the two specials) is the worker's choice within §7's ranges, documented in the move data.
+- `hashState` from `packages/simulation` is reused for duel state, which also holds the duel's own frame counter and generator state if it needs one.
+- The duel starts both fighters at fixed positions, facing each other, with full health and stamina, as §6 requires ("no free opening hit").
+
+## Deferred
+
+- Haki meter and abilities (§10), fruit kits (§9), focus scrolls.
+- Networking, prediction and reconciliation, the input delay policy, reconnect: `duel-online`.
+- Rendering, animation, the duel HUD and control remapping: `duel-online`.
+- Hosting the duel inside `MatchRoom`, reservations, transitions and theft: `encounters-theft`.
+
+
+AUTOMATIC MODE: permission checks are bypassed and Bash is available. Do not wait for a human handoff. Stay within assigned ownership; do not commit, merge, push, launch agents, change runtime evidence or switch billing/provider. On completion write the following JSON shape atomically (temporary file then rename) to /home/agentops/.local/state/agent-workflows/project-B/duel-core/duel-core-001/duel.completion.json. This one output file is allowed outside your worktree. Use status blocked if you cannot finish; never manufacture checks. Write it as your last action, then finish your turn and do not modify more files. Controller checks and independent review still determine acceptance.
+{"version": "1.1.0", "run_id": "duel-core-001", "node_id": "duel", "launch_token": "6a2860f7-f0cd-4dd1-8bc8-d55329eb9423", "status": "completed", "summary": "Describe actual work and checks executed", "open_assumptions": [], "untested": ["A behaviour no executed check covers"], "falsifying_check": "The check id (or exact command) that would fail if this were wrong", "verify_yourself": "One assumption the operator should verify independently", "question": null}
+Completion 1.1.0 evidence: for status completed, untested lists the behaviours no executed check covers (it may be empty), falsifying_check names the check that would fail if your implementation were wrong (a check id from your approved checks, or the exact command), verify_yourself names one assumption the operator should verify independently, and question is null; a completed file without them is refused. The commands you ran are not evidence by themselves: the controller reruns the checks.
+Questions: when a decision you cannot make yourself blocks the work, write the same file with status question, the question text in question (the evidence fields may be empty) and end your turn; the controller pauses your deadline and the operator's answer arrives in this terminal. Then continue and finish with a new completion file. At most 3 questions for this lane: after the third, decide yourself and record an open assumption; a fourth question is treated as blocked.
+Stop (from your task, the bound on this work): Report `blocked` instead of continuing when any of these happens: - `npm ci` or an install fails twice for reasons outside the repository (registry, network). - A rule in §7 or §8 contradicts another in a way that changes this acceptance. - A check can pass only by changing a path outside the owned paths. - After two hours of work, any required check still fails and you cannot name the next fix. Report `question` only for a choice that would change this acceptance. Approved ownership and checks: {"node_id": "duel", "role": "simulation", "required_check_kinds": ["typecheck", "unit", "integration", "build"], "owned_paths": ["packages/simulation/src/duel", "packages/simulation/package.json", "packages/content/src/moves", "packages/content/package.json", "packages/test-tools/src/replay", "packages/test-tools/package.json", "docs/duel.md"], "checks": [{"id": "typecheck", "kind": "typecheck", "argv": ["npm", "run", "typecheck"], "timeout_seconds": 300, "scenarios": []}, {"id": "unit", "kind": "unit", "argv": ["npm", "run", "test:unit"], "timeout_seconds": 300, "scenarios": []}, {"id": "integration", "kind": "integration", "argv": ["npm", "run", "test:integration"], "timeout_seconds": 300, "scenarios": []}, {"id": "build", "kind": "build", "argv": ["npm", "run", "build"], "timeout_seconds": 600, "scenarios": []}]}

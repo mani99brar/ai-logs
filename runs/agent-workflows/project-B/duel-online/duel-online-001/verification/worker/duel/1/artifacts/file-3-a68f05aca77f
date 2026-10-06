@@ -1,0 +1,62 @@
+import { matchMaker, ServerError } from "colyseus";
+import { JoinRefusal, MALFORMED_MATCH_REQUEST_MESSAGE, PROTOCOL_VERSION, protocolMismatchMessage } from "@pirate-sea-race/protocol";
+
+/** Anything with zod's `safeParse`. */
+interface Schema {
+  safeParse(value: unknown): { success: boolean };
+}
+
+/**
+ * The private admission rules one kind of room applies (matches and duels share them): its matchmaking name, its
+ * create and join option schemas, and its refusal messages.
+ */
+export interface AdmissionRules {
+  readonly roomName: string;
+  readonly createSchema: Schema;
+  readonly joinSchema: Schema;
+  readonly noSuchMessage: string;
+  readonly codeRequiredMessage: string;
+  readonly fullMessage: (maxClients: number) => string;
+}
+
+/**
+ * Checks a create or join request before matchmaking places it: Colyseus calls this for every `create`, `join`,
+ * `joinOrCreate` and `joinById` before it reserves a seat. A request carries either a `createToken` (a create) or a
+ * `code` (a join), never both and never neither. Refusals carry a readable message the client shows.
+ */
+export async function authorizePrivateEntry(options: unknown, rules: AdmissionRules): Promise<true> {
+  const request = (options ?? {}) as { protocolVersion?: unknown; code?: unknown; createToken?: unknown };
+  if (request.protocolVersion !== PROTOCOL_VERSION) {
+    throw new ServerError(JoinRefusal.ProtocolMismatch, protocolMismatchMessage(request.protocolVersion));
+  }
+  const hasCode = request.code !== undefined;
+  const hasToken = request.createToken !== undefined;
+  if (hasCode === hasToken) throw new ServerError(JoinRefusal.BadRequest, MALFORMED_MATCH_REQUEST_MESSAGE);
+  if (hasToken) {
+    if (!rules.createSchema.safeParse(options).success) throw new ServerError(JoinRefusal.BadRequest, MALFORMED_MATCH_REQUEST_MESSAGE);
+    return true;
+  }
+  if (!rules.joinSchema.safeParse(options).success) throw new ServerError(JoinRefusal.NoSuchMatch, rules.noSuchMessage);
+  const [listing] = await matchMaker.query({ name: rules.roomName, code: request.code as string });
+  if (listing === undefined) throw new ServerError(JoinRefusal.NoSuchMatch, rules.noSuchMessage);
+  if (listing.locked || listing.clients >= listing.maxClients) {
+    throw new ServerError(JoinRefusal.MatchFull, rules.fullMessage(listing.maxClients));
+  }
+  return true;
+}
+
+/**
+ * The room's own admission check, which also covers `joinById` (no listing filter applies there): the one seat
+ * carrying the creator's token, then only seats carrying this room's code. Returns the creator's token still unspent
+ * (undefined once the creator's seat is taken); throwing refuses and frees the seat.
+ */
+export function admitSeat(options: unknown, room: { readonly code: string; readonly createToken: string | undefined }, rules: AdmissionRules): string | undefined {
+  const request = (options ?? {}) as { code?: unknown; createToken?: unknown };
+  if (request.createToken === undefined) {
+    if (request.code === room.code) return room.createToken;
+    if (request.code !== undefined) throw new ServerError(JoinRefusal.NoSuchMatch, rules.noSuchMessage);
+  } else if (request.code === undefined && room.createToken !== undefined && request.createToken === room.createToken) {
+    return undefined;
+  }
+  throw new ServerError(JoinRefusal.CodeRequired, rules.codeRequiredMessage);
+}

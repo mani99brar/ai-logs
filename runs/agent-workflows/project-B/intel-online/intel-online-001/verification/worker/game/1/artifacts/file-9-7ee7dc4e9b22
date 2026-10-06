@@ -1,0 +1,304 @@
+import { WORLD_STEPS_PER_SECOND } from "@pirate-sea-race/content";
+import { Buttons, FruitMessageType, parseFruitInspectedMessage, type FruitInspectedMessage, type InspectFruitMessage } from "@pirate-sea-race/protocol";
+import { kitDescriptions, type KitDescription } from "@pirate-sea-race/simulation/fruits";
+
+/**
+ * §9's fruit in the browser: the HUD's kit line and pedestal hint, and the fruit panel. A player moored at a pedestal's
+ * dock presses F; the server answers with the pedestal's kit (to them only), which the panel shows with its two
+ * specials and §9's description. Holding F with the panel open eats the fruit in three seconds (the input's fruit
+ * button), with a progress ring; the panel says why an attempt was refused or interrupted. Everything below
+ * `FruitPanel` is plain data, for unit tests; `FruitPanel` and `applyFruit` touch the page.
+ */
+
+/** This player's fruit fields from its private status. */
+export interface FruitStatus {
+  /** "duelist" until this player eats a fruit, then its kit. */
+  readonly kit: string;
+  /** The pedestal where this player is moored: "full", "empty", or "" when there is none. */
+  readonly pedestal: string;
+  readonly fruitHeld: number;
+  readonly fruitTotal: number;
+  /** "eaten:<kit>", "interrupted:<reason>", "refused:<reason>" or "". */
+  readonly fruitResult: string;
+  readonly fruitResultAt: number;
+}
+
+export interface Line {
+  readonly text: string;
+  readonly state: string;
+}
+
+const NONE: Line = { text: "", state: "none" };
+
+/** A kit's description, or undefined for a name that is none. */
+function describe(kit: string): KitDescription | undefined {
+  return Object.hasOwn(kitDescriptions, kit) ? kitDescriptions[kit as keyof typeof kitDescriptions] : undefined;
+}
+
+/** A special's name as a line of prose writes it: "flame bolt". */
+const lower = (name: string) => name.charAt(0).toLowerCase() + name.slice(1);
+
+/** A kit and its two specials on one line: "Ember: U flame bolt, I rising flare". */
+export function kitSummary(kit: string): string {
+  const description = describe(kit);
+  if (description === undefined) return "";
+  return `${description.name}: U ${lower(description.specials[0])}, I ${lower(description.specials[1])}`;
+}
+
+/** The HUD's kit line: the player's kit and what U and I do with it (the Duelist's until they eat a fruit). */
+export function kitLine(status: FruitStatus | undefined): Line {
+  if (status === undefined) return NONE;
+  const text = kitSummary(status.kit);
+  return text === "" ? NONE : { text, state: status.kit };
+}
+
+/** The HUD's pedestal hint where the player is moored: F inspects a full pedestal; an empty one says so. */
+export function pedestalLine(status: FruitStatus | undefined): Line {
+  switch (status?.pedestal) {
+    case "full":
+      return { text: "F: inspect fruit", state: "full" };
+    case "empty":
+      return { text: "Fruit pedestal: empty", state: "empty" };
+    default:
+      return NONE;
+  }
+}
+
+/** Whether F inspects now: moored at a pedestal's dock (a full one, or an empty one to see that it is empty). */
+export function canInspect(status: FruitStatus | undefined): boolean {
+  return status?.pedestal === "full" || status?.pedestal === "empty";
+}
+
+/** Why an attempt ended, as the player reads it; a reason the panel does not know is shown as it came. */
+const REASONS: Readonly<Record<string, string>> = {
+  "interrupted:released": "You let go of F: eating stopped",
+  "interrupted:moved": "You moved to another pedestal: eating stopped",
+  "interrupted:gap": "Eating was interrupted",
+  "interrupted:taken": "Another captain ate this fruit first",
+  "interrupted:reserved": "A duel interrupted your meal",
+  "interrupted:disconnected": "Your connection dropped: eating stopped",
+  "interrupted:left": "You left the match",
+  "refused:already-eaten": "You have already eaten a fruit this match",
+  "refused:empty": "This pedestal is empty",
+  "refused:reserved": "Not during a duel",
+  "refused:disconnected": "Not while disconnected",
+  "refused:left": "You left the match",
+};
+
+/**
+ * How the last attempt ended: the meal (with the kit it gave), or why it was refused or interrupted. A release while
+ * no longer at a pedestal was the ship casting off.
+ */
+export function resultLine(status: FruitStatus | undefined): Line {
+  const result = status?.fruitResult ?? "";
+  if (result === "") return NONE;
+  if (result.startsWith("eaten:")) {
+    const kit = result.slice("eaten:".length);
+    return { text: `You ate the fruit. ${kitSummary(kit)}`, state: result };
+  }
+  if (result === "interrupted:released" && status!.pedestal === "") return { text: "You cast off: eating stopped", state: "interrupted:cast-off" };
+  return { text: REASONS[result] ?? result, state: result };
+}
+
+/** Eating's progress, from 0 to 1. */
+export function eatProgress(status: FruitStatus | undefined): number {
+  if (status === undefined) return 0;
+  return Math.min(1, status.fruitHeld / status.fruitTotal);
+}
+
+/** What the fruit panel shows: hidden, or the inspected pedestal's kit with the eating progress and the last result. */
+export interface FruitPanelView {
+  readonly hidden: boolean;
+  readonly island: number;
+  readonly full: boolean;
+  readonly kit: string;
+  readonly name: string;
+  /** "U: Flame bolt" and "I: Rising flare". */
+  readonly specials: readonly string[];
+  readonly advantage: string;
+  readonly vulnerability: string;
+  /** How to eat it, or why this player cannot. */
+  readonly hint: Line;
+  readonly progress: number;
+  readonly eating: boolean;
+  readonly message: Line;
+}
+
+/** Seconds of F that eat a fruit, from the status. */
+const eatSeconds = (status: FruitStatus | undefined) => Math.round((status?.fruitTotal ?? 0) / WORLD_STEPS_PER_SECOND);
+
+/**
+ * The panel for an inspection and this player's status. `since` hides a result older than the panel (an attempt
+ * before it opened).
+ */
+export function fruitPanelView(inspection: FruitInspectedMessage | undefined, status: FruitStatus | undefined, since: number): FruitPanelView {
+  const message = resultLine(status !== undefined && status.fruitResultAt >= since ? status : undefined);
+  if (inspection === undefined) {
+    return { hidden: true, island: -1, full: false, kit: "", name: "", specials: [], advantage: "", vulnerability: "", hint: NONE, progress: 0, eating: false, message: NONE };
+  }
+  const progress = eatProgress(status);
+  if (!inspection.full) {
+    return {
+      hidden: false,
+      island: inspection.island,
+      full: false,
+      kit: "",
+      name: "Empty pedestal",
+      specials: [],
+      advantage: "",
+      vulnerability: "",
+      hint: { text: "Someone has eaten this fruit", state: "empty" },
+      progress: 0,
+      eating: false,
+      message,
+    };
+  }
+  const fed = status !== undefined && status.kit !== "duelist";
+  const hint: Line = fed ? { text: "You have already eaten a fruit this match", state: "fed" } : { text: `Hold F for ${eatSeconds(status)} s to eat it`, state: "ready" };
+  return {
+    hidden: false,
+    island: inspection.island,
+    full: true,
+    kit: inspection.kit,
+    name: inspection.name,
+    specials: [`U: ${inspection.specials[0]}`, `I: ${inspection.specials[1]}`],
+    advantage: inspection.advantage,
+    vulnerability: inspection.vulnerability,
+    hint,
+    progress,
+    eating: progress > 0,
+    message,
+  };
+}
+
+/** How long the panel stays up after the player left the pedestal, to say why eating stopped (3 s of world ticks). */
+export const FRUIT_LINGER_TICKS = 3 * WORLD_STEPS_PER_SECOND;
+
+/** Whether a status carries an interruption from after the panel opened, recent enough to keep the panel up to show it. */
+export function lingers(status: FruitStatus | undefined, since: number, worldTick: number): boolean {
+  return status !== undefined && status.fruitResult.startsWith("interrupted:") && status.fruitResultAt >= since && worldTick - status.fruitResultAt < FRUIT_LINGER_TICKS;
+}
+
+/**
+ * The fruit panel's behaviour, as `main.ts` wires it: F where the HUD offers it sends `inspect-fruit`, the server's
+ * answer opens the panel, and F held with the panel open is the input's fruit button until it is released (or the
+ * window loses focus); only a fresh press holds it, never the auto-repeat of the press that opened the panel. The panel
+ * closes on Escape and when the player is no longer at a pedestal (casting off, a duel, waiting to respawn), except
+ * that an interruption that came with leaving keeps it up for `FRUIT_LINGER_TICKS`, so it says why (a duel, casting
+ * off); F does nothing meanwhile.
+ */
+export class FruitPanel {
+  private inspection: FruitInspectedMessage | undefined;
+  private status: FruitStatus | undefined;
+  private worldTick = 0;
+  /** The world tick the panel opened on: older results are not its own. */
+  private openedAt = 0;
+  private held = false;
+
+  constructor(
+    private readonly send: (type: string, message: unknown) => void,
+    private readonly render: (view: FruitPanelView) => void,
+  ) {}
+
+  get isOpen(): boolean {
+    return this.inspection !== undefined;
+  }
+
+  /** The input's fruit button: F held with the panel open (closing it lets go). */
+  buttons(): number {
+    return this.held ? Buttons.Fruit : 0;
+  }
+
+  /** The latest private status: a player no longer at a pedestal closes the panel. */
+  update(status: FruitStatus | undefined, worldTick: number): void {
+    this.status = status;
+    this.worldTick = worldTick;
+    if (this.inspection !== undefined && !canInspect(status)) {
+      this.held = false;
+      if (!lingers(status, this.openedAt, worldTick)) this.close();
+    }
+    this.draw();
+  }
+
+  /** The server's inspection (only ever of the pedestal where this player is moored). */
+  inspected(message: unknown): void {
+    const inspection = parseFruitInspectedMessage(message);
+    if (inspection === undefined) return;
+    if (this.inspection === undefined) this.openedAt = this.worldTick;
+    this.inspection = inspection;
+    this.draw();
+  }
+
+  /** A key in the page: F inspects, or eats while held with the panel open; Escape closes it. True when it was the panel's. */
+  keydown(event: Pick<KeyboardEvent, "code" | "repeat">): boolean {
+    if (event.code === "Escape" && this.isOpen) {
+      this.close();
+      this.draw();
+      return true;
+    }
+    if (event.code !== "KeyF") return false;
+    if (this.isOpen) {
+      // Only a fresh press holds F (the auto-repeat of the press that opened the panel starts nothing; a hold already
+      // on stays on), and away from the pedestal (the panel lingering to say why eating stopped) F holds nothing.
+      if (!event.repeat && canInspect(this.status)) this.held = true;
+      return true;
+    }
+    if (event.repeat || !canInspect(this.status)) return false;
+    this.send(FruitMessageType.Inspect, {} satisfies InspectFruitMessage);
+    return true;
+  }
+
+  keyup(code: string): void {
+    if (code === "KeyF") this.held = false;
+  }
+
+  /** The window lost focus: F is no longer held. */
+  blur(): void {
+    this.held = false;
+  }
+
+  private close(): void {
+    this.inspection = undefined;
+    this.held = false;
+  }
+
+  private draw(): void {
+    this.render(fruitPanelView(this.inspection, this.status, this.openedAt));
+  }
+}
+
+function field(root: ParentNode, id: string): HTMLElement {
+  const element = root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  if (element === null) throw new Error(`missing fruit field ${id}`);
+  return element;
+}
+
+function write(element: HTMLElement, line: Line): void {
+  element.textContent = line.text;
+  element.dataset["state"] = line.state;
+}
+
+/** Writes the panel into the page: the kit, its specials and description, the hint, the ring and the last result. */
+export function applyFruit(root: ParentNode, view: FruitPanelView): void {
+  const panel = field(root, "fruit-panel");
+  panel.hidden = view.hidden;
+  panel.dataset["kit"] = view.kit;
+  panel.dataset["island"] = String(view.island);
+  field(root, "fruit-name").textContent = view.name;
+  field(root, "fruit-special-u").textContent = view.specials[0] ?? "";
+  field(root, "fruit-special-i").textContent = view.specials[1] ?? "";
+  field(root, "fruit-advantage").textContent = view.advantage === "" ? "" : `Advantage: ${view.advantage}`;
+  field(root, "fruit-vulnerability").textContent = view.vulnerability === "" ? "" : `Vulnerability: ${view.vulnerability}`;
+  write(field(root, "fruit-hint"), view.hint);
+  const ring = field(root, "fruit-progress");
+  ring.hidden = !view.eating;
+  ring.style.setProperty("--progress", `${Math.round(view.progress * 100)}%`);
+  ring.dataset["progress"] = view.progress.toFixed(2);
+  write(field(root, "fruit-message"), view.message);
+}
+
+/** The HUD's fruit lines: the player's kit, and the pedestal where they are moored. */
+export function renderFruitHud(root: ParentNode, status: FruitStatus | undefined): void {
+  write(field(root, "hud-kit"), kitLine(status));
+  write(field(root, "hud-pedestal"), pedestalLine(status));
+}

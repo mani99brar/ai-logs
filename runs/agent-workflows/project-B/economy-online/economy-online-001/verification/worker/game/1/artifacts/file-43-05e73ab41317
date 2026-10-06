@@ -1,0 +1,171 @@
+import { expect, test, type Page } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/index.js";
+import { attachScreenshot, createMatch, place, readout, selfId, startWithCompanion } from "./helpers.js";
+
+/**
+ * §11's economy in the browser, against the browser server (every island open, Suns on Palm Key): a supply crate at
+ * sea, the dockside shop (B) and the sail tonic (T); and a hold of E that survives a pause in the page's own sends.
+ */
+const PALM_WEST = seaMap.docks.find((dock) => dock.island === 0)!;
+/**
+ * The crate on Palm Key's route to the hub: `supplySites(seaMap)[0]`, the same in every match (its unit test,
+ * `apps/server/src/supply.test.ts`, pins this tile).
+ */
+const CRATE = { id: "crate-0", tileX: 39, tileY: 41 };
+const EAST = 0;
+const WEST = 32;
+
+const gold = (page: Page) => page.getByTestId("purse-gold");
+const drawnCrates = async (page: Page): Promise<string[]> =>
+  (JSON.parse((await page.getByTestId("game").getAttribute("data-crates")) ?? "[]") as { id: string }[]).map((crate) => crate.id);
+
+test("one browser sails over a supply crate (+25 gold), moors and buys a sail tonic in the shop with B (−30, 1 of 2), casts off and drinks it with T: the HUD shows its timer and +10% speed, and the server's top speed goes from 39 to 43 [scenario:shop-and-tonic]", async ({ browser, page, request }, testInfo) => {
+  test.setTimeout(90_000);
+  const code = await createMatch(page);
+  const companion = await startWithCompanion(browser, page, code);
+  try {
+    const id = await selfId(page);
+    const hud = page.locator("#hud");
+    await expect(gold(page)).toHaveAttribute("data-gold", "50");
+    await expect(page.getByTestId("purse-tonics")).toHaveText("0 of 2");
+
+    // Three tiles west of the crate, facing it: it is drawn on the sea; ahead carries the ship over it.
+    await place(request, page, code, CRATE.tileX - 3, CRATE.tileY, EAST);
+    await expect.poll(() => drawnCrates(page)).toContain(CRATE.id);
+    await page.keyboard.down("ArrowUp");
+    try {
+      await expect(gold(page)).toHaveAttribute("data-gold", "75");
+    } finally {
+      await page.keyboard.up("ArrowUp");
+    }
+    // Taken: gone from the sea.
+    await expect.poll(() => drawnCrates(page)).not.toContain(CRATE.id);
+
+    // Moored at Palm Key's west dock (E), B opens the shop: the tonic for 30 gold, none carried yet.
+    await place(request, page, code, PALM_WEST.tileX, PALM_WEST.tileY, WEST);
+    await page.keyboard.press("e");
+    await expect(page.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(PALM_WEST.id));
+    const shop = page.getByTestId("shop");
+    await expect(shop).toBeHidden();
+    await page.keyboard.press("b");
+    await expect(shop).toBeVisible();
+    await expect(page.getByTestId("shop-gold")).toHaveText("75 gold");
+    await expect(page.getByTestId("shop-tonic-carried")).toHaveText("You carry 0 of 2");
+    const tonic = page.getByTestId("shop-tonic");
+    await expect(tonic).toHaveText("Buy a sail tonic (30 gold)");
+    // Opening it focused its first button, the tonic: Enter buys it.
+    await expect(tonic).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(gold(page)).toHaveAttribute("data-gold", "45");
+    await expect(page.getByTestId("shop-tonic-carried")).toHaveText("You carry 1 of 2");
+    await expect(page.getByTestId("shop-message")).toHaveText("Bought a sail tonic (−30 gold): you carry 1 of 2");
+    await expect(page.getByTestId("purse-tonics")).toHaveText("1 of 2");
+    // Its rumors are the journal's: a Buy button per missing type. Tab moves to one, and the focus stays on it through
+    // the page's redraws (20 a second).
+    await expect(page.getByTestId("shop-rumors").locator("button")).toHaveCount(2);
+    const focusedRumor = page.getByTestId("shop-rumors").locator("button").first();
+    for (let presses = 0; presses < 4 && !(await focusedRumor.evaluate((element) => element === document.activeElement)); presses++) await page.keyboard.press("Tab");
+    await expect(focusedRumor).toBeFocused();
+    await page.waitForTimeout(500);
+    await expect(focusedRumor).toBeFocused();
+
+    // Casting off (ahead) closes the shop: no safe zone, and no shop at sea.
+    await expect(hud).toHaveAttribute("data-max-speed", "39");
+    await page.keyboard.down("ArrowUp");
+    try {
+      await expect.poll(async () => (await readout(page, id))?.dock).toBe(-1);
+      await expect(shop).toBeHidden();
+      await expect.poll(async () => (await readout(page, id))?.speed, { timeout: 10_000 }).toBe(39);
+      // T drinks it: the timer and +10% speed, the server's top speed 43, and the ship's speed rising to it.
+      await page.keyboard.press("t");
+      await expect(page.getByTestId("purse-tonic-timer")).toHaveText(/^Sail tonic: 1[12] s left · \+10% speed$/);
+      await expect(page.getByTestId("purse-tonic-timer")).toHaveAttribute("data-active", "true");
+      await expect(hud).toHaveAttribute("data-max-speed", "43");
+      await expect(page.getByTestId("purse-tonics")).toHaveText("0 of 2");
+      await expect.poll(async () => (await readout(page, id))?.speed).toBe(43);
+      await attachScreenshot(page, testInfo, "shop-and-tonic");
+    } finally {
+      await page.keyboard.up("ArrowUp");
+    }
+    // A second T with none left: refused, and the HUD says so.
+    await page.keyboard.press("t");
+    await expect(page.getByTestId("purse-tonic-message")).toHaveText(/^Tonic: (One is already working|You carry none: buy one at a dock \(B\))$/);
+  } finally {
+    await companion.close();
+  }
+});
+
+test("holds E through a 400 ms pause of the page's own sends mid-collection, and the six-second collection completes without starting over; then the shop sells the journal's rumor with a click", async ({ browser, page, request }) => {
+  test.setTimeout(90_000);
+  // The page's own sends: while paused (`__pauseSends(ms)`), every WebSocket message waits, then all go in order before
+  // the next one, as a stalled connection delivers them.
+  await page.addInitScript(() => {
+    const send = WebSocket.prototype.send;
+    const held: [WebSocket, Parameters<WebSocket["send"]>[0]][] = [];
+    const flush = () => {
+      for (const [socket, data] of held.splice(0)) send.call(socket, data);
+    };
+    const pause = window as unknown as { __pausedUntil: number; __pauseSends: (ms: number) => void };
+    pause.__pausedUntil = 0;
+    pause.__pauseSends = (ms) => {
+      pause.__pausedUntil = Date.now() + ms;
+      setTimeout(flush, ms + 10);
+    };
+    WebSocket.prototype.send = function (data) {
+      if (Date.now() < pause.__pausedUntil) {
+        held.push([this, data]);
+        return;
+      }
+      flush();
+      send.call(this, data);
+    };
+  });
+  const code = await createMatch(page);
+  const companion = await startWithCompanion(browser, page, code);
+  try {
+    await place(request, page, code, PALM_WEST.tileX, PALM_WEST.tileY, WEST);
+    await page.keyboard.press("e");
+    await expect(page.getByTestId("hud-dock")).toHaveAttribute("data-dock", String(PALM_WEST.id));
+    // Every hold progress the page shows from now on.
+    await page.evaluate(() => {
+      const bar = document.querySelector<HTMLElement>('[data-testid="hud-hold-progress"]')!;
+      const seen: number[] = [];
+      (window as unknown as { __held: number[] }).__held = seen;
+      new MutationObserver(() => seen.push(Number(bar.dataset["held"]))).observe(bar, { attributes: true, attributeFilter: ["data-held"] });
+    });
+    await page.keyboard.down("e");
+    try {
+      await expect(page.getByTestId("hud-hold")).toHaveAttribute("data-state", "collect:sun");
+      await expect.poll(async () => Number(await page.getByTestId("hud-hold-progress").getAttribute("data-held"))).toBeGreaterThanOrEqual(40);
+      // Two seconds in, the page's sends stop for 400 ms (E still down), then go on.
+      await page.evaluate(() => (window as unknown as { __pauseSends: (ms: number) => void }).__pauseSends(400));
+      await expect(page.getByTestId("purse-rubbings")).toHaveAttribute("data-types", "sun", { timeout: 12_000 });
+    } finally {
+      await page.keyboard.up("e");
+    }
+    // The shop (B) sells the journal's targeted rumor: a click on the missing type's button buys it (−25 gold), and the
+    // journal records it; Close closes the shop.
+    await page.keyboard.press("b");
+    await expect(page.getByTestId("shop")).toBeVisible();
+    const offer = page.getByTestId("shop-rumors").locator('button[data-state="available"]').first();
+    await expect(offer).toBeEnabled();
+    const type = (await offer.getAttribute("data-type"))!;
+    await offer.click();
+    await expect(page.getByTestId("shop-message")).toHaveText(/^Bought a rumor about (Sun|Moon) \(−25 gold\)$/);
+    await expect(page.getByTestId("purse-gold")).toHaveAttribute("data-gold", "25");
+    await page.getByTestId("shop-close").click();
+    await expect(page.getByTestId("shop")).toBeHidden();
+    await page.keyboard.press("m");
+    await expect(page.getByTestId("journal-rumors").locator(`li[data-reason="targeted"][data-type="${type}"]`)).toHaveCount(1);
+    // The progress never went back, through the pause: one hold from its start to the collection.
+    const progress = await page.evaluate(() => (window as unknown as { __held: number[] }).__held);
+    const first = progress.findIndex((value) => value > 0);
+    const last = progress.length - 1 - [...progress].reverse().findIndex((value) => value > 0);
+    const during = progress.slice(first, last + 1);
+    expect(during.length).toBeGreaterThan(10);
+    expect(during.every((value, index) => index === 0 || value >= during[index - 1]!)).toBe(true);
+    expect(Math.max(...during)).toBeGreaterThanOrEqual(110);
+  } finally {
+    await companion.close();
+  }
+});

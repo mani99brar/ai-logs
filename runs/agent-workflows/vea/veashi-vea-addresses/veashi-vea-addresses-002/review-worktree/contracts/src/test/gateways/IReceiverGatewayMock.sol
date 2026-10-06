@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: MIT
+
+/// @custom:authors: [@jaybuidl, @shotaronowhere, @adi274]
+/// @custom:reviewers: []
+/// @custom:auditors: []
+/// @custom:bounties: []
+/// @custom:deployments: []
+
+pragma solidity ^0.8.24;
+
+import "../../interfaces/gateways/IReceiverGateway.sol";
+
+interface IReceiverGatewayMock is IReceiverGateway {
+    /// Receive the message from the sender gateway.
+    function digestMessage(uint256 _data) external;
+
+    /// Receive the message array from the sender gateway.
+    function digestMessageArray(uint256[] calldata _data) external;
+}

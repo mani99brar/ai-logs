@@ -1,0 +1,124 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { createEncounterConfig, encounterRules } from "@pirate-sea-race/simulation/encounters";
+import { ImpairmentProxy, logFromBundles, replayRecordedDuel, type HeadlessClient, type Impairment } from "@pirate-sea-race/test-tools";
+import { attacker, defender, expectWithinBudget, opponentChanges, PLAY_FRAMES, SETTLE_FRAMES, type ScenarioReport } from "./harness.js";
+import { objectiveRules } from "@pirate-sea-race/simulation/objectives";
+import { brawler, collectAt, dockFor, grapple, pairInRange, resultOf, roomOf, TEST_SOURCE_LAYOUT, TILE, tracker } from "./seaDuelSetup.js";
+
+/**
+ * The impairment harness (`harness.ts`) on a duel inside a match room (§14): two players join a match through their
+ * own impaired proxies, one grapples the other, and they fight the harness's scripted duel over the match room's
+ * socket, with the same budget as the standalone duel room. The draw's return is here too: its mirrored fight needs
+ * both fighters' inputs on time, so it runs alone rather than beside the other duels at sea.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+const rules = createEncounterConfig();
+
+beforeAll(async () => {
+  // The test source layout and one-second holds (test-only), so the draw's players carry rubbings into it.
+  const matchTuning = { sourceLayout: TEST_SOURCE_LAYOUT.map((types) => [...types]), objectives: { ...objectiveRules, collectTicks: 20 } };
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false, testPlacement: true, matchTuning });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+async function runScenario(scenario: string, impairment: Impairment, seed: number): Promise<ScenarioReport> {
+  const proxies = await Promise.all([ImpairmentProxy.start(server.port, impairment, seed), ImpairmentProxy.start(server.port, impairment, seed + 1)]);
+  const joined: HeadlessClient[] = [];
+  try {
+    const { host, guest } = await pairInRange(endpoint, (client) => void joined.push(client), { endpoints: proxies.map((proxy) => proxy.endpoint) });
+    host.fighter.play((frame) => (frame <= PLAY_FRAMES ? attacker(frame, host.fighter.duel!) : 0));
+    guest.fighter.play((frame) => (frame <= PLAY_FRAMES ? defender(frame, guest.fighter.duel!) : 0));
+    await grapple(host, guest);
+    await host.waitFor(() => host.fighter.phase === "fighting", 8000);
+    const players = [host.fighter, guest.fighter] as const;
+    for (const player of players) await player.waitForConfirmed(PLAY_FRAMES + SETTLE_FRAMES, 30_000);
+    const duel = roomOf(host).seaDuelDiagnostics(host.sessionId)!;
+
+    // Determinism on top of the live hash checks: the pairs each client received replay to the server's state.
+    for (const player of players) {
+      const log = logFromBundles(player.bundles);
+      const replayed = await replayRecordedDuel(log, { seed: duel.seed });
+      const fromServer = await replayRecordedDuel({ ...duel.inputLog, inputs: duel.inputLog.inputs.slice(0, log.inputs.length) }, { seed: duel.seed });
+      expect(log.inputs.length).toBeGreaterThanOrEqual(PLAY_FRAMES + SETTLE_FRAMES);
+      expect(replayed.hash).toBe(fromServer.hash);
+    }
+    const through = PLAY_FRAMES + SETTLE_FRAMES;
+    const pair = <T>(pick: (player: (typeof players)[number], index: 0 | 1) => T): [T, T] => [pick(players[0], 0), pick(players[1], 1)];
+    return {
+      scenario,
+      inputDelay: duel.inputDelay,
+      corrections: pair((player) => player.stats!.corrections),
+      correctionBound: pair((player, index) => opponentChanges(player, through) + player.stats!.substitutedFrames[index]),
+      substituted: [duel.authority.repeated[0] + duel.authority.neutral[0], duel.authority.repeated[1] + duel.authority.neutral[1]],
+      hashChecks: pair((player) => player.stats!.hashChecks),
+      desyncs: pair((player) => player.stats!.desyncs),
+      deepestReplay: pair((player) => player.stats!.deepestReplay),
+      rateLimited: [duel.dropped["0"]!["rate-limited"], duel.dropped["1"]!["rate-limited"]],
+      lostMessages: proxies[0].stats.lost[0] + proxies[0].stats.lost[1] + proxies[1].stats.lost[0] + proxies[1].stats.lost[1],
+    };
+  } finally {
+    await Promise.all(joined.map((client) => client.leave()));
+    await Promise.all(proxies.map((proxy) => proxy.close()));
+  }
+}
+
+describe("a duel at sea through the impairment harness", () => {
+  it("keeps both fighters on the server's state with 80 ms round trip, 20 ms jitter, 1% loss", async ({ annotate }) => {
+    const report = await runScenario("at sea, 80 ms round trip, 20 ms jitter, 1% loss", { rttMs: 80, jitterMs: 20, loss: 0.01 }, 31);
+    console.log(`duel harness: ${JSON.stringify(report)}`);
+    await annotate(
+      `${report.scenario}: input delay ${report.inputDelay}; corrections ${report.corrections.join("/")} (bound ${report.correctionBound.join("/")}); ` +
+        `server substitutions ${report.substituted.join("/")}; hash checks ${report.hashChecks.join("/")}, desyncs ${report.desyncs.join("/")}; ` +
+        `deepest replay ${report.deepestReplay.join("/")} frames; rate-limited drops ${report.rateLimited.join("/")}; lost messages ${report.lostMessages}`,
+    );
+    expectWithinBudget(report);
+    for (const checks of report.hashChecks) expect(checks).toBeGreaterThanOrEqual(175);
+    expect(report.lostMessages).toBeGreaterThan(0);
+    // The impaired link gets a longer input delay than a local one's minimum.
+    expect(report.inputDelay).toBeGreaterThan(3);
+  }, 60_000);
+});
+
+describe("a draw at sea (§6)", () => {
+  it("returns both players of a draw to separate nearby points with 8 s of protection, and moves no rubbing and no gold", async ({ onTestFinished }) => {
+    const track = tracker(onTestFinished);
+    const { host, guest } = await pairInRange(endpoint, track);
+    const at = { host: host.ship()!, guest: guest.ship()! };
+    // Each carries a rubbing the other lacks into the fight.
+    await Promise.all([collectAt(host, endpoint, dockFor("sun"), "sun"), collectAt(guest, endpoint, dockFor("moon"), "moon")]);
+    await host.placeShip(endpoint, { tileX: Math.floor(at.host.x / TILE), tileY: Math.floor(at.host.y / TILE), heading: at.host.heading });
+    await guest.placeShip(endpoint, { tileX: Math.floor(at.guest.x / TILE), tileY: Math.floor(at.guest.y / TILE), heading: at.guest.heading });
+    await host.waitFor(() => host.ship(guest.sessionId) !== undefined);
+    await grapple(host, guest);
+    // The mirrored fight: both swing on the same frames, so both fall on the same frame.
+    host.fighter.play(brawler(0));
+    guest.fighter.play(brawler(1));
+    expect(await resultOf(host, guest)).toEqual({ phase: "over", winner: -1, reason: "double-ko" });
+    for (const client of [host, guest]) await client.waitFor(() => client.status()?.protection === "draw", 2000);
+    const expected = rules.modes.ship.rules.separateReturn({
+      encounter: { x: Math.floor((at.host.x + at.guest.x) / 2), y: Math.floor((at.host.y + at.guest.y) / 2) },
+      players: [at.host, at.guest],
+      minSeparation: rules.drawReturnMinSeparation,
+      maxDistance: rules.drawReturnMaxDistance,
+    });
+    await host.waitFor(() => host.ship()!.x === expected[0].x && host.ship()!.y === expected[0].y, 2000);
+    await guest.waitFor(() => guest.ship()!.x === expected[1].x && guest.ship()!.y === expected[1].y, 2000);
+    expect(Math.hypot(expected[0].x - expected[1].x, expected[0].y - expected[1].y)).toBeGreaterThanOrEqual(rules.drawReturnMinSeparation);
+    expect(host.status()!.protectedUntil).toBe(guest.status()!.protectedUntil);
+    expect(host.status()!.protectedUntil - host.worldTick).toBeLessThanOrEqual(encounterRules.drawProtectionTicks);
+    expect(host.status()!.protectedUntil - host.worldTick).toBeGreaterThan(encounterRules.drawProtectionTicks - 20);
+    // Both back in the world, and in each other's sight.
+    for (const client of [host, guest]) expect(client.status()?.mode).toBe("sea");
+    await host.waitFor(() => host.ship(guest.sessionId) !== undefined);
+    // §4: a draw moves nothing. The ledger settled it on the fight's result, and each keeps its rubbing and gold.
+    expect(roomOf(host).ledgerState.duels[0]).toMatchObject({ phase: "settled", result: { outcome: "draw" }, settlement: { choice: "none", gold: 0 } });
+    expect(host.objectives()).toMatchObject({ rubbings: ["sun"], gold: 50, settledRole: "draw", stolen: "", goldChange: 0 });
+    expect(guest.objectives()).toMatchObject({ rubbings: ["moon"], gold: 50, settledRole: "draw", stolen: "", goldChange: 0 });
+  }, 30_000);
+});

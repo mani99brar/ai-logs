@@ -1,0 +1,79 @@
+# Encounters
+
+§6's rules for starting and leaving duels, as pure code: `@pirate-sea-race/simulation/encounters` (`stepEncounters`), with the tuning in `@pirate-sea-race/content/encounters` (`encounterRules`, validated by `validateEncounterRules`). They decide who can attack whom, the telegraphed attempt and its escape, same-tick reservation, the ready check and the return to the world. They move no ship, run no duel and touch no inventory. The caller (the match room, `encounters-online`) does those things and reports back. Like `stepClaim`, `stepEncounters(config, state, input) → { state, events }` reads one tick's snapshot, never mutates its input, and uses only integers. Players, attempts and reports are read as sets, so their order in the input never matters.
+
+## Attacks
+
+| | Sea grapple (`ship`) | Island challenge (`foot`) |
+| --- | --- | --- |
+| Windup | 20 ticks (1 s) | 12 ticks (0.6 s) |
+| Range | 6 tiles (`ENGAGEMENT_RANGE_TILES`) | 2 tiles |
+| Target cone at the start / hit area at landing | ±8 / ±4 headings | ±8 / ±4 headings |
+| Line of sight | supercover line touching no land | placeholder: never blocked |
+| Miss cooldown | 120 ticks (6 s) | 120 ticks (6 s) |
+
+A press starts an attempt only if the rules find a target: the nearest eligible player of the same mode in range, in line of sight and in the ±8 front cone of the attacker's heading, ties to the lower id. Otherwise nothing happens and nothing is spent. The aim locks to the bearing toward the target. At the landing tick the attempt hits if the defender is still eligible, in range, within ±4 of the aim and in line of sight. Otherwise it misses, and the attacker's cooldown starts.
+
+**Eligibility.** The attacker must be in the snapshot, connected, not in a duel, not respawning, out of cooldown and without an attempt already running. The defender must be in the snapshot (it may be disconnected, §12), in the same mode, not in a duel, not respawning and unprotected. Fewer than `maxDuels` (4) duels may be unsettled. An attacker who disconnects, leaves, changes mode or is reserved during the windup loses the attempt (`attempt-cancelled`, no cooldown). A defender who has become ineligible by the landing tick is a miss (`defender-ineligible`), as §6 says.
+
+**Geometry**, defined once in `geometry.ts`. Positions are sub-units (256 a tile), and distances are compared squared: exactly at the range is in range. The *bearing* is the heading (of 64) whose table vector has the largest dot product with the offset, ties to the lower heading. *Within ±N* means a circular heading difference of at most N. Distance 0 has no bearing and is inside every cone. *Line of sight* (sea) is the supercover line between the centres of the two ships' tiles: every tile the segment touches, and both side tiles where it passes exactly through a corner. It is the same set in both directions. A land tile or a tile off the map blocks. Shoals and docks do not.
+
+**Per-mode rules** (`ModeRules` in `modes.ts`: `lineOfSight`, `separateReturn`, `respawnPoint`) come from the config. `seaModeRules(map)` is complete. `footPlaceholderRules` never blocks line of sight and returns every player to where they stood. `objectives-endgame` replaces it through `createEncounterConfig({ modeRules: { foot } })`.
+
+## State
+
+`EncounterState` is plain data that `hashState` covers:
+
+- `tick`: the last tick processed.
+- `closed`: set when the caller reports the match over. The step then ignores every later input.
+- `players`: records only for players with something to remember, sorted by id. Each has `protection` (`{ source: spawn | win | draw | respawn, endTick }`, protected while `tick < endTick`), `cooldownEndTick`, and `respawn` (a loser waiting out of the world until `respawnTick`).
+- `attempts`: one per attacker, with `defenderId`, `mode`, `aim`, `startTick` and `landTick`. These are the telegraphs to draw.
+- `duels`: every duel from reservation to settlement, in reservation order. Each has `id = duel:<tick>:<attacker id length>:<attacker>:<defender>`, `mode`, `players` (attacker, defender), each player's position at the hit, and the encounter position (their midpoint). `phase` is `transition`, `fighting` or `ended`, and the duel also holds `startTick` and `end`.
+
+`duelMarkers(state)` gives other players what §6 allows: `{ x, y, startTick }` for each duel, with no id and no player names. Spawn protection comes from `createEncounterState(config, { tick, spawnProtected: ids })` (45 s, §2).
+
+## One tick, and where the caller runs it
+
+The room runs `stepEncounters` first in each world tick, **before `stepClaim`** (§5: accepted reservations first). It passes the previous tick's claim and ledger outcomes as `protectionEndedBy` (`claim` after a `protection-ended` from `stepClaim`, `collection` after a ledger collection start). A protection ended by an objective therefore reaches the encounter rules one tick (50 ms) late. This lag is accepted. Within the step:
+
+1. **Match over** (`matchOver: true`): every attempt is cancelled (`match-over`), and the state closes.
+2. **Protection** that has run out (`expired`), or that last tick's claim or collection ended, ends.
+3. **Reports**, in a fixed order. An `end` report is accepted once per duel (`duel-ended`), in `transition` or `fighting`, with its tick between the reservation and now. A second end report, an unknown duel, a stranger as winner, a future tick or a settlement before the end each give `report-refused` and change nothing. A `settled` report removes the duel (`duel-settled`) and returns its players:
+   - after a **win**, the winner goes back to their own position at the hit (`player-returned`, `win`, 8 s from the settlement tick). The loser is `player-respawning` until 15 s after the fight's *end* tick, or the settlement tick if that is later, so the theft choice doesn't lengthen the wait;
+   - after a **draw or cancellation**, both players go to the centres of two distinct navigable tiles within 6 tiles of the encounter and at least 3 tiles apart (`player-returned`, `draw`, 8 s). The pair chosen is the one nearest to where each player stood, ties row-major.
+4. **Respawns** that are due take place (`player-respawned`, `respawn`, 20 s). The loser goes to the dock nearest the encounter with no other player (except those still respawning) within `SIGHT_RADIUS_TILES`, ties by dock id. If every dock has an opponent that close, the loser goes to the dock farthest from its nearest opponent. The dock is chosen from positions on the respawn tick.
+5. **Transitions.** A fight starts once the 3 s countdown is over and both clients report `ready` (`duel-started`). If a client is still not ready 10 s after the reservation, it forfeits (`duel-forfeited`, which ends the duel with that tick as its end tick). If both are still not ready, the duel is cancelled (`duel-cancelled`, §12's double forfeit).
+6. **Attempts.** Attempts whose attacker is no longer eligible are cancelled. Every attempt landing on this tick is resolved at once. Misses come first. Hits are sorted by attacker-to-defender distance, then attacker id, then defender id. A hit reserves a duel (`duel-reserved`) if both of its players are still free and the cap allows another duel. If a player is already taken, the hit is `attempt-preempted` (`conflict`). If the cap is reached, the hit is `attempt-preempted` (`duel-cap`). Neither costs a cooldown. Pending attempts by players just reserved are cancelled.
+7. **Presses** start attempts (`attempt-started`, with `protection-ended`/`attack` first if the attacker was protected). Targets are chosen from the state before any of this tick's starts, so a protected player who attacks on this tick becomes a target only from the next tick.
+
+## Mapping onto the ledger and the claim
+
+| Event or report | The caller does |
+| --- | --- |
+| `duel-reserved` | `reserveDuel({ duelId, players, tick })`. Pass `state.duels` as the claim's `encounters` (`{ id, playerIds: players }`). |
+| `duel-forfeited` | `reportDuelResult({ duelId, tick, outcome: "win", winner })`. Do not send an `end` report back. |
+| `duel-cancelled` | `reportDuelResult({ duelId, tick, outcome: "cancelled" })`. Do not send an `end` report back. |
+| A fight that ran ends (or a player quits, or the server faults) | `reportDuelResult` with the result, and an `end` report (`win` + `winner`, `draw` or `cancelled`) with the tick it ended. |
+| The ledger settles the duel (a draw or cancellation at once, a win at `chooseTheft` or `advanceLedger`) | A `settled` report with the ledger's settlement tick. |
+| `player-returned`, `player-respawned` | Move the ship (or player) to `x, y`. `protection` is also the claim's `protected` flag. |
+| `stepClaim` emits `protection-ended`, or the ledger starts a collection or a cache claim | Set `protectionEndedBy` next tick (`collection` for both ledger holds). |
+| `stepClaim` emits `match-ended` (its `duel-ended-without-theft` ends running duels) | Set `matchOver: true` next tick. |
+
+## In the match room (`encounters-online`)
+
+`MatchRoom` runs the step each world tick of a running match, after sailing: every ship is a `ship` player, `attack` is the grapple button (J) latched since the last world step, `ready` is the fighter's `duel-ready`, and `connected` whether its client is there (a disconnected ship stays in the snapshot for its seat's 60 s, so it can be grappled, §12). Since `match-online` the rules run only from player control start: at the match flow's `control-started` the room creates the state with `createEncounterState(config, { tick, spawnProtected })`, every ship present protected for `spawnProtectionTicks` (45 s, the departure) from that tick, and it stops stepping them once the match has ended (outcomes freeze; a duel still running is cancelled without theft).
+
+Since `rubbings-theft` the room maps the rules onto the objective ledger as the table above says. Per world tick, in this order:
+
+1. `advanceLedger`: choice windows that closed settle with the default theft.
+2. The §12 timers, on the same tick: a fighter away from an unfinished duel for 10 s is forfeited in its machine; a disconnected player whose seat deadline has come is expired in the ledger (their rubbings into a cache at the dock `respawnPoint` would choose for them) and their ship leaves.
+3. `stepEncounters`, with the reports: a fight that ended since the last tick is reported to the ledger (`reportDuelResult`, unless a player's quit or expiry already decided it there) and its `end` goes to the rules as the ledger recorded it; a `settled` report goes for each duel the ledger has settled, never before. A duel's players therefore return only after the settlement. `duel-reserved` calls `reserveDuel`; a ready-check `duel-forfeited` or `duel-cancelled` calls `reportDuelResult` and gets no `end` report back.
+4. The ledger's holds: each connected player moored at a dock and holding E continues, starts or (without E, mooring or a target) cancels a collection or a cache claim. A hold that starts sets `protectionEndedBy: "collection"` for the next tick, so collecting or claiming ends protection (§2, §6) one tick (50 ms) late.
+5. Since `match-online`: `stepClaim` with this tick's reservations (`state.duels`), then the match flow and the reveals (`docs/architecture.md`). A claim's `protection-ended` sets `protectionEndedBy: "claim"` for the next tick.
+
+A theft choice (`choose-theft`) arrives between ticks and calls `chooseTheft` at the last processed tick; its settlement is reported on the next tick. Every ship starts with the departure's spawn protection at control start. The room's own part (the duel machine, the returns, what each client may see) is in `docs/architecture.md` and `docs/duel.md`.
+
+## Open points
+
+- Island walking doesn't exist yet. The island challenge is tested for timing, range, cone and cooldown only, with caller-supplied positions.
+- If a sea has no valid pair of draw points within 6 tiles, both ships stay where they were. The property tests check the spacing on every draw they produce.

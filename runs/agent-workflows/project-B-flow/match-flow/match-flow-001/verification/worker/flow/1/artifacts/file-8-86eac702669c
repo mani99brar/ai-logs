@@ -1,0 +1,348 @@
+import { afterAll, describe, expect, it } from "vitest";
+import { nextInt } from "../random.js";
+import {
+  createMatchConfig,
+  createMatchState,
+  elapsed,
+  hashState,
+  MATCH_END_REASONS,
+  MATCH_PHASES,
+  matchRules,
+  remaining,
+  replayMatch,
+  stepMatch,
+  type MatchConfig,
+  type MatchEvent,
+  type MatchInput,
+  type MatchKind,
+  type MatchReport,
+  type MatchState,
+} from "./index.js";
+
+type Draw = (bound: number) => number;
+
+function generator(seed: number): Draw {
+  let rng = seed >>> 0;
+  return (bound) => {
+    const drawn = nextInt(rng, bound);
+    rng = drawn.state;
+    return drawn.value;
+  };
+}
+
+/** Recursively frozen, so a step that mutated its input would throw. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+interface Scenario {
+  readonly seed: number;
+  readonly kind: MatchKind;
+  /** Per mille, for each report slot. */
+  readonly leavePerMille: number;
+  readonly claimPerMille: number;
+  readonly faultPerMille: number;
+  /** Per mille of ticks that jump ahead by up to 60 ticks. */
+  readonly skipPerMille: number;
+}
+
+/** Compressed times, so the deadline is reachable: a 1 s ready check, 1.5 s of departure, 20 s matches. */
+const QUICK = { rules: { ...matchRules, readyTicks: 20, departureTicks: 30 }, durationTicks: 400 };
+const IDS = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "C"];
+const ISLANDS = ["palm", "ash", "mist", "ruin"];
+const MAX_STEPS = 700;
+
+const SCENARIOS: Scenario[] = Array.from({ length: 60 }, (_, index) => {
+  const draw = generator(20260925 + index * 7919);
+  return {
+    seed: 1_000 + index,
+    kind: index % 2 === 0 ? "private" : "public",
+    leavePerMille: [20, 60, 150, 300][index % 4]!,
+    // A third of the scenarios never claim or fault, so they run to the deadline or empty out.
+    claimPerMille: index % 3 === 0 ? 0 : 2 + draw(6),
+    faultPerMille: index % 3 === 0 ? 0 : draw(3),
+    skipPerMille: [0, 100, 400][index % 3]!,
+  };
+});
+
+const EXERCISED = new Set<string>();
+const MUST_EXERCISE = [
+  ...MATCH_PHASES.map((phase) => `phase:${phase}`),
+  ...MATCH_END_REASONS.map((reason) => `end:${reason}`),
+  "ready->lobby",
+  "join-refused:started",
+  "join-refused:full",
+  "start-refused:public",
+  "start-refused:not-host",
+  "start-refused:too-few",
+  "transition-skipped",
+  "stale-input",
+  "left-in-results",
+];
+
+const RANK = new Map<string, number>(MATCH_PHASES.map((phase, index) => [phase, index]));
+
+interface Tally {
+  collected: number;
+  thefts: number;
+  lost: number;
+  duelsWon: number;
+  duelsLost: number;
+  duelsDrawn: number;
+  gold: number | null;
+  cachesClaimed: number;
+  islands: Set<string>;
+}
+
+/** Plays one seeded match the way a room would: it reads the state to choose each tick's reports. */
+function play(config: MatchConfig, scenario: Scenario): { inputs: MatchInput[]; events: MatchEvent[]; state: MatchState } {
+  const draw = generator(scenario.seed);
+  const chance = (perMille: number) => draw(1000) < perMille;
+  let state = deepFreeze(createMatchState(config));
+  const inputs: MatchInput[] = [];
+  const events: MatchEvent[] = [];
+  let tick = 0;
+  let resultsSeen = 0;
+
+  for (let step = 0; step < MAX_STEPS && state.end === null; step++) {
+    const before = state;
+    tick += 1 + (chance(scenario.skipPerMille) ? draw(60) : 0);
+    const controlStart = state.controlStartTick ?? (state.readyTick !== null ? state.readyTick + config.readyTicks : null);
+    const deadline = controlStart === null ? null : controlStart + config.durationTicks;
+    // A room steps every tick near the deadline, so the claim module's deadline report lands on its own tick.
+    if (deadline !== null && tick > deadline) tick = deadline;
+    if (tick <= state.tick) tick = state.tick + 1;
+    const running = state.controlStartTick !== null || (controlStart !== null && tick >= controlStart);
+    const inPlayers = state.controlStartTick !== null ? state.players.map((player) => player.id) : [];
+    const pick = <T,>(list: readonly T[]) => list[draw(list.length)]!;
+
+    const reports: MatchReport[] = [];
+    const slots = draw(5);
+    for (let slot = 0; slot < slots; slot++) {
+      const roll = draw(1000);
+      if (roll < 250) reports.push({ kind: "join", playerId: pick(IDS) });
+      else if (roll < 250 + scenario.leavePerMille) reports.push({ kind: "leave", playerId: pick(IDS) });
+      else if (roll < 400 + scenario.leavePerMille) {
+        const host = state.host;
+        reports.push({ kind: "start", playerId: host !== null && chance(700) ? host : pick(IDS) });
+      } else if (inPlayers.length >= 2 && roll < 500 + scenario.leavePerMille) {
+        const a = pick(inPlayers);
+        const others = inPlayers.filter((id) => id !== a);
+        const b = pick(others);
+        const outcome = draw(3);
+        reports.push({ kind: "duel-ended", playerIds: [a, b], winner: outcome === 0 ? null : outcome === 1 ? a : b });
+      } else if (inPlayers.length > 0) {
+        const playerId = pick(inPlayers);
+        switch (draw(6)) {
+          case 0:
+            reports.push({ kind: "collected", playerId });
+            break;
+          case 1:
+            reports.push({ kind: "stole", playerId });
+            break;
+          case 2:
+            reports.push({ kind: "lost", playerId });
+            break;
+          case 3:
+            reports.push({ kind: "cache-claimed", playerId });
+            break;
+          case 4:
+            reports.push({ kind: "island-visited", playerId, island: pick(ISLANDS) });
+            break;
+          default:
+            reports.push({ kind: "gold", playerId, gold: draw(200) });
+        }
+      }
+    }
+    if (running && inPlayers.length > 0 && chance(scenario.claimPerMille)) reports.push({ kind: "match-ended", tick, reason: "claim", winner: pick(inPlayers) });
+    if (chance(scenario.faultPerMille)) reports.push({ kind: "fault" });
+    if (deadline !== null && tick === deadline) {
+      // The claim module ends on its deadline tick unless a claim completed on it.
+      if (!reports.some((report) => report.kind === "match-ended")) reports.push({ kind: "match-ended", tick, reason: "deadline", winner: null });
+    }
+
+    const input = deepFreeze({ tick, reports });
+    const stepped = stepMatch(config, before, input);
+    inputs.push(input);
+    events.push(...stepped.events);
+    state = deepFreeze(stepped.state);
+
+    // Invariants of one step.
+    let phase = before.phase;
+    for (const event of stepped.events) {
+      if (event.kind === "phase-changed") {
+        expect(event.from).toBe(phase);
+        const backwards = RANK.get(event.to)! <= RANK.get(event.from)!;
+        if (backwards) {
+          expect([event.from, event.to]).toEqual(["ready", "lobby"]);
+          EXERCISED.add("ready->lobby");
+        }
+        phase = event.to;
+        if (event.tick < tick) EXERCISED.add("transition-skipped");
+      }
+      if (event.kind === "control-started") {
+        expect(before.readyTick).not.toBeNull();
+        expect(event.tick).toBe(before.readyTick! + config.readyTicks);
+      }
+      if (event.kind === "join-refused") EXERCISED.add(`join-refused:${event.reason}`);
+      if (event.kind === "start-refused") EXERCISED.add(`start-refused:${event.reason}`);
+      if (event.kind === "match-ended") {
+        resultsSeen++;
+        expect(event.results).toBe(state.results);
+      }
+    }
+    expect(phase).toBe(state.phase);
+    EXERCISED.add(`phase:${state.phase}`);
+    expect(state.tick).toBe(tick);
+    expect(state.end === null).toBe(state.results === null);
+    expect(state.end === null).toBe(state.phase !== "ended");
+    const present = state.players.filter((player) => !player.left);
+    expect(present.length).toBeLessThanOrEqual(config.seats);
+    if (state.phase === "ready") expect(present.length).toBeGreaterThanOrEqual(config.minPlayers);
+    if (state.phase === "lobby" || state.phase === "ready") expect(state.players.every((player) => !player.left)).toBe(true);
+    if (!config.custom) expect(state.host).toBeNull();
+    else if (state.end === null) expect(state.host).toBe(present.length === 0 ? null : [...present].sort((a, b) => a.order - b.order)[0]!.id);
+    if (state.phase === "exploration") expect(tick).toBeGreaterThanOrEqual(state.controlStartTick! + config.departureTicks);
+    if (state.phase === "departure") expect(tick).toBeLessThan(state.controlStartTick! + config.departureTicks);
+    for (const probe of [tick - 100, tick, tick + 100]) {
+      const [spent, left] = [elapsed(state, probe), remaining(state, probe)];
+      expect(spent).toBeGreaterThanOrEqual(0);
+      expect(left).toBeGreaterThanOrEqual(0);
+      if (spent <= config.durationTicks) expect(spent + left).toBe(config.durationTicks);
+    }
+    hashState(state);
+
+    // A repeated or stale input changes nothing.
+    if (step % 17 === 0) {
+      const again = stepMatch(config, state, input);
+      expect(again.state).toBe(state);
+      expect(again.events).toEqual([]);
+      EXERCISED.add("stale-input");
+    }
+  }
+  expect(resultsSeen).toBe(state.end === null ? 0 : 1);
+  return { inputs, events, state };
+}
+
+/** Counts every accomplishment report from control start to the end, independently of the step. */
+function tally(inputs: readonly MatchInput[], state: MatchState): Map<string, Tally> {
+  const tallies = new Map<string, Tally>();
+  const of = (id: string) => {
+    let entry = tallies.get(id);
+    if (entry === undefined) {
+      entry = { collected: 0, thefts: 0, lost: 0, duelsWon: 0, duelsLost: 0, duelsDrawn: 0, gold: null, cachesClaimed: 0, islands: new Set() };
+      tallies.set(id, entry);
+    }
+    return entry;
+  };
+  if (state.controlStartTick === null) return tallies;
+  for (const input of inputs) {
+    if (input.tick < state.controlStartTick || (state.end !== null && input.tick > state.end.tick)) continue;
+    for (const report of input.reports) {
+      switch (report.kind) {
+        case "collected":
+          of(report.playerId).collected++;
+          break;
+        case "stole":
+          of(report.playerId).thefts++;
+          break;
+        case "lost":
+          of(report.playerId).lost++;
+          break;
+        case "cache-claimed":
+          of(report.playerId).cachesClaimed++;
+          break;
+        case "island-visited":
+          of(report.playerId).islands.add(report.island);
+          break;
+        case "gold":
+          of(report.playerId).gold = report.gold;
+          break;
+        case "duel-ended":
+          for (const id of report.playerIds) {
+            if (report.winner === null) of(id).duelsDrawn++;
+            else if (report.winner === id) of(id).duelsWon++;
+            else of(id).duelsLost++;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return tallies;
+}
+
+describe("match flow properties", () => {
+  afterAll(() => {
+    expect(MUST_EXERCISE.filter((label) => !EXERCISED.has(label))).toEqual([]);
+  });
+
+  for (const scenario of SCENARIOS) {
+    it(`keeps its invariants: seed ${scenario.seed}, ${scenario.kind}, leaves ${scenario.leavePerMille}‰, skips ${scenario.skipPerMille}‰`, () => {
+      const config = createMatchConfig({ kind: scenario.kind, ...QUICK });
+      const { inputs, events, state } = play(config, scenario);
+
+      // Replaying the same inputs gives the same state, events and hash; so does replaying them with repeats.
+      const first = replayMatch(config, createMatchState(config), inputs);
+      expect(first.hash).toBe(hashState(state));
+      expect(first.events).toEqual(events);
+      const repeated = inputs.flatMap((input, index) => (index % 3 === 0 ? [input, input] : [input]));
+      expect(replayMatch(config, createMatchState(config), repeated).hash).toBe(first.hash);
+
+      expect(events.filter((event) => event.kind === "control-started").length).toBe(state.controlStartTick === null ? 0 : 1);
+      expect(events.filter((event) => event.kind === "match-ended").length).toBeLessThanOrEqual(1);
+
+      if (state.end === null) return;
+      EXERCISED.add(`end:${state.end.reason}`);
+      const results = state.results!;
+      expect(results.winner === null).toBe(state.end.reason !== "claim");
+      expect(results.players.map((player) => player.id).sort()).toEqual(state.players.map((player) => player.id).sort());
+      expect(results.players.filter((player) => player.winner).map((player) => player.id)).toEqual(results.winner === null ? [] : [results.winner]);
+      for (let index = 1; index < results.players.length; index++) {
+        const a = results.players[index - 1]!;
+        const b = results.players[index]!;
+        const ordered = Number(a.winner) > Number(b.winner) || (a.winner === b.winner && (a.rubbingsHeld > b.rubbingsHeld || (a.rubbingsHeld === b.rubbingsHeld && a.id < b.id)));
+        expect(ordered).toBe(true);
+      }
+      const tallies = tally(inputs, state);
+      for (const line of results.players) {
+        const expected = tallies.get(line.id);
+        const player = state.players.find((candidate) => candidate.id === line.id)!;
+        expect(line.left).toBe(player.left);
+        if (line.left) EXERCISED.add("left-in-results");
+        expect({
+          collected: line.collected,
+          thefts: line.thefts,
+          lost: line.lost,
+          duelsWon: line.duelsWon,
+          duelsLost: line.duelsLost,
+          duelsDrawn: line.duelsDrawn,
+          gold: line.gold,
+          cachesClaimed: line.cachesClaimed,
+          islandsVisited: line.islandsVisited,
+        }).toEqual({
+          collected: expected?.collected ?? 0,
+          thefts: expected?.thefts ?? 0,
+          lost: expected?.lost ?? 0,
+          duelsWon: expected?.duelsWon ?? 0,
+          duelsLost: expected?.duelsLost ?? 0,
+          duelsDrawn: expected?.duelsDrawn ?? 0,
+          gold: expected?.gold ?? config.startingGold,
+          cachesClaimed: expected?.cachesClaimed ?? 0,
+          islandsVisited: expected?.islands.size ?? 0,
+        });
+        expect(line.rubbingsHeld).toBe(Math.max(0, line.collected + line.thefts + line.cachesClaimed - line.lost));
+      }
+
+      // Nothing after the end changes anything.
+      const after = stepMatch(config, state, { tick: state.tick + 1, reports: [{ kind: "fault" }, { kind: "join", playerId: "late" }] });
+      expect(after.state).toBe(state);
+      expect(after.events).toEqual([]);
+    });
+  }
+});

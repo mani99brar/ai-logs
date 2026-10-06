@@ -1,0 +1,225 @@
+### 5.2 Derivation rules
+
+Each rule carries its source tag, which the UI shows in a tooltip. Each rule has a unit test on the captured payloads.
+
+1. **Attempt number.** Re-read it from the message with `/\battempt (\d+)/i` before falling back to `event.attempt`. The server parser is case-sensitive (server/projects.ts:1067-1070), so every challenge event reads "attempt 1" today. Expected on skeleton-001: challenge attempts 1, 2, 3.
+2. **Controller rows.** On any node, a message matching `^Automatic checkpoint controller PID \d+` is a `controller_start` marker, never a node status. A `^\[Errno \d+\]` failure on a node that later succeeded is a `controller_error` marker. This fixes guardrails `launch_controller` #5-#17/#24/#29/#32 until B1 lands.
+3. **Spans.** A `running` status event opens a span for (node, attempt). The next terminal status (succeeded, failed, paused, cancelled) closes it. A new attempt that opens while the previous one is still open closes it as "ended without a record". Example: challenge attempt 1, 08:39:42 → 08:45:55.
+4. **Receipts and evidence.** When events are missing:
+   - A worker span runs from `native_started_at` (else `launch_requested_at`) to `stop.confirmed_at`, or to *now* while running. The source is "receipt". Example: 08:50:52 → 09:19:13 = 28m21s.
+   - A review without events ends at `reviewed_at`. Its start is the earliest `reviewers[].launched_at`, else the end of the step it depends on, marked ≈ inferred.
+   - A candidate without a `running` event starts ≈ at the end of the last verify step. Example: 09:29:15 → 09:30:21.
+   - An approval without an event is ≈ an instant at the integrate event's time, with the note "no approval event recorded".
+5. **Run-level rows** (`node_id` null):
+   - `failed identically` becomes a **diagnosis** marker (⚑), attached to the lane named in `<phase>/<lane>`.
+   - `^Repair (\d+) applied` becomes a **repair** marker (⚒). It carries the snapshot and files from the node's `paused` "Repair n by the operator" event (#20).
+   - `Supervisor interrupted` / `Claude Code was unavailable` become an **interrupted** marker.
+   - A controller row whose raw status was `blocked` becomes a **controller_blocked** marker (✗). With B1 it is served as `status: 'failed'` on a node-less row. Before B1, it is recognised as a node-less row that is not one of the running-type messages: the PID checkpoint, `^Rerunning `, `^Resuming `, `^Repair \d+ applied`. Examples: `Worker game deadline exhausted; no automatic relaunch` (automatic.py:1284), `… failed identically on attempts 1 and 2 …` (advance_or_block, :1011; this one is also the diagnosis), and `… ended on it in a state no resume continues` (:1323).
+   - Anything else is a plain log row.
+6. **Gaps.** A stretch of more than 120 s with no event becomes a gap row, classified by what surrounds it:
+   - after a diagnosis, failure or pause and before a repair or resume: **operator time**. Example: skeleton-001, 5m37s.
+   - after a `controller_error` and before a `controller_start`: **controller not running**. Example: guardrails, 4m56s and 6m35s. This applies even inside a worker span, where it is drawn as a hatched band on that bar.
+   - inside a worker span with no other cause: **worker working**. Example: 28m21s.
+   - otherwise: **no activity**.
+
+   Silences over 30 min get an axis break in the Steps bars, so overnight gaps do not squash the chart.
+7. **Questions.** Each `asked_at` gets a row ("duel asked question 2 · waited 5m"), and so does each `answered_at`. While `answer === null` the row is live. When the export is stale, the question event message is the fallback (section 6.2, rule 1).
+8. **Setup and check split** (node view only): attempt start → first `checks[].started_at` is setup; first `started_at` → last `finished_at` is checks. Example: 42 s + 33 s.
+9. **Worker deadline**: `native_started_at + worker_timeout_seconds + Σ(question waits)`. **Reviewer deadline**: `launched_at + review_timeout_seconds`.
+10. **Run span**: `created_at` → the last non-controller activity (events, `reviewed_at`, `stop.confirmed_at`). For skeleton-001 that is 52m51s ending 09:32:31, not "Updated 09:36:07".
+11. **Lane on candidate events.** Until B1 prefixes the lane, candidate failures are matched to lane results by comparing an event's time with each lane result's last `checks[].finished_at`. Guardrails #28 → `candidate_ui/1`, #31 → `candidate_ui/2`.
+
+### 5.3 Display rules
+
+| Rule | Detail |
+|---|---|
+| Element | Every time is `<time dateTime={iso} title="2026-09-24 09:32:31 UTC">`. `src/projects/Time.tsx` replaces the ~20 `formatTime` call sites. |
+| Zone | Local by default. The Local/UTC toggle (`time-zone-toggle`) sits on the run header, next to the live chip; S1 puts it beside the chip on today's run title row, and S3 moves both into `RunHeader` without changing their testids. It is stored in `localStorage` key `mdm.projects.timezone`. Every read and write is wrapped in try/catch, and the page renders correctly without it. In UTC mode the Steps "Started" header and the Activity heading say "UTC"; times are not suffixed one by one. |
+| Clock | `HH:MM` in headers, Steps and lists. `HH:MM:SS` in Activity rows and node timing lines. The date is prefixed (`Sep 23`, or `yesterday` in lists) only when it differs from the run's start day or today. |
+| Relative | "3 min ago" appears on headers, Now, list rows and the live chip for items under 24 h. Activity rows use durations and gaps instead. |
+| Durations | `formatSpan`: `46s`, `2m29s`, `28m21s`, `1h05m`. It is shown on the run header, Steps rows, bars, node timing, check rows, reviewers and run-list rows. Inferred values get a `≈` prefix plus a source tooltip. Missing values show `—` or "not recorded", never a guess. |
+| Attempts | "attempt k" everywhere. Verification and candidate add "k of N on this revision" (N = `inputs.max_verification_attempts`, restarted by a repair) while the node is live or failed. Steps markers: `✗` failed, `?` ended without a record, `⚑` diagnosis, `⚒` repair, `✓` passed. Pending: "not started", never "attempt 0". |
+| Ticking | One `useNow` at RunView. It ticks every 1 s while the run is not terminal and the tab is visible, and does not tick otherwise. |
+| Order | Activity is oldest first by default, with a remembered "Newest first" toggle. The Now banner always carries the latest state. |
+| Humanized messages | SHAs are cut to 7 characters. Known phrases are mapped, for example "Awaiting explicit completion signal; idle is not acceptance" → "waiting for the worker's completion signal (idle is not acceptance)". The sequence number and full message sit in an expander. |
+
+## 6. Live state and next action
+
+### 6.1 Command form
+
+- **Syntax.** Commands use the RUNBOOK's own convention: `"$PY" -m workflow <cmd> "$RUN" …` (RUNBOOK.md:110-111, 261, 269, 301).
+- **Legend.** Each command block has a `$PY/$RUN ▸` disclosure on its label line: *PY: md-manager's `.venv/bin/python`, run from its checkout. RUN: this run's directory.*
+- **With B3.** A second copyable line, `RUN=~/.local/state/agent-workflows/project-B/skeleton/skeleton-001`, makes the command paste-ready.
+- **Without B3.** The disclosure says that RUN is `<runs root of this workflow>/<run id>`, and that the path is not served by default.
+- **Placeholders.** They stay visible as `<…>`. The viewer never invents a feature name, run id, commit or reason.
+- **Multi-step next steps.** They are a numbered list. Each command line has its own Copy button, and a step that is not a command is plain text ("commit the fix in …").
+- **Copy.** The Copy button's text is exactly "Copy" (aria-label "Copy command"). The command lives in `<code>` outside any button, so `expectNoExecutionControls` (support.ts:32-36) still passes. When the clipboard API is unavailable (a non-secure http origin), Copy selects the `<code>` text instead.
+- **Label.** The block is always labelled "Likely next step" and names its RUNBOOK section. Its one-line caption is the command-block honesty statement: "Run these in your terminal; this viewer never changes a run."
+- **`status` is not described as read-only.** It "reports the run's state and changes no run progress; it refreshes `report.html` in the run directory" (RUNBOOK:268-272).
+
+### 6.2 Situations
+
+`deriveNow()` in `triage.ts` checks the rules in this order, and the first match wins. Each rule sets `run-now[data-situation]` to the id in the Situation column.
+
+**Scope rule.** The classifier reads only:
+- each node's snapshot status;
+- the focus node's latest status event, result and lane results;
+- the run's `inputs` (questions, completion, challenge);
+- run-level rows (`node_id: null`) inside the **scope window**. The window opens at the focus node's latest `running` status event. If it has none, it opens at the latest status event of any node it depends on, which for `handoff` means the lanes' launch events.
+
+It never matches older `[Errno …]`, `KeyboardInterrupt` or `blocked` rows. Guardrails has four stale Errno failures between 19:33 and 20:03, and skeleton-001 has one at 08:46.
+
+**Focus node.** The first node in definition order whose status is `failed`, `paused` or `awaiting_approval`, else the first `running` node. Ties go to the latest event.
+
+| # | Situation (`data-situation`) | Detected from (current state only) | Now headline | Likely next step (verified against the CLI) | RUNBOOK |
+|---|---|---|---|---|---|
+| 1 | **Question waiting** (`question`) | Any of: B2 `activity.waiting_questions > 0` (live `<lane>.questions.json`); `inputs.workers[].questions` whose last `answer === null`; `completion.status === 'question'`. Fallback: the lane's latest event is `Worker <lane> asked question N of 3` (guardrails.py:760) with no later status event for that lane, labelled "from the event log; answered state not yet exported". | `? Waiting on you: game asked question 2 of 3 · 14 min ago · deadline paused` + question text | Inside Herdr: `"$PY" -m workflow answer "$RUN" game "<your answer>"`. From any other shell: the same with `--no-herdr`, then type the answer into the session it prints. One caveat line: outside Herdr the first form records the answer and exits 1 undelivered (guardrails.py:996-1001, RUNBOOK:56). | Guardrails › Worker questions |
+| 2 | **Pane needs attention** (`pane_attention`) | The latest event of `launch_<lane>` or `review` says `needs attention in its pane` (automatic.py:281, :556), with no later event for that node; or B2 `activity.attention.kind === 'pane'` | `? Waiting on you: game needs attention in its pane (native state blocked) · since 11:41` | `"$PY" -m workflow.interactive attach-one "$RUN" --node game` (reviewer: `--node review-<id>`) (interactive.py:644-650) | 3. Start and interact; One-command launch |
+| 3 | **Awaiting approval** (`awaiting_approval`) | A node with status `awaiting_approval` | `Awaiting your approval since 10:14 (12 min)` | Approval: `"$PY" -m workflow approve "$RUN" --bundle-sha256 <review.bundle_sha256>`, with the hash filled in. Manual handoff: `"$PY" -m workflow freeze "$RUN" --handoff <lane>=<path>`, once per lane. | 6. Approve; 4. Handoff |
+| 4 | **Challenge paused** (`challenge_paused`) | Challenge node `paused`, or `inputs.challenge.status === 'paused'` | `‖ Paused: design challenge found 1 P1; no worker launched` | Edit the feature files, then `"$PY" -m workflow resume "$RUN"`; or `"$PY" -m workflow resume "$RUN" --accept-challenge "<reason>"` (guardrails.py:935-941) | Guardrails › design challenge |
+| 5 | **Interrupted, or waiting to continue** (`interrupted`) | Run status `paused` or `running`, and one of the four cases below | `‖ Interrupted at <focus step> · 10:02: the controller stopped; sessions keep running`. For case (d): `‖ Repair 1 applied; the run continues when you resume it` | Cases (a)-(c): once `claude --version` works, `"$PY" -m workflow automatic "$RUN" --live`. Case (d): the command the message names, `automatic "$RUN" --live` for an automatic run or `retry "$RUN"` for a manual one (repair.py:109-114). | Status, failures and recovery › Claude Code unavailable (exit 75); 5. Automatic mode: the review step › Interruption; Blocked after freeze |
+| 6 | **Blocked before freeze** (`blocked_before_freeze`) | Automatic run; the focus is `handoff` or a `launch_<lane>` with status `failed`; no `verify_*` node has started; and either a `controller_blocked` row is inside the scope window (reason source 0), or `inputs.workers[].completion.status === 'blocked'` | `✗ Blocked before freeze at Freeze worker handoffs · <cause>`. Examples of `<cause>`: `Worker game deadline exhausted; no automatic relaunch`; `game reported blocked: <completion.summary>`; `game asked a fourth question: <text>` | "`repair` refuses a lane blocked before freeze; an automatic run then needs a new run." Steps: (1) if a `Could not confirm worker stop` row is in scope, stop those sessions by their exact ids first (RUNBOOK "Stopping an unfinished run"; text, no command); (2) fix the cause in the feature files if it lies there, and commit; (3) `"$PY" -m workflow launch <feature> --repo <target repo> --run-id <new run id> --live --automatic` | Status, failures and recovery › Blocked after freeze (Refused, RUNBOOK:315); One-command launch |
+| 7 | **Blocked, identical failure before review** (`blocked_identical`) | The focus is a failed `verify_<lane>` or `candidate`; **and** either the diagnosis marker for that lane is in scope, **or** its latest two attempt results (`results/<lane>/<k-1>`, `/<k>` or `candidate_<lane>/…`) have the same `error.message`; **and** no review has started (review node `pending`, no review result). This catches guardrails, which has no diagnosis event. | `✗ Blocked at Verify combined candidate · lane ui failed identically on attempts 1 and 2 · 20:27` + reason | (1) `"$PY" -m workflow repair "$RUN" ui --workspace`; (2) commit the fix in `$RUN/repair-workspace-<n>`; (3) `"$PY" -m workflow repair "$RUN" ui --commit <sha> --reason "<why>" --dry-run`; (4) the same without `--dry-run`; (5) `"$PY" -m workflow automatic "$RUN" --live` (repair.py:560-569). Manual runs use `retry "$RUN"` in place of `automatic`. | Blocked after freeze: repair a lane |
+| 8 | **Check failed, attempts left** (`check_failed`) | Failed verify or candidate below the attempt cap, not identical | `✗ Verify game failed attempt 1 of 3: unit, integration — no passing test evidence` | Automatic run: "No action: the supervisor retries by itself within the limit." Manual run: `"$PY" -m workflow retry "$RUN" --phase worker\|candidate --node <lane>` (pipeline.py:881-882) | Status, failures and recovery › Failed verification |
+| 9 | **Review blocked** (`review_blocked`) | `review.verdict === 'blocked'` | `✗ Blocked by review at Independent review · general: 1 open P1 — <first sentence>` + reviewer statuses | "Review findings are fixed in a new run, not repaired in place." Three steps: (1) `"$PY" -m workflow init <fixes-feature> --repo <target repo>` (scaffold.py:101-104); (2) fill in the TODOs it writes (`/workflow-grill <fixes-feature>` writes `decisions.md`), then commit the feature files in the target (launch refuses a TODO placeholder and an unknown feature, launch.py:68, :171); (3) `"$PY" -m workflow launch <fixes-feature> --repo <target repo> --live --automatic` (launch.py:250-263) | Status, failures and recovery › Changed code; 5. Automatic mode: the review step › Verdict; 1. Define and commit the feature contract |
+| 10 | **Running** (`running`) | Any node `running` | `● Running · <active steps with elapsed and deadline> · last activity 40 s ago: <message>` | "No action needed: the controller is supervising." Optional: `"$PY" -m workflow.interactive attach-one "$RUN" --node <lane>` to watch a pane | — |
+| 11 | **Succeeded** (`succeeded`) | Run `succeeded` | `✓ Integrated <commit7> into <source_branch> · no push performed · took 31m50s · review approved · 2 open P2 [view]` | "Nothing required by the workflow. Merging or pushing is your decision." **No command is shown.** | 6. Approve local integration |
+| 12 | **Cancelled / pending** (`inactive`) | Run status | One plain line | None | — |
+| 13 | **No rule matched** (`no_rule_matched`) | A failed or paused run that none of rules 1-9 matched | Failed: `✗ Failed at <focus step> · <reason>`. Paused: `‖ Paused at <focus step> · <reason>`. Never "Failed" for a paused run. | "No known next step matched." `"$PY" -m workflow status "$RUN"` (reports state and changes no run progress; refreshes `report.html`), plus a RUNBOOK link | Status, failures and recovery |
+
+**Rule 5, the four cases.** All four look only inside the scope window, and the headline says which one matched.
+- **(a) Controller interrupted.** A run-level `interrupted` marker, with no later status event:
+  - `RESUME_NOTE`: Ctrl-C while waiting on the workers (automatic.py:1116, emitted at :1272).
+  - `UNAVAILABLE_NOTE`: Claude Code was unavailable (:1121, emitted at :1278 and :1316).
+  - With B1 these rows are served as `status: 'paused'`. `projectSnapshot` already shows the handoff as `paused` from them (server/projects.ts:1116, :1133-1137).
+- **(b) Recorded on the focus node itself.** The focus node is `paused`, its latest status event is the last event for that node, and the message contains `interrupted` or `resume with: python -m workflow automatic`. The redacted `<path>` keeps that substring. This covers two notes:
+  - `REVIEW_RESUME_NOTE`, recorded on `review` at automatic.py:624, :738, :804 and :811.
+  - `FREEZE_RESUME_NOTE`, recorded on the freeze, which is aliased to `handoff`, at :1314.
+
+  For the review case the controller deliberately writes no controller row (comment at :1315). The server maps the raw `interrupted` status to `paused` on that node (`EVENT_STATUS`, server/projects.ts:377). Before this revision no rule matched these runs, and the fallback printed "✗ Failed at …" with only `status`.
+- **(c) Controller not running.** The run status is `running`, and B2 `activity.controller === 'not_running'` on polls spanning at least 15 s (6.3). Examples: a closed terminal or a dropped SSH session that killed the controller without an event (RUNBOOK "Interruption").
+- **(d) Repair applied, not yet continued.** The focus is `verify_<lane>` or `candidate`, `paused`, and its latest message contains `Continue with python -m workflow automatic` or `Continue with python -m workflow retry` (repair.py:445). Seen on skeleton-001 #20 until 09:28.
+
+**Reason sources,** in order. Rules 5 (a), 6 and 13 start at source 0; the other rules start at source 1, so a controller row never replaces a review verdict or a gate reason.
+0. The latest `controller_blocked` or `interrupted` run-level row inside the scope window (5.2 rule 5), quoted with its time. It is the only source for rule 5 case (a), and the first for rules 6 and 13. An example for rule 13 is `… ended on it in a state no resume continues; inspect retained evidence` (automatic.py:1323), which can happen after freeze.
+   - The controller writes these as `runtime.event("controller", "blocked", str(error))` at automatic.py:1284 (the wait for handoffs: deadline, `status: blocked`, a fourth question, a rejected completion file, a session that is gone), :1011 and :1323.
+   - `projectSnapshot` already uses the same raw row to mark the handoff failed (`lastController` → `waitingHandoff`, server/projects.ts:1116, :1133-1137). Until B1, `normalizeEvents` serves that row with `status: null` and `type: 'log'` (:1084), so no other source could see why the handoff failed.
+1. The review verdict, the blocking findings (`isBlockingFinding`) and each reviewer's `status`.
+2. The failing lane result's `error.message`. This is the only extra fetch: one or two lane results, and only when the focus is a failed verify or candidate. Results are cached by URI (section 7).
+3. The worker's own completion when `completion.status` is `blocked` or `question`: `completion.summary` or `completion.question`.
+4. The focus node's last status event message.
+
+**Wording rules.**
+- The generic "Marked retryable by the producer. Retrying is done through the workflow CLI" (NodeDetail.tsx:103-107) is replaced by the matching situation. `server/projects.ts:1235` hard-codes `retryable: true`, so the flag carries no information.
+- A viewer message never says "retry" when rule 6 or rule 7 applies.
+- The status word follows the run's status: `✗ Failed`, `✗ Blocked`, `‖ Paused` or `‖ Interrupted`. A paused run is never called failed.
+
+### 6.3 Freshness and controller liveness
+
+The live chip is `LiveStatus.tsx` (`live-status`, with `data-state` and, when known, `data-controller`). It sits on the run header next to the Local/UTC toggle, on the one-line run bar of node pages, and on the Runs home heading.
+
+| State | Text | When |
+|---|---|---|
+| `live` | `● Live · updated 3 s ago` | Run running or awaiting approval, and the last poll succeeded |
+| `watching` | `● Watching · updated 3 s ago` | Run failed or paused. It still polls (ProjectsView.tsx:46-52 stops only for succeeded or cancelled) because it can be repaired or resumed. |
+| `stale` | `▲ Not updating · showing data from 11:14:02 · retrying` | 2 consecutive poll failures, or 15 s without a success. Announced once. |
+| `finished` | `○ Finished · not polling` | Succeeded or cancelled |
+| `hidden` | `Paused while this tab is hidden` | `document.visibilityState === 'hidden'` (usePoll already pauses) |
+
+**Controller suffix** (from S6, which reads B2 `activity.controller`; shown only while the run is running or paused):
+- `· controller running`
+- `· ▲ controller not running`, amber. It is shown only after `not_running` was served on polls spanning at least 15 s. automatic-step exits at every checkpoint and the supervisor starts the next one within seconds (automatic.py:1096-1114), so a single reading can be a hand-over. When shown during `running`, it triggers rule 5 case (c).
+- Nothing when the value is `unknown` or null: a manual run, no PID event, or no `/proc`. The viewer never claims liveness it cannot check.
+
+**Other freshness rules.**
+- **Source of the ages.** `useResource` gains `meta { settledAt, lastError, failures }`.
+- **Refresh.** Header Refresh becomes a background reload: `refreshToken` moves from `base` into `token` (useResource.ts:22-23). The page no longer blanks to "Loading run…", and the scroll position and tab survive. The Projects Refresh button gets the busy state that skills already use (App.tsx:638 vs :641).
+
+### 6.4 Attention outside the banner
+
+- **Kinds.** `data-attention` takes one of three values:
+  - `question`: rule 1.
+  - `pane`: rule 2. The latest `needs attention in its pane` interactive event of that node has no later event for the node (automatic.py:281 for workers, :556 for reviewers; the server maps `interactive` to `running`, server/projects.ts:373).
+  - `approval`: rule 3.
+- **Where it shows.** The kind goes on the graph node, the Steps row, the step-strip chip and the run rows (lists read B2 `activity.attention.kind`). Each gets an amber ring and a `?` glyph. "Running" stays the status: attention is an overlay, never a status change.
+- **Lists.** Runs home shows a Needs-you row for all three kinds. The project and feature pages show a `?` badge on the row.
+- **Tab title.** `document.title` is prefixed with `? ` while any kind waits, for example `? Waiting · duel-core-001 — MD Manager`.
+- **Announcements.** The existing ProjectsView announcer (ProjectsView.tsx:75-89) speaks the Now headline only when the situation changes, never on every poll. The banner is not an `aria-live` region.
+
+## 7. Evidence disclosure rules
+
+**Four levels, each one step deeper:**
+- **L0, run page.** Answers only: the Now reason, Steps outcomes, and the lanes line.
+- **L1, node header.** Status by cause, timing, attempts, and the section index with counts.
+- **L2, sections.** Dense rows.
+- **L3, on demand.** Logs, file contents, full screenshots, raw events, identifiers.
+
+**General rules:**
+- **Fetch on demand.** Content is fetched when its level opens. The only exception is the immutable results the Now banner needs.
+- **Caching.** Results and reviews are immutable per URI (`results/<lane>/<k>`, `reviews/<n>`). A run-scoped cache (`src/projects/useRunData.ts`) keeps them for the run's lifetime. Only detail, events and inputs poll every 5 s.
+- **Empty sections are absent.** A section with nothing in it gets no index chip and no body. The following stay as one short line because they are honesty statements:
+  - `result-none`: a node that should have a result and has none
+  - `inputs-none`
+  - `events-none`, with its reason where known, e.g. "print transport records none"
+- **Dedup by `result_uri`.** When a launch node and its verify node share a `result_uri`, the result facts (commits, session) are shown once, on the verify node, and the worker narrative once, on the launch node.
+
+**By evidence type:**
+
+| Evidence | Rule |
+|---|---|
+| Checks (`checks-list`, `.check`, `.check-exit`) | One row each: glyph, check id (matched to `inputs.workers[].checks` by command, as TaskPanel does, WorkerInputs.tsx:91), truncated command, `+offset` from attempt start, duration, `exit N`, and a `Show contents` / `Hide contents` toggle (button names kept, projects.spec.ts:220-223). Gate reasons are mapped onto their check by their `<check id>:` prefix. A segment with no prefix is a gate-level reason, listed above the table. It is also attached to a row only when the text after `<path>` is the tail of exactly one check's `command` (4.6; `results/controller/1`). A rejected check is red even at exit 0 (`check-rejected`), and its log tail opens automatically. cwd, artifact id and absolute times go in the tooltip. Test counts are shown only once B5 serves them. |
+| Screenshots (`screenshots`) | A thumbnail grid (max 220 px) under the Screenshots section, and inside the browser check row on candidate lanes. The caption is the short artifact id (with B5: scenario id and pass state). A click opens a native `<dialog>` (Esc closes it and focus returns). sha256 goes in the tooltip. |
+| Files (`created-files`, `changed-files` with `li` rows, `created-file`, `captured-file`, `file-rendered`, `file-source`, `show-lines`, `file-findings`, `file-findings-none`) | About 32 px rows. Filters: With findings first, Repair n, All. Optional group-by-folder. No fetch before a row opens. Markdown files start closed and open on Rendered. The findings on a file show inside the opened row as one-line chips (`P1 · general · lines 44–50 [Show lines]`), not the full message. A/M/D marks and per-file diff hunks come from `review.diff` when a review exists (S7). |
+| Worker narrative | Launch node only. `worker-completion` is clamped to 3 lines with More. Assumptions and untested items sit behind counts. Verify and candidate show `worker-report-link` instead. |
+| Findings (`review-findings`, `finding`, `filter-reviewer`, `group-by-*`) | Blocking findings first, as cards. The others follow in the table or as cards (≤760 px: cards only; this fixes the 560 px `min-width` overflow, App.css:408). The requirement quote is collapsible. The 4-line legend moves to `[?]`. |
+| Candidate lanes (`lane-results`, `lane-result:<lane>`) | The table comes first, failing lanes first and open. |
+| Questions (`worker-questions`) | First on the launch node while one waits, and in the Now banner. Otherwise one line in Session. |
+| Task (`task-details`, `task-panel`, `task-highlight`) | Closed on the launch node. The finding → requirement flow still opens it (PRD_VIEWER_CLARITY §4.2). The full view is on Assignment. |
+| Identifiers | Session ids, base and output commits, bundle hash and sha256 go in one closed "Session" disclosure (worker) or "Identifiers" disclosure (other kinds). Each appears once. |
+| Other artifacts (`artifacts`) | Closed. The test report attaches to the browser check row. A log that matches no check is labelled "log (not a check log)" until B5 labels setup logs. |
+| Reuse (`reuse-list`) | Rendered only when `result_reused` events exist. The server never produces them today (server/projects.ts:1087). |
+
+## 8. Copy and wording
+
+The truthfulness requirements stay. Their wording is said once, and the substrings the tests pin are kept.
+
+| Today | New | Pinned substring kept |
+|---|---|---|
+| Run failed: "A graph step or check failed. The workflow did not complete." (status.ts:28), identical for every cause | Worded by cause: "Blocked by review…", "Blocked: lane ui failed identically…", "Failed at <step>…". Each is followed by "The workflow did not complete." | `did not complete` (projects.spec.ts:294) |
+| Paused: "Paused with unresolved state (for example a session that could not be reconciled)" | Worded by cause:<br>• "Paused: the design challenge found 1 P1; no worker launched."<br>• "Interrupted at Independent review: the controller stopped; sessions keep running."<br>• "Repair 1 applied; the run continues when you resume it."<br>• Unmatched: "Paused at <step> · <reason>". A paused run is never labelled "Failed". | — |
+| (none today) a run blocked by the controller before freeze | "Blocked before freeze at Freeze worker handoffs · Worker game deadline exhausted; no automatic relaunch. The workflow did not complete." | `did not complete` |
+| (none today) waiting in a pane | "Waiting on you: game needs attention in its pane (native state blocked) · since 11:41" | — |
+| (none today) controller liveness | "controller running" / "▲ controller not running" as a suffix of the live chip; nothing when unknown | — |
+| Awaiting approval (run) | "Awaiting your approval since 10:14. Not complete until you approve it in the CLI; viewing approves nothing." | `not complete` (projects.spec.ts:313) |
+| Worker node succeeded: 5-line sentence (status.ts:40-41) | "Session ended its turn. This is not workflow completion — verified by Verify game ›" | `This is not workflow completion`, `not workflow completion` (projects.spec.ts:172, :322) |
+| Node failed: "This step failed. The run cannot succeed without intervention." | "This step failed." plus the cause and the next step | `This step failed` (projects.spec.ts:298, review.spec.ts:103) |
+| Awaiting notice | "Awaiting your approval since … Viewing does not approve it; decisions are made in the CLI: <command>" | `Viewing does not approve it` (projects.spec.ts:315) |
+| Graph legend: 3 sentences (WorkflowGraph.tsx:29-33) | 3 short `li`: "Agent session", "Trusted verifier", "Controller". The full sentence is in each item's `title` and in visually hidden text. | 3 `li[data-executor]` with those words (clarity.spec.ts:105-109) |
+| Status enum footnote (RunView.tsx:217) and node footnote (NodeDetail.tsx:488) | Removed. Each status badge gets a short `title` with its meaning. | — |
+| "Reported by the worker" repeated | "Worker's report · completed · as signalled by the session, not verified" (said once) | — |
+| "Marked retryable by the producer. Retrying is done through the workflow CLI" | Removed. Replaced by the section 6 situation. | migrated (projects.spec.ts:305) |
+| Read-only info line on every level | Once on `/projects` (`projects-info`, "Read-only: runs are started, answered and approved in the workflow CLI."), and once in each command block ("This viewer never changes a run.") | `Read-only` (projects.spec.ts:81) |
+| "Observed state: working" after the stop | "State at launch: working", hidden once stopped | migrated (inputs.spec.ts:147) |
+| "Result attempt 3 (graph node attempt is 1)" (NodeDetail.tsx:97) | "Frozen at handoff as 5c1a734; verified on attempt 3 after operator repair 1 ›" | — |
+| Inferred values | "≈09:30" with the tooltip "start inferred from Verify combined candidate; the print transport records no launch time" | — |
+| Empty states | Absent, except the honesty lines in section 7 | — |
+
+Tone: plain words, sentence case, no exclamation marks. Status words are the badge labels (`STATUS_LABEL`), and the cause comes after them.
+
+## 9. Data
+
+### 9.1 Existing fields per element (no backend change)
+
+| Element | Fields |
+|---|---|
+| Header facts | `summary.status/created_at`, `inputs.feature/base_commit/source_branch/mode/automatic.*`, `definition.definition_revision` vs the current definition |
+| Now banner | `snapshot.nodes[].status/attempt/result_uri/lane_results`, `events[]` (incl. `node_id: null`, whose raw controller status B1 keeps), `inputs.workers[].questions/completion/launch/stop`, `inputs.challenge`, `inputs.max_verification_attempts`, `reviews/<n>` (`verdict`, `findings`, `reviewers[].status`, `bundle_sha256`, `reviewed_at`), lane results `error.message` |
+| Steps, Activity, bars | `events[].occurred_at/node_id/status/attempt/message`, `launch.native_started_at/launch_requested_at`, `stop.confirmed_at`, `questions[].asked_at/answered_at`, `challenge.decided_at`, `reviewed_at`, `reviewers[].launched_at/accepted_at`, `summary.created_at` |
+| Node timing and attempts | the above plus `checks[].started_at/finished_at`, and `results/<lane>/<k>` for k < current (served today: game/1 and game/2 return 200, candidate_ui/1 returns 200) |
+| Gate reasons on checks | `error.message` split on `"; "` and keyed by the `<check id>:` prefix; unkeyed segments are gate-level, and matched to a row by the command tail after `<path>` only when exactly one `checks[].command` ends with it; `inputs.workers[].checks[].id/command` |
+| Repair badges | `artifacts[kind=file].path/sha256` of `results/<lane>/1` vs the latest result |
+| Deadlines | `automatic.worker_timeout_seconds/review_timeout_seconds`, question waits |
+| Succeeded outcome | the integrate event message, `inputs.source_branch`, `automatic.finish`, the review verdict and findings |
+| Lists (without B2) | `RunSummary.status/created_at/updated_at` via fan-out |
+
+### 9.2 Backend additions (slice S5, additive)

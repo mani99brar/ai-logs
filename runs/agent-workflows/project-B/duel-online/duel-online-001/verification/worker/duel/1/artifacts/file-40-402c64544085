@@ -1,0 +1,271 @@
+import { createServer, connect, type AddressInfo, type Server, type Socket } from "node:net";
+import { nextRandom } from "@pirate-sea-race/simulation";
+
+/**
+ * How the proxy impairs a connection, per §19's scenarios. Each direction delays every message by half the round
+ * trip plus a uniform offset within ±jitter/2, so round trips spread over `rttMs ± jitterMs`; a message is lost with
+ * probability `loss`, and like TCP it is then retransmitted after `rtoMs`.
+ */
+export interface Impairment {
+  readonly rttMs: number;
+  readonly jitterMs: number;
+  /** From 0 to 1. */
+  readonly loss: number;
+  /** The retransmission timeout a lost message waits (default 200 ms, TCP's minimum RTO on Linux). */
+  readonly rtoMs?: number;
+}
+
+export const NO_IMPAIRMENT: Impairment = { rttMs: 0, jitterMs: 0, loss: 0 };
+
+export interface ImpairmentStats {
+  /** Messages (WebSocket frames, or raw chunks before the upgrade) forwarded, client→server and server→client. */
+  readonly messages: [number, number];
+  /** Of those, the ones "lost" and held for a retransmission timeout. */
+  readonly lost: [number, number];
+  /** The longest time a message spent in the proxy, in milliseconds. */
+  readonly longestHoldMs: number;
+}
+
+const HEADER_END = Buffer.from("\r\n\r\n");
+
+/** Splits a byte stream into whole WebSocket frames (RFC 6455 §5.2) without decoding them. */
+class FrameSplitter {
+  private pending: Buffer = Buffer.alloc(0);
+
+  push(chunk: Buffer): Buffer[] {
+    this.pending = this.pending.length === 0 ? chunk : Buffer.concat([this.pending, chunk]);
+    const frames: Buffer[] = [];
+    for (;;) {
+      const length = frameLength(this.pending);
+      if (length === undefined || this.pending.length < length) return frames;
+      frames.push(this.pending.subarray(0, length));
+      this.pending = this.pending.subarray(length);
+    }
+  }
+}
+
+/** The total length of the frame at the start of `bytes`, or undefined until its header is complete. */
+function frameLength(bytes: Buffer): number | undefined {
+  if (bytes.length < 2) return undefined;
+  const masked = (bytes[1]! & 0x80) !== 0;
+  const short = bytes[1]! & 0x7f;
+  let header = 2;
+  let payload = short;
+  if (short === 126) {
+    if (bytes.length < 4) return undefined;
+    payload = bytes.readUInt16BE(2);
+    header = 4;
+  } else if (short === 127) {
+    if (bytes.length < 10) return undefined;
+    payload = Number(bytes.readBigUInt64BE(2));
+    header = 10;
+  }
+  return header + (masked ? 4 : 0) + payload;
+}
+
+type Direction = 0 | 1;
+
+/**
+ * One direction of one connection. Until the HTTP upgrade completes, raw chunks travel as they arrive; after it, whole
+ * WebSocket frames, each one a message. Messages keep their order: each leaves at the later of its own delivery time
+ * and the previous message's, so jitter only delays, and a lost message holds up everything queued behind it (the
+ * head-of-line stall of a reliable ordered stream).
+ */
+class Pipe {
+  /** Reading the first HTTP head; then raw bytes (plain HTTP), or WebSocket frames after an upgrade. */
+  private mode: "head" | "raw" | "frames" = "head";
+  private header: Buffer = Buffer.alloc(0);
+  private readonly splitter = new FrameSplitter();
+  private readonly queue: { at: number; data: Buffer | "end"; queuedAt: number }[] = [];
+  private lastAt = 0;
+  private timer: NodeJS.Timeout | undefined;
+
+  constructor(
+    private readonly proxy: ImpairmentProxy,
+    private readonly direction: Direction,
+    private readonly to: Socket,
+  ) {}
+
+  /** Bytes arriving from the source socket. */
+  push(chunk: Buffer): void {
+    if (this.mode === "frames") {
+      for (const frame of this.splitter.push(chunk)) this.enqueue(frame);
+      return;
+    }
+    if (this.mode === "raw") {
+      this.enqueue(chunk);
+      return;
+    }
+    this.header = Buffer.concat([this.header, chunk]);
+    const end = this.header.indexOf(HEADER_END);
+    if (end < 0) return;
+    const head = this.header.subarray(0, end + HEADER_END.length);
+    const rest = this.header.subarray(end + HEADER_END.length);
+    this.header = Buffer.alloc(0);
+    this.enqueue(head);
+    const text = head.toString("latin1");
+    const upgrade = this.direction === 0 ? /^upgrade:\s*websocket/im.test(text) : /^HTTP\/1\.1 101/.test(text);
+    this.mode = upgrade ? "frames" : "raw";
+    if (rest.length > 0) this.push(rest);
+  }
+
+  /** The source ended: the end follows the data still queued. */
+  end(): void {
+    this.enqueue("end");
+  }
+
+  stop(): void {
+    clearTimeout(this.timer);
+    this.queue.length = 0;
+  }
+
+  private enqueue(data: Buffer | "end"): void {
+    const now = performance.now();
+    const at = Math.max(this.lastAt, now + this.proxy.delayFor(this.direction, data !== "end"));
+    this.lastAt = at;
+    this.queue.push({ at, data, queuedAt: now });
+    if (this.queue.length === 1) this.schedule();
+  }
+
+  private schedule(): void {
+    const head = this.queue[0];
+    if (head === undefined) return;
+    this.timer = setTimeout(() => this.flush(), Math.max(0, head.at - performance.now()));
+  }
+
+  private flush(): void {
+    const now = performance.now();
+    while (this.queue.length > 0 && this.queue[0]!.at <= now + 0.5) {
+      const { data, queuedAt } = this.queue.shift()!;
+      this.proxy.held(now - queuedAt);
+      if (!this.to.writable) continue;
+      if (data === "end") this.to.end();
+      else this.to.write(data);
+    }
+    this.schedule();
+  }
+}
+
+/**
+ * A TCP proxy in front of the game server that impairs traffic the way a real network impairs a WebSocket (§15,
+ * §19): latency and jitter delay messages without ever reordering them, and loss becomes a stall of about one
+ * retransmission timeout for the lost message and everything behind it. HTTP (matchmaking) passes through the same
+ * delays. The random source is seeded, so a run's losses and delays repeat.
+ */
+export class ImpairmentProxy {
+  private readonly sockets = new Set<Socket>();
+  private readonly pipes = new Set<Pipe>();
+  private random: number;
+  private refusing = false;
+  private readonly counters = { messages: [0, 0] as [number, number], lost: [0, 0] as [number, number], longestHoldMs: 0 };
+
+  private constructor(
+    private readonly server: Server,
+    private impairment: Impairment,
+    seed: number,
+  ) {
+    this.random = seed >>> 0;
+  }
+
+  /** Starts a proxy on a free local port that forwards to `target` (the game server's port on 127.0.0.1). */
+  static async start(targetPort: number, impairment: Impairment = NO_IMPAIRMENT, seed = 1): Promise<ImpairmentProxy> {
+    let proxy: ImpairmentProxy | undefined;
+    // Half-open sockets let each direction finish on its own: an end is forwarded after the data queued before it.
+    const server = createServer({ allowHalfOpen: true }, (client) => proxy!.accept(client, targetPort));
+    proxy = new ImpairmentProxy(server, impairment, seed);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return proxy;
+  }
+
+  /** The address clients use instead of the server's, for example `http://127.0.0.1:41234`. */
+  get endpoint(): string {
+    return `http://127.0.0.1:${(this.server.address() as AddressInfo).port}`;
+  }
+
+  get stats(): ImpairmentStats {
+    return { messages: [...this.counters.messages], lost: [...this.counters.lost], longestHoldMs: this.counters.longestHoldMs };
+  }
+
+  setImpairment(impairment: Impairment): void {
+    this.impairment = impairment;
+  }
+
+  /**
+   * Cuts every open connection at once, as a dropped network would (no WebSocket close frame). With `refuse`, new
+   * connections are refused too until `restore()`, so a client cannot come back.
+   */
+  sever(options: { refuse?: boolean } = {}): void {
+    this.refusing = options.refuse ?? false;
+    for (const pipe of this.pipes) pipe.stop();
+    for (const socket of this.sockets) socket.destroy();
+  }
+
+  restore(): void {
+    this.refusing = false;
+  }
+
+  async close(): Promise<void> {
+    this.sever();
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
+
+  /** The delay for the next message in one direction; counts it, and decides whether it is lost. */
+  delayFor(direction: Direction, message: boolean): number {
+    const { rttMs, jitterMs, loss, rtoMs = 200 } = this.impairment;
+    const delay = Math.max(0, rttMs / 2 + (this.draw() - 0.5) * jitterMs);
+    if (!message) return delay;
+    this.counters.messages[direction]++;
+    if (loss > 0 && this.draw() < loss) {
+      this.counters.lost[direction]++;
+      return delay + rtoMs;
+    }
+    return delay;
+  }
+
+  held(ms: number): void {
+    this.counters.longestHoldMs = Math.max(this.counters.longestHoldMs, ms);
+  }
+
+  /** A uniform draw in [0, 1) from the seeded generator. */
+  private draw(): number {
+    const next = nextRandom(this.random);
+    this.random = next.state;
+    return next.value / 2 ** 32;
+  }
+
+  private accept(client: Socket, targetPort: number): void {
+    if (this.refusing) {
+      client.destroy();
+      return;
+    }
+    const upstream = connect({ port: targetPort, host: "127.0.0.1", allowHalfOpen: true });
+    for (const socket of [client, upstream]) {
+      socket.setNoDelay(true);
+      this.sockets.add(socket);
+      socket.once("close", () => this.sockets.delete(socket));
+    }
+    const up = new Pipe(this, 0, upstream);
+    const down = new Pipe(this, 1, client);
+    this.pipes.add(up);
+    this.pipes.add(down);
+    const teardown = () => {
+      this.pipes.delete(up);
+      this.pipes.delete(down);
+    };
+    client.on("data", (chunk: Buffer) => up.push(chunk));
+    upstream.on("data", (chunk: Buffer) => down.push(chunk));
+    client.on("end", () => up.end());
+    upstream.on("end", () => down.end());
+    // A reset on either side resets the other, like a broken path.
+    client.on("error", () => upstream.destroy());
+    upstream.on("error", () => client.destroy());
+    client.on("close", (hadError) => {
+      teardown();
+      if (hadError) upstream.destroy();
+    });
+    upstream.on("close", (hadError) => {
+      teardown();
+      if (hadError) client.destroy();
+    });
+  }
+}

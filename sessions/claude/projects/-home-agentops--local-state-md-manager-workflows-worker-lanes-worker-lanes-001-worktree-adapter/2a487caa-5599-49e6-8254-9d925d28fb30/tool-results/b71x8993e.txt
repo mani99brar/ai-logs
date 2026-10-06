@@ -1,0 +1,700 @@
+import os
+import subprocess
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+from .interactive import InteractiveSessions, attach_panels, build_interactive_graph, require_shell
+from .sessions import read_json, save_json
+
+
+class InteractiveTests(unittest.TestCase):
+    def setUp(self):
+        from .test_sessions import SessionTests
+        SessionTests.setUp(self)
+        self.plan["mode"] = "interactive"
+        save_json(self.directory / "plan.json", self.plan)
+        self.sessions = InteractiveSessions(self.directory, executable="claude")
+
+    def row(self, node="ui", **updates):
+        info = self.plan["nodes"][node]
+        native_id = "11111111-1111-4111-8111-111111111111" if node == "ui" else "22222222-2222-4222-8222-222222222222"
+        return {"sessionId": native_id, "id": native_id[:8], "name": self.sessions.launch_name(node),
+                "kind": "background", "cwd": info["worktree"], "state": "idle", "pid": os.getpid(), **updates}
+
+    def test_native_launch_and_reconciliation_never_spawn_duplicate(self):
+        with patch.object(self.sessions, "inventory", side_effect=[[], [self.row()], [self.row()]]), patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), patch("workflow.interactive.subprocess.run") as launch:
+            def started(*args, **kwargs):
+                kwargs["stdout"].write(f"claude attach {self.row()['id']}    open in this terminal\n")
+                return subprocess.CompletedProcess([], 0)
+            launch.side_effect = started
+            result = self.sessions.run("ui")
+            self.assertEqual(result["session_id"], self.row()["sessionId"])
+            self.assertNotEqual(result["session_id"], self.plan["nodes"]["ui"]["session_id"])
+            self.assertEqual(self.sessions.run("ui")["status"], "attached_session_available")
+            self.assertEqual(launch.call_count, 1)
+            command = launch.call_args.args[0]
+            self.assertIn("--bg", command)
+            self.assertIn("manual", command)
+            self.assertNotIn("--print", command)
+            self.assertNotIn("bypassPermissions", command)
+            self.assertFalse(any(key.startswith("HERDR_") for key in launch.call_args.kwargs["env"]))
+
+    def test_launch_waits_for_native_pid_to_register(self):
+        def started(*args, **kwargs):
+            kwargs["stdout"].write(f"claude attach {self.row()['id']}    open in this terminal\n")
+            return subprocess.CompletedProcess([], 0)
+        unregistered = {key: value for key, value in self.row().items() if key != "pid"}
+        # Pre-launch name check, then: row absent, row without PID, row without PID, row ready.
+        inventories = [[], [], [unregistered], [unregistered], [self.row()]]
+        with patch.object(self.sessions, "inventory", side_effect=inventories) as inventory, \
+                patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), \
+                patch("workflow.interactive.subprocess.run", side_effect=started) as launch, \
+                patch("workflow.interactive.time.sleep") as sleep:
+            result = self.sessions.run("ui")
+        self.assertEqual(result["status"], "attached_session_available")
+        self.assertEqual(result["background_id"], self.row()["id"])
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(inventory.call_count, 5)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_launch_gives_up_when_pid_never_registers_without_relaunch(self):
+        def started(*args, **kwargs):
+            kwargs["stdout"].write(f"claude attach {self.row()['id']}    open in this terminal\n")
+            return subprocess.CompletedProcess([], 0)
+        unregistered = {key: value for key, value in self.row().items() if key != "pid"}
+        self.sessions.settle_seconds = 0
+        with patch.object(self.sessions, "inventory", side_effect=[[], [unregistered]]), \
+                patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), \
+                patch("workflow.interactive.subprocess.run", side_effect=started) as launch:
+            with self.assertRaisesRegex(RuntimeError, "No live native PID"):
+                self.sessions.run("ui")
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(read_json(self.directory / "ui.interactive.json")["status"], "needs_reconciliation")
+
+    def test_launch_identity_mismatch_fails_immediately(self):
+        def started(*args, **kwargs):
+            kwargs["stdout"].write(f"claude attach {self.row()['id']}    open in this terminal\n")
+            return subprocess.CompletedProcess([], 0)
+        wrong_cwd = self.row(cwd="/elsewhere")
+        with patch.object(self.sessions, "inventory", side_effect=[[], [wrong_cwd]]) as inventory, \
+                patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), \
+                patch("workflow.interactive.subprocess.run", side_effect=started), \
+                patch("workflow.interactive.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "identity/worktree mismatch"):
+                self.sessions.run("ui")
+        self.assertEqual(inventory.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_automatic_permission_bypass_is_run_scoped(self):
+        from .automatic import DEFAULTS
+        self.plan.update(automatic=dict(DEFAULTS), source_branch="feature/test")
+        save_json(self.directory / "plan.json", self.plan)
+        self.sessions = InteractiveSessions(self.directory, executable="claude")
+        def started(*args, **kwargs):
+            kwargs["stdout"].write(f"claude attach {self.row()['id']}    open in this terminal\n")
+            return subprocess.CompletedProcess([], 0)
+        with patch.object(self.sessions, "inventory", side_effect=[[], [self.row()]]), patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), patch("workflow.interactive.subprocess.run", side_effect=started) as launch:
+            self.sessions.run("ui")
+        command = launch.call_args.args[0]
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertIn("bypassPermissions", command)
+        self.assertIn("Bash", command[command.index("--tools") + 1])
+        self.assertIn("ui.completion.json", command[-1])
+        self.assertIn(self.plan["nodes"]["ui"]["session_id"], command[-1])
+        self.assertNotIn("manual", command)
+
+    def test_ambiguous_launch_never_retries_when_session_missing(self):
+        with patch.object(self.sessions, "inventory", return_value=[]), patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), patch("workflow.interactive.subprocess.run", side_effect=subprocess.TimeoutExpired("claude", 45)) as launch:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.sessions.run("ui")
+            with self.assertRaisesRegex(RuntimeError, "reconcile|relaunch"):
+                self.sessions.run("ui")
+            self.assertEqual(launch.call_count, 1)
+        self.assertEqual(read_json(self.directory / "ui.interactive.json")["status"], "needs_reconciliation")
+
+    def test_launch_intent_can_reconcile_exact_surviving_session(self):
+        from .sessions import plan_digest
+        save_json(self.directory / "ui.interactive.json", {"status": "launching", "plan_digest": plan_digest(self.plan), "session_id": None})
+        (self.directory / "ui.launch.log").write_text(f"claude attach {self.row()['id']}    open\n")
+        with patch.object(self.sessions, "inventory", return_value=[self.row()]), patch("workflow.interactive.subprocess.run") as launch:
+            self.assertEqual(self.sessions.run("ui")["background_id"], self.row()["id"])
+            launch.assert_not_called()
+
+    def test_foreign_or_exited_sessions_cannot_be_attached(self):
+        from .sessions import plan_digest
+        save_json(self.directory / "ui.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row()["id"], "session_id": self.row()["sessionId"]})
+        for row in [self.row(cwd=str(self.root)), self.row(kind="interactive"), self.row(state="exited"), self.row(state="done", pid=None)]:
+            with self.assertRaises(RuntimeError):
+                self.sessions.locate("ui", [row])
+        with self.assertRaisesRegex(RuntimeError, "Ambiguous"):
+            self.sessions.locate("ui", [self.row(), self.row()])
+
+    def test_occupied_pane_is_never_sent_a_command(self):
+        with patch("workflow.interactive.herdr", return_value={"result": {"process_info": {"shell_pid": 1, "foreground_processes": [{"pid": 2}]}}}):
+            with self.assertRaisesRegex(RuntimeError, "occupied"):
+                require_shell("w1:p1", settle_seconds=0)
+
+    def test_freshly_created_pane_is_given_time_for_its_shell_to_start(self):
+        def info(**fields):
+            return {"result": {"process_info": {"pane_id": "w1:p1", **fields}}}
+        # Herdr reports the pane before its shell exists, then the shell while it runs
+        # startup files with a child in the foreground, then the idle shell.
+        states = [info(shell_pid=None, foreground_processes=[]),
+                  info(shell_pid=7, foreground_processes=[{"pid": 8, "name": "bash"}]),
+                  info(shell_pid=7, foreground_processes=[{"pid": 7, "name": "bash"}])]
+        with patch("workflow.interactive.herdr", side_effect=states) as query, patch("workflow.interactive.time.sleep") as sleep:
+            require_shell("w1:p1")
+        self.assertEqual(query.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        with patch("workflow.interactive.herdr", return_value=info(shell_pid=None, foreground_processes=[])), patch("workflow.interactive.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "occupied"):
+                require_shell("w1:p1", settle_seconds=0)
+
+    def test_graph_launch_returns_human_handoff_not_verified_completion(self):
+        with SqliteSaver.from_conn_string(str(self.directory / "interactive.sqlite")) as saver:
+            with patch.object(self.sessions, "run", side_effect=lambda node: {"node": node, "status": "attached_session_available"}) as launch:
+                graph = build_interactive_graph(saver, self.sessions)
+                config = {"configurable": {"thread_id": "interactive"}, "max_concurrency": 2}
+                result = graph.invoke({"run_id": "interactive"}, config)
+                self.assertEqual(result["__interrupt__"][0].value["kind"], "interactive_workers_active")
+                self.assertEqual(launch.call_count, 2)
+                graph.invoke(None, config)
+                self.assertEqual(launch.call_count, 2)
+
+    def fake_herdr(self, calls):
+        splits = iter(["w1:p3", "w1:p4"])
+        def herdr(*args):
+            calls.append(args)
+            if args[:2] == ("pane", "current"):
+                return {"result": {"pane": {"workspace_id": "w1", "tab_id": "w1:t1"}}}
+            if args[:2] == ("tab", "create"):
+                return {"result": {"tab": {"tab_id": "w1:t2"}, "root_pane": {"pane_id": "w1:p2"}}}
+            if args[:2] == ("pane", "split"):
+                return {"result": {"pane": {"pane_id": next(splits)}}}
+            if args[:2] == ("pane", "process-info"):
+                return {"result": {"process_info": {"shell_pid": 1, "foreground_processes": [{"pid": 1}]}}}
+            return {}
+        return herdr
+
+    def test_panels_attach_to_native_sessions_in_one_new_tab(self):
+        from .sessions import plan_digest
+        for node in ("ui", "adapter"):
+            save_json(self.directory / f"{node}.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row(node)["id"], "session_id": self.row(node)["sessionId"]})
+        calls = []
+        with patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter")]), patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)):
+            mapping = attach_panels(self.sessions)
+        self.assertEqual(set(mapping), {"ui", "adapter"})
+        self.assertEqual({entry["tab_id"] for entry in mapping.values()}, {"w1:t2"})
+        self.assertEqual(len([call for call in calls if call[:2] == ("pane", "split")]), 1)
+        for call in calls:
+            if call[:2] == ("pane", "run"):
+                self.assertIn("workflow.interactive attach-one", call[3])
+                self.assertNotIn("workflow.observer", call[3])
+            if call[:2] in (("tab", "create"), ("pane", "split")):
+                self.assertIn("--no-focus", call)
+
+    # ---- Native reviewer session -------------------------------------------------------------------
+
+    REVIEWER_UUID = "33333333-3333-4333-8333-333333333333"
+    TOKEN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    def reviewer_row(self, **updates):
+        return {"sessionId": self.REVIEWER_UUID, "id": self.REVIEWER_UUID[:8], "name": self.sessions.launch_name("review"),
+                "kind": "background", "cwd": str(self.directory / "review-worktree"), "state": "idle", "pid": os.getpid(), **updates}
+
+    def reviewer_receipt(self):
+        from .sessions import plan_digest
+        save_json(self.directory / "review.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.reviewer_row()["id"],
+                                                               "session_id": self.REVIEWER_UUID, "node_id": "review"})
+
+    def started(self, *args, **kwargs):
+        kwargs["stdout"].write(f"claude attach {self.reviewer_row()['id']}    open in this terminal\n")
+        return subprocess.CompletedProcess([], 0)
+
+    def test_reviewer_launch_is_read_only_except_its_completion_file(self):
+        (self.directory / "review-worktree").mkdir()
+        candidate = self.plan["base_commit"]
+        with patch.object(self.sessions, "inventory", side_effect=[[], [self.reviewer_row()], [self.reviewer_row()]]), \
+                patch("workflow.interactive.git", side_effect=[candidate, ""]), \
+                patch("workflow.interactive.subprocess.run", side_effect=self.started) as launch:
+            receipt = self.sessions.run_reviewer("Review this candidate.", self.TOKEN, candidate)
+            # A second call reconciles the same session and never launches again.
+            self.assertEqual(self.sessions.run_reviewer("Review this candidate.", self.TOKEN, candidate)["status"], "attached_session_available")
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(self.sessions.launch_name("review"), f"workflow-{self.plan['run_id']}-reviewer")
+        self.assertEqual((receipt["node_id"], receipt["session_id"], receipt["launch_token"], receipt["candidate_commit"]),
+                         ("review", self.REVIEWER_UUID, self.TOKEN, candidate))
+        self.assertEqual((receipt["worktree"], receipt["base_commit"], receipt["attempt"], receipt["launcher_invocations"]),
+                         (str(self.directory / "review-worktree"), self.plan["base_commit"], 1, 1))
+        self.assertEqual(receipt["background_id"], self.reviewer_row()["id"])
+        self.assertIn("launch_requested_at", receipt)
+        command = launch.call_args.args[0]
+        self.assertEqual(command[command.index("--name") + 1], f"workflow-{self.plan['run_id']}-reviewer")
+        self.assertIn("--bg", command)
+        self.assertEqual(command[command.index("--tools") + 1], "Read,Glob,Grep,Write")
+        self.assertEqual(command[command.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(command[command.index("--allowedTools") + 1], f"Edit(//{str(self.directory / 'review.completion.json').lstrip('/')})")
+        self.assertEqual(command[command.index("--add-dir") + 1], str(self.directory))
+        self.assertEqual(command[command.index("--mcp-config") + 1], '{"mcpServers":{}}')
+        for forbidden in ("--dangerously-skip-permissions", "--print", "bypassPermissions", "Bash", "Edit"):
+            self.assertNotIn(forbidden, command)
+        self.assertEqual(command[-1], "Review this candidate.")
+        # --tools, --allowedTools and --add-dir are variadic: the prompt must directly follow a
+        # single-value option, or the CLI swallows it and the session starts idle (seen live).
+        self.assertEqual(command[-3:-1], ["--permission-mode", "dontAsk"])
+        for option in ("--tools", "--allowedTools", "--add-dir"):
+            self.assertLess(command.index(option), command.index("--permission-mode"))
+        self.assertEqual(launch.call_args.kwargs["cwd"], self.directory / "review-worktree")
+        self.assertFalse(any(key.startswith("HERDR_") for key in launch.call_args.kwargs["env"]))
+        prompt = self.directory / "review.prompt.txt"
+        self.assertEqual(prompt.read_text(), "Review this candidate.")
+        self.assertEqual(prompt.stat().st_mode & 0o777, 0o600)
+        self.assertIn("claude attach", (self.directory / "review.launch.log").read_text())
+
+    def test_reviewer_launch_waits_for_native_pid_then_gives_up_without_relaunch(self):
+        (self.directory / "review-worktree").mkdir()
+        candidate = self.plan["base_commit"]
+        unregistered = {key: value for key, value in self.reviewer_row().items() if key != "pid"}
+        inventories = [[], [], [unregistered], [unregistered], [self.reviewer_row()]]
+        with patch.object(self.sessions, "inventory", side_effect=inventories) as inventory, \
+                patch("workflow.interactive.git", side_effect=[candidate, ""]), \
+                patch("workflow.interactive.subprocess.run", side_effect=self.started) as launch, \
+                patch("workflow.interactive.time.sleep") as sleep:
+            result = self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
+        self.assertEqual((result["status"], result["background_id"]), ("attached_session_available", self.reviewer_row()["id"]))
+        self.assertEqual((launch.call_count, inventory.call_count, sleep.call_count), (1, 5, 3))
+        # A reviewer whose PID never registers is left for reconciliation, never relaunched.
+        (self.directory / "review.interactive.json").unlink()
+        self.sessions.settle_seconds = 0
+        with patch.object(self.sessions, "inventory", side_effect=[[], [unregistered]]), \
+                patch("workflow.interactive.git", side_effect=[candidate, ""]), \
+                patch("workflow.interactive.subprocess.run", side_effect=self.started) as launch:
+            with self.assertRaisesRegex(RuntimeError, "No live native PID"):
+                self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
+        self.assertEqual(launch.call_count, 1)
+        receipt = read_json(self.directory / "review.interactive.json")
+        self.assertEqual(receipt["status"], "needs_reconciliation")
+        with patch.object(self.sessions, "inventory", return_value=[]), patch("workflow.interactive.subprocess.run") as launch:
+            with self.assertRaisesRegex(RuntimeError, "reconcile|relaunch"):
+                self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
+            launch.assert_not_called()
+
+    def test_reviewer_launch_requires_the_clean_candidate_worktree(self):
+        candidate = self.plan["base_commit"]
+        with patch("workflow.interactive.subprocess.run") as launch:
+            with self.assertRaisesRegex(RuntimeError, "worktree"):
+                self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
+            (self.directory / "review-worktree").mkdir()
+            with patch("workflow.interactive.git", side_effect=["0" * 40, ""]):
+                with self.assertRaisesRegex(RuntimeError, "candidate"):
+                    self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
+            with patch("workflow.interactive.git", side_effect=[candidate, " M file"]):
+                with self.assertRaisesRegex(RuntimeError, "candidate"):
+                    self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
+            with patch("workflow.interactive.git", side_effect=[candidate, ""]), \
+                    patch.object(self.sessions, "inventory", return_value=[self.reviewer_row()]):
+                with self.assertRaisesRegex(RuntimeError, "launch name"):
+                    self.sessions.run_reviewer("prompt", self.TOKEN, candidate)
+            launch.assert_not_called()
+        self.assertFalse((self.directory / "review.interactive.json").exists())
+
+    def test_locate_reviewer_binds_the_review_worktree(self):
+        self.reviewer_receipt()
+        self.assertEqual(self.sessions.node_worktree("review"), self.directory / "review-worktree")
+        self.assertEqual(self.sessions.node_worktree("ui"), Path(self.plan["nodes"]["ui"]["worktree"]))
+        self.assertEqual(self.sessions.locate("review", [self.reviewer_row(), self.row()])["sessionId"], self.REVIEWER_UUID)
+        for row in [self.reviewer_row(cwd=self.plan["nodes"]["ui"]["worktree"]), self.reviewer_row(name=self.sessions.launch_name("ui")),
+                    self.reviewer_row(state="exited"), self.reviewer_row(pid=None)]:
+            with self.assertRaises(RuntimeError):
+                self.sessions.locate("review", [row])
+        self.assertIsNone(self.sessions.locate("review", [self.row()]))
+        with self.assertRaisesRegex(RuntimeError, "UUID changed"):
+            self.sessions.locate("review", [self.reviewer_row(sessionId="44444444-4444-4444-8444-444444444444")])
+
+    def test_worker_launch_records_the_exact_prompt(self):
+        def started(*args, **kwargs):
+            kwargs["stdout"].write(f"claude attach {self.row()['id']}    open in this terminal\n")
+            return subprocess.CompletedProcess([], 0)
+        with patch.object(self.sessions, "inventory", side_effect=[[], [self.row()]]), patch("workflow.interactive.git", side_effect=[self.plan["base_commit"], ""]), \
+                patch("workflow.interactive.subprocess.run", side_effect=started) as launch:
+            self.sessions.run("ui")
+        prompt = self.directory / "ui.prompt.txt"
+        self.assertEqual(prompt.read_text(), launch.call_args.args[0][-1])
+        self.assertIn(self.plan["nodes"]["ui"]["task"], prompt.read_text())
+        self.assertEqual(prompt.stat().st_mode & 0o777, 0o600)
+
+    def test_panels_attach_reviewer_as_third_pane_when_its_receipt_exists(self):
+        from .sessions import plan_digest
+        for node in ("ui", "adapter"):
+            save_json(self.directory / f"{node}.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row(node)["id"], "session_id": self.row(node)["sessionId"]})
+        self.reviewer_receipt()
+        calls = []
+        with patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter"), self.reviewer_row()]), \
+                patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)):
+            mapping = attach_panels(self.sessions)
+        self.assertEqual(list(mapping), ["ui", "adapter", "review"])
+        self.assertEqual(mapping["review"], {"pane_id": "w1:p4", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.REVIEWER_UUID})
+        splits = [call for call in calls if call[:2] == ("pane", "split")]
+        self.assertEqual(len(splits), 2)
+        self.assertEqual((splits[1][splits[1].index("--pane") + 1], splits[1][splits[1].index("--direction") + 1]), ("w1:p3", "right"))
+        self.assertIn(("pane", "rename", "w1:p4", "Claude: reviewer"), calls)
+        runs = [call for call in calls if call[:2] == ("pane", "run") and call[2] == "w1:p4"]
+        self.assertEqual(len(runs), 1)
+        self.assertIn("attach-one", runs[0][3])
+        self.assertIn("--node review", runs[0][3])
+        self.assertEqual(read_json(self.directory / "terminals.json"), mapping)
+
+    def test_attach_reviewer_panel_extends_existing_mapping_and_refuses_duplicates(self):
+        from .interactive import attach_reviewer_panel
+        calls = []
+        with patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)), \
+                patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter"), self.reviewer_row()]):
+            with self.assertRaisesRegex(RuntimeError, "terminal"):
+                attach_reviewer_panel(self.sessions)  # No worker panes yet.
+            mapping = {"ui": {"pane_id": "w1:p2", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row()["sessionId"]},
+                       "adapter": {"pane_id": "w1:p3", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row("adapter")["sessionId"]}}
+            save_json(self.directory / "terminals.json", mapping)
+            with self.assertRaisesRegex(RuntimeError, "reviewer"):
+                attach_reviewer_panel(self.sessions)  # No reviewer receipt yet.
+            self.reviewer_receipt()
+            result = attach_reviewer_panel(self.sessions)
+            self.assertEqual(result["review"], {"pane_id": "w1:p3", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.REVIEWER_UUID})
+            self.assertEqual(result["ui"], mapping["ui"])
+            self.assertEqual(read_json(self.directory / "terminals.json"), result)
+            with self.assertRaisesRegex(RuntimeError, "already"):
+                attach_reviewer_panel(self.sessions)
+        splits = [call for call in calls if call[:2] == ("pane", "split")]
+        self.assertEqual(len(splits), 1)
+        self.assertEqual(splits[0][splits[0].index("--pane") + 1], "w1:p3")
+        self.assertIn(("pane", "rename", "w1:p3", "Claude: reviewer"), calls)
+        self.assertEqual(len([call for call in calls if call[:2] == ("pane", "run")]), 1)
+
+    def test_attach_adds_the_reviewer_pane_to_the_existing_workflow_tab(self):
+        # `attach` after the review node started: the workers' tab exists, the reviewer does not have a pane yet.
+        from .sessions import plan_digest
+        for node in ("ui", "adapter"):
+            save_json(self.directory / f"{node}.interactive.json", {"plan_digest": plan_digest(self.plan), "background_id": self.row(node)["id"], "session_id": self.row(node)["sessionId"]})
+        existing = {"ui": {"pane_id": "w1:p5", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row()["sessionId"]},
+                    "adapter": {"pane_id": "w1:p6", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.row("adapter")["sessionId"]}}
+        save_json(self.directory / "terminals.json", existing)
+        calls = []
+        with patch.object(self.sessions, "inventory", return_value=[self.row(), self.row("adapter"), self.reviewer_row()]), \
+                patch("workflow.interactive.herdr", side_effect=self.fake_herdr(calls)):
+            with self.assertRaisesRegex(RuntimeError, "already exist"):
+                attach_panels(self.sessions)  # No reviewer yet: the existing refusal stands.
+            self.reviewer_receipt()
+            mapping = attach_panels(self.sessions)
+            with self.assertRaisesRegex(RuntimeError, "already exist"):
+                attach_panels(self.sessions)  # The reviewer pane exists now: refuse again rather than duplicate it.
+        self.assertEqual(list(mapping), ["ui", "adapter", "review"])
+        self.assertEqual((mapping["ui"], mapping["adapter"]), (existing["ui"], existing["adapter"]))
+        self.assertEqual(mapping["review"], {"pane_id": "w1:p3", "tab_id": "w1:t2", "mode": "attach_requested", "session_id": self.REVIEWER_UUID})
+        self.assertEqual(read_json(self.directory / "terminals.json"), mapping)
+        self.assertFalse(any(call[:2] == ("tab", "create") for call in calls))
+        splits = [call for call in calls if call[:2] == ("pane", "split")]
+        self.assertEqual(len(splits), 1)
+        self.assertEqual((splits[0][splits[0].index("--pane") + 1], splits[0][splits[0].index("--direction") + 1]), ("w1:p6", "right"))
+        self.assertIn(("pane", "rename", "w1:p3", "Claude: reviewer"), calls)
+        runs = [call for call in calls if call[:2] == ("pane", "run")]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0][2], "w1:p3")
+        self.assertIn("workflow.interactive attach-one", runs[0][3])
+        self.assertIn("--node review", runs[0][3])
+
+    def test_attach_one_reconnects_the_reviewer_in_its_worktree(self):
+        from .interactive import main
+        self.reviewer_receipt()
+        with patch("workflow.interactive.sys.argv", ["interactive", "attach-one", str(self.directory), "--node", "review"]), \
+                patch("workflow.interactive.sys.stdin") as stdin, patch.object(InteractiveSessions, "inventory", return_value=[self.reviewer_row()]), \
+                patch("workflow.interactive.os.chdir") as chdir, patch("workflow.interactive.os.execvp", side_effect=SystemExit(0)) as execvp:
+            stdin.isatty.return_value = True
+            with self.assertRaises(SystemExit):
+                main()  # A real execvp replaces the process; the mock ends it the same way.
+        chdir.assert_called_once_with(self.directory / "review-worktree")
+        execvp.assert_called_once_with("claude", ["claude", "attach", self.reviewer_row()["id"]])
+
+
+if __name__ == "__main__":
+    unittest.main()
+"""Export version 1.2.0: review/inputs sections from a run directory, stability, and the export CLI."""
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from .export_state import EXPORT_VERSION, export_state, inputs_section, review_section
+from .pipeline import ExportRuntime, digest_file, export_run
+from .sessions import read_json, save_json
+from .verification import policy_digest
+
+REPO = Path(__file__).resolve().parents[1]
+REVIEWER = "dd7bdcd1-adec-4efe-bcd4-bbadc3525d95"
+
+
+def legacy_run(root: Path, *, with_policy: bool = True, automatic: bool = True) -> Path:
+    """A finished run directory shaped like the first live 1.0.0 run, whose worktrees no longer exist."""
+    directory = root / "legacy-001"
+    directory.mkdir()
+    policy = read_json(REPO / "features/project-workflows/policy.json")
+    plan = {"run_id": "legacy-001", "repository": str(root / "gone-repo"), "base_commit": "c" * 40, "allow_edits": True,
+            "nodes": {node: {"worktree": str(directory / f"worktree-{node}"), "task": f"# {node} task\n\nDo the {node} work.\n\nApproved ownership and checks:\n{{}}",
+                             "session_id": f"{node[0] * 8}-0000-4000-8000-000000000000", "observed_start_commit": "c" * 40} for node in ("ui", "adapter")},
+            "mode": "interactive", "policy_sha256": policy_digest(policy), "created_at": "2026-09-21T14:33:23.528543Z",
+            "source_branch": "feature/project-workflows/legacy-001"}
+    if automatic:
+        # Pinned before reviewer_transport existed: four keys only.
+        plan["automatic"] = {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions",
+                             "worker_timeout_seconds": 3600, "review_timeout_seconds": 1800}
+    save_json(directory / "plan.json", plan)
+    if with_policy:
+        save_json(directory / "policy.json", policy)
+    for node in ("ui", "adapter"):
+        save_json(directory / f"{node}.interactive.json", {
+            "node_id": node, "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111", "launch_token": plan["nodes"][node]["session_id"],
+            "plan_digest": "x" * 64, "worktree": plan["nodes"][node]["worktree"], "base_commit": "c" * 40, "status": "attached_session_available",
+            "attempt": 1, "launcher_invocations": 1, "launch_requested_at": "2026-09-21T14:33:25.331982+00:00",
+            "background_id": node[0] * 8, "observed_state": "working", "native_started_at": 1790001207771})
+        save_json(directory / f"{node}.completion.json", {"version": "1.0.0", "run_id": "legacy-001", "node_id": node,
+                                                          "launch_token": plan["nodes"][node]["session_id"], "status": "completed",
+                                                          "summary": f"{node} implemented", "open_assumptions": ["assumed"]})
+        save_json(directory / f"{node}.handoff.json", {"summary": f"{node} implemented", "open_assumptions": ["assumed"]})
+        save_json(directory / f"{node}.stop.json", {"background_id": node[0] * 8, "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111", "pid": 1, "stopped": True})
+    bundle = {"run_id": "legacy-001", "base_commit": "c" * 40, "candidate_commit": "d" * 40, "policy_sha256": policy_digest(policy),
+              "snapshots": {node: {"commit": "d" * 40, "changed_files": [], "session_id": f"{node[0] * 8}-1111-4111-8111-111111111111"} for node in ("ui", "adapter")},
+              "packets": []}
+    save_json(directory / "review-bundle.json", bundle)
+    review = {"run_id": "legacy-001", "bundle_sha256": digest_file(directory / "review-bundle.json"), "candidate_commit": "d" * 40,
+              "reviewer": REVIEWER, "independent": True, "verdict": "approved",
+              "findings": [{"severity": "P2", "message": "Stale task error overrides verified success", "disposition": "open"},
+                           {"severity": "P2", "message": "Root Playwright suite is not in the policy", "disposition": "accepted"}]}
+    save_json(directory / "review.json", review)
+    save_json(directory / "automatic-review.json", {"session_id": REVIEWER, "bundle_sha256": review["bundle_sha256"], "candidate_commit": "d" * 40,
+                                                    "status": "succeeded", "patch_sha256": "0" * 64, "pid": 1, "review": review})
+    (directory / "review.diff").write_text("diff --git a/ui.txt b/ui.txt\n--- a/ui.txt\n+++ b/ui.txt\n@@ -1 +1 @@\n-before\n+after\n")
+    events = [{"sequence": 1, "time": "2026-09-21T14:33:25.000000Z", "node": "ui", "status": "running", "message": "Launching"},
+              {"sequence": 2, "time": "2026-09-21T15:42:27.848828Z", "node": "review", "status": "approved", "message": REVIEWER},
+              {"sequence": 3, "time": "2026-09-21T15:52:04.611348Z", "node": "controller", "status": "running", "message": "PID 1"}]
+    (directory / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+    old = {"version": "1.0.0", "run_id": "legacy-001", "base_commit": "c" * 40, "created_at": plan["created_at"],
+           "definition": {"name": "Feature implementation", "nodes": []}, "values": {"run_id": "legacy-001", "review": review},
+           "next": [], "tasks": [], "events": events, "verification_packets": [], "updated_at": "2026-09-21T15:52:04.675731Z"}
+    save_json(directory / "run-state.json", old)
+    return directory
+
+
+class ExportSectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_review_section_derives_transport_time_and_diff_from_files(self):
+        directory = legacy_run(self.root)
+        section = review_section(directory)
+        self.assertEqual((section["attempt"], section["transport"], section["reviewer_session_id"], section["independent"]), (1, "print", REVIEWER, True))
+        self.assertEqual((section["verdict"], section["candidate_commit"]), ("approved", "d" * 40))
+        self.assertEqual(section["reviewed_at"], "2026-09-21T15:42:27.848828Z")  # Last review event; the old receipt has no accepted_at.
+        self.assertEqual(section["diff"], {"path": "review.diff", "sha256": digest_file(directory / "review.diff"), "bytes": (directory / "review.diff").stat().st_size})
+        self.assertEqual([(finding["worker"], finding["requirement"]) for finding in section["findings"]], [(None, None), (None, None)])
+        self.assertEqual(section["findings"][0]["message"], "Stale task error overrides verified success")
+        # Native receipts win over print receipts; accepted_at wins over events; no diff → null.
+        save_json(directory / "review.interactive.json", {"node_id": "review"})
+        receipt = read_json(directory / "automatic-review.json")
+        receipt["accepted_at"] = "2026-09-21T16:00:00.000000Z"
+        save_json(directory / "automatic-review.json", receipt)
+        (directory / "review.diff").unlink()
+        section = review_section(directory)
+        self.assertEqual((section["transport"], section["reviewed_at"], section["diff"]), ("native", "2026-09-21T16:00:00.000000Z", None))
+        # Manual reviews: no receipts at all, time from the review file itself when no event exists.
+        (directory / "review.interactive.json").unlink()
+        (directory / "automatic-review.json").unlink()
+        (directory / "events.jsonl").unlink()
+        section = review_section(directory)
+        expected = datetime.fromtimestamp((directory / "review.json").stat().st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
+        self.assertEqual((section["transport"], section["reviewed_at"]), ("manual", expected))
+        (directory / "review.json").unlink()
+        self.assertIsNone(review_section(directory))
+
+    def test_inputs_section_pins_plan_policy_and_receipts(self):
+        directory = legacy_run(self.root)
+        plan, policy = read_json(directory / "plan.json"), read_json(directory / "policy.json")
+        (directory / "ui.prompt.txt").write_text("You are a workflow worker.\n\n# ui task")
+        section = inputs_section(directory, plan, policy)
+        self.assertEqual((section["feature"], section["policy_version"], section["base_commit"], section["source_branch"], section["mode"]),
+                         (policy["feature"], "1.1.0", "c" * 40, "feature/project-workflows/legacy-001", "automatic"))
+        # Pinned before reviewer_transport existed: the export reports the transport the run recorded (a print receipt), never a default.
+        self.assertEqual(section["automatic"], {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions",
+                                                "worker_timeout_seconds": 3600, "review_timeout_seconds": 1800, "reviewer_transport": "print"})
+        self.assertEqual(section["setup"], [{"argv": ["npm", "ci"], "command": "npm ci", "timeout_seconds": 600}])
+        self.assertEqual((section["max_verification_attempts"], section["failure_drill"]), (3, {"node_id": "adapter", "phase": "worker", "attempt": 1}))
+        self.assertEqual(list(section["workers"]), ["ui", "adapter"])
+        ui = section["workers"]["ui"]
+        self.assertEqual((ui["role"], ui["task"], ui["prompt"]), ("frontend", plan["nodes"]["ui"]["task"], "You are a workflow worker.\n\n# ui task"))
+        self.assertIsNone(section["workers"]["adapter"]["prompt"])
+        self.assertEqual(ui["owned_paths"], policy["workers"][0]["owned_paths"])
+        browser = next(check for check in ui["checks"] if check["kind"] == "browser")
+        self.assertEqual(browser["command"], "npx --no-install playwright test --config=tests/project-workflows/playwright.config.ts")
+        self.assertEqual(len(browser["scenarios"]), 6)
+        self.assertEqual(ui["launch"], {"session_id": "uuuuuuuu-1111-4111-8111-111111111111", "launch_token": plan["nodes"]["ui"]["session_id"],
+                                        "launch_requested_at": "2026-09-21T14:33:25.331982Z", "native_started_at": 1790001207771,
+                                        "observed_state": "working", "status": "attached_session_available", "launcher_invocations": 1, "background_id": "uuuuuuuu"})
+        self.assertEqual(ui["completion"], {"status": "completed", "summary": "ui implemented", "open_assumptions": ["assumed"]})
+        self.assertEqual(ui["handoff"], {"summary": "ui implemented", "open_assumptions": ["assumed"]})
+        stop = directory / "ui.stop.json"
+        self.assertEqual(ui["stop"], {"stopped": True, "confirmed_at": datetime.fromtimestamp(stop.stat().st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")})
+        # Absent or malformed receipts are null, a manual plan has no automatic block, an unconfirmed stop has no time.
+        (directory / "adapter.completion.json").write_text("{not json")
+        (directory / "adapter.handoff.json").unlink()
+        (directory / "adapter.interactive.json").unlink()
+        save_json(directory / "adapter.stop.json", {"stopped": False})
+        del plan["automatic"]
+        section = inputs_section(directory, plan, policy)
+        adapter = section["workers"]["adapter"]
+        self.assertEqual((section["mode"], section["automatic"]), ("manual", None))
+        self.assertEqual((adapter["completion"], adapter["handoff"], adapter["launch"], adapter["stop"]), (None, None, None, {"stopped": False, "confirmed_at": None}))
+        plan["automatic"] = {"finish": "verified-feature-branch", "permission_mode": "bypassPermissions", "worker_timeout_seconds": 1,
+                             "review_timeout_seconds": 1, "reviewer_transport": "print"}
+        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "print")
+
+    def test_legacy_plan_reports_the_recorded_reviewer_transport_or_null(self):
+        directory = legacy_run(self.root)
+        plan, policy = read_json(directory / "plan.json"), read_json(directory / "policy.json")
+        self.assertNotIn("reviewer_transport", plan["automatic"])
+        # A print receipt without a native receipt: the run reviewed headlessly.
+        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "print")
+        # A native receipt wins, exactly as the review section derives it.
+        save_json(directory / "review.interactive.json", {"node_id": "review"})
+        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "native")
+        self.assertEqual(review_section(directory)["transport"], "native")
+        # No reviewer receipt at all (the run has not reviewed yet): null, never a guessed default.
+        (directory / "review.interactive.json").unlink()
+        (directory / "automatic-review.json").unlink()
+        (directory / "review.json").unlink()
+        self.assertIsNone(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"])
+        # A plan that pins the key reports the key regardless of receipts.
+        plan["automatic"]["reviewer_transport"] = "native"
+        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "native")
+        save_json(directory / "automatic-review.json", {"status": "running"})
+        plan["automatic"]["reviewer_transport"] = "print"
+        self.assertEqual(inputs_section(directory, plan, policy)["automatic"]["reviewer_transport"], "print")
+        # The full export of a legacy run carries the recorded transport in both sections.
+        (directory / "automatic-review.json").unlink()
+        del plan["automatic"]["reviewer_transport"]
+        save_json(directory / "plan.json", plan)
+        exported = export_run(ExportRuntime(directory))
+        self.assertIsNone(exported["review"])
+        self.assertIsNone(exported["inputs"]["automatic"]["reviewer_transport"])
+
+
+class ExportRunTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_legacy_run_directory_re_exports_to_current_version_and_stays_stable(self):
+        directory = legacy_run(self.root)
+        # The checkpoint of a finished run: no pending work, integrated commit recorded.
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        from .pipeline import build_pipeline
+        runtime = ExportRuntime(directory)
+        self.assertFalse(Path(runtime.plan["repository"]).exists())  # Worktrees and repository are gone.
+        with SqliteSaver.from_conn_string(str(directory / "pipeline.sqlite")) as saver:
+            graph = build_pipeline(saver, runtime)
+            graph.update_state({"configurable": {"thread_id": "legacy-001"}}, {"run_id": "legacy-001", "integrated_commit": "d" * 40}, as_node="integrate")
+        before = read_json(directory / "run-state.json")
+        exported = export_run(runtime)
+        self.assertEqual(exported["version"], EXPORT_VERSION)
+        self.assertEqual(exported["version"], "1.2.0")
+        self.assertNotEqual(exported["updated_at"], before["updated_at"])
+        self.assertEqual(exported["created_at"], before["created_at"])
+        self.assertEqual(exported["values"]["integrated_commit"], "d" * 40)
+        self.assertEqual(exported["next"], [])
+        self.assertEqual((exported["review"]["transport"], exported["review"]["reviewer_session_id"], exported["review"]["verdict"]), ("print", REVIEWER, "approved"))
+        self.assertEqual(exported["inputs"]["mode"], "automatic")
+        self.assertEqual(exported["inputs"]["workers"]["ui"]["launch"]["launch_requested_at"], "2026-09-21T14:33:25.331982Z")
+        self.assertEqual(len(exported["definition"]["nodes"]), 9)
+        written = (directory / "run-state.json").read_bytes()
+        self.assertEqual(export_run(ExportRuntime(directory)), exported)
+        self.assertEqual((directory / "run-state.json").read_bytes(), written)  # Unchanged content does not bump updated_at.
+        self.assertFalse((directory / "review-worktree").exists())
+        self.assertFalse(any(path.name.endswith(".launch.log") for path in directory.iterdir()))
+
+    def test_prepared_run_without_checkpoint_exports_the_prepare_shape(self):
+        directory = legacy_run(self.root)
+        (directory / "run-state.json").unlink()
+        exported = export_run(ExportRuntime(directory))
+        self.assertEqual((exported["values"], exported["next"], exported["tasks"]), ({}, ["launch_ui", "launch_adapter"], []))
+        self.assertFalse((directory / "pipeline.sqlite").exists())
+
+    def test_run_without_policy_exports_null_inputs(self):
+        directory = legacy_run(self.root, with_policy=False)
+        exported = export_run(ExportRuntime(directory))
+        self.assertIsNone(exported["inputs"])
+        self.assertIsNotNone(exported["review"])
+
+    def test_malformed_or_contradictory_runs_are_refused(self):
+        directory = legacy_run(self.root)
+        review = read_json(directory / "review.json")
+        review["findings"][0]["worker"] = "reviewer"
+        save_json(directory / "review.json", review)
+        with self.assertRaisesRegex(ValueError, "finding"):
+            ExportRuntime(directory)
+        review["findings"][0]["worker"] = "ui"
+        review["findings"][0]["requirement"] = "Do the ui work."
+        review["verdict"] = "blocked"
+        save_json(directory / "review.json", review)
+        exported = export_run(ExportRuntime(directory))  # A blocked review exports; only approval is not required.
+        self.assertEqual(exported["review"]["verdict"], "blocked")
+        self.assertEqual(exported["review"]["findings"][0]["requirement"], "Do the ui work.")
+        review["candidate_commit"] = "e" * 40
+        save_json(directory / "review.json", review)
+        with self.assertRaisesRegex(ValueError, "exact run"):
+            ExportRuntime(directory)
+        (directory / "review-bundle.json").unlink()
+        with self.assertRaisesRegex(ValueError, "contradictory"):
+            ExportRuntime(directory)
+        (directory / "review.json").unlink()
+        policy = read_json(directory / "policy.json")
+        policy["feature"] = "edited after pinning"
+        save_json(directory / "policy.json", policy)
+        with self.assertRaisesRegex(ValueError, "policy changed"):
+            ExportRuntime(directory)
+        plan = read_json(directory / "plan.json")
+        plan["automatic"]["reviewer_transport"] = "stdio"
+        save_json(directory / "plan.json", plan)
+        with self.assertRaisesRegex(ValueError, "reviewer transport"):
+            ExportRuntime(directory)
+
+    def test_export_cli_takes_the_lock_and_launches_nothing(self):
+        directory = legacy_run(self.root)
+        result = subprocess.run([sys.executable, "-m", "workflow", "export", str(directory)], cwd=REPO, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("version 1.2.0", result.stdout)
+        self.assertIn("No agents launched", result.stdout)
+        exported = read_json(directory / "run-state.json")
+        self.assertEqual((exported["version"], exported["review"]["reviewer_session_id"]), ("1.2.0", REVIEWER))
+        self.assertTrue((directory / "controller.lock").exists())
+        self.assertFalse((directory / "review.interactive.json").exists())
+        review = read_json(directory / "review.json")
+        review["reviewer"] = "uuuuuuuu-1111-4111-8111-111111111111"  # A worker reviewing itself is not independent.
+        save_json(directory / "review.json", review)
+        result = subprocess.run([sys.executable, "-m", "workflow", "export", str(directory)], cwd=REPO, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Independent reviewer identity required", result.stderr)
+        self.assertEqual(read_json(directory / "run-state.json"), exported)  # A refused export leaves the previous file untouched.
+
+
+if __name__ == "__main__":
+    unittest.main()

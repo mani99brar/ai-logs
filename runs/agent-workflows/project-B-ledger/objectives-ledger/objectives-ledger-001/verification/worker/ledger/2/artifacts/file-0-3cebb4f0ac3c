@@ -1,0 +1,105 @@
+# Objective ledger
+
+The pure rubbing ledger of §4 with duel settlement (§11's theft and PvP gold) and §12's recovery caches. `@pirate-sea-race/simulation/objectives` has the state, the operations and the invariant. `@pirate-sea-race/content/objectives` has the types, rubbing ids, timings, the gold rule and the zod validators for source sites and assignments. It is plain integer data with no clocks and no `Math.random`. Time is the world tick (20 per second), supplied by the caller. Positions are integer sub-units, supplied by the caller. Nothing here is wired into `MatchRoom` yet.
+
+## Content
+
+- **Types:** `sun`, `moon`, `tide`, `storm`. This fixed order breaks ties. The slice plays the first two.
+- **Rubbing ids:** `<type>-<copy>`, such as `tide-2`. The slice has `sun-1…4` and `moon-1…4`. The alpha has three copies of each of the four types.
+- **Sources:** `assignSources(preset, sites, seed)` deals the rubbings onto the caller's sites with a seeded Fisher–Yates shuffle. There must be `sourcesPerIsland` sites per island. Source ids are `source-<island>-<slot>`. `sourceAssignmentSchema` checks the result: each rubbing sealed once, the right island counts, unique ids, and types that match the ids.
+- **`objectiveRules`:**
+
+  | Rule | Value |
+  | --- | --- |
+  | Collection | 120 ticks (6 s) |
+  | Cache claim | 120 ticks (6 s) |
+  | Theft choice window | 100 ticks (5 s) |
+  | Repeated-win window | 3600 ticks (3 min) |
+  | Seat reservation | 1200 ticks (60 s) |
+  | Starting gold | 50 |
+  | PvP gold | 20 %, capped at 50 |
+
+  `pvpGoldTransfer` rounds down and never takes more than the loser has.
+
+## State (`LedgerState`, all covered by `hashState`)
+
+- `preset`, `rules`, `types`, `tick` (the latest tick an applied request carried), `rng`.
+- `sources`: id, island, position, type, the rubbing sealed there, and `unlocked`. Sources start locked, and a later ruin feature unlocks them.
+- `rubbings`: id, type, `revision` (bumped on every move) and **one** `location`:
+  - `source` (only its own source);
+  - `player`;
+  - `cache`;
+  - `duel` (reserved for one of the two players of an unresolved duel).
+
+  This is the only record of where a rubbing is. Inventories and cache contents are derived from it, so no second copy can disagree.
+- `players`:
+  - `gold`;
+  - `status`: `connected`, `disconnected` (with `reservationDeadline`) or `left` (with `exit`, the position its leftover rubbings go to);
+  - `channel`: a collection or cache claim, with `startTick`, `lastTick` and `heldTicks`;
+  - `freshRumors`: the types lost to theft, a flag for the future rumor system.
+- `caches`: id, position and creation tick. A cache never despawns and is removed as soon as it is empty.
+- `duels`: the players, `phase` (`fighting`, `choosing` or `settled`), `result`, `choiceDeadline` and `settlement`. A duel is committed once, and settled duels are kept so that a repeated message finds its result.
+- `wins`: the last win tick per ordered (winner, loser) pair.
+- `goldIssued`: the gold brought in by joining players. Settlements only move gold.
+
+## Operations
+
+Each operation is `(state, request) → { state, result }` and never writes into its input. `result.ok` tells whether it applied. `transfers` lists every move, with the before and after revisions (§16). `cacheIds` lists the caches opened.
+
+| Operation | Rule |
+| --- | --- |
+| `addPlayer` | Joins with the starting purse. An id is never reused. |
+| `unlockSource` | Makes a source collectable. |
+| `startCollect`, `startCacheClaim` | Start a hold at an unlocked, still-sealed source or on one selected cached rubbing, for a type the player lacks. Not while disconnected or in a duel. |
+| `progressChannel` | One held tick. It must be exactly `lastTick + 1`: after a gap the hold was interrupted and counts from 0 again. At 120 ticks the target is checked again and the rubbing moves. If another player already took it, or the type is now held, the result is `failed` and nothing moves. |
+| `cancelChannel` | Drops the hold and its progress. |
+| `reserveDuel` | Reserves both players' rubbings in the duel and cancels their channels. A disconnected player can be challenged. |
+| `reportDuelResult` | `win`, `draw` or `cancelled` (both players forfeited on the same tick). A draw or cancellation returns everything. A win with no eligible type settles at once and gold still moves. Otherwise it opens the choice window. |
+| `chooseTheft` | The winner only, before `choiceDeadline`, for an eligible type (held by the loser, lacked by the winner). It commits. |
+| `advanceLedger` | Call once per tick first. It settles every window whose deadline has come with the default theft: fewest sealed sources of the type, then type order. |
+| `disconnectPlayer`, `reconnectPlayer` | Cancel the channel and reserve the seat. Returning before the deadline reattaches the same player. A repeated disconnect keeps the original deadline. |
+| `expireReservation`, `quitPlayer` | Remove the player. Outside a duel, all their rubbings go into one cache at the given position (none if they hold nothing). In a fight, the player forfeits: the opponent wins, and what the winner does not take goes into a cache when the duel settles. As the loser in a choice window, the same happens at settlement. As the winner in a choice window, the duel settles at once, and the winner takes neither rubbing nor gold. |
+
+The commit checks eligibility again. It then moves the stolen rubbing and adds the lost type to the loser's `freshRumors`. Gold moves unless the same winner beat the same loser less than 3600 ticks before; theft still applies then. Last, the commit returns every other reserved rubbing to its owner, or to a cache if the owner has left. A disconnected loser therefore loses one rubbing first, and the rest is cached only at expiry, so nothing is duplicated.
+
+## Idempotency (§16)
+
+A request that is stale (its tick is before `state.tick`), duplicate, unauthorised, malformed or already resolved returns `ok: false`, a `rejection` reason, the current duel, channel or player, and **the very same state object**. Examples:
+
+- A second result message for a duel gets `already-resolved`, even if it names another winner.
+- A choice after the commit gets `already-resolved`, and a late one gets `choice-window-closed`.
+- A repeated start gets `duplicate` and keeps the progress.
+- A second quit gets `player-left`.
+
+There is no operation to drop, trade, copy or destroy a rubbing.
+
+## Invariant
+
+`checkLedger(state)` returns every violation, and `assertLedger` throws on any. It checks the following:
+
+- Every rubbing id of the preset is present exactly once, with its type, and there are no others.
+- Each location is valid: the rubbing's own source, a player still in the match who is not in a duel, an existing cache, or an unresolved duel that the named player is in.
+- No player holds two rubbings of one type, counting reserved ones.
+- No cache is empty.
+- No player is in two unresolved duels, and nobody channels while disconnected, gone or in a duel.
+- Gold is non-negative and sums to `goldIssued`.
+- The state is plain safe-integer data.
+
+The tests run every operation on a deeply frozen state and check the invariant after each one. The property tests run 3 seeded matches per preset, 1200 random steps each, about 2700–5100 operations each. The steps cover:
+
+- joins, collections, interruptions and contested completions;
+- duels won, lost, drawn and cancelled;
+- choices, wrong choices and timeouts;
+- replayed messages;
+- disconnects, returns, expiries, quits and cache claims;
+- stale requests.
+
+The same seed replays to the same `hashState`.
+
+## Decisions taken here
+
+- The slice uses Sun and Moon.
+- "Free sources" in the default theft counts sealed sources, locked or not. Cached rubbings are not counted.
+- The repeated-win window is measured from the previous win over that opponent, whether or not that win paid gold.
+- A winner who leaves during the choice window takes nothing.
+- Both players stay reserved until the choice window settles, so neither can collect or be challenged during it.

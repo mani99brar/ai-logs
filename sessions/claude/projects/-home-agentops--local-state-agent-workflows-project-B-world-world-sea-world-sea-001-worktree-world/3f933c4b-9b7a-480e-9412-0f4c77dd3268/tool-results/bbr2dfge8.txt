@@ -1,0 +1,882 @@
+=== tests/integration/admission.test.ts
+import { Client, ErrorCode, type Room } from "@colyseus/sdk";
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import {
+  MALFORMED_MATCH_REQUEST_MESSAGE,
+  MATCH_CODE_REQUIRED_MESSAGE,
+  MATCH_ROOM,
+  MATCH_UNAVAILABLE_MESSAGE,
+  matchFullMessage,
+  NO_SUCH_MATCH_MESSAGE,
+  PROTOCOL_VERSION,
+} from "@pirate-sea-race/protocol";
+import { MatchRoom, startGameServer, type MatchMetadata, type RunningGameServer } from "@pirate-sea-race/server";
+import type { MatchStateSchema } from "@pirate-sea-race/server/schema";
+import { HeadlessClient, newCreateToken } from "@pirate-sea-race/test-tools";
+
+/**
+ * Private-match admission (skeleton-fixes decisions): a private match can be neither joined nor have a seat reserved
+ * in it without its code, whichever matchmaker method the caller uses over HTTP.
+ */
+let server: RunningGameServer;
+let endpoint: string;
+const players: HeadlessClient[] = [];
+const rooms: Room<unknown, MatchStateSchema>[] = [];
+
+async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
+  const joined = await client;
+  players.push(joined);
+  return joined;
+}
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  await Promise.all(players.splice(0).map((player) => player.leave()));
+  await Promise.all(rooms.splice(0).map((room) => room.leave(true).catch(() => undefined)));
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+type Method = "join" | "joinOrCreate" | "joinById";
+
+/** One raw matchmaker request through the SDK, as any HTTP caller could send it. Joined rooms are left afterwards. */
+async function request(method: Method, target: string, options: Record<string, unknown>): Promise<Room<unknown, MatchStateSchema>> {
+  const client = new Client(endpoint);
+  let room: Room<unknown, MatchStateSchema>;
+  if (method === "join") room = await client.join<MatchStateSchema>(target, options);
+  else if (method === "joinOrCreate") room = await client.joinOrCreate<MatchStateSchema>(target, options);
+  else room = await client.joinById<MatchStateSchema>(target, options);
+  rooms.push(room);
+  return room;
+}
+
+/** The refusal a request ends with; fails the test if the request succeeds. */
+async function refusal(attempt: Promise<unknown>): Promise<{ code: unknown; message: string }> {
+  const error: unknown = await attempt.then(
+    () => expect.fail("the request was admitted"),
+    (reason: unknown) => reason,
+  );
+  return { code: (error as { code?: unknown }).code, message: (error as Error).message };
+}
+
+function listingOf(roomId: string) {
+  return matchMaker.query({ roomId });
+}
+
+function roomOf(player: HeadlessClient): MatchRoom {
+  return matchMaker.getLocalRoomById(player.room.roomId) as unknown as MatchRoom;
+}
+
+/** The host's ship still moves under its own input: the room kept running. */
+async function expectRunning(host: HeadlessClient): Promise<void> {
+  expect(host.connected).toBe(true);
+  const start = host.ship()!;
+  const direction = start.x < (seaMap.widthTiles * seaMap.subUnitsPerTile) / 2 ? 1 : -1;
+  await host.hold({ moveX: direction, moveY: 0 }, 300);
+  await host.waitFor(() => (host.ship()!.x - start.x) * direction > 0);
+}
+
+describe("private match admission", () => {
+  it("refuses join, joinOrCreate and joinById without the code, with a wrong code, or with a code and a token", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const other = await track(HeadlessClient.create(endpoint));
+    const unknownCode = host.code === "ZZZZZ9" || other.code === "ZZZZZ9" ? "ZZZZZ8" : "ZZZZZ9";
+    const version = { protocolVersion: PROTOCOL_VERSION };
+
+    for (const method of ["join", "joinOrCreate"] as const) {
+      expect(await refusal(request(method, MATCH_ROOM, version))).toEqual({ code: 400, message: MALFORMED_MATCH_REQUEST_MESSAGE });
+      expect(await refusal(request(method, MATCH_ROOM, { ...version, code: unknownCode }))).toEqual({
+        code: 404,
+        message: NO_SUCH_MATCH_MESSAGE,
+      });
+      expect(await refusal(request(method, MATCH_ROOM, { ...version, code: host.code, createToken: newCreateToken() }))).toEqual({
+        code: 400,
+        message: MALFORMED_MATCH_REQUEST_MESSAGE,
+      });
+    }
+
+    const roomId = host.room.roomId;
+    expect(await refusal(request("joinById", roomId, version))).toEqual({ code: 400, message: MALFORMED_MATCH_REQUEST_MESSAGE });
+    expect(await refusal(request("joinById", roomId, { ...version, code: unknownCode }))).toEqual({
+      code: 404,
+      message: NO_SUCH_MATCH_MESSAGE,
+    });
+    // Another live match's code passes the matchmaker's check but not the room's own.
+    expect(await refusal(request("joinById", roomId, { ...version, code: other.code }))).toEqual({
+      code: 404,
+      message: NO_SUCH_MATCH_MESSAGE,
+    });
+    expect(await refusal(request("joinById", roomId, { ...version, code: host.code, createToken: newCreateToken() }))).toEqual({
+      code: 400,
+      message: MALFORMED_MATCH_REQUEST_MESSAGE,
+    });
+    // A token passes the matchmaker's check as a create, but the room admits only its own creator's token.
+    expect(await refusal(request("joinById", roomId, { ...version, createToken: newCreateToken() }))).toEqual({
+      code: 403,
+      message: MATCH_CODE_REQUIRED_MESSAGE,
+    });
+    // A create request that carries a code instead of a token makes no match.
+    expect(await refusal(new Client(endpoint).create(MATCH_ROOM, { ...version, code: host.code }))).toEqual({
+      code: ErrorCode.MATCHMAKE_INVALID_CRITERIA,
+      message: MATCH_UNAVAILABLE_MESSAGE,
+    });
+
+    expect(host.playerCount).toBe(1);
+    expect(roomOf(host).clients.length).toBe(1);
+    await expectRunning(host);
+    // The real code still gets in, by every join method.
+    const guest = await request("join", MATCH_ROOM, { ...version, code: host.code });
+    const joinOrCreateGuest = await request("joinOrCreate", MATCH_ROOM, { ...version, code: host.code });
+    const byIdGuest = await request("joinById", roomId, { ...version, code: host.code });
+    for (const room of [guest, joinOrCreateGuest, byIdGuest]) expect(room.roomId).toBe(roomId);
+    await host.waitFor(() => host.playerCount === 4);
+  });
+
+  it("reserves no seat for requests without the code, so players with the code still fill the match", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const roomId = host.room.roomId;
+    const version = { protocolVersion: PROTOCOL_VERSION };
+    const attempts: Promise<unknown>[] = [];
+    for (let round = 0; round < 4; round++) {
+      attempts.push(
+        refusal(request("join", MATCH_ROOM, version)),
+        refusal(request("joinOrCreate", MATCH_ROOM, version)),
+        refusal(request("joinById", roomId, version)),
+        refusal(request("joinById", roomId, { ...version, createToken: newCreateToken() })),
+      );
+    }
+    await Promise.all(attempts);
+    const [listing] = await listingOf(roomId);
+    expect(listing?.clients).toBe(1);
+    expect(listing?.locked).toBe(false);
+
+    for (let seat = 0; seat < 7; seat++) await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 8);
+    await expectRunning(host);
+  });
+
+  it("creates a new match for a joinOrCreate carrying a token, never landing in an existing one", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const version = { protocolVersion: PROTOCOL_VERSION };
+    const created = new Set<string>();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const room = await request("joinOrCreate", MATCH_ROOM, { ...version, createToken: newCreateToken() });
+      expect(room.roomId).not.toBe(host.room.roomId);
+      expect(created.has(room.roomId)).toBe(false);
+      created.add(room.roomId);
+    }
+    // A plain join carrying a token matches no listing at all.
+    expect(await refusal(request("join", MATCH_ROOM, { ...version, createToken: newCreateToken() }))).toEqual({
+      code: ErrorCode.MATCHMAKE_INVALID_CRITERIA,
+      message: "no rooms found with provided criteria",
+    });
+    expect(host.playerCount).toBe(1);
+    for (const roomId of created) expect((await listingOf(roomId))[0]?.clients).toBe(1);
+  });
+
+  it("keeps the creator's token out of the listing and admits it once", async () => {
+    const createToken = newCreateToken();
+    const creator = await new Client(endpoint).create<MatchStateSchema>(MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION, createToken });
+    rooms.push(creator);
+    const listings = await matchMaker.query({ name: MATCH_ROOM });
+    expect(listings.length).toBeGreaterThan(0);
+    for (const listing of listings) expect(JSON.stringify(listing)).not.toContain(createToken);
+    const [own] = await listingOf(creator.roomId);
+    const room = matchMaker.getLocalRoomById(creator.roomId) as unknown as MatchRoom;
+    expect(own?.metadata).toEqual({ code: room.state.code, custom: true } satisfies MatchMetadata);
+    expect(await matchMaker.query({ name: MATCH_ROOM, createToken })).toEqual([]);
+
+    // The token was spent on the creator's seat: replaying it does not get a second one.
+    expect(await refusal(request("joinById", creator.roomId, { protocolVersion: PROTOCOL_VERSION, createToken }))).toEqual({
+      code: 403,
+      message: MATCH_CODE_REQUIRED_MESSAGE,
+    });
+    // Nor does it lead anyone into this match: a request carrying it can only create another one.
+    const elsewhere = await request("joinOrCreate", MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION, createToken });
+    expect(elsewhere.roomId).not.toBe(creator.roomId);
+    expect(room.clients.length).toBe(1);
+  });
+
+  it("tells the loser of a race for the last seat that the match is full, not that it is missing", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let seat = 0; seat < 6; seat++) await track(HeadlessClient.join(endpoint, host.code));
+    const racers = await Promise.allSettled([0, 1, 2].map(() => HeadlessClient.join(endpoint, host.code)));
+    const joined = racers.flatMap((racer) => (racer.status === "fulfilled" ? [racer.value] : []));
+    players.push(...joined);
+    expect(joined).toHaveLength(1);
+    // The loser gets the server's own full-match refusal, or, when both passed its check at once, Colyseus's
+    // generic "no rooms found", which the web client words as MATCH_UNAVAILABLE_MESSAGE (apps/web connection.test.ts).
+    for (const racer of racers) {
+      if (racer.status === "fulfilled") continue;
+      const { code, message } = racer.reason as { code: unknown; message: string };
+      if (code === ErrorCode.MATCHMAKE_INVALID_CRITERIA) continue;
+      expect({ code, message }).toEqual({ code: 409, message: matchFullMessage(8) });
+    }
+    await host.waitFor(() => host.playerCount === 8);
+  });
+});
+=== tests/integration/match.test.ts
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { seaMap } from "@pirate-sea-race/content";
+import { MessageType, PROTOCOL_VERSION } from "@pirate-sea-race/protocol";
+import { MatchRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { HeadlessClient, sleep } from "@pirate-sea-race/test-tools";
+
+let server: RunningGameServer;
+let endpoint: string;
+const clients: HeadlessClient[] = [];
+const MAP_CENTRE_X = (seaMap.widthTiles * seaMap.subUnitsPerTile) / 2;
+
+async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
+  const joined = await client;
+  clients.push(joined);
+  return joined;
+}
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((client) => client.leave()));
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+function roomOf(client: HeadlessClient): MatchRoom {
+  return matchMaker.getLocalRoomById(client.room.roomId) as unknown as MatchRoom;
+}
+
+describe("private match", () => {
+  it("creates a custom match with a six-character code", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    expect(host.code).toMatch(/^[A-Z0-9]{6}$/);
+    expect(host.room.state.custom).toBe(true);
+    expect(host.room.state.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(host.playerCount).toBe(1);
+  });
+
+  it("lets two clients join the same code and see the same authoritative movement", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await track(HeadlessClient.join(endpoint, host.code.toLowerCase()));
+    expect(guest.room.roomId).toBe(host.room.roomId);
+    await host.waitFor(() => host.playerCount === 2);
+
+    const start = host.ship()!;
+    expect(guest.ship(host.sessionId)).toEqual(start);
+    const guestStart = guest.ship()!;
+
+    // Sail toward the middle of the sea, so the map edge cannot clamp the ship whatever its spawn slot.
+    const direction = start.x < MAP_CENTRE_X ? 1 : -1;
+    await host.hold({ moveX: direction, moveY: 0 }, 600);
+    await host.waitFor(() => (host.ship()!.x - start.x) * direction > 0);
+    const moved = host.ship()!;
+    expect(moved.y).toBe(start.y);
+
+    // Both clients converge on the same server-decided position once the ship stops.
+    await sleep(400);
+    const settled = host.ship()!;
+    await guest.waitFor(() => guest.ship(host.sessionId)?.x === settled.x);
+    expect(guest.ship(host.sessionId)).toEqual(settled);
+    expect((settled.x - start.x) * direction).toBeGreaterThan(0);
+    // The guest sent nothing, so its ship has not moved.
+    expect(guest.ship()).toEqual(guestStart);
+    expect(host.ship(guest.sessionId)).toEqual(guestStart);
+  });
+
+  it("removes a ship when its player leaves", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    await host.waitFor(() => host.playerCount === 2);
+    await guest.leave();
+    await host.waitFor(() => host.playerCount === 1);
+    expect(host.ship(guest.sessionId)).toBeUndefined();
+  });
+
+  it("refuses a client with a different protocol version", async () => {
+    await expect(HeadlessClient.create(endpoint, { protocolVersion: PROTOCOL_VERSION + 1 })).rejects.toThrow(
+      /Protocol version mismatch/,
+    );
+    const host = await track(HeadlessClient.create(endpoint));
+    await expect(HeadlessClient.join(endpoint, host.code, { protocolVersion: PROTOCOL_VERSION - 1 })).rejects.toThrow(
+      /Protocol version mismatch/,
+    );
+    expect(host.playerCount).toBe(1);
+  });
+
+  it("refuses an unknown code", async () => {
+    await expect(HeadlessClient.join(endpoint, "ZZZZZ9")).rejects.toThrow(/No match with that code/);
+  });
+
+  it("holds eight players and refuses a ninth", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let index = 0; index < 7; index++) await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 8);
+    const slots = new Set([...host.room.state.ships.values()].map((ship) => ship.slot));
+    expect(slots.size).toBe(8);
+    await expect(HeadlessClient.join(endpoint, host.code)).rejects.toThrow(/full/);
+  });
+});
+
+describe("match clock", () => {
+  it("steps the simulation about 60 times a second and patches clients no faster than 20 Hz", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const room = roomOf(host);
+    const broadcasts = vi.spyOn(room, "broadcastPatch");
+    let patches = 0;
+    host.room.onStateChange(() => patches++);
+    const startFrame = room.state.frame;
+    const startedAt = performance.now();
+    // A moving ship changes the state on every world step, so every patch the server sends carries a change.
+    const direction = host.ship()!.x < MAP_CENTRE_X ? 1 : -1;
+    await host.hold({ moveX: direction, moveY: 0 }, 2000);
+    const seconds = (performance.now() - startedAt) / 1000;
+    const framesPerSecond = (room.state.frame - startFrame) / seconds;
+    const broadcastsPerSecond = broadcasts.mock.calls.length / seconds;
+    const patchesPerSecond = patches / seconds;
+    broadcasts.mockRestore();
+    // §15's rates as literals, so that a misread constant cannot move the expectation with it.
+    expect(framesPerSecond).toBeGreaterThan(60 * 0.85);
+    expect(framesPerSecond).toBeLessThan(60 * 1.15);
+    // The server's patch timer runs at 20 Hz; clients decode at most that many patches. The lower bounds only catch
+    // a much slower patch rate: a busy machine delays timer callbacks, so they are looser than the upper ones.
+    expect(broadcastsPerSecond).toBeGreaterThan(20 * 0.7);
+    expect(broadcastsPerSecond).toBeLessThan(20 * 1.15);
+    expect(patchesPerSecond).toBeLessThan(20 * 1.15);
+    expect(patchesPerSecond).toBeGreaterThan(20 * 0.5);
+  });
+});
+
+describe("input validation on the server", () => {
+  it("drops malformed, oversized, stale and future-frame messages and keeps the room running", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 2);
+    const start = host.ship()!;
+
+    host.sendRaw(MessageType.Input, "not an input");
+    host.sendRaw(MessageType.Input, { seq: 1, frame: 0, buttons: 0, moveX: 5, moveY: 0 });
+    host.sendRaw(MessageType.Input, { seq: 2, frame: 0, buttons: 0, moveX: 1, moveY: 0, padding: "x".repeat(400) });
+    host.sendRaw(MessageType.Input, { seq: 3, frame: host.frame + 10_000, buttons: 0, moveX: 1, moveY: 0 });
+    host.sendRaw("teleport", { x: 0, y: 0 });
+    await sleep(300);
+
+    expect(host.connected).toBe(true);
+    expect(guest.connected).toBe(true);
+    expect(host.ship()).toEqual(start);
+    const dropped = roomOf(host).droppedInputs(host.sessionId)!;
+    expect(dropped).toMatchObject({ malformed: 2, oversized: 1, "future-frame": 1 });
+
+    // A late, lower sequence number is ignored: the ship keeps its accepted heading.
+    host.sendRaw(MessageType.Input, { seq: 50, frame: host.frame, buttons: 0, moveX: 1, moveY: 0 });
+    host.sendRaw(MessageType.Input, { seq: 40, frame: host.frame, buttons: 0, moveX: -1, moveY: 0 });
+    await host.waitFor(() => host.ship()!.x > start.x);
+    expect(roomOf(host).droppedInputs(host.sessionId)!["stale-sequence"]).toBe(1);
+    await guest.waitFor(() => (guest.ship(host.sessionId)?.x ?? 0) > start.x);
+    expect(host.connected && guest.connected).toBe(true);
+  });
+
+  it("drops input beyond the per-second rate cap without disconnecting", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let index = 0; index < 100; index++) host.sendInput({ moveX: 0, moveY: 0 });
+    await sleep(200);
+    expect(host.connected).toBe(true);
+    expect(roomOf(host).droppedInputs(host.sessionId)!["rate-limited"]).toBeGreaterThan(0);
+  });
+});
+=== tests/e2e/playwright.config.ts
+import { fileURLToPath } from "node:url";
+import { defineConfig, devices } from "@playwright/test";
+
+const root = fileURLToPath(new URL("../..", import.meta.url));
+const SERVER_PORT = 2593;
+const WEB_PORT = 5393;
+
+/**
+ * Browser scenarios against the real server and web client on their fixed ports. Both start from source: the server
+ * through tsx, the client as a fresh Vite production build served by `vite preview`, so no prior build is needed.
+ */
+export default defineConfig({
+  testDir: ".",
+  testMatch: "**/*.spec.ts",
+  timeout: 60_000,
+  expect: { timeout: 10_000 },
+  fullyParallel: false,
+  workers: 1,
+  retries: 0,
+  forbidOnly: !!process.env["CI"],
+  reporter: "list",
+  use: {
+    baseURL: `http://localhost:${WEB_PORT}`,
+    trace: "retain-on-failure",
+  },
+  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  webServer: [
+    {
+      command: "npm run start:source -w @pirate-sea-race/server",
+      cwd: root,
+      env: { PORT: String(SERVER_PORT) },
+      url: `http://localhost:${SERVER_PORT}/__healthcheck`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+    {
+      command: "npm run build -w @pirate-sea-race/web && npm run preview -w @pirate-sea-race/web",
+      cwd: root,
+      url: `http://localhost:${WEB_PORT}`,
+      reuseExistingServer: false,
+      timeout: 120_000,
+    },
+  ],
+});
+=== tests/e2e/private-match.spec.ts
+import { expect, test, type Page } from "@playwright/test";
+import { seaMap } from "../../packages/content/src/sea.js";
+import { PROTOCOL_VERSION } from "../../packages/protocol/src/version.js";
+
+const SUB_UNITS_PER_TILE = seaMap.subUnitsPerTile;
+const MAP_CENTRE_X = (seaMap.widthTiles * seaMap.subUnitsPerTile) / 2;
+
+interface DrawnShip {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly color: string;
+}
+
+async function createMatch(page: Page): Promise<string> {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Create match" }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+  const code = page.getByTestId("hud-code");
+  await expect(code).toHaveText(/^[A-Z0-9]{6}$/);
+  return (await code.textContent())!;
+}
+
+async function joinMatch(page: Page, code: string): Promise<void> {
+  await page.goto("/");
+  await page.getByLabel("Match code").fill(code);
+  await page.getByRole("button", { name: "Join" }).click();
+}
+
+/** The authoritative position of a ship in a page's HUD readout. */
+async function readout(page: Page, shipId: string): Promise<{ x: number; y: number }> {
+  const item = page.locator(`[data-ship-id="${shipId}"]`);
+  return { x: Number(await item.getAttribute("data-x")), y: Number(await item.getAttribute("data-y")) };
+}
+
+/**
+ * The ids of ships whose colour is actually on the canvas where the scene says it drew them. Reads a real
+ * screenshot of the canvas, so it checks rendered pixels rather than scene bookkeeping.
+ */
+async function shipsOnCanvas(page: Page): Promise<string[]> {
+  const drawn = JSON.parse((await page.getByTestId("game").getAttribute("data-drawn-ships")) ?? "[]") as DrawnShip[];
+  const png = await page.locator("#game canvas").screenshot();
+  const visible = await page.evaluate(
+    async ({ base64, ships }) => {
+      const blob = await (await fetch(`data:image/png;base64,${base64}`)).blob();
+      const bitmap = await createImageBitmap(blob);
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const context = canvas.getContext("2d")!;
+      context.drawImage(bitmap, 0, 0);
+      return ships
+        .filter((ship) => {
+          const [r, g, b] = context.getImageData(ship.x, ship.y, 1, 1).data;
+          const want = Number.parseInt(ship.color.slice(1), 16);
+          const near = (actual: number, expected: number) => Math.abs(actual - expected) <= 24;
+          return near(r!, (want >> 16) & 0xff) && near(g!, (want >> 8) & 0xff) && near(b!, want & 0xff);
+        })
+        .map((ship) => ship.id);
+    },
+    { base64: png.toString("base64"), ships: drawn },
+  );
+  return visible.sort();
+}
+
+test("create a private match from the landing page and see it in the HUD [scenario:join-private-match]", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Pirate Sea Race" })).toBeVisible();
+
+  // An unknown code is refused on the landing page.
+  await page.getByLabel("Match code").fill("zzzzz9");
+  await page.getByRole("button", { name: "Join" }).click();
+  await expect(page.getByTestId("join-error")).toHaveText("No match with that code");
+
+  await page.getByRole("button", { name: "Create match" }).click();
+  await expect(page.getByTestId("hud-status")).toHaveText("connected");
+  await expect(page.getByTestId("hud-code")).toHaveText(/^[A-Z0-9]{6}$/);
+  await expect(page.getByTestId("hud-protocol")).toHaveText(`v${PROTOCOL_VERSION}`);
+  await expect(page.getByTestId("hud-players")).toHaveText("1");
+  await expect(page.getByTestId("hud-mode")).toHaveText("custom");
+  await expect(page.getByRole("button", { name: "Create match" })).toBeHidden();
+
+  const self = (await page.getByTestId("hud-self").textContent())!;
+  await expect.poll(() => shipsOnCanvas(page)).toEqual([self]);
+
+  const screenshot = testInfo.outputPath("join-private-match.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("screenshot:join-private-match", { path: screenshot, contentType: "image/png" });
+});
+
+test("a ship moved in one browser moves in the other [scenario:two-ships-sync]", async ({ browser }, testInfo) => {
+  const hostContext = await browser.newContext();
+  const guestContext = await browser.newContext();
+  try {
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+
+    const code = await createMatch(host);
+    await joinMatch(guest, code.toLowerCase());
+    await expect(guest.getByTestId("hud-status")).toHaveText("connected");
+    await expect(guest.getByTestId("hud-code")).toHaveText(code);
+    await expect(host.getByTestId("hud-players")).toHaveText("2");
+    await expect(guest.getByTestId("hud-players")).toHaveText("2");
+
+    const hostId = (await host.getByTestId("hud-self").textContent())!;
+    const guestId = (await guest.getByTestId("hud-self").textContent())!;
+    const start = await readout(guest, hostId);
+    const guestStart = await readout(guest, guestId);
+
+    // Sail the host's ship a tile or more toward the middle of the sea with the keyboard; the guest's readout
+    // follows the server.
+    const direction = start.x < MAP_CENTRE_X ? 1 : -1;
+    const key = direction > 0 ? "ArrowRight" : "ArrowLeft";
+    await host.keyboard.down(key);
+    await expect
+      .poll(async () => ((await readout(guest, hostId)).x - start.x) * direction, { timeout: 10_000 })
+      .toBeGreaterThan(SUB_UNITS_PER_TILE);
+    await host.keyboard.up(key);
+
+    // Once the ship stops, both browsers show the same authoritative position.
+    await expect
+      .poll(async () => {
+        const [inHost, inGuest] = await Promise.all([readout(host, hostId), readout(guest, hostId)]);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const [laterHost, laterGuest] = await Promise.all([readout(host, hostId), readout(guest, hostId)]);
+        return inHost.x === inGuest.x && laterHost.x === inHost.x && laterGuest.x === inGuest.x ? inGuest : undefined;
+      })
+      .toBeDefined();
+    const settled = await readout(guest, hostId);
+    expect((settled.x - start.x) * direction).toBeGreaterThan(SUB_UNITS_PER_TILE);
+    expect(settled.y).toBe(start.y);
+    expect(await readout(host, hostId)).toEqual(settled);
+    expect(await readout(guest, guestId)).toEqual(guestStart);
+
+    // Both ships are drawn on the guest's canvas.
+    await expect.poll(() => shipsOnCanvas(guest)).toEqual([hostId, guestId].sort());
+
+    const screenshot = testInfo.outputPath("two-ships-sync.png");
+    await guest.screenshot({ path: screenshot });
+    await testInfo.attach("screenshot:two-ships-sync", { path: screenshot, contentType: "image/png" });
+  } finally {
+    await hostContext.close();
+    await guestContext.close();
+  }
+});
+=== tests/unit/purity.test.ts
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+/**
+ * The authoritative packages stay pure (CLAUDE.md, §17): no Phaser, Colyseus, DOM, timers, wall-clock time or
+ * Math.random, so the same match can be simulated headlessly and identically on client and server. Nor do they call
+ * floating-point transcendental functions, whose results may differ between JavaScript engines (skeleton decision:
+ * integer maths only, so `hashState` is engine-independent).
+ */
+const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
+const PURE_PACKAGES = ["packages/simulation", "packages/protocol", "packages/content"];
+
+const FORBIDDEN_MODULES: readonly RegExp[] = [
+  /^phaser(\/|$)/,
+  /^colyseus(\/|$)/,
+  /^@colyseus\//,
+  /^(node:)?timers(\/|$)/,
+  /^(node:)?perf_hooks$/,
+  /^(node:)?worker_threads$/,
+  /^(node:)?(fs|net|http|https|dgram|child_process|os|process|crypto)(\/|$)/,
+];
+
+const FORBIDDEN_CALLS: readonly [RegExp, string][] = [
+  [/\bMath\.random\b/, "Math.random"],
+  [/\bDate\.now\b/, "Date.now"],
+  [/\bnew Date\b/, "new Date"],
+  [/\bperformance\.now\b/, "performance.now"],
+  [/\bprocess\.hrtime\b/, "process.hrtime"],
+  [/\b(setTimeout|setInterval|setImmediate|queueMicrotask|requestAnimationFrame)\s*\(/, "timers"],
+  [/\b(window|document|navigator|localStorage|sessionStorage)\s*[.[]/, "DOM globals"],
+  [/\bcrypto\.(getRandomValues|randomUUID)\b/, "crypto randomness"],
+  [
+    /\bMath\.(sqrt|cbrt|hypot|pow|exp|expm1|log\w*|sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|asinh|acosh|atanh)\b/,
+    "floating-point transcendental Math functions",
+  ],
+];
+
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return sourceFiles(path);
+    return /\.(ts|tsx|js|mjs|cjs)$/.test(entry.name) ? [path] : [];
+  });
+}
+
+/** Source without comments or string contents, so that prose mentioning a forbidden call is not a violation. */
+function code(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1")
+    .replace(/(["'`])(?:\\.|(?!\1)[^\\\n])*\1/g, '""');
+}
+
+function importedModules(source: string): string[] {
+  const specifiers: string[] = [];
+  const patterns = [
+    /\bimport\s+(?:type\s+)?(?:[\w*{}\s,$]+\s+from\s+)?["']([^"']+)["']/g,
+    /\bexport\s+(?:type\s+)?[\w*{}\s,$]+\s+from\s+["']([^"']+)["']/g,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
+  ];
+  for (const pattern of patterns) for (const match of source.matchAll(pattern)) specifiers.push(match[1]!);
+  return specifiers;
+}
+
+function violations(source: string): string[] {
+  const found = importedModules(source)
+    .filter((specifier) => FORBIDDEN_MODULES.some((pattern) => pattern.test(specifier)))
+    .map((specifier) => `imports ${specifier}`);
+  const stripped = code(source);
+  for (const [pattern, label] of FORBIDDEN_CALLS) if (pattern.test(stripped)) found.push(`uses ${label}`);
+  return found;
+}
+
+describe("purity rule", () => {
+  it("catches each forbidden dependency in a sample", () => {
+    expect(violations('import Phaser from "phaser";')).toEqual(["imports phaser"]);
+    expect(violations('import { Room } from "colyseus";')).toEqual(["imports colyseus"]);
+    expect(violations('import type { Client } from "@colyseus/sdk";')).toEqual(["imports @colyseus/sdk"]);
+    expect(violations('import { setTimeout } from "node:timers/promises";')).toEqual(["imports node:timers/promises"]);
+    expect(violations('export { x } from "phaser/src/x";')).toEqual(["imports phaser/src/x"]);
+    expect(violations('const m = await import("colyseus");')).toEqual(["imports colyseus"]);
+    expect(violations("const r = Math.random();")).toEqual(["uses Math.random"]);
+    expect(violations("const t = Date.now();")).toEqual(["uses Date.now"]);
+    expect(violations("setInterval(tick, 16);")).toEqual(["uses timers"]);
+    expect(violations("document.body.append(x);")).toEqual(["uses DOM globals"]);
+    const transcendental = ["uses floating-point transcendental Math functions"];
+    expect(violations("const d = Math.sqrt(x * x + y * y);")).toEqual(transcendental);
+    for (const call of ["Math.cbrt(v)", "Math.hypot(x, y)", "Math.pow(2, n)", "Math.exp(t)", "Math.log2(n)", "Math.atan2(y, x)", "Math.sin(a)"]) {
+      expect(violations(`const r = ${call};`)).toEqual(transcendental);
+    }
+    expect(violations("const r = Math.floor(Math.sign(x) * Math.imul(a, b));")).toEqual([]);
+    expect(violations('// Math.random is banned\nconst s = "Date.now";')).toEqual([]);
+  });
+
+  for (const pkg of PURE_PACKAGES) {
+    describe(pkg, () => {
+      it("imports and calls nothing impure", () => {
+        const files = sourceFiles(join(root, pkg, "src"));
+        expect(files.length).toBeGreaterThan(0);
+        const report = files.flatMap((file) =>
+          violations(readFileSync(file, "utf8")).map((violation) => `${relative(root, file)} ${violation}`),
+        );
+        expect(report).toEqual([]);
+      });
+
+      it("depends on no impure package", () => {
+        const manifest = JSON.parse(readFileSync(join(root, pkg, "package.json"), "utf8")) as Record<string, unknown>;
+        const names = ["dependencies", "peerDependencies", "optionalDependencies"].flatMap((field) =>
+          Object.keys((manifest[field] as Record<string, string> | undefined) ?? {}),
+        );
+        expect(names.filter((name) => FORBIDDEN_MODULES.some((pattern) => pattern.test(name)))).toEqual([]);
+      });
+
+      it("leaves the DOM library out of its tsconfig", () => {
+        const tsconfig = JSON.parse(readFileSync(join(root, pkg, "tsconfig.json"), "utf8")) as {
+          compilerOptions: { lib?: string[]; types?: string[] };
+        };
+        const lib = tsconfig.compilerOptions.lib;
+        expect(lib).toBeDefined();
+        expect(lib!.map((entry) => entry.toLowerCase()).filter((entry) => entry.startsWith("dom"))).toEqual([]);
+        expect(tsconfig.compilerOptions.types).toEqual([]);
+      });
+    });
+  }
+});
+=== scripts/smoke-build.ts
+/**
+ * The last step of `npm run build`: proves the build output runs, not just that it compiled. It loads every workspace
+ * package through its `default` export (the built `dist/`), starts the built server (`node apps/server/dist/main.js`)
+ * on a free port, waits for its health check, creates a private match through the Colyseus SDK and waits for the
+ * creator's ship. Every wait is bounded and the server is killed on every path, so a failure fails the build with
+ * its real error and no process outlives the script.
+ */
+import { spawn, type ChildProcess } from "node:child_process";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+
+const root = fileURLToPath(new URL("..", import.meta.url));
+const SERVER_ENTRY = "apps/server/dist/main.js";
+const LISTENING_LINE = /listening on ws:\/\/localhost:(\d+)/;
+
+const LISTEN_TIMEOUT_MS = 20_000;
+const HEALTH_TIMEOUT_MS = 10_000;
+const MATCH_TIMEOUT_MS = 15_000;
+const STOP_TIMEOUT_MS = 5_000;
+/** Everything together stays far below the build check's 600 s. */
+const OVERALL_TIMEOUT_MS = 90_000;
+
+/** The built entry points, as a consumer without the `@pirate-sea-race/source` condition resolves them. */
+const WORKSPACE_EXPORTS = [
+  "@pirate-sea-race/content",
+  "@pirate-sea-race/protocol",
+  "@pirate-sea-race/simulation",
+  "@pirate-sea-race/server",
+  "@pirate-sea-race/server/schema",
+  "@pirate-sea-race/test-tools",
+];
+
+let server: ChildProcess | undefined;
+
+function log(message: string): void {
+  console.log(`build smoke: ${message}`);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not finish within ${timeoutMs} ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function running(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+async function checkWorkspaceExports(): Promise<void> {
+  for (const specifier of WORKSPACE_EXPORTS) {
+    const resolved = fileURLToPath(import.meta.resolve(specifier));
+    if (!/[\\/]dist[\\/][^\\/]+\.js$/.test(resolved)) throw new Error(`${specifier} resolves to ${resolved}, not to its dist/`);
+    const module = (await import(specifier)) as Record<string, unknown>;
+    if (Object.keys(module).length === 0) throw new Error(`${specifier} (${resolved}) exports nothing`);
+  }
+  log(`${WORKSPACE_EXPORTS.length} workspace exports load from dist/`);
+}
+
+/** Starts the built server on a free port and resolves with the port from its "listening" line. */
+function startServer(): Promise<number> {
+  const child = spawn(process.execPath, [SERVER_ENTRY], {
+    cwd: root,
+    env: { ...process.env, PORT: "0" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  server = child;
+  child.stderr!.on("data", (chunk: Buffer) => process.stderr.write(chunk));
+  return withTimeout(
+    new Promise<number>((resolve, reject) => {
+      createInterface({ input: child.stdout! }).on("line", (line) => {
+        console.log(`  server: ${line}`);
+        const match = LISTENING_LINE.exec(line);
+        if (match !== null) resolve(Number(match[1]));
+      });
+      child.once("error", reject);
+      child.once("exit", (code, signal) => reject(new Error(`${SERVER_ENTRY} exited (code ${code}, signal ${signal}) before listening`)));
+    }),
+    LISTEN_TIMEOUT_MS,
+    `${SERVER_ENTRY} listening`,
+  );
+}
+
+async function waitForHealth(endpoint: string): Promise<void> {
+  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${endpoint}/__healthcheck`, { signal: AbortSignal.timeout(1000) });
+      if (response.ok) return;
+      last = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      last = error;
+    }
+    await sleep(100);
+  }
+  throw new Error(`${endpoint}/__healthcheck did not answer OK within ${HEALTH_TIMEOUT_MS} ms`, { cause: last });
+}
+
+async function createMatch(endpoint: string): Promise<void> {
+  const { HeadlessClient } = await import("@pirate-sea-race/test-tools");
+  const host = await withTimeout(HeadlessClient.create(endpoint), MATCH_TIMEOUT_MS, "creating a match");
+  try {
+    const ship = host.ship();
+    if (!/^[A-Z0-9]{6}$/.test(host.code)) throw new Error(`the match has no code (got "${host.code}")`);
+    if (ship === undefined || host.playerCount !== 1) throw new Error("the creator's ship is not in the match state");
+    log(`created match ${host.code}; the creator's ship is at (${ship.x}, ${ship.y})`);
+  } finally {
+    await withTimeout(host.leave(), STOP_TIMEOUT_MS, "leaving the match").catch(() => undefined);
+  }
+}
+
+/** Stops the server: SIGTERM lets it drain; SIGKILL follows if it does not exit in time. */
+async function stopServer(): Promise<void> {
+  const child = server;
+  if (child === undefined || !running(child)) return;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGTERM");
+  await withTimeout(exited, STOP_TIMEOUT_MS, "server shutdown").catch(async () => {
+    child.kill("SIGKILL");
+    await withTimeout(exited, STOP_TIMEOUT_MS, "killing the server");
+  });
+}
+
+// Last resort for paths that skip `finally`: an exit, or a signal from whoever runs the build.
+process.once("exit", () => {
+  if (server !== undefined && running(server)) server.kill("SIGKILL");
+});
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    console.error(`build smoke: interrupted by ${signal}`);
+    process.exit(1);
+  });
+}
+
+async function main(): Promise<void> {
+  await checkWorkspaceExports();
+  const port = await startServer();
+  const endpoint = `http://localhost:${port}`;
+  log(`${SERVER_ENTRY} listens on port ${port}`);
+  await waitForHealth(endpoint);
+  log("health check answers");
+  await createMatch(endpoint);
+}
+
+let failed = false;
+try {
+  await withTimeout(main(), OVERALL_TIMEOUT_MS, "the build smoke test");
+  log("passed");
+} catch (error) {
+  failed = true;
+  console.error("build smoke: FAILED");
+  console.error(error);
+} finally {
+  await stopServer().catch((error: unknown) => {
+    failed = true;
+    console.error("build smoke: could not stop the server", error);
+  });
+}
+process.exit(failed ? 1 : 0);

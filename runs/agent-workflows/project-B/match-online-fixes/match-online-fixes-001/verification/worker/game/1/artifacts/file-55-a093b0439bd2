@@ -1,0 +1,238 @@
+import { matchMaker } from "colyseus";
+import { expect } from "vitest";
+import { isNavigable, seaMap } from "@pirate-sea-race/content";
+import { encounterRules, type EncounterRules } from "@pirate-sea-race/content/encounters";
+import { matchRules } from "@pirate-sea-race/content/match";
+import type { MatchRoom, MatchTuning } from "@pirate-sea-race/server";
+import { defaultSimulationConfig, hullPathIsClear, tileCentre } from "@pirate-sea-race/simulation";
+import { duelInput } from "@pirate-sea-race/simulation/duel";
+import { Buttons } from "@pirate-sea-race/protocol";
+import { HeadlessClient, sleep, type DuelScript, type HeadlessClientOptions, type Movement } from "@pirate-sea-race/test-tools";
+
+/**
+ * What the duel-at-sea tests share: the open stretch of sea they sail on, a pair of players placed on it, and the
+ * scripted fighters. Each test file starts its own server; tests in a file run at once, one match each.
+ */
+
+/** The row three tiles south of the hub, which the map keeps clear for a hull 20 tiles either side of the hub. */
+export const OPEN_ROW = seaMap.hub.tileY + 3;
+export const HUB_X = seaMap.hub.tileX;
+export const TILE = seaMap.subUnitsPerTile;
+/** Headings of 64: east, south, west, north. */
+export const EAST = 0;
+export const SOUTH = 16;
+export const WEST = 32;
+export const NORTH = 48;
+
+/**
+ * Collects a test's clients and has them leave when that test finishes (tests in a file run at once). When it
+ * finishes, and again once every client has left, it checks each match room those clients were in: the room checked
+ * `checkLedger` and its own invariant (no ship removed while the ledger counts its player in the match, and no ship
+ * without such a player) after every world tick, and found no violation; and the ledger refused nothing the room asked.
+ */
+export function tracker(onTestFinished: (fn: () => Promise<void>) => void): (client: HeadlessClient) => void {
+  const clients: HeadlessClient[] = [];
+  const rooms = new Set<MatchRoom>();
+  onTestFinished(async () => {
+    const checked = [...rooms];
+    await Promise.all(clients.map((client) => client.leave()));
+    await sleep(150);
+    for (const room of checked) expectRoomChecks(room);
+  });
+  return (client) => {
+    clients.push(client);
+    const room = roomOf(client);
+    if (room !== undefined) rooms.add(room);
+  };
+}
+
+/**
+ * The test source layout (the server's test-only setting): Palm Key (island 0) and Old Stones (2) seal two Suns each,
+ * Ember Rock (1) and Mist Cay (3) two Moons each, so a test picks a type by the island it moors at.
+ */
+export const TEST_SOURCE_LAYOUT = [
+  ["sun", "sun"],
+  ["moon", "moon"],
+  ["sun", "sun"],
+  ["moon", "moon"],
+] as const;
+
+/** A dock of the island that seals `type` in the test layout: Palm Key's west dock for Sun, Ember Rock's east for Moon. */
+export function dockFor(type: "sun" | "moon", which = 0): (typeof seaMap.docks)[number] {
+  const islands = TEST_SOURCE_LAYOUT.flatMap((types, island) => (types[0] === type ? [island] : []));
+  return seaMap.docks.filter((dock) => islands.includes(dock.island))[which]!;
+}
+
+/** Holding E with no throttle: moors at a dock in reach, and keeps holding to collect or claim there. */
+export const HOLD_E: Movement = { moveX: 0, moveY: 0, buttons: Buttons.Interact };
+
+/**
+ * Puts a client's ship on a dock's tile, moors it there and holds E until it holds `type` (a collection, or a claim
+ * from a cache there), then lets go.
+ */
+export async function collectAt(client: HeadlessClient, endpoint: string, dock: { id: number; tileX: number; tileY: number }, type: string, timeoutMs = 15_000): Promise<void> {
+  await client.placeShip(endpoint, { tileX: dock.tileX, tileY: dock.tileY, heading: 0 });
+  await client.holdUntil(HOLD_E, () => client.rubbings().includes(type), timeoutMs);
+  expect(client.ship()?.dock).toBe(dock.id);
+}
+
+/**
+ * What `tracker` asserts of each match room, for files that clean up their own clients: the room checked
+ * `checkLedger` and its own invariant after every world tick and found no violation, and the ledger refused nothing.
+ */
+export function expectRoomChecks(room: MatchRoom): void {
+  expect(room.invariantViolations, `invariants of match ${room.state.code}`).toEqual([]);
+  expect(room.ledgerRefusals, `ledger refusals in match ${room.state.code}`).toEqual([]);
+}
+
+export function roomOf(client: HeadlessClient): MatchRoom {
+  return matchMaker.getLocalRoomById(client.room.roomId) as unknown as MatchRoom;
+}
+
+/** Resolves once `predicate` holds for the room itself (its ledger or rules state), polling; rejects after `timeoutMs`. */
+export async function until(predicate: () => boolean, timeoutMs = 5000, what = "condition"): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`${what} not met within ${timeoutMs} ms`);
+    await sleep(10);
+  }
+}
+
+export interface Seat {
+  readonly tileX: number;
+  readonly tileY: number;
+  readonly heading: number;
+}
+
+/** Whether a hull can sail the straight line between two tile centres (and so the tiles between see each other). */
+export function openWater(from: Seat, to: Seat): boolean {
+  const a = tileCentre(defaultSimulationConfig, from.tileX, from.tileY);
+  const b = tileCentre(defaultSimulationConfig, to.tileX, to.tileY);
+  return isNavigable(seaMap, from.tileX, from.tileY) && hullPathIsClear(defaultSimulationConfig, a.x, a.y, b.x, b.y);
+}
+
+/**
+ * A tuning whose matches start at once: a two-tick ready countdown and a one-tick departure protection, over the
+ * given encounter rules (the rules' own by default). The lobby still runs: the host starts, and the flow counts down.
+ */
+export function quickStart(tuning: Partial<MatchTuning> = {}, encounters: EncounterRules = tuning.encounters ?? encounterRules): Partial<MatchTuning> {
+  return { ...tuning, match: { ...matchRules, readyTicks: 2 }, encounters: { ...encounters, spawnProtectionTicks: 1 } };
+}
+
+/**
+ * Starts a match through its lobby, as players do (§2): the host sends Start, and every client waits for player
+ * control. A private match needs two players, so a lone player gets a bench companion that joins, stays at its spawn
+ * slot and does nothing; it is returned so the caller can track it.
+ */
+export async function startThroughLobby(endpoint: string, clients: readonly HeadlessClient[]): Promise<HeadlessClient | undefined> {
+  const host = clients[0]!;
+  const bench = clients.length === 1 ? await HeadlessClient.join(endpoint, host.code) : undefined;
+  const everyone = bench === undefined ? clients : [...clients, bench];
+  await host.waitFor(() => host.playerCount === everyone.length);
+  host.startMatch();
+  for (const client of everyone) await client.waitForControl();
+  return bench;
+}
+
+/**
+ * Players in one match, created in order (the first creates it), placed at rest on their seats in the lobby, then
+ * started through the lobby (a lone player with a bench companion, which `track` also gets).
+ */
+export async function playersAt(
+  endpoint: string,
+  seats: readonly Seat[],
+  track: (client: HeadlessClient) => void,
+  options: { readonly endpoints?: readonly string[]; readonly clients?: readonly HeadlessClientOptions[]; readonly start?: boolean } = {},
+): Promise<HeadlessClient[]> {
+  const clients: HeadlessClient[] = [];
+  for (const [index, seat] of seats.entries()) {
+    const via = options.endpoints?.[index] ?? endpoint;
+    const client = index === 0 ? await HeadlessClient.create(via, options.clients?.[0]) : await HeadlessClient.join(via, clients[0]!.code, options.clients?.[index]);
+    track(client);
+    clients.push(client);
+    expect(openWater(seat, seat)).toBe(true);
+  }
+  await clients[0]!.waitFor(() => clients[0]!.playerCount === seats.length);
+  for (const [index, seat] of seats.entries()) await clients[index]!.placeShip(endpoint, seat);
+  if (options.start !== false) {
+    const bench = await startThroughLobby(endpoint, clients);
+    if (bench !== undefined) track(bench);
+  }
+  return clients;
+}
+
+/**
+ * The host (attacker) and the guest in grapple range on the open row, `apart` tiles apart around the hub: the host
+ * west facing east, the guest east facing `guestHeading` (west by default, toward the host).
+ */
+export async function pairInRange(
+  endpoint: string,
+  track: (client: HeadlessClient) => void,
+  options: {
+    readonly apart?: number;
+    readonly guestHeading?: number;
+    readonly endpoints?: readonly string[];
+    readonly clients?: readonly HeadlessClientOptions[];
+  } = {},
+): Promise<{ host: HeadlessClient; guest: HeadlessClient }> {
+  const apart = options.apart ?? 6;
+  const host: Seat = { tileX: HUB_X - Math.floor(apart / 2), tileY: OPEN_ROW, heading: EAST };
+  const guest: Seat = { tileX: host.tileX + apart, tileY: OPEN_ROW, heading: options.guestHeading ?? WEST };
+  expect(openWater(host, guest)).toBe(true);
+  const [first, second] = await playersAt(endpoint, [host, guest], track, options);
+  await first!.waitFor(() => first!.ship(second!.sessionId) !== undefined);
+  return { host: first!, guest: second! };
+}
+
+/** Grapples: the host taps J, and both fighters' duel reaches its countdown. */
+export async function grapple(host: HeadlessClient, guest: HeadlessClient): Promise<void> {
+  host.tapGrapple();
+  for (const client of [host, guest]) await client.waitFor(() => client.fighter.phase === "countdown", 3000);
+}
+
+const R = duelInput("right");
+const L = duelInput("left");
+const K = duelInput("heavy");
+
+/**
+ * A fighter who walks in, then swings a heavy every 50 frames and steps forward before each: from either side, the
+ * mirror of the other side's (player one starts on the left). Against a fighter who stands still it wins by KO in
+ * about 500 frames; played by both, the mirrored fight ends in a double KO.
+ */
+export function brawler(slot: 0 | 1): DuelScript {
+  const toward = slot === 0 ? R : L;
+  return (frame) => {
+    if (frame < 30) return toward;
+    const beat = (frame - 30) % 50;
+    if (beat === 0) return K;
+    return beat > 44 ? toward : 0;
+  };
+}
+
+/** The lobby a fighter sees, as plain values. */
+export function lobbyOf(client: HeadlessClient): { phase: string; winner: number; reason: string } | undefined {
+  const lobby = client.fighter.lobby;
+  return lobby === undefined ? undefined : { phase: lobby.phase, winner: lobby.winner, reason: lobby.reason };
+}
+
+/** The fighters' result, once both see it (the same in both). */
+export async function resultOf(host: HeadlessClient, guest: HeadlessClient, timeoutMs = 20_000): Promise<{ phase: string; winner: number; reason: string }> {
+  for (const client of [host, guest]) await client.waitFor(() => client.fighter.phase === "over", timeoutMs);
+  expect(lobbyOf(guest)).toEqual(lobbyOf(host));
+  return lobbyOf(host)!;
+}
+
+/** Every grapple and marker a client decoded from now on, as the patches arrive. */
+export function recordSightings(client: HeadlessClient): { grapples: Set<string>; markers: number; duelLobbies: number } {
+  const seen = { grapples: new Set<string>(), markers: 0, duelLobbies: 0 };
+  client.room.onStateChange(() => {
+    for (const grapple of client.grapples()) seen.grapples.add(`${grapple.attackerId}>${grapple.defenderId}`);
+    seen.markers = Math.max(seen.markers, client.markers().length);
+    seen.duelLobbies = Math.max(seen.duelLobbies, client.duelCount);
+  });
+  return seen;
+}
+
+export function containsText(frame: Uint8Array, text: string): boolean {
+  return Buffer.from(frame).includes(Buffer.from(text, "utf8"));
+}

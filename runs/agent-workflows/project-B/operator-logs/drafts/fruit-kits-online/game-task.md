@@ -1,0 +1,81 @@
+# Task: game
+
+## Goal
+
+Make fruit powers part of the race (§9). Four fruit pedestals, two Ember and two Smoke, sit at island docks. Moored at a pedestal's dock, a captain can inspect its kit: the two specials and what they're good for. Holding **F** for 3 s eats the fruit, and releasing F, casting off, a grapple, a disconnect or someone else finishing first interrupts it. The eaten kit replaces the player's two specials (U, I) in every sea duel for the rest of the match, including after a defeat. The arena draws the Ember and Smoke moves: flame bolts, the rising flare, the feint's reappearance and the smoke screen with its obscured fighters. Both players can read what's happening. The pure rules are on `main` (`packages/simulation/src/fruits`, `docs/fruits.md`; the kits in `packages/simulation/src/duel`, `docs/fruit-kits.md`). This feature wires them in.
+
+## Context
+
+- Read `docs/spec.md` §9 (all of it), §6 (duels at sea), §12 (disconnects) and §16 (hidden information).
+- Read `docs/fruits.md` (`createFruitState`, `stepFruits`, `kitOf`, `inspectPedestal`, the events, contests by id), `docs/fruit-kits.md` (the kit data, `createDuelState(config, { kits })`, the step changes, and "What the renderer must show": `fighterTells`, `strikesWithHitbox`), `docs/duel.md` (the netcode, and a duel inside the match room), `docs/architecture.md` (the room, the master secret and per-system seeds, the ruins wiring as a model) and `apps/server/src/objectives.ts` (`sourceSites`, `islandDocks`).
+- The verifier runs `npm ci`, then `npm run typecheck`, `npm run test:unit`, `npm run test:integration`, `npm run build` and `npx --no-install playwright test --config=tests/e2e/playwright.config.ts`.
+- **This machine is shared by several runs. Never stop processes by name pattern (`pkill -f`, `killall`, and so on). Stop only the PIDs you started.**
+
+## Constraints
+
+- Owned paths as in `policy.json`. The pure modules and their content aren't owned: use them through their exports, and report `blocked` naming the gap if a change is truly needed.
+- Server authoritative, zod-validated messages, protocol version bump. One Phaser game per page, canvas renderer for the match game (decision #43).
+- Tests drive input like players do.
+- Hidden information: the deal (which pedestal holds which kit) is revealed only to a player moored at that pedestal's dock who inspects it. Other players see a pedestal's marker (full or empty) only when it's in sight. A player's kit is private until a duel starts; then both duelists see both kits, because the arena shows the moves.
+- Duel netcode: the kits must be fixed in the duel's initial state on both clients and the server (the per-frame hash covers them), so a kit never desyncs a duel.
+
+## Design (settled)
+
+- **Sites:** one pedestal per regular island at that island's docks, chosen in the server like `sourceSites`: the island's highest-id dock, so it differs from the rubbing source's dock whenever the island has more than one. That gives 4 sites in the slice, which is what `createFruitState` needs. A pure function `pedestalSites(map)` in `apps/server/src`, unit-tested.
+- **Seed:** the fruit deal uses its own seed derived from the master secret (`deriveSeed('fruit')`), never the match code or another system's seed.
+- **Inspect and eat:** moored at a pedestal's dock, the HUD shows "F: inspect fruit" on a full pedestal. Pressing F opens a small panel with the kit name, its two specials and its §9 description from `kitDescriptions`. Holding F for 3 s from the panel eats it, with a progress ring. The panel shows why an attempt was refused or interrupted (`taken`, `already-eaten`, `empty`, `reserved`, `disconnected`). Once fed, the HUD shows the kit ("Ember: U flame bolt, I rising flare"). F doesn't clash with E (collect), R (ruin) or J (grapple), and the ruin panel's key-typing rules apply to this panel too.
+- **Into duels:** the room creates every sea duel with `kits: [kitOf(a), kitOf(b)]`. Both clients receive the kits in the duel start message and build the same initial state. `restoreDuel` and the per-frame hashes cover them.
+- **Arena drawing:** the arena scene draws, from `fighterTells`, each fighter's bolt as a moving sprite, the smoke screen as a translucent zone, a generic startup flash for an obscured fighter, the feint's reappearance, and threat hitboxes only for `strikesWithHitbox` moves. The arena HUD shows each fighter's kit and the U and I move names.
+- **Tick order:** fruits step in the world tick after encounters and before claims, like the ruins' presence. A duel reservation interrupts eating (the pure rules do this when the room passes `reserved`).
+
+## Acceptance
+
+Each item names the test that proves it. Integration tests use headless clients through the real room.
+
+1. **Pedestals:** `pedestalSites` gives 4 distinct dock sites on the slice sea, one per island (unit). The deal is seeded from the master secret, is distinct from the other systems' seeds, and doesn't depend on the match code (unit).
+2. **Eating through the room** (integration):
+   - holding F for 3 s at a full pedestal eats it: the player's kit is set and the pedestal is empty for everyone;
+   - releasing, casting off, a grapple reservation or a disconnect interrupts it, with the reason;
+   - two players eating at the same pedestal: the lowest id gets it, and the other is interrupted with `taken`;
+   - a fed player's further attempts are refused;
+   - the kit survives a lost duel.
+3. **Hidden information on raw messages** (integration): the inspect reply goes only to the inspector at that dock; no message to any other player names a pedestal's kit; a player's kit reaches the opponent only in the duel start.
+4. **Kits in duels** (integration): a sea duel between an Ember eater and a Duelist starts with those kits on both clients and the server, the per-frame hash checks stay clean, and a flame bolt cast by the Ember player damages the Duelist by the move data's amount.
+5. **UI** (web unit): the fruit panel model (kit name, specials, description, refusal reasons, progress), the HUD kit line, and the arena drawing model (bolt, screen, obscured flash, reappearance, threat boxes only for striking moves).
+6. **Browser scenario `fruit-duel`:**
+   - one browser moors at a pedestal's dock (test-only fruit deal pinned), presses F, reads the kit name from the panel, holds F for 3 s and sees its HUD show Ember;
+   - it grapples the second browser at sea;
+   - in the arena it casts the flame bolt (U); both browsers see the bolt drawn;
+   - the second browser's health bar drops by the bolt's damage.
+7. **The existing scenarios still pass.** Players who never eat keep the Duelist, so `sea-duel` and `theft-loop` behave as before.
+8. **Carried from `ruins-online`'s approving reviews:**
+   - the ruins keydown handler in `main.ts` skips key events aimed at text fields (like `keyboard.ts`'s `isTyping`), with a web unit test;
+   - a test pins that the ruin panel's Digit1–6 keys match the clue's tablet order;
+   - a room-level test pins the 3 s lockout exactly (`lockedUntil` = answer tick + `LOCKOUT_TICKS`);
+   - a room-level test shows that an open-ruin from open water sends no clue. Replace the `equivalent` row in `docs/ruins-online-coverage.md` with it.
+9. **The branch table:** `docs/fruit-kits-online-coverage.md` has one row for each room-level and UI branch this feature adds or changes: the file and function, the branch, and the test that fails when the branch is deleted.
+   - Build it by deleting each branch on a scratch copy, running the deletions in parallel batches. Don't commit those edits.
+   - A branch with no failing test gets a new test. A branch that can't change the outcome is marked `equivalent`, with a one-line reason. Dead code is removed.
+   - There are no `unreachable` or `untested` rows, and the completion report's `untested` list is empty.
+10. `docs/architecture.md` gains a "Fruits in the room" section of at most half a page. `docs/duel.md` notes that room duels carry kits.
+11. `npm ci` then each of the five policy checks passes from a clean checkout, with all browser scenarios. The integration suite stays well inside its time budget; report its duration.
+
+Browser checks: each scenario id appears in exactly one test title as `[scenario:<id>]`. That test, when it passes, attaches exactly one image/png named `screenshot:<id>` (other attachments are fine). The verifier refuses anything else. Before completing, run the spec files you changed with a JSON report:
+
+```bash
+WORKFLOW_VERIFICATION_PHASE=worker PLAYWRIGHT_JSON_OUTPUT_FILE=<tmp>/report.json \
+  npx --no-install playwright test --config=tests/e2e/playwright.config.ts --reporter=json <spec files>
+```
+
+Then check the report with the verifier's own rules: run the exact `check-report` command the controller appends to this task when it pins it.
+
+## Stop
+
+Report `blocked` instead of continuing when any of these happens:
+
+- `npm ci` or an install fails twice for reasons outside the repository (registry, network).
+- A pure module or content change outside the owned paths is truly required. Name the missing operation.
+- A check can pass only by changing a path outside the owned paths.
+- After two hours of work, any required check still fails and you cannot name the next fix. The worker deadline is three hours; leave time for the branch table and the final checks.
+
+Report `question` only for a choice that would change this acceptance.

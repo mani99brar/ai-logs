@@ -1,0 +1,139 @@
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { MessageType, PROTOCOL_VERSION } from "@pirate-sea-race/protocol";
+import { MatchRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { HeadlessClient, sleep } from "@pirate-sea-race/test-tools";
+
+let server: RunningGameServer;
+let endpoint: string;
+const clients: HeadlessClient[] = [];
+
+async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
+  const joined = await client;
+  clients.push(joined);
+  return joined;
+}
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((client) => client.leave()));
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+function roomOf(client: HeadlessClient): MatchRoom {
+  return matchMaker.getLocalRoomById(client.room.roomId) as unknown as MatchRoom;
+}
+
+describe("private match", () => {
+  it("creates a custom match with a six-character code", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    expect(host.code).toMatch(/^[A-Z0-9]{6}$/);
+    expect(host.room.state.custom).toBe(true);
+    expect(host.room.state.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(host.playerCount).toBe(1);
+  });
+
+  it("lets two clients join the same code and see the same authoritative movement", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await track(HeadlessClient.join(endpoint, host.code.toLowerCase()));
+    expect(guest.room.roomId).toBe(host.room.roomId);
+    await host.waitFor(() => host.playerCount === 2);
+
+    const start = host.ship()!;
+    expect(guest.ship(host.sessionId)).toEqual(start);
+    const guestStart = guest.ship()!;
+
+    await host.hold({ moveX: 1, moveY: 0 }, 600);
+    await host.waitFor(() => host.ship()!.x > start.x);
+    const moved = host.ship()!;
+    expect(moved.y).toBe(start.y);
+
+    // Both clients converge on the same server-decided position once the ship stops.
+    await sleep(400);
+    const settled = host.ship()!;
+    await guest.waitFor(() => guest.ship(host.sessionId)?.x === settled.x);
+    expect(guest.ship(host.sessionId)).toEqual(settled);
+    expect(settled.x).toBeGreaterThan(start.x);
+    // The guest sent nothing, so its ship has not moved.
+    expect(guest.ship()).toEqual(guestStart);
+    expect(host.ship(guest.sessionId)).toEqual(guestStart);
+  });
+
+  it("removes a ship when its player leaves", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await HeadlessClient.join(endpoint, host.code);
+    await host.waitFor(() => host.playerCount === 2);
+    await guest.leave();
+    await host.waitFor(() => host.playerCount === 1);
+    expect(host.ship(guest.sessionId)).toBeUndefined();
+  });
+
+  it("refuses a client with a different protocol version", async () => {
+    await expect(HeadlessClient.create(endpoint, { protocolVersion: PROTOCOL_VERSION + 1 })).rejects.toThrow(
+      /Protocol version mismatch/,
+    );
+    const host = await track(HeadlessClient.create(endpoint));
+    await expect(HeadlessClient.join(endpoint, host.code, { protocolVersion: PROTOCOL_VERSION - 1 })).rejects.toThrow(
+      /Protocol version mismatch/,
+    );
+    expect(host.playerCount).toBe(1);
+  });
+
+  it("refuses an unknown code", async () => {
+    await expect(HeadlessClient.join(endpoint, "ZZZZZ9")).rejects.toThrow(/No match with that code/);
+  });
+
+  it("holds eight players and refuses a ninth", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let index = 0; index < 7; index++) await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 8);
+    const slots = new Set([...host.room.state.ships.values()].map((ship) => ship.slot));
+    expect(slots.size).toBe(8);
+    await expect(HeadlessClient.join(endpoint, host.code)).rejects.toThrow(/full/);
+  });
+});
+
+describe("input validation on the server", () => {
+  it("drops malformed, oversized, stale and future-frame messages and keeps the room running", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    const guest = await track(HeadlessClient.join(endpoint, host.code));
+    await host.waitFor(() => host.playerCount === 2);
+    const start = host.ship()!;
+
+    host.sendRaw(MessageType.Input, "not an input");
+    host.sendRaw(MessageType.Input, { seq: 1, frame: 0, buttons: 0, moveX: 5, moveY: 0 });
+    host.sendRaw(MessageType.Input, { seq: 2, frame: 0, buttons: 0, moveX: 1, moveY: 0, padding: "x".repeat(400) });
+    host.sendRaw(MessageType.Input, { seq: 3, frame: host.frame + 10_000, buttons: 0, moveX: 1, moveY: 0 });
+    host.sendRaw("teleport", { x: 0, y: 0 });
+    await sleep(300);
+
+    expect(host.connected).toBe(true);
+    expect(guest.connected).toBe(true);
+    expect(host.ship()).toEqual(start);
+    const dropped = roomOf(host).droppedInputs(host.sessionId)!;
+    expect(dropped).toMatchObject({ malformed: 2, oversized: 1, "future-frame": 1 });
+
+    // A late, lower sequence number is ignored: the ship keeps its accepted heading.
+    host.sendRaw(MessageType.Input, { seq: 50, frame: host.frame, buttons: 0, moveX: 1, moveY: 0 });
+    host.sendRaw(MessageType.Input, { seq: 40, frame: host.frame, buttons: 0, moveX: -1, moveY: 0 });
+    await host.waitFor(() => host.ship()!.x > start.x);
+    expect(roomOf(host).droppedInputs(host.sessionId)!["stale-sequence"]).toBe(1);
+    await guest.waitFor(() => (guest.ship(host.sessionId)?.x ?? 0) > start.x);
+    expect(host.connected && guest.connected).toBe(true);
+  });
+
+  it("drops input beyond the per-second rate cap without disconnecting", async () => {
+    const host = await track(HeadlessClient.create(endpoint));
+    for (let index = 0; index < 100; index++) host.sendInput({ moveX: 0, moveY: 0 });
+    await sleep(200);
+    expect(host.connected).toBe(true);
+    expect(roomOf(host).droppedInputs(host.sessionId)!["rate-limited"]).toBeGreaterThan(0);
+  });
+});

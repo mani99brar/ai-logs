@@ -1,0 +1,1153 @@
+diff --git a/README.md b/README.md
+index a55b5ae..7bc216e 100644
+--- a/README.md
++++ b/README.md
+@@ -19,7 +19,7 @@ Run these from the repository root.
+ | Typecheck every workspace | `npm run typecheck` |
+ | Unit tests | `npm run test:unit` |
+ | Integration tests (a real server in-process, headless clients) | `npm run test:integration` |
+-| Build every package and the web client | `npm run build` |
++| Build every package and the web client, then smoke-test the built server | `npm run build` |
+ | Run the built server | `npm start` |
+ | Browser tests (start the server and web client themselves) | `npx --no-install playwright test --config=tests/e2e/playwright.config.ts` |
+ 
+diff --git a/apps/server/src/MatchRoom.ts b/apps/server/src/MatchRoom.ts
+index 0b1560f..127a29d 100644
+--- a/apps/server/src/MatchRoom.ts
++++ b/apps/server/src/MatchRoom.ts
+@@ -1,11 +1,14 @@
+ import { randomInt } from "node:crypto";
+-import { matchMaker, Room, ServerError, type AuthContext, type Client } from "colyseus";
++import { ErrorCode, matchMaker, Room, ServerError, type AuthContext, type Client } from "colyseus";
+ import { privateMatch } from "@pirate-sea-race/content";
+ import {
+   createMatchOptionsSchema,
+   JoinRefusal,
+   joinMatchOptionsSchema,
++  MALFORMED_MATCH_REQUEST_MESSAGE,
++  MATCH_CODE_REQUIRED_MESSAGE,
+   MATCH_ROOM,
++  MATCH_UNAVAILABLE_MESSAGE,
+   matchFullMessage,
+   MAX_INPUT_MESSAGES_PER_SECOND,
+   MessageType,
+@@ -28,24 +31,37 @@ import { InputGate } from "./inputGate.js";
+ import { generateMatchCode } from "./matchCode.js";
+ import { MatchStateSchema, ShipSchema } from "./schema.js";
+ 
+-/** The room's matchmaking listing: private matches are found by `code` (Colyseus `filterBy`). */
++/**
++ * The room's matchmaking listing: private matches are found by `code` (Colyseus `filterBy`). It never holds the
++ * creator's `createToken`, so a request carrying a token matches no listing.
++ */
+ export interface MatchMetadata {
+   code: string;
+   custom: boolean;
++  /** A `filterBy` field that is never set: no listing holds a token, so no token-carrying request matches one. */
++  createToken?: never;
+ }
+ 
+ /** World updates go out at 20 Hz, the world simulation rate (§15). */
+ const PATCH_INTERVAL_MS = 1000 / 20;
+ 
+ /**
+- * Checks a create or join request before matchmaking places it (Colyseus calls this for every seat request).
+- * Refusals carry a readable message the client shows.
++ * Checks a create or join request before matchmaking places it: Colyseus calls this for every `create`, `join`,
++ * `joinOrCreate` and `joinById` before it reserves a seat. A request carries either a `createToken` (a create) or a
++ * `code` (a join), never both and never neither. Refusals carry a readable message the client shows.
+  */
+ export async function authorizeEntry(options: unknown): Promise<true> {
+-  const version = (options as { protocolVersion?: unknown } | undefined)?.protocolVersion;
+-  if (version !== PROTOCOL_VERSION) throw new ServerError(JoinRefusal.ProtocolMismatch, protocolMismatchMessage(version));
+-  if ((options as { code?: unknown }).code === undefined) {
+-    if (!createMatchOptionsSchema.safeParse(options).success) throw new ServerError(JoinRefusal.BadRequest, "Malformed match request");
++  const request = (options ?? {}) as { protocolVersion?: unknown; code?: unknown; createToken?: unknown };
++  if (request.protocolVersion !== PROTOCOL_VERSION) {
++    throw new ServerError(JoinRefusal.ProtocolMismatch, protocolMismatchMessage(request.protocolVersion));
++  }
++  const hasCode = request.code !== undefined;
++  const hasToken = request.createToken !== undefined;
++  if (hasCode === hasToken) throw new ServerError(JoinRefusal.BadRequest, MALFORMED_MATCH_REQUEST_MESSAGE);
++  if (hasToken) {
++    if (!createMatchOptionsSchema.safeParse(options).success) {
++      throw new ServerError(JoinRefusal.BadRequest, MALFORMED_MATCH_REQUEST_MESSAGE);
++    }
+     return true;
+   }
+   const parsed = joinMatchOptionsSchema.safeParse(options);
+@@ -72,17 +88,26 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+   private readonly config = defaultSimulationConfig;
+   private simulation: MatchState = createMatchState(0);
+   private readonly gates = new Map<string, InputGate>();
++  /** The creator's one-time token; cleared once the creator's seat is taken. */
++  private createToken: string | undefined;
+ 
+   static override async onAuth(_token: string, options: unknown, _context: AuthContext): Promise<true> {
+     return authorizeEntry(options);
+   }
+ 
+-  override async onCreate(): Promise<void> {
++  override async onCreate(options: unknown): Promise<void> {
++    // Only a token-carrying request creates a match. A join by code reaches here only when its match filled up or
++    // closed after authorizeEntry admitted it (joinOrCreate then falls back to create).
++    const parsed = createMatchOptionsSchema.safeParse(options);
++    if (!parsed.success) throw new ServerError(ErrorCode.MATCHMAKE_INVALID_CRITERIA, MATCH_UNAVAILABLE_MESSAGE);
++    this.createToken = parsed.data.createToken;
+     const code = await this.allocateCode();
+     this.simulation = createMatchState(randomInt(0, 2 ** 32));
+     this.state.code = code;
+     this.state.protocolVersion = PROTOCOL_VERSION;
+     this.state.custom = privateMatch.custom;
++    // Colyseus copied the filterBy fields of the create request, the token among them, into the listing's metadata.
++    // Replacing the metadata drops the token before the listing is first stored.
+     await this.setMatchmaking({ metadata: { code, custom: privateMatch.custom } });
+ 
+     this.onMessage(MessageType.Input, (client, message: unknown) => {
+@@ -93,7 +118,12 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     this.setFixedTimestep(() => this.advance(), STEPS_PER_SECOND);
+   }
+ 
+-  override onJoin(client: Client): void {
++  /**
++   * The room's own admission check, which also covers `joinById` (no listing filter applies there): the one seat
++   * carrying the creator's token, then only seats carrying this match's code. Throwing refuses and frees the seat.
++   */
++  override onJoin(client: Client, options: unknown): void {
++    this.admit(options);
+     this.simulation = addShip(this.config, this.simulation, client.sessionId);
+     this.gates.set(client.sessionId, new InputGate());
+     this.mirror();
+@@ -110,6 +140,18 @@ export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMe
+     return this.gates.get(sessionId)?.dropped;
+   }
+ 
++  private admit(options: unknown): void {
++    const request = (options ?? {}) as { code?: unknown; createToken?: unknown };
++    if (request.createToken === undefined) {
++      if (request.code === this.state.code) return;
++      if (request.code !== undefined) throw new ServerError(JoinRefusal.NoSuchMatch, NO_SUCH_MATCH_MESSAGE);
++    } else if (request.code === undefined && this.createToken !== undefined && request.createToken === this.createToken) {
++      this.createToken = undefined;
++      return;
++    }
++    throw new ServerError(JoinRefusal.CodeRequired, MATCH_CODE_REQUIRED_MESSAGE);
++  }
++
+   private advance(): void {
+     const frame = this.simulation.frame + 1;
+     const inputs: Record<string, PlayerInput> = {};
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 906080e..b5c297e 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -28,8 +28,9 @@ export async function startGameServer(options: GameServerOptions): Promise<Runni
+     gracefullyShutdown: options.handleSignals ?? true,
+     transport: new WebSocketTransport({ maxPayload: MAX_FRAME_BYTES }),
+     rooms: {
+-      // Private matches are found by their code.
+-      [MATCH_ROOM]: defineRoom(MatchRoom).filterBy(["code"]),
++      // Private matches are found by their code. A create's one-time token is a filter field too, and no listing
++      // holds it, so a request carrying one matches no existing match: `join` fails and `joinOrCreate` creates.
++      [MATCH_ROOM]: defineRoom(MatchRoom).filterBy(["code", "createToken"]),
+     },
+   });
+   await server.listen(options.port, options.host);
+diff --git a/apps/web/src/connection.test.ts b/apps/web/src/connection.test.ts
+new file mode 100644
+index 0000000..e893859
+--- /dev/null
++++ b/apps/web/src/connection.test.ts
+@@ -0,0 +1,60 @@
++import { ErrorCode, MatchMakeError } from "@colyseus/sdk";
++import { describe, expect, it } from "vitest";
++import {
++  JoinRefusal,
++  MALFORMED_MATCH_REQUEST_MESSAGE,
++  MATCH_CODE_REQUIRED_MESSAGE,
++  MATCH_UNAVAILABLE_MESSAGE,
++  matchFullMessage,
++  NO_SUCH_MATCH_MESSAGE,
++  PROTOCOL_VERSION,
++  protocolMismatchMessage,
++} from "@pirate-sea-race/protocol";
++import { createMatch, joinMatch, refusalMessage } from "./connection.js";
++
++/** A localhost endpoint nothing listens on (TCP port 1 is a privileged service port no one runs). */
++const UNREACHABLE_ENDPOINT = "http://127.0.0.1:1";
++
++/** Refusals as the SDK surfaces them: the server's status or Colyseus error code, and its message. */
++describe("refusalMessage", () => {
++  it("shows the server's protocol-mismatch refusal as sent", () => {
++    const message = protocolMismatchMessage(PROTOCOL_VERSION - 1);
++    expect(refusalMessage(new MatchMakeError(message, JoinRefusal.ProtocolMismatch))).toBe(message);
++    expect(message).toMatch(/^Protocol version mismatch: client v\d+, server v\d+\./);
++  });
++
++  it("shows the server's unknown-code refusal as sent", () => {
++    expect(refusalMessage(new MatchMakeError(NO_SUCH_MATCH_MESSAGE, JoinRefusal.NoSuchMatch))).toBe("No match with that code");
++  });
++
++  it("shows the server's full-match refusal as sent", () => {
++    expect(refusalMessage(new MatchMakeError(matchFullMessage(8), JoinRefusal.MatchFull))).toBe("That match is full (8 players)");
++  });
++
++  it("shows the room's own refusals as sent", () => {
++    expect(refusalMessage(new MatchMakeError(MATCH_CODE_REQUIRED_MESSAGE, JoinRefusal.CodeRequired))).toBe(MATCH_CODE_REQUIRED_MESSAGE);
++    expect(refusalMessage(new MatchMakeError(MALFORMED_MATCH_REQUEST_MESSAGE, JoinRefusal.BadRequest))).toBe(MALFORMED_MATCH_REQUEST_MESSAGE);
++  });
++
++  it("does not claim the match is missing on the generic matchmaker failure", () => {
++    const generic = new MatchMakeError("no rooms found with provided criteria", ErrorCode.MATCHMAKE_INVALID_CRITERIA);
++    expect(refusalMessage(generic)).toBe(MATCH_UNAVAILABLE_MESSAGE);
++    expect(refusalMessage(generic)).toBe("That match is full or no longer exists");
++    expect(refusalMessage(generic)).not.toBe(NO_SUCH_MATCH_MESSAGE);
++  });
++
++  it("says the server cannot be reached when nothing listens at the endpoint", async () => {
++    const endpoint = UNREACHABLE_ENDPOINT;
++    const createError: unknown = await createMatch(endpoint).catch((error: unknown) => error);
++    expect(createError).toBeInstanceOf(Error);
++    expect(refusalMessage(createError)).toBe("Cannot reach the match server");
++    const joinError: unknown = await joinMatch(endpoint, "k7q2mx").catch((error: unknown) => error);
++    expect(refusalMessage(joinError)).toBe("Cannot reach the match server");
++    expect(refusalMessage(new TypeError("Failed to fetch"))).toBe("Cannot reach the match server");
++  });
++
++  it("falls back to a generic message for anything unreadable", () => {
++    expect(refusalMessage(undefined)).toBe("Could not join the match");
++    expect(refusalMessage(new Error(""))).toBe("Could not join the match");
++  });
++});
+diff --git a/apps/web/src/connection.ts b/apps/web/src/connection.ts
+index 5951a7c..a3412ca 100644
+--- a/apps/web/src/connection.ts
++++ b/apps/web/src/connection.ts
+@@ -1,5 +1,12 @@
+-import { Client, ErrorCode, type Room } from "@colyseus/sdk";
+-import { MATCH_ROOM, NO_SUCH_MATCH_MESSAGE, normalizeMatchCode, PROTOCOL_VERSION } from "@pirate-sea-race/protocol";
++import { Client, ErrorCode, MatchMakeError, type Room } from "@colyseus/sdk";
++import {
++  CREATE_TOKEN_BYTES,
++  formatCreateToken,
++  MATCH_ROOM,
++  MATCH_UNAVAILABLE_MESSAGE,
++  normalizeMatchCode,
++  PROTOCOL_VERSION,
++} from "@pirate-sea-race/protocol";
+ import type { MatchStateSchema } from "@pirate-sea-race/server/schema";
+ 
+ export type MatchRoom = Room<unknown, MatchStateSchema>;
+@@ -12,8 +19,10 @@ export function serverEndpoint(location: Location): string {
+   return typeof configured === "string" && configured !== "" ? configured : `${location.protocol}//${location.hostname}:${SERVER_PORT}`;
+ }
+ 
++/** Creates a private match, proving to the new room with a fresh one-time token that this client is its creator. */
+ export function createMatch(endpoint: string): Promise<MatchRoom> {
+-  return new Client(endpoint).create<MatchStateSchema>(MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION });
++  const createToken = formatCreateToken(crypto.getRandomValues(new Uint8Array(CREATE_TOKEN_BYTES)));
++  return new Client(endpoint).create<MatchStateSchema>(MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION, createToken });
+ }
+ 
+ export function joinMatch(endpoint: string, code: string): Promise<MatchRoom> {
+@@ -23,11 +32,18 @@ export function joinMatch(endpoint: string, code: string): Promise<MatchRoom> {
+   });
+ }
+ 
+-/** What to tell the player when the server refuses or cannot be reached. The server's own messages are readable. */
++/**
++ * What to tell the player when the server refuses or cannot be reached. The server's own refusals (400, 403, 404,
++ * 409, 426) carry readable messages. Colyseus's generic "no rooms found" means the server admitted the request but
++ * the match filled up or closed before a seat was reserved, so it must not claim the match is missing. A failed
++ * request that never reached the server carries no numeric code (the SDK wraps fetch's error).
++ */
+ export function refusalMessage(error: unknown): string {
+   const code = (error as { code?: unknown } | null)?.code;
+-  if (code === ErrorCode.MATCHMAKE_INVALID_CRITERIA) return NO_SUCH_MATCH_MESSAGE;
+-  if (error instanceof TypeError) return "Cannot reach the match server";
++  if (code === ErrorCode.MATCHMAKE_INVALID_CRITERIA) return MATCH_UNAVAILABLE_MESSAGE;
++  if (error instanceof TypeError || (error instanceof MatchMakeError && typeof code !== "number")) {
++    return "Cannot reach the match server";
++  }
+   if (error instanceof Error && error.message !== "") return error.message;
+   return "Could not join the match";
+ }
+diff --git a/apps/web/src/seaScene.ts b/apps/web/src/seaScene.ts
+index 6fb04dd..48a79aa 100644
+--- a/apps/web/src/seaScene.ts
++++ b/apps/web/src/seaScene.ts
+@@ -1,6 +1,6 @@
+ import * as Phaser from "phaser";
+ import { defaultSimulationConfig } from "@pirate-sea-race/simulation";
+-import { slotColor, type MatchView } from "./matchView.js";
++import { cssColor, slotColor, type MatchView } from "./matchView.js";
+ 
+ const { map } = defaultSimulationConfig;
+ export const TILE_PIXELS = 16;
+@@ -60,7 +60,7 @@ export class SeaScene extends Phaser.Scene {
+       const y = position.y * PIXELS_PER_SUB_UNIT;
+       graphics.setPosition(x, y);
+       graphics.setRotation((ship.heading * Math.PI) / 4);
+-      drawn.push({ id: ship.id, x: Math.round(x), y: Math.round(y), color: `#${slotColor(ship.slot).toString(16).padStart(6, "0")}` });
++      drawn.push({ id: ship.id, x: Math.round(x), y: Math.round(y), color: cssColor(slotColor(ship.slot)) });
+     }
+     for (const [id, graphics] of this.shipGraphics) {
+       if (present.has(id)) continue;
+diff --git a/apps/web/src/web.test.ts b/apps/web/src/web.test.ts
+index 29d522b..b0c210f 100644
+--- a/apps/web/src/web.test.ts
++++ b/apps/web/src/web.test.ts
+@@ -1,7 +1,8 @@
+ import { describe, expect, it } from "vitest";
+-import { SnapshotBuffer } from "./interpolation.js";
++import { INTERPOLATION_DELAY_MS, SnapshotBuffer } from "./interpolation.js";
+ import { axis } from "./keyboard.js";
+ import { estimateServerFrame } from "./inputSender.js";
++import { MatchView } from "./matchView.js";
+ 
+ describe("SnapshotBuffer", () => {
+   it("interpolates between the snapshots around the render time", () => {
+@@ -31,6 +32,35 @@ describe("SnapshotBuffer", () => {
+   });
+ });
+ 
++describe("MatchView", () => {
++  const ship = (x: number, y: number) => ({ id: "a", slot: 0, x, y, heading: 0 });
++
++  it("draws ships between two snapshots INTERPOLATION_DELAY_MS behind now, not at the latest one", () => {
++    const view = new MatchView("a");
++    view.ingest([ship(0, 500)], 1000);
++    view.ingest([ship(100, 500)], 1050);
++    view.ingest([ship(200, 600)], 1100);
++    expect(INTERPOLATION_DELAY_MS).toBe(100);
++    // At 1175 the scene draws the ship as it was at 1075, halfway between the patches of 1050 and 1100.
++    const drawn = view.renderPosition("a", 1175)!;
++    expect(drawn).toEqual({ x: 150, y: 550 });
++    expect(drawn.x).toBeGreaterThan(100);
++    expect(drawn.x).toBeLessThan(200);
++    // The HUD's readout is the latest decoded server position.
++    expect(view.ships()).toEqual([ship(200, 600)]);
++    // Once now is INTERPOLATION_DELAY_MS past the last patch, the drawing catches up with it.
++    expect(view.renderPosition("a", 1100 + INTERPOLATION_DELAY_MS)).toEqual({ x: 200, y: 600 });
++  });
++
++  it("forgets a ship that leaves", () => {
++    const view = new MatchView("a");
++    view.ingest([ship(0, 0)], 0);
++    view.ingest([], 50);
++    expect(view.renderPosition("a", 200)).toBeUndefined();
++    expect(view.ships()).toEqual([]);
++  });
++});
++
+ describe("keyboard axes", () => {
+   it("makes opposing keys neutral", () => {
+     expect(axis(true, true)).toBe(0);
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 9f3b5e3..f5d1429 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -7,7 +7,7 @@ The walking skeleton of the §14 browser architecture: browsers join a private m
+ | `apps/web` | Browser client and web shell | Landing page (create or join by code), HUD, keyboard input adapter, input sender, snapshot interpolation, Phaser scene drawing placeholder ships |
+ | `apps/server` | Match process | `MatchRoom` (one Colyseus room per match), the Schema mirror of the simulation state, per-client input gate, server bootstrap |
+ | `packages/simulation` | Combat simulation (shared fixed-step functions) | Integer match state, seeded generator, 60 Hz `step` with world logic every third step, `hashState` |
+-| `packages/protocol` | Data contracts (§16) | Protocol version, join options, the input message schema (zod) and its validation, refusal codes and messages |
++| `packages/protocol` | Data contracts (§16) | Protocol version, create and join options (with the create token format), the input message schema (zod) and its validation, refusal codes and messages |
+ | `packages/content` | Content and tuning (§17) | Sea map, spawn slots, ship speed, private-match rules, the `slice` and `alpha` rules presets and §8's frame budgets, with validators |
+ | `packages/test-tools` | Test harness (§17) | `HeadlessClient`: a browserless player on the real Colyseus SDK |
+ 
+@@ -15,13 +15,18 @@ The HTTP service, PostgreSQL, static hosting and monitoring are not built yet (`
+ 
+ ## Rules the code keeps
+ 
+-- **Purity.** `simulation`, `protocol` and `content` import no Phaser, Colyseus, DOM, timers, wall-clock time or `Math.random`; their tsconfig leaves out the DOM library, and `tests/unit/purity.test.ts` fails on a violation.
++- **Purity.** `simulation`, `protocol` and `content` import no Phaser, Colyseus, DOM, timers, wall-clock time or `Math.random`, and call no floating-point transcendental `Math` function (`sqrt`, `cbrt`, `hypot`, `pow`, `exp`, `log*`, trigonometric). Their tsconfig leaves out the DOM library, and `tests/unit/purity.test.ts` fails on a violation.
+ - **Integers.** Every number in the simulation state is an integer. Positions are sub-units (256 per 16 px tile) on a 48 × 32 tile sea with the origin top-left. Diagonals are normalised with an integer square root, so `hashState` (64-bit FNV-1a over a canonical serialization) does not depend on the JavaScript engine.
+-- **One clock.** The room steps the simulation 60 times a second with Colyseus `setFixedTimestep`, the accumulator-based successor of `setSimulationInterval`. World logic runs on frames divisible by 3 (20 Hz); the room then mirrors the plain state into its Colyseus Schema, which Colyseus patches to clients at 20 Hz.
+-- **The server alone writes state.** Clients send only `input` messages: `{seq, frame, buttons, moveX, moveY}`. `InputGate` drops, and counts, messages over the rate cap (60 per second of match time) or over 128 bytes, malformed ones (including axes outside [-1, 1], which are rejected rather than clamped), ones with a sequence number that is not higher than the last one, and ones tagged more than 30 frames ahead of the server. A held input lapses to neutral after 15 frames without a fresh one. Unknown message types are dropped. Colyseus's own limits sit above these and do disconnect: WebSocket frames over 4 KiB and more than 240 messages a second.
+-- **Joining.** `create` makes a room whose code is generated on the server. `join` finds a room by code through `filterBy(['code'])`. The room's static `onAuth` refuses a mismatched protocol version (426), an unknown code (404) or a full match (409, eight players) with a readable message that the client shows.
++- **One clock.** The room steps the simulation 60 times a second with Colyseus `setFixedTimestep`, the accumulator-based successor of `setSimulationInterval`. World logic runs on frames divisible by 3 (20 Hz); the room then mirrors the plain state into its Colyseus Schema, which Colyseus patches to clients at 20 Hz. An integration test measures both rates on a running room.
++- **The server alone writes state.** Clients send only `input` messages: `{seq, frame, buttons, moveX, moveY}`. `InputGate` drops, and counts, messages over the rate cap (60 per second of match time) or over 128 bytes, malformed ones (including axes outside [-1, 1], which are rejected rather than clamped), ones with a sequence number that is not higher than the last one, and ones tagged more than 30 frames ahead of the server. A held input lapses to neutral after 15 frames without a fresh one. The frame tag is only checked against that 30-frame window: an accepted input applies from the server's next step, whatever frame it names. That is sound only while clients do not predict. The combat spike must apply inputs at their tagged frame when it adds prediction and reconciliation (§15). Unknown message types are dropped. Colyseus's own limits sit above these and do disconnect: WebSocket frames over 4 KiB and more than 240 messages a second.
++- **Joining.** Colyseus serves `create`, `join`, `joinOrCreate` and `joinById` over HTTP to any caller and reserves a seat before any room-level check runs, so a private match is guarded in three layers:
++  - The static `onAuth` (`authorizeEntry`) runs before any seat is reserved. It refuses a mismatched protocol version (426). It also refuses a request that carries neither a `code` nor a `createToken`, or both, or a malformed token (400). A request with a code is refused when the code is unknown (404, a malformed code included) or the match is full (409, eight players).
++  - `create` carries a one-time `createToken` (128 random bits from the platform's crypto API: `crypto.getRandomValues` in the browser, `node:crypto` in tests). The room is registered with `filterBy(['code', 'createToken'])`. Colyseus copies filter fields from the create options into the listing's metadata, so `onCreate` replaces the metadata with `{code, custom}` before the listing is stored. No listing ever holds a token, so a `join` carrying one finds nothing and a `joinOrCreate` carrying one can only create. `onCreate` refuses to make a match for a request without a token.
++  - The room's `onJoin` is the backstop, and the only check a `joinById` meets after `onAuth`. It admits one seat carrying the creator's token, then only seats whose `code` equals the match's code (404 for another code, 403 otherwise). Its refusal frees the seat at once.
++
++  Refusal messages stay under 100 bytes, because a refusal from the room travels over the WebSocket. The client shows the server's messages. Colyseus's generic "no rooms found" (the match filled up or closed between the check and the seat, as when two players race for the last seat) is worded "That match is full or no longer exists". What remains: a caller who already knows a room id (a current or former member) can send `joinById` requests without connecting and hold seats until each reservation expires (Colyseus's seat reservation timeout, 15 s by default).
+ - **Rendering.** The client keeps a snapshot buffer per ship and draws 100 ms in the past, interpolating between patches. The HUD lists the latest decoded server positions without interpolation. Prediction and reconciliation are left to the combat spike.
+ 
+ ## Toolchain
+ 
+-npm workspaces, TypeScript 7.0.2 (`tsc` for typechecks and package builds), Vite 8.3.0 (web build), Vitest 5.0.1 (`unit` and `integration` projects), Phaser 4.2.1, `colyseus` 0.18.8 with `@colyseus/schema` 5.0.34, `@colyseus/sdk` 0.18.4, zod 4.6.5, Playwright 1.63.0. Every one is the current major; none is pinned to a previous one. Workspace packages export a `@pirate-sea-race/source` condition that points at `src/`. Vite, Vitest, tsx and `tsc` typechecks resolve through it, so development and tests need no build. `npm run build` compiles each package to `dist/` in dependency order, and `node apps/server/dist/main.js` runs the built server. `colyseus` brings `uWebSockets.js` in from GitHub as a peer dependency, so `npm ci` needs access to github.com as well as the npm registry.
++npm workspaces, TypeScript 7.0.2 (`tsc` for typechecks and package builds), Vite 8.3.0 (web build), Vitest 5.0.1 (`unit` and `integration` projects), Phaser 4.2.1, `colyseus` 0.18.8 with `@colyseus/schema` 5.0.34, `@colyseus/sdk` 0.18.4, zod 4.6.5, Playwright 1.63.0. Every one is the current major; none is pinned to a previous one. Workspace packages export a `@pirate-sea-race/source` condition that points at `src/`. Vite, Vitest, tsx and `tsc` typechecks resolve through it, so development and tests need no build. `npm run build` compiles each package to `dist/` in dependency order, then runs `scripts/smoke-build.ts`. The script loads every workspace export from `dist/`, starts `node apps/server/dist/main.js` on a free port (`PORT=0`), waits for `/__healthcheck`, creates a match through the SDK and waits for the creator's ship. Every wait is bounded, and it kills the server on every path, so a broken build output fails the build check with its real error. `colyseus` brings `uWebSockets.js` in from GitHub as a peer dependency, so `npm ci` needs access to github.com as well as the npm registry.
+diff --git a/package.json b/package.json
+index 98740b5..54ab030 100644
+--- a/package.json
++++ b/package.json
+@@ -26,7 +26,8 @@
+   "description": "Pirate Sea Race: a browser multiplayer pirate treasure race (docs/spec.md)",
+   "scripts": {
+     "dev": "concurrently --names server,web --kill-others-on-fail \"npm run dev -w @pirate-sea-race/server\" \"npm run dev -w @pirate-sea-race/web\"",
+-    "build": "npm run build --workspaces",
++    "build": "npm run build --workspaces && npm run smoke:build",
++    "smoke:build": "node scripts/smoke-build.ts",
+     "start": "npm run start -w @pirate-sea-race/server",
+     "typecheck": "tsc -p tsconfig.json && npm run typecheck --workspaces",
+     "test": "npm run test:unit && npm run test:integration",
+diff --git a/packages/protocol/src/join.ts b/packages/protocol/src/join.ts
+index 79dd297..bd58dd5 100644
+--- a/packages/protocol/src/join.ts
++++ b/packages/protocol/src/join.ts
+@@ -12,9 +12,25 @@ export function normalizeMatchCode(input: string): string {
+   return input.trim().toUpperCase();
+ }
+ 
++/**
++ * A one-time secret the creator of a match sends with its `create` request: 128 random bits as 32 lowercase hex
++ * digits, generated by the caller with the platform's crypto API. The room admits exactly one seat carrying it (the
++ * creator's) and never lists it, so a request carrying a token can only ever create a new match.
++ */
++export const CREATE_TOKEN_BYTES = 16;
++export const createTokenSchema = z.string().regex(/^[0-9a-f]{32}$/);
++
++/** Hex-encodes random bytes from the platform's crypto API into a create token. */
++export function formatCreateToken(bytes: Uint8Array): string {
++  let token = "";
++  for (const byte of bytes) token += byte.toString(16).padStart(2, "0");
++  return token;
++}
++
+ /** Options for creating a private match. The server generates the code. */
+ export const createMatchOptionsSchema = z.object({
+   protocolVersion: z.int(),
++  createToken: createTokenSchema,
+ });
+ 
+ /** Options for joining a private match by code. */
+@@ -29,6 +45,7 @@ export type JoinMatchOptions = z.infer<typeof joinMatchOptionsSchema>;
+ /** Why the server refused a create or join. Colyseus answers matchmaking over HTTP, so these are HTTP statuses. */
+ export const JoinRefusal = {
+   BadRequest: 400,
++  CodeRequired: 403,
+   NoSuchMatch: 404,
+   MatchFull: 409,
+   ProtocolMismatch: 426,
+@@ -36,12 +53,29 @@ export const JoinRefusal = {
+ 
+ export type JoinRefusalCode = (typeof JoinRefusal)[keyof typeof JoinRefusal];
+ 
++/**
++ * Refusal messages stay under 100 bytes: a refusal from the room itself can travel as a WebSocket close reason, which
++ * is capped at 123 bytes. The client's version is echoed only when it is an integer, so the caller cannot lengthen it.
++ */
+ export function protocolMismatchMessage(clientVersion: unknown): string {
+-  return `Protocol version mismatch: this client speaks v${String(clientVersion)}, the server speaks v${PROTOCOL_VERSION}. Reload the page to update.`;
++  const client = Number.isSafeInteger(clientVersion) ? String(clientVersion) : "?";
++  return `Protocol version mismatch: client v${client}, server v${PROTOCOL_VERSION}. Reload the page to update.`;
+ }
+ 
++/** A request must carry either a match code (join) or a create token (create), and not both. */
++export const MALFORMED_MATCH_REQUEST_MESSAGE = "Malformed match request";
++
+ export const NO_SUCH_MATCH_MESSAGE = "No match with that code";
+ 
++/** The room refuses a seat whose request carries neither this match's code nor its creator's token. */
++export const MATCH_CODE_REQUIRED_MESSAGE = "Joining this match needs its code";
++
++/**
++ * What the client shows when Colyseus's matchmaker finds no open listing after the server admitted the request: the
++ * match filled up or closed in the meantime (for example, two players racing for the last seat).
++ */
++export const MATCH_UNAVAILABLE_MESSAGE = "That match is full or no longer exists";
++
+ export function matchFullMessage(maxPlayers: number): string {
+   return `That match is full (${maxPlayers} players)`;
+ }
+diff --git a/packages/protocol/src/protocol.test.ts b/packages/protocol/src/protocol.test.ts
+index 21818f3..844b5e3 100644
+--- a/packages/protocol/src/protocol.test.ts
++++ b/packages/protocol/src/protocol.test.ts
+@@ -1,5 +1,16 @@
+ import { describe, expect, it } from "vitest";
+ import {
++  CREATE_TOKEN_BYTES,
++  createMatchOptionsSchema,
++  createTokenSchema,
++  encodedSize,
++  formatCreateToken,
++  MALFORMED_MATCH_REQUEST_MESSAGE,
++  MATCH_CODE_REQUIRED_MESSAGE,
++  MATCH_UNAVAILABLE_MESSAGE,
++  matchFullMessage,
++  NO_SUCH_MATCH_MESSAGE,
++  protocolMismatchMessage,
+   MAX_INPUT_LEAD_FRAMES,
+   MAX_INPUT_MESSAGE_BYTES,
+   PROTOCOL_VERSION,
+@@ -71,3 +82,43 @@ describe("join options", () => {
+     }
+   });
+ });
++
++describe("create tokens", () => {
++  it("formats 128 random bits as 32 lowercase hex digits", () => {
++    expect(CREATE_TOKEN_BYTES * 8).toBeGreaterThanOrEqual(128);
++    const token = formatCreateToken(Uint8Array.from({ length: CREATE_TOKEN_BYTES }, (_, index) => index * 17));
++    expect(token).toBe("00112233445566778899aabbccddeeff");
++    expect(createTokenSchema.safeParse(token).success).toBe(true);
++  });
++
++  it("refuses anything but a well-formed token in a create request", () => {
++    const token = "0123456789abcdef0123456789abcdef";
++    expect(createMatchOptionsSchema.safeParse({ protocolVersion: PROTOCOL_VERSION, createToken: token }).success).toBe(true);
++    for (const createToken of [undefined, "", token.toUpperCase(), token.slice(1), `${token}0`, 42]) {
++      expect(createMatchOptionsSchema.safeParse({ protocolVersion: PROTOCOL_VERSION, createToken }).success).toBe(false);
++    }
++  });
++});
++
++describe("refusal messages", () => {
++  it("stay under 100 bytes, whatever version the client claims", () => {
++    const messages = [
++      MALFORMED_MATCH_REQUEST_MESSAGE,
++      NO_SUCH_MATCH_MESSAGE,
++      MATCH_CODE_REQUIRED_MESSAGE,
++      MATCH_UNAVAILABLE_MESSAGE,
++      matchFullMessage(8),
++      ...[PROTOCOL_VERSION - 1, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, "x".repeat(500), undefined, 1.5].map(
++        protocolMismatchMessage,
++      ),
++    ];
++    for (const message of messages) expect(encodedSize(message)! - 2).toBeLessThan(100);
++  });
++
++  it("names both protocol versions", () => {
++    expect(protocolMismatchMessage(1)).toBe(
++      `Protocol version mismatch: client v1, server v${PROTOCOL_VERSION}. Reload the page to update.`,
++    );
++    expect(protocolMismatchMessage("1; drop")).toContain("client v?,");
++  });
++});
+diff --git a/packages/protocol/src/version.ts b/packages/protocol/src/version.ts
+index c6c5e9d..d8afb93 100644
+--- a/packages/protocol/src/version.ts
++++ b/packages/protocol/src/version.ts
+@@ -1,5 +1,5 @@
+ /** The client and server must speak the same protocol version to join (§17). Bump it on any message change. */
+-export const PROTOCOL_VERSION = 1;
++export const PROTOCOL_VERSION = 2;
+ 
+ /** The Colyseus room name of a match. */
+ export const MATCH_ROOM = "match";
+diff --git a/packages/simulation/src/simulation.test.ts b/packages/simulation/src/simulation.test.ts
+index fc0307b..98adc8c 100644
+--- a/packages/simulation/src/simulation.test.ts
++++ b/packages/simulation/src/simulation.test.ts
+@@ -151,6 +151,17 @@ describe("movement", () => {
+     expect(quantizeAxis(Number.NaN)).toBe(0);
+   });
+ 
++  it("points the heading along each of the eight directions and keeps it when the ship stops", () => {
++    const directions: [number, number, number][] = [
++      [1, 0, 0], [1, 1, 1], [0, 1, 2], [-1, 1, 3], [-1, 0, 4], [-1, -1, 5], [0, -1, 6], [1, -1, 7],
++    ];
++    for (const [dx, dy, heading] of directions) {
++      const moved = run(matchWithShips(3, ["a"]), [{ frame: 1, shipId: "a", input: move(dx * AXIS_SCALE, dy * AXIS_SCALE) }], WORLD_STEP_INTERVAL);
++      expect(moved.ships[0]!.heading).toBe(heading);
++      expect(step(config, run(moved, [], WORLD_STEP_INTERVAL - 1), {}).ships[0]!.heading).toBe(heading);
++    }
++  });
++
+   it("reads a position as a tile plus an offset", () => {
+     const size = config.map.subUnitsPerTile;
+     expect(toTilePosition(config, 3 * size + 5, 2 * size)).toEqual({ tileX: 3, tileY: 2, offsetX: 5, offsetY: 0 });
+diff --git a/packages/simulation/src/step.ts b/packages/simulation/src/step.ts
+index 1e67ad9..ea4ae6f 100644
+--- a/packages/simulation/src/step.ts
++++ b/packages/simulation/src/step.ts
+@@ -44,12 +44,10 @@ function moveShip(config: SimulationConfig, ship: ShipState, input: PlayerInput)
+   };
+ }
+ 
++/** Headings by the signs of the velocity, at index `(sy + 1) * 3 + (sx + 1)`. Built once, not per call. */
++const HEADINGS: readonly number[] = [5, 6, 7, 4, 0, 0, 3, 2, 1];
++
+ /** Eight-way heading from the signs of the velocity (0 = east, clockwise with y down). */
+ function headingOf(vx: number, vy: number): number {
+-  const sx = Math.sign(vx);
+-  const sy = Math.sign(vy);
+-  const table: Record<string, number> = {
+-    "1,0": 0, "1,1": 1, "0,1": 2, "-1,1": 3, "-1,0": 4, "-1,-1": 5, "0,-1": 6, "1,-1": 7,
+-  };
+-  return table[`${sx},${sy}`] ?? 0;
++  return HEADINGS[(Math.sign(vy) + 1) * 3 + (Math.sign(vx) + 1)] ?? 0;
+ }
+diff --git a/packages/test-tools/src/headlessClient.ts b/packages/test-tools/src/headlessClient.ts
+index bb020ab..300176d 100644
+--- a/packages/test-tools/src/headlessClient.ts
++++ b/packages/test-tools/src/headlessClient.ts
+@@ -1,5 +1,8 @@
++import { randomBytes } from "node:crypto";
+ import { Client, type Room } from "@colyseus/sdk";
+ import {
++  CREATE_TOKEN_BYTES,
++  formatCreateToken,
+   MATCH_ROOM,
+   MessageType,
+   normalizeMatchCode,
+@@ -45,6 +48,7 @@ export class HeadlessClient {
+     const client = new Client(endpoint);
+     const room = await client.create<MatchStateSchema>(MATCH_ROOM, {
+       protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
++      createToken: newCreateToken(),
+     });
+     const headless = new HeadlessClient(room);
+     await headless.waitFor(() => headless.code !== "" && headless.ship() !== undefined);
+@@ -131,6 +135,11 @@ export class HeadlessClient {
+   }
+ }
+ 
++/** A fresh one-time create token from Node's crypto API. */
++export function newCreateToken(): string {
++  return formatCreateToken(randomBytes(CREATE_TOKEN_BYTES));
++}
++
+ export function sleep(ms: number): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, ms));
+ }
+diff --git a/packages/test-tools/src/index.ts b/packages/test-tools/src/index.ts
+index 58a2619..ac6e75a 100644
+--- a/packages/test-tools/src/index.ts
++++ b/packages/test-tools/src/index.ts
+@@ -1 +1 @@
+-export { HeadlessClient, sleep, type HeadlessClientOptions, type Movement, type ShipView } from "./headlessClient.js";
++export { HeadlessClient, newCreateToken, sleep, type HeadlessClientOptions, type Movement, type ShipView } from "./headlessClient.js";
+diff --git a/scripts/smoke-build.ts b/scripts/smoke-build.ts
+new file mode 100644
+index 0000000..6ad8576
+--- /dev/null
++++ b/scripts/smoke-build.ts
+@@ -0,0 +1,165 @@
++/**
++ * The last step of `npm run build`: proves the build output runs, not just that it compiled. It loads every workspace
++ * package through its `default` export (the built `dist/`), starts the built server (`node apps/server/dist/main.js`)
++ * on a free port, waits for its health check, creates a private match through the Colyseus SDK and waits for the
++ * creator's ship. Every wait is bounded and the server is killed on every path, so a failure fails the build with
++ * its real error and no process outlives the script.
++ */
++import { spawn, type ChildProcess } from "node:child_process";
++import { createInterface } from "node:readline";
++import { fileURLToPath } from "node:url";
++
++const root = fileURLToPath(new URL("..", import.meta.url));
++const SERVER_ENTRY = "apps/server/dist/main.js";
++const LISTENING_LINE = /listening on ws:\/\/localhost:(\d+)/;
++
++const LISTEN_TIMEOUT_MS = 20_000;
++const HEALTH_TIMEOUT_MS = 10_000;
++const MATCH_TIMEOUT_MS = 15_000;
++const STOP_TIMEOUT_MS = 5_000;
++/** Everything together stays far below the build check's 600 s. */
++const OVERALL_TIMEOUT_MS = 90_000;
++
++/** The built entry points, as a consumer without the `@pirate-sea-race/source` condition resolves them. */
++const WORKSPACE_EXPORTS = [
++  "@pirate-sea-race/content",
++  "@pirate-sea-race/protocol",
++  "@pirate-sea-race/simulation",
++  "@pirate-sea-race/server",
++  "@pirate-sea-race/server/schema",
++  "@pirate-sea-race/test-tools",
++];
++
++let server: ChildProcess | undefined;
++
++function log(message: string): void {
++  console.log(`build smoke: ${message}`);
++}
++
++function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): Promise<T> {
++  let timer: NodeJS.Timeout | undefined;
++  const timeout = new Promise<never>((_, reject) => {
++    timer = setTimeout(() => reject(new Error(`${what} did not finish within ${timeoutMs} ms`)), timeoutMs);
++  });
++  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
++}
++
++function sleep(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++function running(child: ChildProcess): boolean {
++  return child.exitCode === null && child.signalCode === null;
++}
++
++async function checkWorkspaceExports(): Promise<void> {
++  for (const specifier of WORKSPACE_EXPORTS) {
++    const resolved = fileURLToPath(import.meta.resolve(specifier));
++    if (!/[\\/]dist[\\/][^\\/]+\.js$/.test(resolved)) throw new Error(`${specifier} resolves to ${resolved}, not to its dist/`);
++    const module = (await import(specifier)) as Record<string, unknown>;
++    if (Object.keys(module).length === 0) throw new Error(`${specifier} (${resolved}) exports nothing`);
++  }
++  log(`${WORKSPACE_EXPORTS.length} workspace exports load from dist/`);
++}
++
++/** Starts the built server on a free port and resolves with the port from its "listening" line. */
++function startServer(): Promise<number> {
++  const child = spawn(process.execPath, [SERVER_ENTRY], {
++    cwd: root,
++    env: { ...process.env, PORT: "0" },
++    stdio: ["ignore", "pipe", "pipe"],
++  });
++  server = child;
++  child.stderr!.on("data", (chunk: Buffer) => process.stderr.write(chunk));
++  return withTimeout(
++    new Promise<number>((resolve, reject) => {
++      createInterface({ input: child.stdout! }).on("line", (line) => {
++        console.log(`  server: ${line}`);
++        const match = LISTENING_LINE.exec(line);
++        if (match !== null) resolve(Number(match[1]));
++      });
++      child.once("error", reject);
++      child.once("exit", (code, signal) => reject(new Error(`${SERVER_ENTRY} exited (code ${code}, signal ${signal}) before listening`)));
++    }),
++    LISTEN_TIMEOUT_MS,
++    `${SERVER_ENTRY} listening`,
++  );
++}
++
++async function waitForHealth(endpoint: string): Promise<void> {
++  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
++  let last: unknown;
++  while (Date.now() < deadline) {
++    try {
++      const response = await fetch(`${endpoint}/__healthcheck`, { signal: AbortSignal.timeout(1000) });
++      if (response.ok) return;
++      last = new Error(`HTTP ${response.status}`);
++    } catch (error) {
++      last = error;
++    }
++    await sleep(100);
++  }
++  throw new Error(`${endpoint}/__healthcheck did not answer OK within ${HEALTH_TIMEOUT_MS} ms`, { cause: last });
++}
++
++async function createMatch(endpoint: string): Promise<void> {
++  const { HeadlessClient } = await import("@pirate-sea-race/test-tools");
++  const host = await withTimeout(HeadlessClient.create(endpoint), MATCH_TIMEOUT_MS, "creating a match");
++  try {
++    const ship = host.ship();
++    if (!/^[A-Z0-9]{6}$/.test(host.code)) throw new Error(`the match has no code (got "${host.code}")`);
++    if (ship === undefined || host.playerCount !== 1) throw new Error("the creator's ship is not in the match state");
++    log(`created match ${host.code}; the creator's ship is at (${ship.x}, ${ship.y})`);
++  } finally {
++    await withTimeout(host.leave(), STOP_TIMEOUT_MS, "leaving the match").catch(() => undefined);
++  }
++}
++
++/** Stops the server: SIGTERM lets it drain; SIGKILL follows if it does not exit in time. */
++async function stopServer(): Promise<void> {
++  const child = server;
++  if (child === undefined || !running(child)) return;
++  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
++  child.kill("SIGTERM");
++  await withTimeout(exited, STOP_TIMEOUT_MS, "server shutdown").catch(async () => {
++    child.kill("SIGKILL");
++    await withTimeout(exited, STOP_TIMEOUT_MS, "killing the server");
++  });
++}
++
++// Last resort for paths that skip `finally`: an exit, or a signal from whoever runs the build.
++process.once("exit", () => {
++  if (server !== undefined && running(server)) server.kill("SIGKILL");
++});
++for (const signal of ["SIGINT", "SIGTERM"] as const) {
++  process.once(signal, () => {
++    console.error(`build smoke: interrupted by ${signal}`);
++    process.exit(1);
++  });
++}
++
++async function main(): Promise<void> {
++  await checkWorkspaceExports();
++  const port = await startServer();
++  const endpoint = `http://localhost:${port}`;
++  log(`${SERVER_ENTRY} listens on port ${port}`);
++  await waitForHealth(endpoint);
++  log("health check answers");
++  await createMatch(endpoint);
++}
++
++let failed = false;
++try {
++  await withTimeout(main(), OVERALL_TIMEOUT_MS, "the build smoke test");
++  log("passed");
++} catch (error) {
++  failed = true;
++  console.error("build smoke: FAILED");
++  console.error(error);
++} finally {
++  await stopServer().catch((error: unknown) => {
++    failed = true;
++    console.error("build smoke: could not stop the server", error);
++  });
++}
++process.exit(failed ? 1 : 0);
+diff --git a/tests/integration/admission.test.ts b/tests/integration/admission.test.ts
+new file mode 100644
+index 0000000..99e984a
+--- /dev/null
++++ b/tests/integration/admission.test.ts
+@@ -0,0 +1,224 @@
++import { Client, ErrorCode, type Room } from "@colyseus/sdk";
++import { matchMaker } from "colyseus";
++import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
++import { seaMap } from "@pirate-sea-race/content";
++import {
++  MALFORMED_MATCH_REQUEST_MESSAGE,
++  MATCH_CODE_REQUIRED_MESSAGE,
++  MATCH_ROOM,
++  MATCH_UNAVAILABLE_MESSAGE,
++  matchFullMessage,
++  NO_SUCH_MATCH_MESSAGE,
++  PROTOCOL_VERSION,
++} from "@pirate-sea-race/protocol";
++import { MatchRoom, startGameServer, type MatchMetadata, type RunningGameServer } from "@pirate-sea-race/server";
++import type { MatchStateSchema } from "@pirate-sea-race/server/schema";
++import { HeadlessClient, newCreateToken } from "@pirate-sea-race/test-tools";
++
++/**
++ * Private-match admission (skeleton-fixes decisions): a private match can be neither joined nor have a seat reserved
++ * in it without its code, whichever matchmaker method the caller uses over HTTP.
++ */
++let server: RunningGameServer;
++let endpoint: string;
++const players: HeadlessClient[] = [];
++const rooms: Room<unknown, MatchStateSchema>[] = [];
++
++async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
++  const joined = await client;
++  players.push(joined);
++  return joined;
++}
++
++beforeAll(async () => {
++  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
++  endpoint = `http://127.0.0.1:${server.port}`;
++});
++
++afterEach(async () => {
++  await Promise.all(players.splice(0).map((player) => player.leave()));
++  await Promise.all(rooms.splice(0).map((room) => room.leave(true).catch(() => undefined)));
++});
++
++afterAll(async () => {
++  await server.close();
++});
++
++type Method = "join" | "joinOrCreate" | "joinById";
++
++/** One raw matchmaker request through the SDK, as any HTTP caller could send it. Joined rooms are left afterwards. */
++async function request(method: Method, target: string, options: Record<string, unknown>): Promise<Room<unknown, MatchStateSchema>> {
++  const client = new Client(endpoint);
++  let room: Room<unknown, MatchStateSchema>;
++  if (method === "join") room = await client.join<MatchStateSchema>(target, options);
++  else if (method === "joinOrCreate") room = await client.joinOrCreate<MatchStateSchema>(target, options);
++  else room = await client.joinById<MatchStateSchema>(target, options);
++  rooms.push(room);
++  return room;
++}
++
++/** The refusal a request ends with; fails the test if the request succeeds. */
++async function refusal(attempt: Promise<unknown>): Promise<{ code: unknown; message: string }> {
++  const error: unknown = await attempt.then(
++    () => expect.fail("the request was admitted"),
++    (reason: unknown) => reason,
++  );
++  return { code: (error as { code?: unknown }).code, message: (error as Error).message };
++}
++
++function listingOf(roomId: string) {
++  return matchMaker.query({ roomId });
++}
++
++function roomOf(player: HeadlessClient): MatchRoom {
++  return matchMaker.getLocalRoomById(player.room.roomId) as unknown as MatchRoom;
++}
++
++/** The host's ship still moves under its own input: the room kept running. */
++async function expectRunning(host: HeadlessClient): Promise<void> {
++  expect(host.connected).toBe(true);
++  const start = host.ship()!;
++  const direction = start.x < (seaMap.widthTiles * seaMap.subUnitsPerTile) / 2 ? 1 : -1;
++  await host.hold({ moveX: direction, moveY: 0 }, 300);
++  await host.waitFor(() => (host.ship()!.x - start.x) * direction > 0);
++}
++
++describe("private match admission", () => {
++  it("refuses join, joinOrCreate and joinById without the code, with a wrong code, or with a code and a token", async () => {
++    const host = await track(HeadlessClient.create(endpoint));
++    const other = await track(HeadlessClient.create(endpoint));
++    const unknownCode = host.code === "ZZZZZ9" || other.code === "ZZZZZ9" ? "ZZZZZ8" : "ZZZZZ9";
++    const version = { protocolVersion: PROTOCOL_VERSION };
++
++    for (const method of ["join", "joinOrCreate"] as const) {
++      expect(await refusal(request(method, MATCH_ROOM, version))).toEqual({ code: 400, message: MALFORMED_MATCH_REQUEST_MESSAGE });
++      expect(await refusal(request(method, MATCH_ROOM, { ...version, code: unknownCode }))).toEqual({
++        code: 404,
++        message: NO_SUCH_MATCH_MESSAGE,
++      });
++      expect(await refusal(request(method, MATCH_ROOM, { ...version, code: host.code, createToken: newCreateToken() }))).toEqual({
++        code: 400,
++        message: MALFORMED_MATCH_REQUEST_MESSAGE,
++      });
++    }
++
++    const roomId = host.room.roomId;
++    expect(await refusal(request("joinById", roomId, version))).toEqual({ code: 400, message: MALFORMED_MATCH_REQUEST_MESSAGE });
++    expect(await refusal(request("joinById", roomId, { ...version, code: unknownCode }))).toEqual({
++      code: 404,
++      message: NO_SUCH_MATCH_MESSAGE,
++    });
++    // Another live match's code passes the matchmaker's check but not the room's own.
++    expect(await refusal(request("joinById", roomId, { ...version, code: other.code }))).toEqual({
++      code: 404,
++      message: NO_SUCH_MATCH_MESSAGE,
++    });
++    expect(await refusal(request("joinById", roomId, { ...version, code: host.code, createToken: newCreateToken() }))).toEqual({
++      code: 400,
++      message: MALFORMED_MATCH_REQUEST_MESSAGE,
++    });
++    // A token passes the matchmaker's check as a create, but the room admits only its own creator's token.
++    expect(await refusal(request("joinById", roomId, { ...version, createToken: newCreateToken() }))).toEqual({
++      code: 403,
++      message: MATCH_CODE_REQUIRED_MESSAGE,
++    });
++    // A create request that carries a code instead of a token makes no match.
++    expect(await refusal(new Client(endpoint).create(MATCH_ROOM, { ...version, code: host.code }))).toEqual({
++      code: ErrorCode.MATCHMAKE_INVALID_CRITERIA,
++      message: MATCH_UNAVAILABLE_MESSAGE,
++    });
++
++    expect(host.playerCount).toBe(1);
++    expect(roomOf(host).clients.length).toBe(1);
++    await expectRunning(host);
++    // The real code still gets in, by every join method.
++    const guest = await request("join", MATCH_ROOM, { ...version, code: host.code });
++    const joinOrCreateGuest = await request("joinOrCreate", MATCH_ROOM, { ...version, code: host.code });
++    const byIdGuest = await request("joinById", roomId, { ...version, code: host.code });
++    for (const room of [guest, joinOrCreateGuest, byIdGuest]) expect(room.roomId).toBe(roomId);
++    await host.waitFor(() => host.playerCount === 4);
++  });
++
++  it("reserves no seat for requests without the code, so players with the code still fill the match", async () => {
++    const host = await track(HeadlessClient.create(endpoint));
++    const roomId = host.room.roomId;
++    const version = { protocolVersion: PROTOCOL_VERSION };
++    const attempts: Promise<unknown>[] = [];
++    for (let round = 0; round < 4; round++) {
++      attempts.push(
++        refusal(request("join", MATCH_ROOM, version)),
++        refusal(request("joinOrCreate", MATCH_ROOM, version)),
++        refusal(request("joinById", roomId, version)),
++        refusal(request("joinById", roomId, { ...version, createToken: newCreateToken() })),
++      );
++    }
++    await Promise.all(attempts);
++    const [listing] = await listingOf(roomId);
++    expect(listing?.clients).toBe(1);
++    expect(listing?.locked).toBe(false);
++
++    for (let seat = 0; seat < 7; seat++) await track(HeadlessClient.join(endpoint, host.code));
++    await host.waitFor(() => host.playerCount === 8);
++    await expectRunning(host);
++  });
++
++  it("creates a new match for a joinOrCreate carrying a token, never landing in an existing one", async () => {
++    const host = await track(HeadlessClient.create(endpoint));
++    const version = { protocolVersion: PROTOCOL_VERSION };
++    const created = new Set<string>();
++    for (let attempt = 0; attempt < 3; attempt++) {
++      const room = await request("joinOrCreate", MATCH_ROOM, { ...version, createToken: newCreateToken() });
++      expect(room.roomId).not.toBe(host.room.roomId);
++      expect(created.has(room.roomId)).toBe(false);
++      created.add(room.roomId);
++    }
++    // A plain join carrying a token matches no listing at all.
++    expect(await refusal(request("join", MATCH_ROOM, { ...version, createToken: newCreateToken() }))).toEqual({
++      code: ErrorCode.MATCHMAKE_INVALID_CRITERIA,
++      message: "no rooms found with provided criteria",
++    });
++    expect(host.playerCount).toBe(1);
++    for (const roomId of created) expect((await listingOf(roomId))[0]?.clients).toBe(1);
++  });
++
++  it("keeps the creator's token out of the listing and admits it once", async () => {
++    const createToken = newCreateToken();
++    const creator = await new Client(endpoint).create<MatchStateSchema>(MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION, createToken });
++    rooms.push(creator);
++    const listings = await matchMaker.query({ name: MATCH_ROOM });
++    expect(listings.length).toBeGreaterThan(0);
++    for (const listing of listings) expect(JSON.stringify(listing)).not.toContain(createToken);
++    const [own] = await listingOf(creator.roomId);
++    const room = matchMaker.getLocalRoomById(creator.roomId) as unknown as MatchRoom;
++    expect(own?.metadata).toEqual({ code: room.state.code, custom: true } satisfies MatchMetadata);
++    expect(await matchMaker.query({ name: MATCH_ROOM, createToken })).toEqual([]);
++
++    // The token was spent on the creator's seat: replaying it does not get a second one.
++    expect(await refusal(request("joinById", creator.roomId, { protocolVersion: PROTOCOL_VERSION, createToken }))).toEqual({
++      code: 403,
++      message: MATCH_CODE_REQUIRED_MESSAGE,
++    });
++    // Nor does it lead anyone into this match: a request carrying it can only create another one.
++    const elsewhere = await request("joinOrCreate", MATCH_ROOM, { protocolVersion: PROTOCOL_VERSION, createToken });
++    expect(elsewhere.roomId).not.toBe(creator.roomId);
++    expect(room.clients.length).toBe(1);
++  });
++
++  it("tells the loser of a race for the last seat that the match is full, not that it is missing", async () => {
++    const host = await track(HeadlessClient.create(endpoint));
++    for (let seat = 0; seat < 6; seat++) await track(HeadlessClient.join(endpoint, host.code));
++    const racers = await Promise.allSettled([0, 1, 2].map(() => HeadlessClient.join(endpoint, host.code)));
++    const joined = racers.flatMap((racer) => (racer.status === "fulfilled" ? [racer.value] : []));
++    players.push(...joined);
++    expect(joined).toHaveLength(1);
++    // The loser gets the server's own full-match refusal, or, when both passed its check at once, Colyseus's
++    // generic "no rooms found", which the web client words as MATCH_UNAVAILABLE_MESSAGE (apps/web connection.test.ts).
++    for (const racer of racers) {
++      if (racer.status === "fulfilled") continue;
++      const { code, message } = racer.reason as { code: unknown; message: string };
++      if (code === ErrorCode.MATCHMAKE_INVALID_CRITERIA) continue;
++      expect({ code, message }).toEqual({ code: 409, message: matchFullMessage(8) });
++    }
++    await host.waitFor(() => host.playerCount === 8);
++  });
++});
+diff --git a/tests/integration/match.test.ts b/tests/integration/match.test.ts
+index e4445d3..c469abd 100644
+--- a/tests/integration/match.test.ts
++++ b/tests/integration/match.test.ts
+@@ -1,5 +1,6 @@
+ import { matchMaker } from "colyseus";
+-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++import { seaMap } from "@pirate-sea-race/content";
+ import { MessageType, PROTOCOL_VERSION } from "@pirate-sea-race/protocol";
+ import { MatchRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+ import { HeadlessClient, sleep } from "@pirate-sea-race/test-tools";
+@@ -7,6 +8,7 @@ import { HeadlessClient, sleep } from "@pirate-sea-race/test-tools";
+ let server: RunningGameServer;
+ let endpoint: string;
+ const clients: HeadlessClient[] = [];
++const MAP_CENTRE_X = (seaMap.widthTiles * seaMap.subUnitsPerTile) / 2;
+ 
+ async function track(client: Promise<HeadlessClient>): Promise<HeadlessClient> {
+   const joined = await client;
+@@ -50,8 +52,10 @@ describe("private match", () => {
+     expect(guest.ship(host.sessionId)).toEqual(start);
+     const guestStart = guest.ship()!;
+ 
+-    await host.hold({ moveX: 1, moveY: 0 }, 600);
+-    await host.waitFor(() => host.ship()!.x > start.x);
++    // Sail toward the middle of the sea, so the map edge cannot clamp the ship whatever its spawn slot.
++    const direction = start.x < MAP_CENTRE_X ? 1 : -1;
++    await host.hold({ moveX: direction, moveY: 0 }, 600);
++    await host.waitFor(() => (host.ship()!.x - start.x) * direction > 0);
+     const moved = host.ship()!;
+     expect(moved.y).toBe(start.y);
+ 
+@@ -60,7 +64,7 @@ describe("private match", () => {
+     const settled = host.ship()!;
+     await guest.waitFor(() => guest.ship(host.sessionId)?.x === settled.x);
+     expect(guest.ship(host.sessionId)).toEqual(settled);
+-    expect(settled.x).toBeGreaterThan(start.x);
++    expect((settled.x - start.x) * direction).toBeGreaterThan(0);
+     // The guest sent nothing, so its ship has not moved.
+     expect(guest.ship()).toEqual(guestStart);
+     expect(host.ship(guest.sessionId)).toEqual(guestStart);
+@@ -100,6 +104,35 @@ describe("private match", () => {
+   });
+ });
+ 
++describe("match clock", () => {
++  it("steps the simulation about 60 times a second and patches clients no faster than 20 Hz", async () => {
++    const host = await track(HeadlessClient.create(endpoint));
++    const room = roomOf(host);
++    const broadcasts = vi.spyOn(room, "broadcastPatch");
++    let patches = 0;
++    host.room.onStateChange(() => patches++);
++    const startFrame = room.state.frame;
++    const startedAt = performance.now();
++    // A moving ship changes the state on every world step, so every patch the server sends carries a change.
++    const direction = host.ship()!.x < MAP_CENTRE_X ? 1 : -1;
++    await host.hold({ moveX: direction, moveY: 0 }, 2000);
++    const seconds = (performance.now() - startedAt) / 1000;
++    const framesPerSecond = (room.state.frame - startFrame) / seconds;
++    const broadcastsPerSecond = broadcasts.mock.calls.length / seconds;
++    const patchesPerSecond = patches / seconds;
++    broadcasts.mockRestore();
++    // §15's rates as literals, so that a misread constant cannot move the expectation with it.
++    expect(framesPerSecond).toBeGreaterThan(60 * 0.85);
++    expect(framesPerSecond).toBeLessThan(60 * 1.15);
++    // The server's patch timer runs at 20 Hz; clients decode at most that many patches. The lower bounds only catch
++    // a much slower patch rate: a busy machine delays timer callbacks, so they are looser than the upper ones.
++    expect(broadcastsPerSecond).toBeGreaterThan(20 * 0.7);
++    expect(broadcastsPerSecond).toBeLessThan(20 * 1.15);
++    expect(patchesPerSecond).toBeLessThan(20 * 1.15);
++    expect(patchesPerSecond).toBeGreaterThan(20 * 0.5);
++  });
++});
++
+ describe("input validation on the server", () => {
+   it("drops malformed, oversized, stale and future-frame messages and keeps the room running", async () => {
+     const host = await track(HeadlessClient.create(endpoint));
+diff --git a/tests/unit/purity.test.ts b/tests/unit/purity.test.ts
+index 8f4a5bf..6ad6318 100644
+--- a/tests/unit/purity.test.ts
++++ b/tests/unit/purity.test.ts
+@@ -5,7 +5,9 @@ import { describe, expect, it } from "vitest";
+ 
+ /**
+  * The authoritative packages stay pure (CLAUDE.md, §17): no Phaser, Colyseus, DOM, timers, wall-clock time or
+- * Math.random, so the same match can be simulated headlessly and identically on client and server.
++ * Math.random, so the same match can be simulated headlessly and identically on client and server. Nor do they call
++ * floating-point transcendental functions, whose results may differ between JavaScript engines (skeleton decision:
++ * integer maths only, so `hashState` is engine-independent).
+  */
+ const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
+ const PURE_PACKAGES = ["packages/simulation", "packages/protocol", "packages/content"];
+@@ -29,6 +31,10 @@ const FORBIDDEN_CALLS: readonly [RegExp, string][] = [
+   [/\b(setTimeout|setInterval|setImmediate|queueMicrotask|requestAnimationFrame)\s*\(/, "timers"],
+   [/\b(window|document|navigator|localStorage|sessionStorage)\s*[.[]/, "DOM globals"],
+   [/\bcrypto\.(getRandomValues|randomUUID)\b/, "crypto randomness"],
++  [
++    /\bMath\.(sqrt|cbrt|hypot|pow|exp|expm1|log\w*|sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|asinh|acosh|atanh)\b/,
++    "floating-point transcendental Math functions",
++  ],
+ ];
+ 
+ function sourceFiles(directory: string): string[] {
+@@ -80,6 +86,12 @@ describe("purity rule", () => {
+     expect(violations("const t = Date.now();")).toEqual(["uses Date.now"]);
+     expect(violations("setInterval(tick, 16);")).toEqual(["uses timers"]);
+     expect(violations("document.body.append(x);")).toEqual(["uses DOM globals"]);
++    const transcendental = ["uses floating-point transcendental Math functions"];
++    expect(violations("const d = Math.sqrt(x * x + y * y);")).toEqual(transcendental);
++    for (const call of ["Math.cbrt(v)", "Math.hypot(x, y)", "Math.pow(2, n)", "Math.exp(t)", "Math.log2(n)", "Math.atan2(y, x)", "Math.sin(a)"]) {
++      expect(violations(`const r = ${call};`)).toEqual(transcendental);
++    }
++    expect(violations("const r = Math.floor(Math.sign(x) * Math.imul(a, b));")).toEqual([]);
+     expect(violations('// Math.random is banned\nconst s = "Date.now";')).toEqual([]);
+   });
+ 
+diff --git a/tsconfig.json b/tsconfig.json
+index 7a77332..a60d3af 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -4,5 +4,5 @@
+     "lib": ["es2024", "dom"],
+     "types": ["node"]
+   },
+-  "include": ["vitest.config.ts", "apps/web/vite.config.ts", "tests/**/*.ts"]
++  "include": ["vitest.config.ts", "apps/web/vite.config.ts", "tests/**/*.ts", "scripts/**/*.ts"]
+ }

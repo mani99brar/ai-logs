@@ -1,0 +1,159 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtemp, mkdir, rm, symlink, writeFile, chmod } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createApp, defaultFixtureRoot, bundledFixtureRoot, listingErrorMessage } from './app.ts'
+
+async function temporaryRoot() {
+  const root = await mkdtemp(join(tmpdir(), 'md-manager-test-'))
+  await mkdir(join(root, 'pi'))
+  await mkdir(join(root, 'claude'))
+  return root
+}
+
+test('lists the bundled fixtures as a flat, ordered list of directories and Markdown files', async () => {
+  const app = createApp()
+  try {
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 200)
+    assert.deepEqual(response.json(), {
+      entries: [
+        { source: 'Pi', path: 'skills', kind: 'directory' },
+        { source: 'Pi', path: 'skills/review.md', kind: 'file' },
+        { source: 'Pi', path: 'workflow.md', kind: 'file' },
+        { source: 'Claude', path: 'empty.md', kind: 'file' },
+        { source: 'Claude', path: 'subagents', kind: 'directory' },
+        { source: 'Claude', path: 'subagents/implementer.md', kind: 'file' },
+        { source: 'Claude', path: 'workflow.md', kind: 'file' },
+      ],
+    })
+    // Query parameters cannot select a root or path.
+    const withParameters = await app.inject('/api/entries?root=/tmp&path=../../etc&source=Pi')
+    assert.equal(withParameters.body, response.body)
+  } finally {
+    await app.close()
+  }
+})
+
+test('the old /api/files endpoint is gone', async () => {
+  const app = createApp()
+  try {
+    assert.equal((await app.inject('/api/files')).statusCode, 404)
+  } finally {
+    await app.close()
+  }
+})
+
+test('nested and empty directories, case-insensitive .md, ignored extensions, and symlink exclusion', async () => {
+  const root = await temporaryRoot()
+  const app = createApp(root)
+  try {
+    await mkdir(join(root, 'pi', 'empty'))
+    await mkdir(join(root, 'pi', 'nested', 'deeper'), { recursive: true })
+    await writeFile(join(root, 'pi', 'nested', 'deeper', 'UPPER.MD'), '')
+    await writeFile(join(root, 'pi', 'nested', 'Mixed.Md'), '')
+    await writeFile(join(root, 'pi', 'nested', 'notes.txt'), 'ignored')
+    await writeFile(join(root, 'pi', 'nested', 'readme.markdown'), 'ignored')
+    await writeFile(join(root, 'pi', 'nested', 'archive.md.bak'), 'ignored')
+    await writeFile(join(root, 'pi', 'b.md'), '')
+    await writeFile(join(root, 'pi', 'A.md'), '')
+    await writeFile(join(root, 'pi', 'item10.md'), '')
+    await writeFile(join(root, 'pi', 'item2.md'), '')
+    await writeFile(join(root, 'pi', 'name with spaces & #hash?.md'), '')
+    await writeFile(join(root, 'outside.md'), 'outside every source')
+    await mkdir(join(root, 'outside-directory'))
+    await symlink(join(root, 'outside.md'), join(root, 'pi', 'linked.md'))
+    await symlink(join(root, 'outside-directory'), join(root, 'claude', 'linked-directory'))
+    await symlink(join(root, 'pi', 'nested'), join(root, 'claude', 'linked-sibling'))
+
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 200)
+    assert.deepEqual(response.json(), {
+      entries: [
+        { source: 'Pi', path: 'A.md', kind: 'file' },
+        { source: 'Pi', path: 'b.md', kind: 'file' },
+        { source: 'Pi', path: 'empty', kind: 'directory' },
+        { source: 'Pi', path: 'item2.md', kind: 'file' },
+        { source: 'Pi', path: 'item10.md', kind: 'file' },
+        { source: 'Pi', path: 'name with spaces & #hash?.md', kind: 'file' },
+        { source: 'Pi', path: 'nested', kind: 'directory' },
+        { source: 'Pi', path: 'nested/deeper', kind: 'directory' },
+        { source: 'Pi', path: 'nested/deeper/UPPER.MD', kind: 'file' },
+        { source: 'Pi', path: 'nested/Mixed.Md', kind: 'file' },
+      ],
+    })
+  } finally {
+    await app.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('two empty sources produce an empty list, not an error', async () => {
+  const root = await temporaryRoot()
+  const app = createApp(root)
+  try {
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 200)
+    assert.deepEqual(response.json(), { entries: [] })
+  } finally {
+    await app.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a missing source is an error, not a partial listing', async () => {
+  const root = await temporaryRoot()
+  const app = createApp(root)
+  try {
+    await writeFile(join(root, 'pi', 'present.md'), '')
+    await rm(join(root, 'claude'), { recursive: true })
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 500)
+    assert.deepEqual(response.json(), { error: listingErrorMessage })
+    assert.ok(!response.body.includes(root), 'error must not expose absolute paths')
+    assert.ok(!response.body.includes('present.md'), 'error must not include partial results')
+  } finally {
+    await app.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a symlinked source directory is rejected rather than followed', async () => {
+  const root = await temporaryRoot()
+  const app = createApp(root)
+  try {
+    await rm(join(root, 'claude'), { recursive: true })
+    await symlink(join(root, 'pi'), join(root, 'claude'))
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 500)
+    assert.deepEqual(response.json(), { error: listingErrorMessage })
+  } finally {
+    await app.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an unreadable source is an error that does not expose the path', { skip: process.getuid?.() === 0 && 'root ignores permissions' }, async () => {
+  const root = await temporaryRoot()
+  const app = createApp(root)
+  try {
+    await mkdir(join(root, 'claude', 'hidden'))
+    await chmod(join(root, 'claude'), 0o000)
+    const response = await app.inject('/api/entries')
+    assert.equal(response.statusCode, 500)
+    assert.deepEqual(response.json(), { error: listingErrorMessage })
+    assert.ok(!response.body.includes(root))
+  } finally {
+    await chmod(join(root, 'claude'), 0o755)
+    await app.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('MD_MANAGER_FIXTURE_ROOT selects the root; otherwise the bundled fixtures are used', () => {
+  assert.equal(defaultFixtureRoot({}), bundledFixtureRoot)
+  assert.equal(defaultFixtureRoot({ MD_MANAGER_FIXTURE_ROOT: '   ' }), bundledFixtureRoot)
+  assert.equal(defaultFixtureRoot({ MD_MANAGER_FIXTURE_ROOT: '/tmp/scratch-root' }), '/tmp/scratch-root')
+  assert.ok(bundledFixtureRoot.endsWith('/fixtures/'))
+})

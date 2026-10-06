@@ -1,0 +1,98 @@
+import { matchMaker } from "colyseus";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { DuelRoom, startGameServer, type RunningGameServer } from "@pirate-sea-race/server";
+import { duelInput } from "@pirate-sea-race/simulation/duel";
+import { linkStats, MAX_INPUT_DELAY, MIN_INPUT_DELAY } from "@pirate-sea-race/simulation/netcode";
+import { HeadlessDuelClient } from "@pirate-sea-race/test-tools";
+// The browser's own module: the setting the operator's playtest uses (only `npm run dev` loads it in the browser).
+import { applyDevLatency, type DevLatency } from "../../apps/web/src/devLatency.js";
+
+/**
+ * The dev latency setting below the browser (the browser checks run the production build, where it is absent): two
+ * headless duel clients, running the browser's rollback session, get their sockets wrapped by the same module the page
+ * uses with `?rtt=80&jitter=20`, and the room they play in measures the round trip and chooses the input delay from
+ * it. Live sockets on a shared machine give no exact values, so the checks are banded and relative to the same duel
+ * without the setting.
+ */
+const PLAYTEST: DevLatency = { rttMs: 80, jitterMs: 20 };
+
+let server: RunningGameServer;
+let endpoint: string;
+const clients: HeadlessDuelClient[] = [];
+
+beforeAll(async () => {
+  server = await startGameServer({ port: 0, host: "127.0.0.1", handleSignals: false });
+  endpoint = `http://127.0.0.1:${server.port}`;
+});
+
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((client) => client.leave()));
+});
+
+afterAll(async () => {
+  await server.close();
+});
+
+interface Measured {
+  readonly inputDelay: number;
+  /** The room's median round trip per seat, from its probes. */
+  readonly rttMs: [number, number];
+  /** The round trip each client was told (what its HUD shows). */
+  readonly clientRttMs: [number, number];
+  readonly desyncs: [number, number];
+  readonly hashChecks: [number, number];
+}
+
+/** One duel, with both clients' sockets wrapped in the dev latency setting when `latency` is given. */
+async function duel(latency: DevLatency | undefined): Promise<Measured> {
+  const host = await HeadlessDuelClient.create(endpoint);
+  clients.push(host);
+  if (latency !== undefined) applyDevLatency(host.room, latency);
+  const guest = await HeadlessDuelClient.join(endpoint, host.code);
+  clients.push(guest);
+  if (latency !== undefined) applyDevLatency(guest.room, latency);
+  // They walk towards each other, so the rollback has inputs to predict and confirm.
+  host.play(() => duelInput("right"));
+  guest.play(() => duelInput("left"));
+  await host.waitFor(() => host.phase === "fighting", 8000);
+  for (const player of [host, guest]) await player.waitForConfirmed(120, 20_000);
+  const room = matchMaker.getLocalRoomById(host.room.roomId) as unknown as DuelRoom;
+  const diagnostics = room.diagnostics();
+  const pair = <T>(pick: (player: HeadlessDuelClient) => T): [T, T] => [pick(host), pick(guest)];
+  return {
+    inputDelay: diagnostics.inputDelay,
+    rttMs: [linkStats(diagnostics.rttSamples["0"]!)!.rttMs, linkStats(diagnostics.rttSamples["1"]!)!.rttMs],
+    clientRttMs: pair((player) => player.duel!.rttMs),
+    desyncs: pair((player) => player.stats!.desyncs),
+    hashChecks: pair((player) => player.stats!.hashChecks),
+  };
+}
+
+describe("dev latency setting on a headless duel client", () => {
+  it("raises the room's measured round trip and its chosen input delay above the same duel without it", async ({ annotate }) => {
+    const plain = await duel(undefined);
+    await Promise.all(clients.splice(0).map((client) => client.leave()));
+    const delayed = await duel(PLAYTEST);
+    console.log(`dev latency: ${JSON.stringify({ plain, delayed })}`);
+    await annotate(
+      `input delay ${plain.inputDelay} → ${delayed.inputDelay} frames; room round trip ${plain.rttMs.map(Math.round).join("/")} → ` +
+        `${delayed.rttMs.map(Math.round).join("/")} ms; client round trip ${delayed.clientRttMs.map(Math.round).join("/")} ms`,
+    );
+
+    for (const measured of [plain, delayed]) {
+      expect(measured.inputDelay).toBeGreaterThanOrEqual(MIN_INPUT_DELAY);
+      expect(measured.inputDelay).toBeLessThanOrEqual(MAX_INPUT_DELAY);
+      // The duel itself still runs on the server's state.
+      expect(measured.desyncs).toEqual([0, 0]);
+      expect(Math.min(...measured.hashChecks)).toBeGreaterThanOrEqual(30);
+    }
+    expect(delayed.inputDelay).toBeGreaterThan(plain.inputDelay);
+    for (const seat of [0, 1] as const) {
+      // Each way at least half the round trip less half the jitter, whatever else the machine is doing.
+      expect(delayed.rttMs[seat]).toBeGreaterThanOrEqual(PLAYTEST.rttMs - PLAYTEST.jitterMs);
+      expect(delayed.rttMs[seat]).toBeGreaterThan(plain.rttMs[seat]);
+      // The probes carry it back to the client, whose HUD shows it.
+      expect(delayed.clientRttMs[seat]).toBeGreaterThanOrEqual(PLAYTEST.rttMs - PLAYTEST.jitterMs);
+    }
+  }, 60_000);
+});

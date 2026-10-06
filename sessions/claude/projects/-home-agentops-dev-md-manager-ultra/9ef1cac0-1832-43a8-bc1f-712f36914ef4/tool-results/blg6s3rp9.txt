@@ -1,0 +1,667 @@
+     1	import { createHash } from 'node:crypto'
+     2	import fs, { type FileHandle } from 'node:fs/promises'
+     3	import { constants } from 'node:fs'
+     4	import { z } from 'zod'
+     5	import { validateRunDetail, type Project, type RunDetail, type RunSummary, type WorkflowDefinition } from '../contracts/projects/v1.ts'
+     6	import { eventSchema, validateWorkerResult, type RunSnapshot, type WorkerResult, type WorkflowEvent } from '../contracts/workflow/v1.ts'
+     7	import { DIRECTORY_FLAGS, at } from './files.ts'
+     8	import { ID_PATTERN, publishDefinition, storedDefinitionSchema, type ProjectConfig, type ProjectsConfig, type WorkflowConfig } from './projectsConfig.ts'
+     9	
+    10	/**
+    11	 * Read-only access to persisted workflow runs. A run is a directory below a registered workflow's `runs_root`
+    12	 * containing the controller's atomic `run-state.json` export (plus `plan.json`, `events.jsonl` and
+    13	 * `verification/<phase>/<node>/<attempt>/packet.json` evidence). Nothing here spawns a process, decodes the
+    14	 * checkpoint database or writes to run storage; every request re-reads the persisted files and projects them
+    15	 * onto the public contract. Missing or contradictory evidence is reported as an error or a paused/failed state,
+    16	 * never as success.
+    17	 */
+    18	
+    19	/** A rejected or failed project request. `message` is safe to send: it never carries absolute paths. */
+    20	export class ProjectApiError extends Error {
+    21	  readonly status: number
+    22	  readonly code: string
+    23	  constructor(status: number, code: string, message: string) {
+    24	    super(message)
+    25	    this.status = status
+    26	    this.code = code
+    27	  }
+    28	}
+    29	
+    30	export const DEFAULT_EXPORT_BYTE_LIMIT = 16 * 1024 * 1024
+    31	export const DEFAULT_PACKET_BYTE_LIMIT = 16 * 1024 * 1024
+    32	export const DEFAULT_ARTIFACT_BYTE_LIMIT = 32 * 1024 * 1024
+    33	export const DEFAULT_RUN_LIMIT = 50
+    34	export const MAX_RUN_LIMIT = 100
+    35	
+    36	const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+    37	const EXPORT_VERSION = '1.0.0'
+    38	const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    39	
+    40	/** Absolute filesystem paths in persisted messages are never forwarded to clients. */
+    41	export function redactPaths(text: string): string {
+    42	  return text.replace(/(?:^|(?<=[\s"'`(=:;,]))(?:~|\/[A-Za-z0-9._@~+-]+)(?:\/[A-Za-z0-9._@~+-]*)+/g, '<path>')
+    43	}
+    44	
+    45	/** `stored` id pattern shared with the registry; also keeps run directories one safe component. */
+    46	const id = z.string().regex(ID_PATTERN)
+    47	const sha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/)
+    48	const hex64 = z.string().regex(/^[a-f0-9]{64}$/)
+    49	const timestamp = z.iso.datetime()
+    50	
+    51	const exportSchema = z.object({
+    52	  version: z.literal(EXPORT_VERSION),
+    53	  run_id: id,
+    54	  base_commit: sha,
+    55	  created_at: timestamp,
+    56	  updated_at: timestamp,
+    57	  definition: storedDefinitionSchema,
+    58	  values: z.record(z.string(), z.unknown()),
+    59	  next: z.array(z.string()),
+    60	  tasks: z.array(z.object({
+    61	    node_id: z.string(),
+    62	    error: z.string().nullable(),
+    63	    interrupts: z.array(z.record(z.string(), z.unknown())),
+    64	    result: z.record(z.string(), z.unknown()).nullable(),
+    65	  })),
+    66	  events: z.array(z.unknown()),
+    67	  verification_packets: z.array(z.object({
+    68	    phase: z.enum(['worker', 'candidate']),
+    69	    node_id: id,
+    70	    attempt: z.number().int().positive(),
+    71	    path: z.string().min(1),
+    72	    sha256: hex64,
+    73	  })),
+    74	})
+    75	
+    76	const rawEventSchema = z.object({
+    77	  sequence: z.number().int().positive(),
+    78	  time: timestamp,
+    79	  node: z.string(),
+    80	  status: z.string(),
+    81	  message: z.string(),
+    82	})
+    83	
+    84	const planSchema = z.object({ run_id: id, base_commit: sha })
+    85	
+    86	const packetSchema = z.object({
+    87	  phase: z.enum(['worker', 'candidate']),
+    88	  result: z.record(z.string(), z.unknown()),
+    89	  gate: z.object({ status: z.string(), reasons: z.array(z.string()) }),
+    90	})
+    91	
+    92	type RunExport = z.infer<typeof exportSchema>
+    93	type RawEvent = z.infer<typeof rawEventSchema>
+    94	type PacketRegistration = RunExport['verification_packets'][number]
+    95	
+    96	/** A registered packet after loading: either verified content or the reason it cannot be trusted. */
+    97	type LoadedPacket = PacketRegistration & (
+    98	  | { ok: true; gate: { status: string; reasons: string[] }; result: Record<string, unknown> }
+    99	  | { ok: false; reason: string }
+   100	)
+   101	
+   102	type Scope = { project: ProjectConfig; workflow: WorkflowConfig }
+   103	
+   104	export type LoadedRun = {
+   105	  detail: RunDetail
+   106	  events: WorkflowEvent[]
+   107	  packets: LoadedPacket[]
+   108	}
+   109	
+   110	export type ArtifactContent = {
+   111	  artifact_id: string
+   112	  kind: 'patch' | 'log' | 'screenshot' | 'test_report' | 'other'
+   113	  contentType: string
+   114	  disposition: 'inline' | 'attachment'
+   115	  bytes: Buffer
+   116	}
+   117	
+   118	/** Internal graph node → the LangGraph state key whose presence proves that node completed. */
+   119	const EVIDENCE_KEY: Record<string, string> = {
+   120	  launch_ui: 'ui', launch_adapter: 'adapter', handoff: 'snapshots', verify_ui: 'ui_packet', verify_adapter: 'adapter_packet',
+   121	  candidate: 'bundle', review: 'review', approval: 'approved_bundle', integrate: 'integrated_commit',
+   122	}
+   123	/** Graph nodes that concern one logical worker (`ui`/`adapter`), whose results are served under that ID. */
+   124	const WORKER_OF: Record<string, string> = { launch_ui: 'ui', launch_adapter: 'adapter', verify_ui: 'ui', verify_adapter: 'adapter' }
+   125	const VERIFY_NODES = new Set(['verify_ui', 'verify_adapter'])
+   126	/** Raw event node aliases → graph nodes. Anything else must already be a graph node or is left unattributed. */
+   127	const EVENT_ALIASES: Record<string, string> = { ui: 'launch_ui', adapter: 'launch_adapter', freeze: 'handoff', candidate_ui: 'candidate', candidate_adapter: 'candidate' }
+   128	const EVENT_STATUS: Record<string, RunSnapshot['status']> = {
+   129	  running: 'running', interactive: 'running', blocked: 'failed', succeeded: 'succeeded', passed: 'succeeded', approved: 'succeeded',
+   130	}
+   131	const CONTENT_TYPES: Record<ArtifactContent['kind'], string> = {
+   132	  log: 'text/plain; charset=utf-8', patch: 'text/plain; charset=utf-8', test_report: 'application/json; charset=utf-8',
+   133	  screenshot: 'image/png', other: 'application/octet-stream',
+   134	}
+   135	
+   136	export function encodeCursor(scope: { project_id: string; workflow_id: string }, run: { updated_at: string; run_id: string }): string {
+   137	  return Buffer.from(JSON.stringify({ v: 1, p: scope.project_id, w: scope.workflow_id, u: run.updated_at, r: run.run_id }), 'utf8').toString('base64url')
+   138	}
+   139	
+   140	const cursorSchema = z.strictObject({ v: z.literal(1), p: id, w: id, u: timestamp, r: id })
+   141	
+   142	/** Cursors are opaque keyset tokens bound to one workflow; anything else is a 400, never a path or a guess. */
+   143	export function decodeCursor(cursor: string, scope: { project_id: string; workflow_id: string }): { updated_at: string; run_id: string } {
+   144	  const invalid = new ProjectApiError(400, 'INVALID_CURSOR', 'The cursor is not a paging token issued for this workflow. Restart from the first page.')
+   145	  let parsed: unknown
+   146	  try {
+   147	    parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
+   148	  } catch {
+   149	    throw invalid
+   150	  }
+   151	  const result = cursorSchema.safeParse(parsed)
+   152	  if (!result.success || result.data.p !== scope.project_id || result.data.w !== scope.workflow_id) throw invalid
+   153	  return { updated_at: result.data.u, run_id: result.data.r }
+   154	}
+   155	
+   156	/** Sort key: newest update first, then run ID ascending; the same order the keyset cursor walks. */
+   157	export function compareRuns(a: { updated_at: string; run_id: string }, b: { updated_at: string; run_id: string }): number {
+   158	  const byTime = Date.parse(b.updated_at) - Date.parse(a.updated_at)
+   159	  if (byTime !== 0) return byTime
+   160	  return a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0
+   161	}
+   162	
+   163	function sha256(bytes: Buffer): string {
+   164	  return createHash('sha256').update(bytes).digest('hex')
+   165	}
+   166	
+   167	function errno(error: unknown): string | undefined {
+   168	  return (error as NodeJS.ErrnoException)?.code
+   169	}
+   170	
+   171	function isMissing(error: unknown): boolean {
+   172	  const code = errno(error)
+   173	  return code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP' || code === 'ENXIO'
+   174	}
+   175	
+   176	/**
+   177	 * Reads `components` below an open directory with one no-follow open per step, so no symlink inside a run can
+   178	 * redirect the read outside it. Returns null when any component is missing, a symlink or not the expected kind.
+   179	 * The final file is read at most `limit` bytes; a larger file is refused rather than truncated.
+   180	 */
+   181	async function readBounded(directory: FileHandle, components: readonly string[], limit: number): Promise<Buffer | null> {
+   182	  const handles: FileHandle[] = []
+   183	  try {
+   184	    let parent = directory
+   185	    for (const component of components.slice(0, -1)) {
+   186	      parent = await fs.open(at(parent, component), DIRECTORY_FLAGS)
+   187	      handles.push(parent)
+   188	    }
+   189	    const file = await fs.open(at(parent, components[components.length - 1]), FILE_FLAGS)
+   190	    handles.push(file)
+   191	    if (!(await file.stat()).isFile()) return null
+   192	    const buffer = Buffer.allocUnsafe(limit + 1)
+   193	    let offset = 0
+   194	    while (offset < buffer.length) {
+   195	      const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset)
+   196	      if (bytesRead === 0) break
+   197	      offset += bytesRead
+   198	    }
+   199	    if (offset > limit) throw new ProjectApiError(500, 'FILE_TOO_LARGE', `The file ${components.join('/')} exceeds the ${limit} byte read limit.`)
+   200	    return buffer.subarray(0, offset)
+   201	  } catch (error) {
+   202	    if (isMissing(error)) return null
+   203	    throw error
+   204	  } finally {
+   205	    await Promise.all(handles.reverse().map(handle => handle.close()))
+   206	  }
+   207	}
+   208	
+   209	async function openDirectory(parent: FileHandle, name: string): Promise<FileHandle | null> {
+   210	  try {
+   211	    return await fs.open(at(parent, name), DIRECTORY_FLAGS)
+   212	  } catch (error) {
+   213	    if (isMissing(error)) return null
+   214	    throw error
+   215	  }
+   216	}
+   217	
+   218	function parseJson(bytes: Buffer, describe: string): unknown {
+   219	  try {
+   220	    return JSON.parse(bytes.toString('utf8'))
+   221	  } catch {
+   222	    throw new ProjectApiError(500, 'RUN_STORAGE_INVALID', `${describe} is not valid JSON.`)
+   223	  }
+   224	}
+   225	
+   226	function invalidRun(runId: string, detail: string): ProjectApiError {
+   227	  return new ProjectApiError(500, 'RUN_STORAGE_INVALID', `Run "${runId}" has malformed or contradictory persisted state: ${redactPaths(detail)}`)
+   228	}
+   229	
+   230	function issueText(error: z.ZodError): string {
+   231	  return error.issues.slice(0, 3).map(issue => `${issue.path.length ? issue.path.join('.') : '(root)'}: ${issue.message}`).join('; ')
+   232	}
+   233	
+   234	function packetPath(packet: PacketRegistration): string {
+   235	  return `verification/${packet.phase}/${packet.node_id}/${packet.attempt}/packet.json`
+   236	}
+   237	
+   238	function resultRoute(scope: Scope, runId: string, phase: 'worker' | 'candidate', worker: string, attempt: number): string {
+   239	  const node = phase === 'worker' ? worker : `candidate_${worker}`
+   240	  return `${runRoute(scope, runId)}/results/${encodeURIComponent(node)}/${attempt}`
+   241	}
+   242	
+   243	function runRoute(scope: Scope, runId: string): string {
+   244	  return `/api/projects/${encodeURIComponent(scope.project.project_id)}/workflows/${encodeURIComponent(scope.workflow.workflow_id)}/runs/${encodeURIComponent(runId)}`
+   245	}
+   246	
+   247	/** Splits `ui`/`candidate_ui` result route IDs back into a registered packet phase and worker. */
+   248	function parseResultNode(nodeId: string): { phase: 'worker' | 'candidate'; worker: string } {
+   249	  return nodeId.startsWith('candidate_') ? { phase: 'candidate', worker: nodeId.slice('candidate_'.length) } : { phase: 'worker', worker: nodeId }
+   250	}
+   251	
+   252	function laterTimestamp(a: string, b: string): string {
+   253	  return Date.parse(b) > Date.parse(a) ? b : a
+   254	}
+   255	
+   256	export type RunStoreOptions = {
+   257	  exportByteLimit?: number
+   258	  packetByteLimit?: number
+   259	  artifactByteLimit?: number
+   260	  /** Receives skipped legacy directories and unexpected failures for logging; details may name run directories. */
+   261	  warn?: (message: string, details: Record<string, unknown>) => void
+   262	}
+   263	
+   264	export class RunStore {
+   265	  readonly config: ProjectsConfig
+   266	  private readonly projectsById = new Map<string, ProjectConfig>()
+   267	  private readonly options: Required<Omit<RunStoreOptions, 'warn'>> & Pick<RunStoreOptions, 'warn'>
+   268	
+   269	  constructor(config: ProjectsConfig, options: RunStoreOptions = {}) {
+   270	    this.config = config
+   271	    for (const project of config.projects) this.projectsById.set(project.project_id, project)
+   272	    this.options = {
+   273	      exportByteLimit: options.exportByteLimit ?? DEFAULT_EXPORT_BYTE_LIMIT,
+   274	      packetByteLimit: options.packetByteLimit ?? DEFAULT_PACKET_BYTE_LIMIT,
+   275	      artifactByteLimit: options.artifactByteLimit ?? DEFAULT_ARTIFACT_BYTE_LIMIT,
+   276	      warn: options.warn,
+   277	    }
+   278	  }
+   279	
+   280	  projects(): Project[] {
+   281	    return this.config.projects.map(project => ({ project_id: project.project_id, name: project.name }))
+   282	  }
+   283	
+   284	  project(projectId: string): ProjectConfig {
+   285	    const project = this.projectsById.get(projectId)
+   286	    if (!project) throw new ProjectApiError(404, 'PROJECT_NOT_FOUND', 'No project with that ID is registered.')
+   287	    return project
+   288	  }
+   289	
+   290	  workflows(projectId: string): WorkflowDefinition[] {
+   291	    return this.project(projectId).workflows.map(workflow => workflow.definition)
+   292	  }
+   293	
+   294	  scope(projectId: string, workflowId: string): Scope {
+   295	    const project = this.project(projectId)
+   296	    const workflow = project.workflows.find(candidate => candidate.workflow_id === workflowId)
+   297	    if (!workflow) throw new ProjectApiError(404, 'WORKFLOW_NOT_FOUND', 'No workflow with that ID is registered in this project.')
+   298	    return { project, workflow }
+   299	  }
+   300	
+   301	  /** Opens the workflow's configured run root no-follow for one operation. An unusable root is a 503, never an empty list. */
+   302	  private async withRunsRoot<T>(scope: Scope, operation: (root: FileHandle) => Promise<T>): Promise<T> {
+   303	    let root: FileHandle
+   304	    try {
+   305	      root = await fs.open(scope.workflow.runs_root, DIRECTORY_FLAGS)
+   306	    } catch (error) {
+   307	      const code = errno(error)
+   308	      const reason = code === 'ENOENT' ? 'does not exist' : code === 'EACCES' || code === 'EPERM' ? 'is not readable' : 'is not a directory (symbolic links are never followed)'
+   309	      if (!isMissing(error) && code !== 'EACCES' && code !== 'EPERM') throw error
+   310	      throw new ProjectApiError(503, 'RUNS_ROOT_UNAVAILABLE', `The configured run storage for this workflow ${reason}. Check the registry configuration.`)
+   311	    }
+   312	    try {
+   313	      return await operation(root)
+   314	    } finally {
+   315	      await root.close()
+   316	    }
+   317	  }
+   318	
+   319	  /** Every run under the workflow root, newest first. Legacy directories without a supported export are skipped with a warning. */
+   320	  async listRuns(scope: Scope): Promise<RunSummary[]> {
+   321	    return this.withRunsRoot(scope, async root => {
+   322	      const names = (await fs.readdir(at(root), { withFileTypes: true }))
+   323	        .filter(dirent => dirent.isDirectory() && ID_PATTERN.test(dirent.name)).map(dirent => dirent.name).sort()
+   324	      const summaries: RunSummary[] = []
+   325	      const seen = new Set<string>()
+   326	      for (const name of names) {
+   327	        const directory = await openDirectory(root, name)
+   328	        if (!directory) continue
+   329	        try {
+   330	          const state = await readBounded(directory, ['run-state.json'], this.options.exportByteLimit)
+   331	          if (state === null) {
+   332	            if (await readBounded(directory, ['plan.json'], this.options.exportByteLimit) !== null) {
+   333	              this.options.warn?.('Skipping run directory without a supported run-state.json export; explicit import is required', { project_id: scope.project.project_id, workflow_id: scope.workflow.workflow_id, run: name })
+   334	            }
+   335	            continue
+   336	          }
+   337	          const run = await this.projectRun(scope, name, directory, state)
+   338	          if (seen.has(run.detail.summary.run_id)) throw invalidRun(name, 'duplicate run ID within the workflow')
+   339	          seen.add(run.detail.summary.run_id)
+   340	          summaries.push(run.detail.summary)
+   341	        } finally {
+   342	          await directory.close()
+   343	        }
+   344	      }
+   345	      return summaries.sort(compareRuns)
+   346	    })
+   347	  }
+   348	
+   349	  async loadRun(scope: Scope, runId: string): Promise<LoadedRun> {
+   350	    return this.withRunsRoot(scope, async root => {
+   351	      const directory = await openDirectory(root, runId)
+   352	      if (!directory) throw new ProjectApiError(404, 'RUN_NOT_FOUND', 'No run with that ID exists in this workflow.')
+   353	      try {
+   354	        const state = await readBounded(directory, ['run-state.json'], this.options.exportByteLimit)
+   355	        if (state === null) {
+   356	          if (await readBounded(directory, ['plan.json'], this.options.exportByteLimit) !== null) {
+   357	            throw new ProjectApiError(404, 'RUN_UNSUPPORTED', 'This run predates the supported state export and needs an explicit import; it is not displayed.')
+   358	          }
+   359	          throw new ProjectApiError(404, 'RUN_NOT_FOUND', 'No run with that ID exists in this workflow.')
+   360	        }
+   361	        return await this.projectRun(scope, runId, directory, state)
+   362	      } finally {
+   363	        await directory.close()
+   364	      }
+   365	    })
+   366	  }
+   367	
+   368	  async workerResult(scope: Scope, runId: string, nodeId: string, attempt: number): Promise<WorkerResult> {
+   369	    const run = await this.loadRun(scope, runId)
+   370	    const { phase, worker } = parseResultNode(nodeId)
+   371	    const packet = run.packets.find(candidate => candidate.phase === phase && candidate.node_id === worker && candidate.attempt === attempt)
+   372	    if (!packet) throw new ProjectApiError(404, 'RESULT_NOT_FOUND', 'No verified result is registered for that node and attempt.')
+   373	    if (!packet.ok) throw new ProjectApiError(500, 'EVIDENCE_MISMATCH', `The registered verification packet for ${nodeId}/${attempt} cannot be trusted: ${packet.reason}`)
+   374	    return projectWorkerResult(scope, runId, nodeId, packet)
+   375	  }
+   376	
+   377	  async artifact(scope: Scope, runId: string, artifactId: string): Promise<ArtifactContent> {
+   378	    const run = await this.loadRun(scope, runId)
+   379	    const registered: { packet: LoadedPacket & { ok: true }; artifact: { kind: ArtifactContent['kind']; uri: string; sha256: string } }[] = []
+   380	    let untrusted = false
+   381	    for (const packet of run.packets) {
+   382	      if (!packet.ok) { untrusted = true; continue }
+   383	      const artifacts = Array.isArray(packet.result.artifacts) ? packet.result.artifacts as Record<string, unknown>[] : []
+   384	      for (const artifact of artifacts) {
+   385	        if (artifact?.artifact_id !== artifactId) continue
+   386	        const parsed = artifactRegistrationSchema.safeParse(artifact)
+   387	        if (!parsed.success) throw new ProjectApiError(500, 'EVIDENCE_MISMATCH', 'The registered artifact entry is malformed.')
+   388	        registered.push({ packet, artifact: parsed.data })
+   389	      }
+   390	    }
+   391	    if (registered.length === 0) {
+   392	      if (untrusted) throw new ProjectApiError(500, 'EVIDENCE_MISMATCH', 'A verification packet in this run cannot be trusted, so its artifacts are not served.')
+   393	      throw new ProjectApiError(404, 'ARTIFACT_NOT_FOUND', 'No artifact with that ID is registered for this run.')
+   394	    }
+   395	    const digests = new Set(registered.map(entry => entry.artifact.sha256))
+   396	    if (digests.size !== 1) throw new ProjectApiError(500, 'EVIDENCE_MISMATCH', 'The artifact ID is registered with conflicting content hashes.')
+   397	    const { packet, artifact } = registered[0]
+   398	    const components = ['verification', packet.phase, packet.node_id, String(packet.attempt), 'artifacts', artifact.uri]
+   399	    const bytes = await this.withRunsRoot(scope, async root => {
+   400	      const directory = await openDirectory(root, runId)
+   401	      if (!directory) throw new ProjectApiError(404, 'RUN_NOT_FOUND', 'No run with that ID exists in this workflow.')
+   402	      try {
+   403	        return await readBounded(directory, components, this.options.artifactByteLimit)
+   404	      } catch (error) {
+   405	        if (error instanceof ProjectApiError && error.code === 'FILE_TOO_LARGE') throw new ProjectApiError(500, 'ARTIFACT_TOO_LARGE', 'The registered artifact exceeds the size limit for viewing.')
+   406	        throw error
+   407	      } finally {
+   408	        await directory.close()
+   409	      }
+   410	    })
+   411	    if (bytes === null) throw new ProjectApiError(500, 'ARTIFACT_UNAVAILABLE', 'The registered artifact file is missing, is not a regular file or is a symbolic link.')
+   412	    if (sha256(bytes) !== artifact.sha256) throw new ProjectApiError(500, 'ARTIFACT_HASH_MISMATCH', 'The artifact content does not match its registered hash and is not served.')
+   413	    const png = artifact.kind === 'screenshot' && bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+   414	    const kind = artifact.kind === 'screenshot' && !png ? 'other' : artifact.kind
+   415	    return { artifact_id: artifactId, kind: artifact.kind, contentType: CONTENT_TYPES[kind], disposition: kind === 'other' ? 'attachment' : 'inline', bytes }
+   416	  }
+   417	
+   418	  /** Validates the export and companion files, then projects them onto the public contract. */
+   419	  private async projectRun(scope: Scope, runId: string, directory: FileHandle, stateBytes: Buffer): Promise<LoadedRun> {
+   420	    const parsedExport = exportSchema.safeParse(parseJson(stateBytes, `run-state.json of run "${runId}"`))
+   421	    if (!parsedExport.success) throw invalidRun(runId, `run-state.json ${issueText(parsedExport.error)}`)
+   422	    const state = parsedExport.data
+   423	    if (state.run_id !== runId) throw invalidRun(runId, 'run-state.json names a different run_id than its directory')
+   424	    const planBytes = await readBounded(directory, ['plan.json'], this.options.exportByteLimit)
+   425	    if (planBytes === null) throw invalidRun(runId, 'plan.json is missing')
+   426	    const plan = planSchema.safeParse(parseJson(planBytes, `plan.json of run "${runId}"`))
+   427	    if (!plan.success) throw invalidRun(runId, `plan.json ${issueText(plan.error)}`)
+   428	    if (plan.data.run_id !== state.run_id || plan.data.base_commit !== state.base_commit) throw invalidRun(runId, 'plan.json and run-state.json disagree about the run identity')
+   429	    let definition: WorkflowDefinition
+   430	    try {
+   431	      definition = publishDefinition(scope.project.project_id, scope.workflow.workflow_id, state.definition)
+   432	    } catch (error) {
+   433	      throw invalidRun(runId, `pinned definition is invalid (${error instanceof z.ZodError ? issueText(error) : (error as Error).message})`)
+   434	    }
+   435	    const packets = await this.loadPackets(runId, directory, state.verification_packets)
+   436	    const rawEvents = await this.readEvents(runId, directory, state)
+   437	    const events = normalizeEvents(state.run_id, definition, rawEvents)
+   438	    const snapshot = projectSnapshot(scope, definition, state, rawEvents, packets)
+   439	    const created_at = state.created_at
+   440	    const updated_at = laterTimestamp(laterTimestamp(state.updated_at, rawEvents.at(-1)?.time ?? created_at), created_at)
+   441	    const summary: RunSummary = {
+   442	      contract_version: '1.0.0', project_id: scope.project.project_id, workflow_id: scope.workflow.workflow_id,
+   443	      definition_revision: definition.definition_revision, run_id: state.run_id, status: snapshot.status, created_at, updated_at,
+   444	    }
+   445	    let detail: RunDetail
+   446	    try {
+   447	      detail = validateRunDetail({ summary, definition, snapshot })
+   448	    } catch (error) {
+   449	      throw invalidRun(runId, `projection violates the contract (${error instanceof z.ZodError ? issueText(error) : (error as Error).message})`)
+   450	    }
+   451	    return { detail, events, packets }
+   452	  }
+   453	
+   454	  private async loadPackets(runId: string, directory: FileHandle, registrations: PacketRegistration[]): Promise<LoadedPacket[]> {
+   455	    const keys = new Set<string>()
+   456	    const packets: LoadedPacket[] = []
+   457	    for (const registration of registrations) {
+   458	      const key = `${registration.phase}:${registration.node_id}:${registration.attempt}`
+   459	      if (keys.has(key)) throw invalidRun(runId, `duplicate verification packet registration ${key}`)
+   460	      keys.add(key)
+   461	      if (registration.path !== packetPath(registration)) throw invalidRun(runId, `verification packet ${key} is registered outside the run's verification directory`)
+   462	      let bytes: Buffer | null
+   463	      try {
+   464	        bytes = await readBounded(directory, registration.path.split('/'), this.options.packetByteLimit)
+   465	      } catch (error) {
+   466	        if (!(error instanceof ProjectApiError)) throw error
+   467	        packets.push({ ...registration, ok: false, reason: 'packet exceeds the read limit' })
+   468	        continue
+   469	      }
+   470	      if (bytes === null) { packets.push({ ...registration, ok: false, reason: 'packet file is missing or not a regular file' }); continue }
+   471	      if (sha256(bytes) !== registration.sha256) { packets.push({ ...registration, ok: false, reason: 'packet content does not match its registered hash' }); continue }
+   472	      let parsed: unknown
+   473	      try {
+   474	        parsed = JSON.parse(bytes.toString('utf8'))
+   475	      } catch {
+   476	        packets.push({ ...registration, ok: false, reason: 'packet is not valid JSON' })
+   477	        continue
+   478	      }
+   479	      const packet = packetSchema.safeParse(parsed)
+   480	      if (!packet.success) { packets.push({ ...registration, ok: false, reason: `packet ${issueText(packet.error)}` }); continue }
+   481	      if (packet.data.phase !== registration.phase) { packets.push({ ...registration, ok: false, reason: 'packet phase differs from its registration' }); continue }
+   482	      packets.push({ ...registration, ok: true, gate: packet.data.gate, result: packet.data.result })
+   483	    }
+   484	    return packets
+   485	  }
+   486	
+   487	  /** `events.jsonl` is the live append-only log; the export's embedded copy is the fallback when it is absent. */
+   488	  private async readEvents(runId: string, directory: FileHandle, state: RunExport): Promise<RawEvent[]> {
+   489	    const bytes = await readBounded(directory, ['events.jsonl'], this.options.exportByteLimit)
+   490	    let raw: unknown[]
+   491	    if (bytes === null) {
+   492	      raw = state.events
+   493	    } else {
+   494	      const text = bytes.toString('utf8')
+   495	      const lines = text.split('\n')
+   496	      // A partially appended final line (no trailing newline) is in flight, not corruption.
+   497	      if (lines.length && lines[lines.length - 1] !== '' && !text.endsWith('\n')) lines.pop()
+   498	      raw = []
+   499	      for (const line of lines) {
+   500	        if (line.trim() === '') continue
+   501	        try {
+   502	          raw.push(JSON.parse(line))
+   503	        } catch {
+   504	          throw invalidRun(runId, 'events.jsonl contains a malformed line')
+   505	        }
+   506	      }
+   507	    }
+   508	    const events: RawEvent[] = []
+   509	    for (const [index, item] of raw.entries()) {
+   510	      const parsed = rawEventSchema.safeParse(item)
+   511	      if (!parsed.success) throw invalidRun(runId, `event ${index} ${issueText(parsed.error)}`)
+   512	      if (events.length && parsed.data.sequence <= events[events.length - 1].sequence) throw invalidRun(runId, 'event sequence numbers are not strictly increasing')
+   513	      events.push(parsed.data)
+   514	    }
+   515	    return events
+   516	  }
+   517	}
+   518	
+   519	const artifactRegistrationSchema = z.object({
+   520	  artifact_id: z.string().min(1),
+   521	  kind: z.enum(['patch', 'log', 'screenshot', 'test_report', 'other']),
+   522	  /** Producer registries store the artifact's basename beside the packet; anything else is not followed. */
+   523	  uri: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/),
+   524	  sha256: hex64,
+   525	})
+   526	
+   527	/** Maps a raw event node name onto the pinned graph, or null when it names nothing in this definition. */
+   528	function eventNode(definition: WorkflowDefinition, node: string): string | null {
+   529	  const known = new Set(definition.nodes.map(item => item.node_id))
+   530	  if (known.has(node)) return node
+   531	  const alias = EVENT_ALIASES[node]
+   532	  return alias && known.has(alias) ? alias : null
+   533	}
+   534	
+   535	function hasEvidence(state: RunExport, key: string | undefined): boolean {
+   536	  if (!key) return false
+   537	  if (state.values[key] !== undefined && state.values[key] !== null) return true
+   538	  return state.tasks.some(task => task.result !== null && task.result[key] !== undefined && task.result[key] !== null)
+   539	}
+   540	
+   541	function attemptFromMessage(message: string): number | null {
+   542	  const match = /\bAttempt (\d+)\b/.exec(message)
+   543	  return match ? Number(match[1]) : null
+   544	}
+   545	
+   546	/** Normalizes internal `{sequence,time,node,status,message}` records into workflow-v1 events. */
+   547	export function normalizeEvents(runId: string, definition: WorkflowDefinition, raw: readonly RawEvent[]): WorkflowEvent[] {
+   548	  const attempts = new Map<string, number>()
+   549	  return raw.map(event => {
+   550	    const node_id = eventNode(definition, event.node)
+   551	    let attempt = 0
+   552	    if (node_id) {
+   553	      const parsed = attemptFromMessage(event.message)
+   554	      if (parsed !== null) attempts.set(node_id, parsed)
+   555	      attempt = attempts.get(node_id) ?? 1
+   556	    }
+   557	    // A status only means something for a node in the pinned graph; unattributed records are plain log lines.
+   558	    const status = node_id ? EVENT_STATUS[event.status] ?? null : null
+   559	    return eventSchema.parse({
+   560	      contract_version: '1.0.0', run_id: runId, event_id: `${runId}:${event.sequence}`, sequence: event.sequence, occurred_at: event.time,
+   561	      node_id, attempt, type: status ? 'status_changed' : 'log', status, message: redactPaths(event.message),
+   562	      artifact: null, result_uri: null, reused_from_attempt: null,
+   563	    })
+   564	  })
+   565	}
+   566	
+   567	type NodeStatus = RunSnapshot['nodes'][number]['status']
+   568	
+   569	/**
+   570	 * Projects the persisted graph state onto the pinned definition. Precedence per node: a task error is failed, an
+   571	 * interrupt is awaiting approval, confirmed completion evidence is succeeded (verification nodes additionally need
+   572	 * their registered packet to load, match its hash and have passed), then the last persisted event, then pending.
+   573	 * The run succeeds only once integrated with nothing pending; contradictory evidence is paused.
+   574	 */
+   575	export function projectSnapshot(scope: Scope, definition: WorkflowDefinition, state: RunExport, rawEvents: readonly RawEvent[], packets: readonly LoadedPacket[]): RunSnapshot {
+   576	  const lastEvent = new Map<string, RawEvent>()
+   577	  const eventAttempt = new Map<string, number>()
+   578	  for (const event of rawEvents) {
+   579	    const node = eventNode(definition, event.node)
+   580	    if (!node) continue
+   581	    lastEvent.set(node, event)
+   582	    const attempt = attemptFromMessage(event.message)
+   583	    if (attempt !== null) eventAttempt.set(node, Math.max(attempt, eventAttempt.get(node) ?? 0))
+   584	  }
+   585	  const latestPacket = (phase: 'worker' | 'candidate', worker: string) => packets
+   586	    .filter(packet => packet.phase === phase && packet.node_id === worker).sort((a, b) => b.attempt - a.attempt)[0]
+   587	  const workers = new Set(packets.map(packet => packet.node_id))
+   588	  const nodes = definition.nodes.map(node => {
+   589	    const task = state.tasks.find(candidate => candidate.node_id === node.node_id)
+   590	    const key = EVIDENCE_KEY[node.node_id]
+   591	    const worker = WORKER_OF[node.node_id]
+   592	    const workerPacket = worker ? latestPacket('worker', worker) : undefined
+   593	    let attempt = 0
+   594	    let session_id: string | null = null
+   595	    let result_uri: string | null = null
+   596	    if (worker) {
+   597	      if (workerPacket) {
+   598	        attempt = VERIFY_NODES.has(node.node_id) ? workerPacket.attempt : 1
+   599	        result_uri = resultRoute(scope, state.run_id, 'worker', worker, workerPacket.attempt)
+   600	        const session = workerPacket.ok ? workerPacket.result.session_id : null
+   601	        session_id = typeof session === 'string' && session.length > 0 ? session : null
+   602	      }
+   603	      if (!VERIFY_NODES.has(node.node_id)) {
+   604	        const receipt = state.values[worker]
+   605	        const session = receipt && typeof receipt === 'object' ? (receipt as Record<string, unknown>).session_id : null
+   606	        if (typeof session === 'string' && session.length > 0) session_id = session
+   607	      }
+   608	    }
+   609	    if (node.node_id === 'candidate') attempt = Math.max(0, ...packets.filter(packet => packet.phase === 'candidate').map(packet => packet.attempt))
+   610	    if (VERIFY_NODES.has(node.node_id)) attempt = Math.max(attempt, eventAttempt.get(node.node_id) ?? 0)
+   611	    let status: NodeStatus
+   612	    const event = lastEvent.get(node.node_id)
+   613	    const eventStatus = event ? EVENT_STATUS[event.status] ?? null : null
+   614	    if (task?.error) status = 'failed'
+   615	    else if (task && task.interrupts.length > 0) status = 'awaiting_approval'
+   616	    else if (hasEvidence(state, key)) {
+   617	      if (VERIFY_NODES.has(node.node_id)) status = workerPacket?.ok && workerPacket.gate.status === 'passed' ? 'succeeded' : 'paused'
+   618	      else if (node.node_id === 'candidate') {
+   619	        const latest = [...workers].map(candidate => latestPacket('candidate', candidate)).filter(packet => packet !== undefined)
+   620	        status = latest.length > 0 && latest.every(packet => packet.ok && packet.gate.status === 'passed') ? 'succeeded' : 'paused'
+   621	      } else status = 'succeeded'
+   622	    } else if (eventStatus === 'succeeded') status = key ? 'paused' : 'succeeded'
+   623	    else if (eventStatus) status = eventStatus
+   624	    else status = 'pending'
+   625	    if (status !== 'pending' && attempt === 0) attempt = 1
+   626	    if (status === 'pending') { attempt = 0; session_id = null; result_uri = null }
+   627	    return { node_id: node.node_id, kind: node.kind, depends_on: [...node.depends_on], status, attempt, session_id, result_uri }
+   628	  })
+   629	  const statuses = new Set(nodes.map(node => node.status))
+   630	  const integrated = hasEvidence(state, 'integrated_commit')
+   631	  let status: NodeStatus
+   632	  if (statuses.has('failed')) status = 'failed'
+   633	  else if (statuses.has('awaiting_approval')) status = 'awaiting_approval'
+   634	  else if (statuses.has('paused')) status = 'paused'
+   635	  else if (integrated && state.next.length === 0 && !statuses.has('running') && !statuses.has('pending')) status = 'succeeded'
+   636	  else if (integrated) status = 'paused'
+   637	  else if (statuses.has('running') || state.next.length > 0) status = 'running'
+   638	  else if (statuses.size === 1 && statuses.has('pending')) status = 'pending'
+   639	  else status = 'paused'
+   640	  return { contract_version: '1.0.0', run_id: state.run_id, status, last_sequence: rawEvents.at(-1)?.sequence ?? 0, nodes }
+   641	}
+   642	
+   643	/** Publishes a verified packet's result: scoped artifact links, no worktree paths, and a failed status when the gate did not pass. */
+   644	function projectWorkerResult(scope: Scope, runId: string, nodeId: string, packet: LoadedPacket & { ok: true }): WorkerResult {
+   645	  const raw = packet.result
+   646	  if (raw.run_id !== runId || raw.node_id !== packet.node_id || raw.attempt !== packet.attempt) {
+   647	    throw new ProjectApiError(500, 'EVIDENCE_MISMATCH', 'The verification packet result does not match its registration.')
+   648	  }
+   649	  const passed = packet.gate.status === 'passed'
+   650	  const checks = Array.isArray(raw.checks) ? (raw.checks as Record<string, unknown>[]).map(check => ({ ...check, cwd: `verification/${packet.phase}/${packet.node_id}/${packet.attempt}/worktree` })) : raw.checks
+   651	  const artifacts = Array.isArray(raw.artifacts) ? (raw.artifacts as Record<string, unknown>[]).map(artifact => ({
+   652	    ...artifact, uri: typeof artifact.artifact_id === 'string' ? `${runRoute(scope, runId)}/artifacts/${encodeURIComponent(artifact.artifact_id)}` : artifact.uri,
+   653	  })) : raw.artifacts
+   654	  const assumptions = Array.isArray(raw.open_assumptions) ? raw.open_assumptions.filter(item => typeof item === 'string' && item.trim().length > 0) : raw.open_assumptions
+   655	  const candidate = {
+   656	    contract_version: '1.0.0', run_id: runId, node_id: nodeId, attempt: packet.attempt, session_id: raw.session_id,
+   657	    status: passed ? raw.status : 'failed', base_commit: raw.base_commit, output_commit: raw.output_commit,
+   658	    changed_files: raw.changed_files, checks, open_assumptions: assumptions, artifacts,
+   659	    summary: typeof raw.summary === 'string' ? redactPaths(raw.summary) : raw.summary,
+   660	    error: passed ? raw.error : { code: 'VERIFICATION_BLOCKED', message: redactPaths(packet.gate.reasons.join('; ')) || 'Verification did not pass.', retryable: true },
+   661	  }
+   662	  try {
+   663	    return validateWorkerResult(candidate)
+   664	  } catch (error) {
+   665	    throw new ProjectApiError(500, 'RESULT_INVALID', `The verification packet result does not conform to the worker result contract: ${error instanceof z.ZodError ? issueText(error) : (error as Error).message}`)
+   666	  }
+   667	}

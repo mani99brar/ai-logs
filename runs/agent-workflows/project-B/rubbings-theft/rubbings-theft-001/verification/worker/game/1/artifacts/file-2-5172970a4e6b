@@ -1,0 +1,1010 @@
+import { randomInt } from "node:crypto";
+import { StateView } from "@colyseus/schema";
+import { ErrorCode, matchMaker, Room, ServerError, type AuthContext, type Client, type Deferred } from "colyseus";
+import { privateMatch } from "@pirate-sea-race/content";
+import { encounterRules, type EncounterRules } from "@pirate-sea-race/content/encounters";
+import {
+  createMatchOptionsSchema,
+  DUEL_RECONNECT_SECONDS,
+  DuelMessageType,
+  duelReadyMessageSchema,
+  JoinRefusal,
+  joinMatchOptionsSchema,
+  MATCH_CODE_REQUIRED_MESSAGE,
+  MATCH_ROOM,
+  MATCH_UNAVAILABLE_MESSAGE,
+  matchFullMessage,
+  MAX_CHOOSE_THEFT_PER_SECOND,
+  MAX_INPUT_MESSAGES_PER_SECOND,
+  MessageType,
+  NO_SUCH_MATCH_MESSAGE,
+  PROTOCOL_VERSION,
+  RubbingMessageType,
+  validateChooseTheftMessage,
+} from "@pirate-sea-race/protocol";
+import {
+  addShip,
+  canSee,
+  createMatchState,
+  defaultSimulationConfig,
+  GRAPPLE_BUTTON,
+  INTERACT_BUTTON,
+  isWorldStep,
+  NEUTRAL_INPUT,
+  NOT_DOCKED,
+  placeShip,
+  pointInSight,
+  removeShip,
+  returnShip,
+  step,
+  STEPS_PER_SECOND,
+  stopShip,
+  visibleShipIds,
+  WORLD_STEP_INTERVAL,
+  type MatchState,
+  type Placement,
+  type PlayerInput,
+} from "@pirate-sea-race/simulation";
+import type { PlayerIndex } from "@pirate-sea-race/simulation/duel";
+import {
+  createEncounterConfig,
+  createEncounterState,
+  duelOf,
+  stepEncounters,
+  type DuelReport,
+  type EncounterConfig,
+  type EncounterEvent,
+  type EncounterPlayerInput,
+  type EncounterState,
+} from "@pirate-sea-race/simulation/encounters";
+import type { DuelAuthority } from "@pirate-sea-race/simulation/netcode";
+import {
+  addPlayer,
+  advanceLedger,
+  cacheRubbings,
+  cancelChannel,
+  checkLedger,
+  chooseTheft,
+  disconnectPlayer,
+  eligibleTheftTypes,
+  expireReservation,
+  findDuel,
+  findPlayer,
+  heldTypes,
+  objectiveRules,
+  progressChannel,
+  quitPlayer,
+  reconnectPlayer,
+  reportDuelResult,
+  reserveDuel,
+  startCacheClaim,
+  startCollect,
+  type LedgerChannel,
+  type LedgerDuel,
+  type LedgerState,
+  type ObjectiveRules,
+} from "@pirate-sea-race/simulation/objectives";
+import { admitSeat, authorizePrivateEntry, type AdmissionRules } from "./admission.js";
+import { DuelMachine, type DuelDiagnostics, type DuelOutcome } from "./duelMachine.js";
+import { InputGate } from "./inputGate.js";
+import { generateMatchCode } from "./matchCode.js";
+import { cachedTypesAt, cacheDock, createMatchLedger, dockCentre, interactTarget, nearestDockBySea, sealedTypesAt, type InteractTarget } from "./objectives.js";
+import {
+  CacheMarkerSchema,
+  DuelMarkerSchema,
+  GrappleSchema,
+  MatchStateSchema,
+  PlayerStatusSchema,
+  SeaDuelSchema,
+  ShipSchema,
+} from "./schema.js";
+
+/**
+ * The room's listing: private matches are found by `code` (Colyseus `filterBy`). It never holds the
+ * creator's `createToken`, so a request carrying a token matches no listing.
+ */
+export interface MatchMetadata {
+  code: string;
+  custom: boolean;
+  /** A `filterBy` field that is never set: no listing holds a token, so no token-carrying request matches one. */
+  createToken?: never;
+}
+
+/** World updates go out at 20 Hz, the world simulation rate (§15). */
+const PATCH_INTERVAL_MS = 1000 / 20;
+
+/** World ticks a second (§15). */
+const WORLD_TICKS_PER_SECOND = STEPS_PER_SECOND / WORLD_STEP_INTERVAL;
+
+/**
+ * World ticks a settled duel's lobby stays in its fighters' views, so both read the result before their clients return
+ * to the sea (2 s). The winner's protection and the loser's respawn already run meanwhile.
+ */
+export const DUEL_RESULT_TICKS = 40;
+
+/**
+ * Colyseus' reconnection window (§12): only an outer bound that keeps the socket's seat open. The world tick decides
+ * everything else (the 60 s seat reservation, the 10 s duel absence); if this window closes first, it is a quit.
+ */
+export const RECONNECTION_OUTER_BOUND_SECONDS = 70;
+
+/** The key suffix of a grapple's blanked twin, the entry for viewers who see the attacker but not the defender (§16). */
+export const BLANK_GRAPPLE_SUFFIX = "~";
+
+/**
+ * A match's timings and test-only settings. Production uses `DEFAULT_MATCH_TUNING`; tests shorten the timings through
+ * `startGameServer({ matchTuning })` (never read by the production entry), and assert in world ticks.
+ */
+export interface MatchTuning {
+  /** The ledger's rules (§4, §11, §12): collection and claim holds, the theft window, the seat reservation, gold. */
+  readonly objectives: ObjectiveRules;
+  /** The encounter rules (§6): windups, the countdown and ready check, protections, the respawn delay. */
+  readonly encounters: EncounterRules;
+  /** §12: world ticks a fighter may be away from an unfinished duel before forfeiting it (10 s). */
+  readonly duelAbsenceTicks: number;
+  /** Colyseus' reconnection window, the outer bound (70 s). */
+  readonly reconnectionSeconds: number;
+  /** Test-only: deal the sources in this layout (types per island) instead of the private shuffle. */
+  readonly sourceLayout: readonly (readonly string[])[] | undefined;
+  /** Check `checkLedger` and the room's own invariant after every world tick (development and tests). */
+  readonly checkInvariants: boolean;
+}
+
+export const DEFAULT_MATCH_TUNING: MatchTuning = {
+  objectives: objectiveRules,
+  encounters: encounterRules,
+  duelAbsenceTicks: DUEL_RECONNECT_SECONDS * WORLD_TICKS_PER_SECOND,
+  reconnectionSeconds: RECONNECTION_OUTER_BOUND_SECONDS,
+  sourceLayout: undefined,
+  checkInvariants: true,
+};
+
+/** A duel at sea: the encounter rules' duel, its synced lobby and marker, and the duel machine the fighters play. */
+interface SeaDuel {
+  /** The encounter rules' duel id, also the ledger's. */
+  readonly id: string;
+  /** The opaque key of its lobby and marker in the synced state. */
+  readonly key: string;
+  /** Attacker (slot 0), then the grappled player (slot 1). */
+  readonly players: readonly [string, string];
+  readonly lobby: SeaDuelSchema;
+  readonly machine: DuelMachine;
+  /** The rules' ready check ended it (a forfeit or a cancellation), so no end report goes back to them. */
+  endedByRules: boolean;
+  /** The fight's end went to the rules (or they decided it themselves). */
+  ended: boolean;
+  /** The ledger's settlement went to the rules. */
+  settled: boolean;
+  /** The world tick after which the lobby leaves the fighters' views, once settled. */
+  removeAfterTick: number | undefined;
+}
+
+/** A player whose connection dropped (§12): their seat's outer bound, and since when they are away from a duel. */
+interface Away {
+  readonly reconnection: Deferred<Client> | undefined;
+  /** The world tick they dropped out of an unfinished duel; undefined outside one. */
+  duelAbsentSince: number | undefined;
+}
+
+/** What a player last saw of their own holds and duels, for their HUD. */
+interface Notices {
+  channelResult: string;
+  channelResultAt: number;
+  settledRole: string;
+  stolen: string;
+  goldChange: number;
+  settledAt: number;
+}
+
+/** What tests and diagnostics read about a duel at sea. */
+export interface SeaDuelDiagnostics extends DuelDiagnostics {
+  readonly id: string;
+  readonly outcome: DuelOutcome | undefined;
+  readonly players: readonly [string, string];
+  readonly seed: number;
+  readonly inputLog: ReturnType<DuelAuthority["inputLog"]>;
+}
+
+/** Checks a create or join request for a match before matchmaking places it (see `authorizePrivateEntry`). */
+export async function authorizeEntry(options: unknown): Promise<true> {
+  return authorizePrivateEntry(options, MATCH_ADMISSION);
+}
+
+/** A match's admission: the `match` listing, the match option schemas and the match refusal messages. */
+const MATCH_ADMISSION: AdmissionRules = {
+  roomName: MATCH_ROOM,
+  createSchema: createMatchOptionsSchema,
+  joinSchema: joinMatchOptionsSchema,
+  noSuchMessage: NO_SUCH_MATCH_MESSAGE,
+  codeRequiredMessage: MATCH_CODE_REQUIRED_MESSAGE,
+  fullMessage: matchFullMessage,
+};
+
+const sameTarget = (channel: LedgerChannel | null, target: InteractTarget): boolean =>
+  channel !== null &&
+  (target.kind === "collect"
+    ? channel.kind === "collect" && channel.sourceId === target.sourceId
+    : channel.kind === "claim" && channel.cacheId === target.cacheId && channel.rubbingId === target.rubbingId);
+
+/**
+ * One private match (§14): the only writer of its state. It runs the shared simulation on a 60 Hz fixed step,
+ * applies validated client intent, and mirrors the simulation into the synced schema after every world step.
+ *
+ * Encounters (§6): each world step the room builds the tick's snapshot for `stepEncounters` (every ship, whether its
+ * player is connected, pressed the grapple, or has a loaded arena) and applies the events: a landed grapple stops both
+ * ships and opens a duel at sea, a `DuelMachine` (the standalone duel room's own) whose fight starts when the rules
+ * say so; its end goes back as a report; the returns and respawns move ships. Reserved and respawning ships get
+ * neutral input.
+ *
+ * Rubbings (§4, §11, §12): the objective ledger is the only writer of rubbings and gold; the room calls its operations
+ * and never moves either itself. Holding E moored at an island's dock collects its first eligible source, or else
+ * claims a rubbing from a recovery cache at that dock. A reservation reserves the duel in the ledger; the fight's end
+ * is reported to it; the room reports `settled` to the encounter rules only when the ledger has settled the duel (the
+ * winner's theft choice, or the default at the deadline), and only then do the players return. The world tick drives
+ * every §12 timer: a drop disconnects the player in the ledger at once (the ship stays, and can be grappled), a
+ * fighter away from an unfinished duel forfeits it after `duelAbsenceTicks`, the seat expires at the ledger's
+ * deadline into a cache at the respawn dock, and any other leave is a quit into a cache at the nearest dock by sea.
+ * No path removes a ship while the ledger still counts its player; `checkInvariants` checks that and `checkLedger`
+ * after every tick.
+ *
+ * Visibility (§16): every client has a Colyseus StateView. After each mirror the room puts into it the client's own
+ * ship and every ship inside that ship's sight radius, and takes out the rest, so a ship out of sight is never encoded
+ * into that client's patches. Ships in a duel or waiting to respawn are hidden from everyone else (a duel shows as a
+ * marker). Grapples, markers and caches are filtered by the same sight rule (a grapple's target is blanked for a
+ * viewer who cannot see it); a player's status (gold, rubbings, what their island and dock hold, their theft choice)
+ * and duel go to that player only, and a duel's frames and probes are messages to its two fighters. A fighter or a
+ * player waiting to respawn sees no other ship. Terrain is static content every client already has, so it is not
+ * synced at all.
+ */
+export class MatchRoom extends Room<{ state: MatchStateSchema; metadata: MatchMetadata }> {
+  override maxClients = privateMatch.maxPlayers;
+  /** A flood ceiling: past it Colyseus disconnects the client. Excess input is dropped well below it, in InputGate. */
+  override maxMessagesPerSecond = MAX_INPUT_MESSAGES_PER_SECOND * 4;
+  override patchRate = PATCH_INTERVAL_MS;
+  override state = new MatchStateSchema();
+
+  private readonly config = defaultSimulationConfig;
+  private tuning: MatchTuning = DEFAULT_MATCH_TUNING;
+  private encounterConfig: EncounterConfig = createEncounterConfig({ map: defaultSimulationConfig.map });
+  private simulation: MatchState = createMatchState(0);
+  private encounters: EncounterState = createEncounterState(this.encounterConfig);
+  private ledger: LedgerState = createMatchLedger({ map: defaultSimulationConfig.map, seed: 0, rules: objectiveRules });
+  private readonly gates = new Map<string, InputGate>();
+  /** Duels at sea by encounter id, from the grapple until their lobby leaves the fighters' views. */
+  private readonly seaDuels = new Map<string, SeaDuel>();
+  private nextDuelKey = 1;
+  /** Players whose connection dropped and who have not come back or left. */
+  private readonly away = new Map<string, Away>();
+  /** Players who started a collection or cache claim this tick: their protection ends on the next (§6). */
+  private protectionEndedNext = new Set<string>();
+  private readonly notices = new Map<string, Notices>();
+  /** Ledger duels whose settlement is already in the players' notices. */
+  private readonly noticed = new Set<string>();
+  /** Theft choices per session in the current second, for the rate cap. */
+  private readonly choiceRate = new Map<string, { windowStart: number; count: number }>();
+  /** Reports the rules refused (none are expected), for tests. */
+  private refusedReports = 0;
+  /** Ledger requests the room made that the ledger refused, by operation and reason, for tests. */
+  private readonly refusals: string[] = [];
+  /** Invariant violations found after a world tick (none are expected), for tests. */
+  private readonly violations: string[] = [];
+  /** The creator's one-time token; cleared once the creator's seat is taken. */
+  private createToken: string | undefined;
+
+  static override async onAuth(_token: string, options: unknown, _context: AuthContext): Promise<true> {
+    return authorizeEntry(options);
+  }
+
+  /** The match's timings; the server's test-only setting overrides it in a subclass (`startGameServer`). */
+  protected matchTuning(): MatchTuning {
+    return DEFAULT_MATCH_TUNING;
+  }
+
+  override async onCreate(options: unknown): Promise<void> {
+    // Only a token-carrying request creates a match. A join by code reaches here only when its match filled up or
+    // closed after authorizeEntry admitted it (joinOrCreate then falls back to create).
+    const parsed = createMatchOptionsSchema.safeParse(options);
+    if (!parsed.success) throw new ServerError(ErrorCode.MATCHMAKE_INVALID_CRITERIA, MATCH_UNAVAILABLE_MESSAGE);
+    this.createToken = parsed.data.createToken;
+    const code = await this.allocateCode();
+    this.tuning = this.matchTuning();
+    this.encounterConfig = createEncounterConfig({ map: this.config.map, rules: this.tuning.encounters });
+    this.encounters = createEncounterState(this.encounterConfig);
+    this.simulation = createMatchState(randomInt(0, 2 ** 32));
+    // The ledger's seed is the room's own private randomness, never the public match code (§3, §16).
+    this.ledger = createMatchLedger({ map: this.config.map, seed: randomInt(0, 2 ** 32), rules: this.tuning.objectives, layout: this.tuning.sourceLayout });
+    this.state.code = code;
+    this.state.protocolVersion = PROTOCOL_VERSION;
+    this.state.custom = privateMatch.custom;
+    // Colyseus copied the filterBy fields of the create request, the token among them, into the listing's metadata.
+    // Replacing the metadata drops the token before the listing is first stored.
+    await this.setMatchmaking({ metadata: { code, custom: privateMatch.custom } });
+
+    this.onMessage(MessageType.Input, (client, message: unknown) => {
+      this.gates.get(client.sessionId)?.receive(message, this.simulation.frame);
+    });
+    // A duel's messages reach only its machine, and only from its two fighters.
+    this.onMessage(DuelMessageType.Input, (client, message: unknown) => this.duelOfSession(client.sessionId)?.machine.receiveInput(client.sessionId, message));
+    this.onMessage(DuelMessageType.Probe, (client, message: unknown) => this.duelOfSession(client.sessionId)?.machine.receiveProbeReply(client.sessionId, message));
+    this.onMessage(DuelMessageType.Ready, (client, message: unknown) => {
+      if (duelReadyMessageSchema.safeParse(message).success) this.duelOfSession(client.sessionId)?.machine.markReady(client.sessionId);
+    });
+    this.onMessage(RubbingMessageType.ChooseTheft, (client, message: unknown) => this.receiveTheftChoice(client.sessionId, message));
+    // Unknown message types are dropped, not answered: Colyseus would otherwise disconnect the sender.
+    this.onMessage("*", () => undefined);
+    this.setFixedTimestep(() => this.advance(), STEPS_PER_SECOND);
+  }
+
+  /**
+   * The room's own admission check, which also covers `joinById` (no listing filter applies there): the one seat
+   * carrying the creator's token, then only seats carrying this match's code. Throwing refuses and frees the seat.
+   */
+  override onJoin(client: Client, options: unknown): void {
+    this.admit(options);
+    this.simulation = addShip(this.config, this.simulation, client.sessionId);
+    this.ledgerStep("addPlayer", addPlayer(this.ledger, { playerId: client.sessionId, tick: this.simulation.worldTick }));
+    this.gates.set(client.sessionId, new InputGate());
+    client.view = new StateView();
+    this.mirror();
+  }
+
+  /**
+   * A player's connection dropped without leaving (§12). The ledger marks them disconnected at once (their hold is
+   * cancelled and their seat reserved until its deadline); the ship stays in the world and can be grappled. A fighter
+   * in an unfinished duel is marked away, the fight going on with their input substituted, and forfeits if still away
+   * after `duelAbsenceTicks`. Colyseus keeps the socket's seat for the outer bound only.
+   */
+  override onDrop(client: Client): void {
+    const id = client.sessionId;
+    const tick = this.simulation.worldTick;
+    this.ledgerStep("disconnectPlayer", disconnectPlayer(this.ledger, { playerId: id, tick }));
+    const duel = this.duelOfSession(id);
+    const fighting = duel !== undefined && duel.machine.outcome === undefined;
+    if (fighting) duel.machine.drop(id);
+    const reconnection = this.allowReconnection(client, this.tuning.reconnectionSeconds);
+    reconnection.catch(() => undefined);
+    this.away.set(id, { reconnection, duelAbsentSince: fighting ? tick : undefined });
+  }
+
+  /** The same player is back before the deadline: the same identity, view, ship and rubbings; a fighter resumes. */
+  override onReconnect(client: Client): void {
+    const id = client.sessionId;
+    this.away.delete(id);
+    this.ledgerStep("reconnectPlayer", reconnectPlayer(this.ledger, { playerId: id, tick: this.simulation.worldTick }));
+    this.duelOfSession(id)?.machine.reconnect(id);
+  }
+
+  /**
+   * A player is gone for good. Unless the reservation already expired (the world tick removed them), this is a quit:
+   * a consented leave, or Colyseus' outer bound closing first. The ledger forfeits a duel in progress and sends the
+   * rest of their rubbings into a cache at the dock nearest their ship by sea; then the ship leaves.
+   */
+  override onLeave(client: Client): void {
+    const id = client.sessionId;
+    if (findPlayer(this.ledger, id)?.status !== "left") this.quit(id);
+    this.removePlayer(id);
+    client.view?.dispose();
+    client.view = undefined;
+    this.mirror();
+  }
+
+  /**
+   * Test-only (the server's test-placement setting, off by default): puts a player's ship at rest on a navigable tile.
+   * Visibility follows at once, as after any move.
+   */
+  placeShip(sessionId: string, placement: Placement): void {
+    this.simulation = placeShip(this.config, this.simulation, sessionId, placement);
+    this.mirror();
+  }
+
+  /** The ship ids a client's view holds, for tests and diagnostics. */
+  viewedShipIds(sessionId: string): string[] {
+    const view = this.clients.get(sessionId)?.view;
+    if (view === undefined) return [];
+    return [...this.state.ships.values()].filter((ship) => view.has(ship)).map((ship) => ship.id);
+  }
+
+  /** Inputs dropped per client and reason, for tests and diagnostics. */
+  droppedInputs(sessionId: string): InputGate["dropped"] | undefined {
+    return this.gates.get(sessionId)?.dropped;
+  }
+
+  /** The encounter rules' state, for tests. */
+  get encounterState(): EncounterState {
+    return this.encounters;
+  }
+
+  /** The simulation state, for tests. */
+  get matchState(): MatchState {
+    return this.simulation;
+  }
+
+  /** The objective ledger, for tests. */
+  get ledgerState(): LedgerState {
+    return this.ledger;
+  }
+
+  /** The match's timings, for tests. */
+  get timings(): MatchTuning {
+    return this.tuning;
+  }
+
+  /** Reports the encounter rules refused, for tests (none are expected). */
+  get refusedDuelReports(): number {
+    return this.refusedReports;
+  }
+
+  /** Ledger requests the room made and the ledger refused, as "operation: reason", for tests. */
+  get ledgerRefusals(): readonly string[] {
+    return this.refusals;
+  }
+
+  /** Invariant violations found after any world tick so far (none are expected), for tests. */
+  get invariantViolations(): readonly string[] {
+    return this.violations;
+  }
+
+  /** The duel at sea a player is in (until its lobby leaves their view), for tests and the harness. */
+  seaDuelDiagnostics(sessionId: string): SeaDuelDiagnostics | undefined {
+    const duel = this.duelOfSession(sessionId);
+    if (duel === undefined) return undefined;
+    return { ...duel.machine.diagnostics(), id: duel.id, outcome: duel.machine.outcome, players: duel.players, seed: duel.lobby.seed, inputLog: duel.machine.authority.inputLog() };
+  }
+
+  private admit(options: unknown): void {
+    this.createToken = admitSeat(options, { code: this.state.code, createToken: this.createToken }, MATCH_ADMISSION);
+  }
+
+  /** Applies a ledger step, and remembers a refusal (the room checks before it asks, so none are expected). */
+  private ledgerStep<R extends { readonly ok: boolean; readonly rejection: string | null }>(operation: string, stepped: { state: LedgerState; result: R }): R {
+    this.ledger = stepped.state;
+    if (!stepped.result.ok) this.refusals.push(`${operation}: ${stepped.result.rejection}`);
+    return stepped.result;
+  }
+
+  private advance(): void {
+    const frame = this.simulation.frame + 1;
+    const inputs: Record<string, PlayerInput> = {};
+    const held = this.heldPlayers();
+    for (const [sessionId, gate] of this.gates) {
+      // A reserved or respawning ship ignores its player's helm (§6).
+      if (held.has(sessionId)) inputs[sessionId] = NEUTRAL_INPUT;
+      // A lapsed client gets no entry: its ship sails as neutral, but keeps its mooring throttle until real input.
+      else if (!gate.lapsedAt(frame)) inputs[sessionId] = gate.inputAt(frame);
+    }
+    this.simulation = step(this.config, this.simulation, inputs);
+    for (const duel of this.seaDuels.values()) duel.machine.advance();
+    if (!isWorldStep(this.simulation.frame)) return;
+    const tick = this.simulation.worldTick;
+    // The ledger's clock first: choice windows that closed settle with the default theft.
+    this.ledgerStep("advanceLedger", advanceLedger(this.ledger, { tick }));
+    this.runAbsences(tick);
+    this.stepEncounters(frame, held);
+    this.stepChannels(frame, tick);
+    for (const gate of this.gates.values()) gate.worldStepTaken();
+    this.noteSettlements();
+    this.checkInvariants(tick);
+    this.mirror();
+  }
+
+  /** Players whose ship is reserved for a duel (until it is settled) or waits out of the world to respawn. */
+  private heldPlayers(): Set<string> {
+    const held = new Set<string>();
+    for (const duel of this.encounters.duels) for (const id of duel.players) held.add(id);
+    for (const player of this.encounters.players) if (player.respawn !== null) held.add(player.id);
+    return held;
+  }
+
+  /** The duel at sea a session fights in (until its lobby is removed). */
+  private duelOfSession(sessionId: string): SeaDuel | undefined {
+    for (const duel of this.seaDuels.values()) if (duel.players.includes(sessionId)) return duel;
+    return undefined;
+  }
+
+  /** Takes a settled duel's lobby out of its fighters' views. */
+  private closeSeaDuel(duel: SeaDuel): void {
+    this.state.duels.delete(duel.key);
+    this.seaDuels.delete(duel.id);
+  }
+
+  /**
+   * §12 on the world tick: a fighter away from an unfinished duel for `duelAbsenceTicks` forfeits it (the duel goes on
+   * to its settlement; they keep their seat); a disconnected player whose reservation deadline has come is removed,
+   * their remaining rubbings going into a cache at the respawn dock the encounter rules would choose.
+   */
+  private runAbsences(tick: number): void {
+    for (const [id, away] of this.away) {
+      if (away.duelAbsentSince === undefined) continue;
+      const duel = this.duelOfSession(id);
+      if (duel === undefined || duel.machine.outcome !== undefined) away.duelAbsentSince = undefined;
+      else if (tick - away.duelAbsentSince >= this.tuning.duelAbsenceTicks) {
+        duel.machine.leave(id);
+        away.duelAbsentSince = undefined;
+      }
+    }
+    for (const player of this.ledger.players) {
+      if (player.status !== "disconnected" || player.reservationDeadline === null || tick < player.reservationDeadline) continue;
+      const position = this.respawnDockOf(player.id);
+      this.ledgerStep("expireReservation", expireReservation(this.ledger, { playerId: player.id, tick, position }));
+      const duel = this.duelOfSession(player.id);
+      if (duel !== undefined && duel.machine.outcome === undefined) duel.machine.leave(player.id);
+      const away = this.away.get(player.id);
+      this.removePlayer(player.id);
+      // The socket's seat goes too: Colyseus then calls onLeave, which finds the player already gone.
+      if (typeof away?.reconnection?.reject === "function") away.reconnection.reject(false);
+    }
+  }
+
+  /** §12 expiry: the dock the encounter rules would respawn this player at, from where their ship is (or waits). */
+  private respawnDockOf(id: string): { x: number; y: number } {
+    const ship = this.simulation.ships.find((each) => each.id === id);
+    const respawn = this.encounters.players.find((each) => each.id === id)?.respawn ?? null;
+    const from = respawn !== null ? { x: respawn.x, y: respawn.y } : ship !== undefined ? { x: ship.x, y: ship.y } : dockCentre(this.config.map, 0);
+    const waiting = new Set(this.encounters.players.filter((each) => each.respawn !== null).map((each) => each.id));
+    const opponents = this.simulation.ships.filter((each) => each.id !== id && !waiting.has(each.id)).map((each) => ({ x: each.x, y: each.y }));
+    const point = this.encounterConfig.modes.ship.rules.respawnPoint({ encounter: from, own: from, opponents, clearRadius: this.encounterConfig.respawnClearRadius });
+    return { x: point.x, y: point.y };
+  }
+
+  /** §12 quit: a duel in progress is forfeited (in the ledger and in the fight), the rest goes to the nearest dock. */
+  private quit(id: string): void {
+    const ship = this.simulation.ships.find((each) => each.id === id);
+    const at = ship ?? dockCentre(this.config.map, 0);
+    const position = dockCentre(this.config.map, nearestDockBySea(this.config.map, at.x, at.y));
+    this.ledgerStep("quitPlayer", quitPlayer(this.ledger, { playerId: id, tick: this.simulation.worldTick, position }));
+    const duel = this.duelOfSession(id);
+    if (duel !== undefined && duel.machine.outcome === undefined) duel.machine.leave(id);
+  }
+
+  /** The ship and the input channel of a player who has left the ledger's match. */
+  private removePlayer(id: string): void {
+    this.simulation = removeShip(this.simulation, id);
+    this.gates.delete(id);
+    this.away.delete(id);
+    this.choiceRate.delete(id);
+  }
+
+  /**
+   * One world tick of §6 (`stepEncounters`): this tick's snapshot of every ship, the reports of duels that ended since
+   * the last tick and of duels the ledger has settled, then the events applied. The rules alone choose targets, land
+   * or miss grapples, start fights and decide returns; the room moves ships and runs the duels.
+   */
+  private stepEncounters(frame: number, held: ReadonlySet<string>): void {
+    const tick = this.simulation.worldTick;
+    const endedBy = this.protectionEndedNext;
+    this.protectionEndedNext = new Set();
+    const players: EncounterPlayerInput[] = this.simulation.ships.map((ship) => {
+      const gate = this.gates.get(ship.id);
+      const duel = this.duelOfSession(ship.id);
+      return {
+        id: ship.id,
+        mode: "ship",
+        x: ship.x,
+        y: ship.y,
+        heading: ship.heading,
+        connected: this.clients.get(ship.id) !== undefined,
+        attack: !held.has(ship.id) && gate !== undefined && !gate.lapsedAt(frame) && (gate.inputAt(frame).buttons & GRAPPLE_BUTTON) !== 0,
+        ready: duel?.machine.isReady(ship.id) === true,
+        // §6: last tick's collection or cache claim ended this player's protection.
+        protectionEndedBy: endedBy.has(ship.id) ? "collection" : null,
+      };
+    });
+    const stepped = stepEncounters(this.encounterConfig, this.encounters, { tick, players, reports: this.duelReports(tick), matchOver: false });
+    this.encounters = stepped.state;
+    for (const event of stepped.events) this.apply(event);
+    for (const duel of [...this.seaDuels.values()]) if (duel.removeAfterTick !== undefined && tick > duel.removeAfterTick) this.closeSeaDuel(duel);
+  }
+
+  /**
+   * The reports for this tick. A fight that ended since the last tick is reported to the ledger (unless a player's
+   * leaving already decided it there) and its end to the rules, as the ledger recorded it. A duel the ledger has
+   * settled (at once for a draw, a cancellation or a win with nothing to steal; otherwise at the winner's choice or the
+   * deadline's default) gets its `settled` report, never before: only then do its players return.
+   */
+  private duelReports(tick: number): DuelReport[] {
+    const reports: DuelReport[] = [];
+    for (const duel of this.seaDuels.values()) {
+      const outcome = duel.machine.outcome;
+      if (outcome !== undefined && !duel.ended) {
+        duel.ended = true;
+        if (findDuel(this.ledger, duel.id)?.phase === "fighting") {
+          const winner = outcome.winner === null ? null : duel.players[outcome.winner];
+          // §12: both fighters forfeiting on the same frame cancels; a double KO or an exact tie is a draw.
+          const result = winner !== null ? "win" : outcome.reason === "forfeit" || outcome.reason === "cancelled" ? "cancelled" : "draw";
+          this.ledgerStep("reportDuelResult", reportDuelResult(this.ledger, { duelId: duel.id, tick, outcome: result, ...(winner !== null ? { winner } : {}) }));
+        }
+        if (!duel.endedByRules) reports.push(this.endReport(duel, tick));
+      }
+      if (!duel.ended || duel.settled) continue;
+      const settled = findDuel(this.ledger, duel.id);
+      if (settled === undefined || settled.phase === "settled") {
+        duel.settled = true;
+        const endTick = this.encounters.duels.find((each) => each.id === duel.id)?.end?.tick ?? tick;
+        reports.push({ kind: "settled", duelId: duel.id, tick: Math.min(tick, Math.max(endTick, settled?.settlement?.tick ?? tick)) });
+      }
+    }
+    return reports;
+  }
+
+  /** The end report of a fight, as the ledger recorded its result (a quit may have decided it there first). */
+  private endReport(duel: SeaDuel, tick: number): DuelReport {
+    const result = findDuel(this.ledger, duel.id)?.result;
+    if (result?.outcome === "win" && result.winner !== null) return { kind: "end", duelId: duel.id, tick, outcome: "win", winner: result.winner };
+    if (result !== null && result !== undefined) return { kind: "end", duelId: duel.id, tick, outcome: result.outcome === "draw" ? "draw" : "cancelled" };
+    const outcome = duel.machine.outcome!;
+    if (outcome.winner !== null) return { kind: "end", duelId: duel.id, tick, outcome: "win", winner: duel.players[outcome.winner] };
+    return { kind: "end", duelId: duel.id, tick, outcome: outcome.reason === "forfeit" || outcome.reason === "cancelled" ? "cancelled" : "draw" };
+  }
+
+  private apply(event: EncounterEvent): void {
+    switch (event.kind) {
+      case "duel-reserved":
+        this.ledgerStep("reserveDuel", reserveDuel(this.ledger, { duelId: event.duelId, players: event.players, tick: event.tick }));
+        this.openSeaDuel(event.duelId, event.players, event.x, event.y, event.tick);
+        return;
+      case "duel-started":
+        this.seaDuels.get(event.duelId)?.machine.start();
+        return;
+      case "duel-forfeited":
+      case "duel-cancelled": {
+        const duel = this.seaDuels.get(event.duelId);
+        if (findDuel(this.ledger, event.duelId)?.phase === "fighting") {
+          const report = event.kind === "duel-cancelled" ? { outcome: "cancelled" as const } : { outcome: "win" as const, winner: event.winner };
+          this.ledgerStep("reportDuelResult", reportDuelResult(this.ledger, { duelId: event.duelId, tick: event.tick, ...report }));
+        }
+        if (duel === undefined) return;
+        duel.endedByRules = true;
+        duel.ended = true;
+        if (event.kind === "duel-cancelled") duel.machine.end(null, "cancelled");
+        else duel.machine.end(duel.players.indexOf(event.winner) as PlayerIndex, "forfeit");
+        return;
+      }
+      case "duel-settled": {
+        const duel = this.seaDuels.get(event.duelId);
+        if (duel === undefined) return;
+        duel.removeAfterTick = event.tick + DUEL_RESULT_TICKS;
+        this.state.markers.delete(duel.key);
+        return;
+      }
+      case "player-returned":
+      case "player-respawned":
+        if (!this.simulation.ships.some((ship) => ship.id === event.playerId)) return;
+        this.simulation = returnShip(this.config, this.simulation, event.playerId, {
+          x: event.x,
+          y: event.y,
+          dock: event.kind === "player-respawned" ? (event.dockId ?? NOT_DOCKED) : NOT_DOCKED,
+        });
+        return;
+      case "report-refused":
+        this.refusedReports++;
+        return;
+      default:
+        // Attempts, protection and the loser's wait are mirrored from the rules' state.
+        return;
+    }
+  }
+
+  /** A grapple landed: both ships stop, and their duel's countdown starts, in its lobby and marker. */
+  private openSeaDuel(id: string, players: readonly [string, string], x: number, y: number, tick: number): void {
+    // A winner who attacks again while the last result is still showing: that lobby goes now.
+    for (const duel of [...this.seaDuels.values()]) if (duel.players.some((player) => players.includes(player))) this.closeSeaDuel(duel);
+    for (const player of players) if (this.simulation.ships.some((ship) => ship.id === player)) this.simulation = stopShip(this.simulation, player);
+    const key = `d${this.nextDuelKey++}`;
+    const lobby = new SeaDuelSchema();
+    lobby.code = this.state.code;
+    lobby.practice = false;
+    this.state.duels.set(key, lobby);
+    const machine = new DuelMachine({
+      lobby,
+      seed: randomInt(0, 2 ** 32),
+      start: "called",
+      send: (sessionId, type, message) => this.clients.get(sessionId)?.send(type, message),
+    });
+    players.forEach((player, slot) => {
+      machine.addSeat(player, slot as PlayerIndex);
+      if (this.clients.get(player) === undefined) machine.drop(player);
+    });
+    // A player grappled while away counts as away from the duel from its start.
+    for (const player of players) {
+      const away = this.away.get(player);
+      if (away !== undefined) away.duelAbsentSince = tick;
+    }
+    machine.beginCountdown();
+    const marker = new DuelMarkerSchema();
+    marker.x = x;
+    marker.y = y;
+    marker.startTick = tick;
+    this.state.markers.set(key, marker);
+    this.seaDuels.set(id, { id, key, players, lobby, machine, endedByRules: false, ended: false, settled: false, removeAfterTick: undefined });
+  }
+
+  /**
+   * §4 and §12's holds, one world tick: a connected player moored at a dock, out of any duel and holding E works on
+   * E's target there (`interactTarget`). The same target as their hold continues it; another starts a new hold from
+   * zero; no E, no mooring or no target cancels it (the ledger's rule: progress resets). Starting one ends protection
+   * on the next tick.
+   */
+  private stepChannels(frame: number, tick: number): void {
+    const held = this.heldPlayers();
+    const ships = new Map(this.simulation.ships.map((ship) => [ship.id, ship]));
+    for (const player of this.ledger.players) {
+      if (player.status !== "connected") continue;
+      const id = player.id;
+      const ship = ships.get(id);
+      const gate = this.gates.get(id);
+      const holding =
+        ship !== undefined && gate !== undefined && ship.dock !== NOT_DOCKED && !held.has(id) && !gate.lapsedAt(frame) && (gate.inputAt(frame).buttons & INTERACT_BUTTON) !== 0;
+      const target = holding ? interactTarget(this.ledger, this.config.map, id, ship.dock) : undefined;
+      if (target === undefined) {
+        if (player.channel !== null) this.ledgerStep("cancelChannel", cancelChannel(this.ledger, { playerId: id, tick }));
+        continue;
+      }
+      if (sameTarget(player.channel, target)) {
+        const result = this.ledgerStep("progressChannel", progressChannel(this.ledger, { playerId: id, tick }));
+        if (result.status === "collected" || result.status === "claimed" || result.status === "failed") {
+          const notice = this.noticesOf(id);
+          notice.channelResult = result.status === "failed" ? `failed:${result.failure}` : `${result.status}:${target.type}`;
+          notice.channelResultAt = tick;
+        }
+        continue;
+      }
+      const started =
+        target.kind === "collect"
+          ? this.ledgerStep("startCollect", startCollect(this.ledger, { playerId: id, sourceId: target.sourceId, tick }))
+          : this.ledgerStep("startCacheClaim", startCacheClaim(this.ledger, { playerId: id, cacheId: target.cacheId, rubbingId: target.rubbingId, tick }));
+      if (started.ok) this.protectionEndedNext.add(id);
+    }
+  }
+
+  /** §4's theft choice from a client: the winner of a duel at sea, in its window, for an eligible type. */
+  private receiveTheftChoice(sessionId: string, message: unknown): void {
+    const frame = this.simulation.frame;
+    const rate = this.choiceRate.get(sessionId) ?? { windowStart: frame, count: 0 };
+    if (frame - rate.windowStart >= STEPS_PER_SECOND) {
+      rate.windowStart = frame;
+      rate.count = 0;
+    }
+    rate.count++;
+    this.choiceRate.set(sessionId, rate);
+    if (rate.count > MAX_CHOOSE_THEFT_PER_SECOND) return;
+    const choice = validateChooseTheftMessage(message);
+    if (choice === undefined) return;
+    const duel = [...this.seaDuels.values()].find((each) => each.key === choice.duel && each.players.includes(sessionId));
+    if (duel === undefined) return;
+    // The ledger checks that this player won, the window is open and the type is eligible; otherwise nothing changes.
+    const stepped = chooseTheft(this.ledger, { duelId: duel.id, playerId: sessionId, type: choice.type, tick: this.simulation.worldTick });
+    this.ledger = stepped.state;
+    this.noteSettlements();
+  }
+
+  private noticesOf(id: string): Notices {
+    let notices = this.notices.get(id);
+    if (notices === undefined) {
+      notices = { channelResult: "", channelResultAt: 0, settledRole: "", stolen: "", goldChange: 0, settledAt: 0 };
+      this.notices.set(id, notices);
+    }
+    return notices;
+  }
+
+  /** Each newly settled ledger duel, in its players' notices: what was stolen and the gold that moved. */
+  private noteSettlements(): void {
+    for (const duel of this.ledger.duels) {
+      if (duel.phase !== "settled" || this.noticed.has(duel.id)) continue;
+      this.noticed.add(duel.id);
+      this.noteSettlement(duel);
+    }
+  }
+
+  private noteSettlement(duel: LedgerDuel): void {
+    const settlement = duel.settlement!;
+    const result = duel.result!;
+    for (const id of duel.players) {
+      const notice = this.noticesOf(id);
+      notice.settledAt = settlement.tick;
+      notice.stolen = settlement.stolenType ?? "";
+      if (result.outcome !== "win") {
+        notice.settledRole = "draw";
+        notice.goldChange = 0;
+      } else {
+        const winner = result.winner === id;
+        notice.settledRole = winner ? "winner" : "loser";
+        notice.goldChange = winner ? settlement.gold : -settlement.gold;
+      }
+    }
+  }
+
+  /**
+   * After every world tick in development and tests: the ledger's own invariant, and the room's: every player the
+   * ledger counts in the match has a ship, and every ship belongs to such a player.
+   */
+  private checkInvariants(tick: number): void {
+    if (!this.tuning.checkInvariants) return;
+    const problems = checkLedger(this.ledger);
+    const ships = new Set(this.simulation.ships.map((ship) => ship.id));
+    for (const player of this.ledger.players) {
+      if (player.status !== "left" && !ships.has(player.id)) problems.push(`player ${player.id} is in the ledger's match without a ship`);
+    }
+    for (const id of ships) {
+      const player = findPlayer(this.ledger, id);
+      if (player === undefined || player.status === "left") problems.push(`ship ${id} has no player in the ledger's match`);
+    }
+    if (problems.length === 0) return;
+    for (const problem of problems) this.violations.push(`tick ${tick}: ${problem}`);
+    console.error(`match ${this.state.code} invariant violated at tick ${tick}: ${problems.join("; ")}`);
+  }
+
+  /** Copies the plain simulation state into the synced schema, then updates what each client may see. */
+  private mirror(): void {
+    this.state.frame = this.simulation.frame;
+    this.state.worldTick = this.simulation.worldTick;
+    this.state.players = this.simulation.ships.length;
+    const present = new Set<string>();
+    for (const ship of this.simulation.ships) {
+      present.add(ship.id);
+      let synced = this.state.ships.get(ship.id);
+      if (synced === undefined) {
+        synced = new ShipSchema();
+        synced.id = ship.id;
+        synced.slot = ship.slot;
+        this.state.ships.set(ship.id, synced);
+      }
+      synced.x = ship.x;
+      synced.y = ship.y;
+      synced.heading = ship.heading;
+      synced.speed = ship.speed;
+      synced.dock = ship.dock;
+    }
+    for (const id of [...this.state.ships.keys()]) if (!present.has(id)) this.state.ships.delete(id);
+    this.mirrorEncounters(present);
+    this.mirrorObjectives(present);
+    this.updateViews();
+  }
+
+  /** The rules' telegraphs and each player's status into the synced state (markers change only on events). */
+  private mirrorEncounters(present: ReadonlySet<string>): void {
+    const keys = new Set<string>();
+    for (const attempt of this.encounters.attempts) {
+      for (const [key, defenderId] of [
+        [attempt.attackerId, attempt.defenderId],
+        [attempt.attackerId + BLANK_GRAPPLE_SUFFIX, ""],
+      ] as const) {
+        keys.add(key);
+        let synced = this.state.grapples.get(key);
+        if (synced === undefined) {
+          synced = new GrappleSchema();
+          synced.attackerId = attempt.attackerId;
+          this.state.grapples.set(key, synced);
+        }
+        synced.defenderId = defenderId;
+        synced.aim = attempt.aim;
+        synced.startTick = attempt.startTick;
+        synced.landTick = attempt.landTick;
+      }
+    }
+    for (const key of [...this.state.grapples.keys()]) if (!keys.has(key)) this.state.grapples.delete(key);
+
+    const records = new Map(this.encounters.players.map((player) => [player.id, player]));
+    for (const id of present) {
+      let status = this.state.status.get(id);
+      if (status === undefined) {
+        status = new PlayerStatusSchema();
+        this.state.status.set(id, status);
+      }
+      const record = records.get(id);
+      status.mode = record?.respawn != null ? "respawning" : duelOf(this.encounters, id) !== undefined ? "duel" : "sea";
+      status.protection = record?.protection?.source ?? "";
+      status.protectedUntil = record?.protection?.endTick ?? 0;
+      status.cooldownUntil = record?.cooldownEndTick ?? 0;
+      status.respawnAt = record?.respawn?.respawnTick ?? 0;
+    }
+    for (const id of [...this.state.status.keys()]) if (!present.has(id)) this.state.status.delete(id);
+  }
+
+  /**
+   * The ledger into the synced state: each player's private status (gold, rubbings, what their island and dock hold
+   * while moored there, E's target and progress, their theft choice and their last results), and a contentless marker
+   * for each recovery cache.
+   */
+  private mirrorObjectives(present: ReadonlySet<string>): void {
+    const map = this.config.map;
+    const ships = new Map(this.simulation.ships.map((ship) => [ship.id, ship]));
+    const held = this.heldPlayers();
+    for (const id of present) {
+      const status = this.state.status.get(id)!;
+      const player = findPlayer(this.ledger, id);
+      const ship = ships.get(id)!;
+      const moored = ship.dock !== NOT_DOCKED && !held.has(id) && player !== undefined;
+      status.gold = player?.gold ?? 0;
+      status.rubbings = player === undefined ? "" : heldTypes(this.ledger, id).join(",");
+      status.islandTypes = moored ? sealedTypesAt(this.ledger, map.docks[ship.dock]!.island).join(",") : "";
+      status.cacheTypes = moored ? cachedTypesAt(this.ledger, map, ship.dock).join(",") : "";
+      const target = moored && player.status === "connected" ? interactTarget(this.ledger, map, id, ship.dock) : undefined;
+      status.target = target === undefined ? "" : `${target.kind}:${target.type}`;
+      const channel = player?.channel ?? null;
+      status.channel = channel?.kind ?? "";
+      status.channelType = channel === null ? "" : (this.ledger.rubbings.find((rubbing) => rubbing.id === channel.rubbingId)?.type ?? "");
+      status.channelHeld = channel?.heldTicks ?? 0;
+      status.channelTotal = channel === null ? 0 : channel.kind === "collect" ? this.ledger.rules.collectTicks : this.ledger.rules.cacheClaimTicks;
+      const choosing = this.ledger.duels.find((duel) => duel.phase === "choosing" && duel.result?.winner === id);
+      const options = choosing === undefined ? [] : eligibleTheftTypes(this.ledger, choosing.id);
+      status.theftDuel = choosing === undefined || options.length === 0 ? "" : (this.seaDuels.get(choosing.id)?.key ?? "");
+      status.theftOptions = status.theftDuel === "" ? "" : options.join(",");
+      status.theftDeadline = status.theftDuel === "" ? 0 : choosing!.choiceDeadline!;
+      const notice = this.noticesOf(id);
+      status.channelResult = notice.channelResult;
+      status.channelResultAt = notice.channelResultAt;
+      status.settledRole = notice.settledRole;
+      status.stolen = notice.stolen;
+      status.goldChange = notice.goldChange;
+      status.settledAt = notice.settledAt;
+    }
+    const caches = new Set<string>();
+    for (const cache of this.ledger.caches) {
+      if (cacheRubbings(this.ledger, cache.id).length === 0) continue;
+      caches.add(cache.id);
+      let synced = this.state.caches.get(cache.id);
+      if (synced === undefined) {
+        synced = new CacheMarkerSchema();
+        synced.x = cache.x;
+        synced.y = cache.y;
+        synced.dock = cacheDock(map, cache);
+        this.state.caches.set(cache.id, synced);
+      }
+    }
+    for (const id of [...this.state.caches.keys()]) if (!caches.has(id)) this.state.caches.delete(id);
+  }
+
+  /**
+   * Each client's view (§3, §6, §12, §16): its own ship unless it waits to respawn, the ships it can see that are not
+   * in a duel or waiting to respawn, the grapples whose attacker it sees or that aim at it (with the target blanked
+   * unless it sees the target too), the duel markers and caches in its sight, its own status and its own duel. A
+   * fighter or a player waiting to respawn sees no other ship, grapple, marker or cache. Nothing else is encoded for it.
+   */
+  private updateViews(): void {
+    const inDuel = new Set(this.encounters.duels.flatMap((duel) => duel.players));
+    const respawning = new Set(this.encounters.players.filter((player) => player.respawn !== null).map((player) => player.id));
+    const ships = new Map(this.simulation.ships.map((ship) => [ship.id, ship]));
+    for (const client of this.clients) {
+      const view = client.view;
+      if (view === undefined) continue;
+      const self = client.sessionId;
+      const viewer = ships.get(self);
+      const away = inDuel.has(self) || respawning.has(self);
+      const sync = (item: Parameters<typeof view.add>[0], visible: boolean) => {
+        const shown = view.has(item);
+        if (visible && !shown) view.add(item);
+        else if (!visible && shown) view.remove(item);
+      };
+      const visible = visibleShipIds(this.config, this.simulation, self);
+      for (const [id, ship] of this.state.ships) {
+        sync(ship, id === self ? !respawning.has(id) : visible.has(id) && !away && !inDuel.has(id) && !respawning.has(id));
+      }
+      const sees = (id: string) => {
+        const other = ships.get(id);
+        return !away && viewer !== undefined && other !== undefined && canSee(this.config, viewer, other);
+      };
+      for (const attempt of this.encounters.attempts) {
+        const aimedAt = attempt.attackerId === self || attempt.defenderId === self;
+        const full = aimedAt || (sees(attempt.attackerId) && sees(attempt.defenderId));
+        const blank = !full && sees(attempt.attackerId);
+        const fullEntry = this.state.grapples.get(attempt.attackerId);
+        const blankEntry = this.state.grapples.get(attempt.attackerId + BLANK_GRAPPLE_SUFFIX);
+        if (fullEntry !== undefined) sync(fullEntry, full);
+        if (blankEntry !== undefined) sync(blankEntry, blank);
+      }
+      for (const marker of this.state.markers.values()) sync(marker, !away && viewer !== undefined && pointInSight(this.config, viewer, marker));
+      for (const cache of this.state.caches.values()) sync(cache, !away && viewer !== undefined && pointInSight(this.config, viewer, cache));
+      for (const [id, status] of this.state.status) sync(status, id === self);
+      for (const lobby of this.state.duels.values()) sync(lobby, lobby.seats.some((seat) => seat.sessionId === self));
+    }
+  }
+
+  private async allocateCode(): Promise<string> {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const code = generateMatchCode();
+      const taken = await matchMaker.query({ name: this.roomName, code });
+      if (taken.length === 0) return code;
+    }
+    throw new ServerError(JoinRefusal.BadRequest, "Could not allocate a match code");
+  }
+}
