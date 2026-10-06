@@ -1,5 +1,7 @@
 # AI Roadmap — Evidence and Run Log (md-manager)
 
+> **Superseded (6 Oct 2026).** The current report is the submission doc at https://claude.ai/artifact/4Rif48YoL5xGZUvoxrM6LS with its companion at https://claude.ai/artifact/L4u5pfDtjjBqZCAYuKGcqo; the 6 Oct evidence bundle is in `evidence/2026-10-06/`. This file is the 24 Sep version, kept for history.
+
 Course: *AI driven development — 36h30 study program*, 16 September 2026 edition (`~/dev/AI_ROADMAP.pdf`).
 Project: **md-manager** — a graph explorer, document viewer and explicit-save Markdown editor for the Pi and Claude skill directories on this machine, plus the LangGraph workflow lab that runs supervised multi-lane Claude Code workers.
 Author: Mani Brar. Report assembled from machine artifacts on 2026-09-24.

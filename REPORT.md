@@ -1,5 +1,7 @@
 # AI Roadmap — Master Report (md-manager + project-B)
 
+> **Superseded (6 Oct 2026).** The current report is the submission doc at https://claude.ai/artifact/4Rif48YoL5xGZUvoxrM6LS with its companion at https://claude.ai/artifact/L4u5pfDtjjBqZCAYuKGcqo; the 6 Oct evidence bundle is in `evidence/2026-10-06/`. This file is the 29 Sep version, kept for history.
+
 Course: *AI driven development — 36h30 study program*, 16 September 2026 edition (`roadmap/AI_ROADMAP.pdf`).
 Author: Mani Brar. Report assembled from machine artifacts, 2026-09-29. **Supersedes** `docs/AI_ROADMAP_REPORT.md` (written 24 Sep, before the project-B campaign).
 
